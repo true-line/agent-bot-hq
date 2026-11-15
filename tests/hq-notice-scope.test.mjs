@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { validateConfig } from '../hq/hq.mjs';
+import { validNoticeScope } from '../hq/notices-config.mjs';
 import { DIGEST, SOUL, hello, startHQ, fakeLegacy } from './hq-harness.mjs';
 import { legacySigner } from '../hq/legacy.mjs';
 
@@ -113,4 +114,26 @@ test('scope effect shares the admission queue: supersession and queued lease exp
 test('scope configuration is explicit, bounded and unique per accepted assignment', () => {
   assert.doesNotThrow(() => validateConfig(config()));
   for (const scopes of [null, {}, Array(1025).fill(mapping), [mapping, mapping], [{ ...mapping, unknown: true }], [{ ...mapping, harness: 'not-polled' }], [{ ...mapping, repo: 'https://github.com/a/b' }], [{ ...mapping, repo: 'owner/..' }], [{ ...mapping, repo: 'owner/a/b' }], [{ ...mapping, definition_digest: 'latest' }], [{ ...mapping, role: '*' }]]) assert.throws(() => validateConfig(config(scopes)));
+});
+
+test('notice owner mappings reject trailing line terminators in every authority field', () => {
+  for (const suffix of ['\n', '\r', '\u2028', '\u2029']) {
+    for (const field of Object.keys(mapping)) {
+      const bad = { ...mapping, [field]: mapping[field] + suffix };
+      assert.throws(() => validateConfig(config([bad])), undefined, `${field} ending ${JSON.stringify(suffix)}`);
+    }
+    assert.equal(validNoticeScope({ harness: mapping.harness + suffix, repo: mapping.repo }), false);
+  }
+});
+
+test('notice repository assertions with trailing line terminators refuse before the effect', async () => {
+  const t = await start();
+  try {
+    const a = await admit(t);
+    let effects = 0;
+    for (const suffix of ['\n', '\r', '\u2028', '\u2029']) {
+      await assert.rejects(guard(t, a, { ...a.context, expected_repository: mapping.repo + suffix }, () => { effects++; }), (e) => e.code === 'host.invalid_request');
+    }
+    assert.equal(effects, 0);
+  } finally { await t.done(); }
 });

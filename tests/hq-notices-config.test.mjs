@@ -26,3 +26,9 @@ test('HQ keeps exact notice assignments out of the comms ingestion configuration
   const t = await startHQ({ config: { notices: { ...notices, scopes } }, plugins: [comms] });
   try { assert.deepEqual(t.hq.host.provided('agent-comms').notices(), notices); } finally { await t.done(); }
 });
+
+test('notice ingestion harness names reject trailing line terminators', () => {
+  for (const suffix of ['\n', '\r', '\u2028', '\u2029']) {
+    assert.throws(() => validateConfig({ notices: { ...notices, harnesses: ['test-codex-agent' + suffix] } }));
+  }
+});
