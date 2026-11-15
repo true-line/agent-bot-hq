@@ -44,6 +44,7 @@ import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
 import { negotiateVersions, supportWindow } from '../sdk/wire/versions.mjs';
 import { profileWarning } from './profile.mjs';
+import { resolveNoticeScope, validNoticeScope, validNoticeRepository } from './notices-config.mjs';
 
 export const CURRENT_VERSIONS = Object.freeze({ hq: 1, wire: 1, task: 1 });
 export const SCHEMA_NAMES = Object.freeze(['hello', 'admission-result', 'equip', 'ready-and-lease-renewal']);
@@ -89,7 +90,7 @@ const unboundOf = (tx) => tx.list('runtimes').map(([, rt]) => rt).filter((rt) =>
 // the account a broker connection arrived from ({ account, uid }), or
 // undefined on the shared socket. HQ core supplies all three; an agent never
 // does.
-export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined }) {
+export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false }) {
   for (const n of SCHEMA_NAMES) if (!schemas?.[n]) throw new TypeError(`admission needs the pinned hq/v1 ${n} schema`);
 
   const check = (name, value, inbound) => {
@@ -100,6 +101,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
     throw new Error(`HQ built an invalid hq/v1 ${name} (${first}); refusing to send it`);
   };
 
+  const normalizeScopes = new WeakMap();
   return definePlugin({
     name: 'hq-admission',
     version: '0.1.0',
@@ -109,6 +111,14 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
       const { store, receipts, clock, random, config, profile } = ctx.services;
       const ttl = () => config.get('leaseTtlMs') ?? DEFAULT_LEASE_TTL_MS;
       const accepted = (soul, digest) => (config.get('acceptedDefinitions')?.[soul] ?? []).includes(digest);
+      const scopeOf = (assignment) => resolveNoticeScope(config.get('notices'), assignment, (harness) => {
+        try { return allowsNoticeHarness(harness) === true; } catch { return false; }
+      });
+      // Startup migration only closes old authority; a missing snapshot is
+      // never backfilled from today's configuration. Init may only read.
+      normalizeScopes.set(ctx, () => store.tx((tx) => {
+        for (const [rid, rt] of tx.list('runtimes')) if (!Object.hasOwn(rt, 'notice_scope')) tx.put('runtimes', rid, { ...rt, notice_scope: null });
+      }));
       const id = (prefix, bytes = 12) => `${prefix}_${random.hex(bytes)}`;
       // The live runtimes with no harness account, for HQ core's status
       // (unboundRuntimes below). Refreshed after every transaction that adds
@@ -194,6 +204,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             const account = harnessAccount(adapterId);
             tx.put('runtimes', a.runtime_id, {
               soul_id: payload.soul_id, installation_id: payload.installation_id, member_id: a.member_id, role: a.role, adapter_id: adapterId,
+              definition_digest: payload.definition_digest,
+              notice_scope: scopeOf({ soul_id: payload.soul_id, definition_digest: payload.definition_digest, member_id: a.member_id, role: a.role, adapter_id: adapterId }),
               channel_binding: a.channel_binding, caller, epoch, lease_generation: leaseGeneration,
               lease_expires_at: leaseExpires, renewal_sequence: 0, ready: false, superseded: false,
               // The harness account this runtime belongs to, fixed at
@@ -405,6 +417,26 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         if (!rt) fail('host.invalid_request', `unknown runtime ${runtimeId}`);
         return fn(Object.freeze(current(rt, runtimeId, clock.now())));
       });
+      // Trusted broker consumers pass the bound runtime id, never a payload
+      // runtime selector. Keep liveness, assignment and mailbox effect in the
+      // same admission queue used by Hello/Lease and task commits.
+      const withNoticeScope = (boundRuntimeId, context, effect) => withBoundRuntime(boundRuntimeId, (rt) => {
+        if (!context || typeof context !== 'object' || Array.isArray(context)
+          || Object.keys(context).some((key) => !['installation_epoch', 'lease_generation', 'expected_repository'].includes(key))
+          || !Number.isSafeInteger(context.installation_epoch) || context.installation_epoch < 1
+          || !Number.isSafeInteger(context.lease_generation) || context.lease_generation < 1
+          || (Object.hasOwn(context, 'expected_repository') && !validNoticeRepository(context.expected_repository))
+          || typeof effect !== 'function') fail('host.invalid_request', 'notice scope needs epoch/generation assertions and a trusted effect');
+        if (context.installation_epoch !== rt.epoch) fail('stale_epoch', 'notice request epoch does not match the bound admission');
+        if (context.lease_generation !== rt.lease_generation) fail('lease_expired', 'notice request generation does not match the bound admission');
+        const frozen = rt.notice_scope;
+        const configured = scopeOf(rt);
+        if (!validNoticeScope(frozen) || Object.keys(frozen).length !== 2
+          || !accepted(rt.soul_id, rt.definition_digest) || !configured
+          || configured.harness !== frozen.harness || configured.repo.toLowerCase() !== frozen.repo.toLowerCase()) fail('caller_mismatch', 'no current owner-authorized notice scope; send Hello again');
+        if (Object.hasOwn(context, 'expected_repository') && context.expected_repository.toLowerCase() !== frozen.repo.toLowerCase()) fail('caller_mismatch', 'expected repository differs from the frozen notice scope');
+        return effect(Object.freeze({ harness: frozen.harness, repo: frozen.repo }));
+      });
       // For HQ core's profile reasons (§9 row 16b): the live runtimes with no
       // harness account, as { soul_id, member_id, adapter_id }. HQ core reads
       // them only through this, never this plugin's tables.
@@ -412,7 +444,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         const now = clock.now();
         return unbound.filter((rt) => now <= rt.lease_expires_at).map(({ soul_id: soulId, member_id: memberId, adapter_id: adapterId }) => ({ soul_id: soulId, member_id: memberId, adapter_id: adapterId }));
       };
-      return { provides: { withLiveRuntime, withLeases, verifyBinding, bindChallenge, forgetConnection, withBoundRuntime, unboundRuntimes } };
+      return { provides: { withLiveRuntime, withLeases, verifyBinding, bindChallenge, forgetConnection, withBoundRuntime, withNoticeScope, unboundRuntimes } };
     },
+    async start(ctx) { await normalizeScopes.get(ctx)(); },
   });
 }

@@ -88,10 +88,14 @@ HQ is enrolled from its next start. `--force` re-enrolls with a fresh key.
 `notices` opts the agent-comms broker plugin into explicit identity-service
 queues, for example `{ "harnesses": ["example-codex-agent"] }`. HQ validates
 the queue list, count, poll/lease intervals, storage caps, retention and wake
-class (`none` or `notify`), then passes the section to that plugin. Without
+class (`none` or `notify`), then passes ingestion settings to that plugin. Without
 the section, ingestion is disabled. The broker owns the custody and recovery
 behavior; see [agent-bot-comms's notice ingestion](https://github.com/true-line/agent-bot-comms/blob/main/docs/hq-notices.md)
 and [HQ issue #123](https://github.com/true-line/agent-bot-hq/issues/123).
+Optional owner-local `notices.scopes` binds an exact accepted assignment to a
+remote harness and repository, frozen per runtime. Those mappings stay with
+admission; see [HQ notice scope](../docs/hq-notice-scope.md) for configuration,
+the trusted guard and rollout dependencies.
 
 `features` holds feature flags, all off by default. `hardwareSigner` gates
 the `helper` signer backend: with it off, HQ refuses a config that names a

@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createPublicKey, generateKeyPairSync, verify as cryptoVerify } from 'node:crypto';
-import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { validateConfig } from '../hq/hq.mjs';
 import { createEnrollment, validateServiceUrl } from '../hq/enrollment.mjs';
@@ -206,4 +206,33 @@ test('HQ configured with enrollment.source hq: the grant runs from config alone 
     assert.ok(kinds.indexOf('device.enroll.started') < kinds.indexOf('device.enrolled'));
     assert.equal(t.hq.core.receipts.find((r) => r.kind === 'device.enrolled').key_storage, 'software');
   } finally { await t.done(); await svc.close(); }
+});
+
+test('notice harness membership is secret-free and tied to the current enrolled record, server and signer key', async () => {
+  const svc = await fakeIdentityService();
+  const home = tempHome();
+  try {
+    const signer = setup(home, svc);
+    assert.equal(signer.enrollment.allowsHarness('claude-code'), false);
+    await signer.enroll({ harnesses: ['claude-code'] });
+    svc.decide('approved'); await signer.enrollment.settled();
+    assert.equal(signer.enrollment.allowsHarness('claude-code'), true);
+    assert.equal(signer.enrollment.allowsHarness('different-bot'), false);
+    const path = join(home, 'identity/device.json');
+    const original = readFileSync(path, 'utf8');
+    const record = JSON.parse(original);
+    const save = (value) => writeFileSync(path, JSON.stringify(value), { mode: 0o600 });
+    for (const changes of [{ server: 'https://other.example' }, { jkt: 'wrong-key' }, { key_storage: 'different' }, { key_generation: 99 }, { revoked_at: '2026-11-14T00:00:00Z' }, { device_id: '' }, { harnesses: undefined }, { harnesses: [] }, { harnesses: ['claude-code', 'bad name'] }, { harnesses: ['claude-code', 'claude-code'] }]) {
+      save({ ...record, ...changes });
+      assert.equal(signer.enrollment.allowsHarness('claude-code'), false, JSON.stringify(changes));
+    }
+    writeFileSync(path, '{broken');
+    assert.equal(signer.enrollment.allowsHarness('claude-code'), false);
+    writeFileSync(path, original); chmodSync(path, 0o644);
+    assert.equal(signer.enrollment.allowsHarness('claude-code'), false);
+    chmodSync(path, 0o600);
+    assert.equal(signer.enrollment.allowsHarness('claude-code'), true);
+    signer.createKey({ replace: true });
+    assert.equal(signer.enrollment.allowsHarness('claude-code'), false, 'a key rotation cannot reuse the old enrollment');
+  } finally { await svc.close(); rmSync(home, { recursive: true, force: true }); }
 });

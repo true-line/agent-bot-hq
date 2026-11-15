@@ -194,6 +194,22 @@ export function createEnrollment({
       return stateOf(record(), key().thumbprint);
     },
 
+    // A secret-free, current membership proof for host admission. Unreadable,
+    // revoked, malformed or differently keyed records grant no notice scope.
+    allowsHarness(harness) {
+      try {
+        const rec = record();
+        const current = key();
+        return typeof harness === 'string' && HARNESS.test(harness)
+          && stateOf(rec, current.thumbprint) === 'enrolled'
+          && typeof rec.device_id === 'string' && rec.device_id.length > 0 && rec.device_id.length <= 256
+          && rec.key_storage === current.key_storage && rec.key_generation === current.generation
+          && Array.isArray(rec.harnesses) && rec.harnesses.length > 0 && rec.harnesses.length <= 64
+          && rec.harnesses.every((h) => typeof h === 'string' && HARNESS.test(h))
+          && new Set(rec.harnesses).size === rec.harnesses.length && rec.harnesses.includes(harness);
+      } catch { return false; }
+    },
+
     // What status and device.status show about the enrollment.
     progress() {
       let rec;
