@@ -50,7 +50,7 @@ import { loadPlugins } from './plugins.mjs';
 import { checkSocketPath, listenSocket } from './socket.mjs';
 import { checkHarnessSocket, planHarnessEndpoints, validateHarnessesConfig } from './harness-accounts.mjs';
 import { coreTable, CORE_PLUGIN, ensurePrivateDir, openStore } from './store.mjs';
-import { validateNoticesConfig } from './notices-config.mjs';
+import { validateNoticesConfig, noticeIngestionConfig } from './notices-config.mjs';
 
 export const HQ_VERSION = '0.1.0';
 const CONFIG_KEYS = new Set(['standalone', 'leaseTtlMs', 'acceptedDefinitions', 'concurrentWriters', 'legacy', 'signer', 'features', 'enrollment', 'harnesses', 'notices']);
@@ -239,9 +239,9 @@ export function createHQ({
         : unlinkedIdentity()),
       persist: () => store.persist(),
       config: {
-        'hq-admission': { acceptedDefinitions: cfg.acceptedDefinitions ?? {}, ...(cfg.leaseTtlMs ? { leaseTtlMs: cfg.leaseTtlMs } : {}) },
+        'hq-admission': { acceptedDefinitions: cfg.acceptedDefinitions ?? {}, notices: cfg.notices ?? null, ...(cfg.leaseTtlMs ? { leaseTtlMs: cfg.leaseTtlMs } : {}) },
         'hq-tasks': { concurrentWriters: cfg.concurrentWriters ?? [] },
-        'agent-comms': { notices: cfg.notices ?? null },
+        'agent-comms': { notices: noticeIngestionConfig(cfg.notices) },
       },
     });
     // Revocation can also arrive from the signer/legacy probe, rather than
@@ -290,6 +290,7 @@ export function createHQ({
     // receipt say why.
     const admission = admissionPlugin({
       schemas,
+      allowsNoticeHarness: (harness) => signer.enrollment?.allowsHarness?.(harness) === true,
       profileReasons: (pending, unbound) => profileReasons(pending, unbound),
       harnessAccount: (adapterId) => harnessPlan.accountOf(adapterId),
       callerOf: (connection) => brokerCallers.get(connection),

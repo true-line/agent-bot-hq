@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { definePlugin } from '../sdk/plugin.mjs';
 import { validateConfig } from '../hq/hq.mjs';
-import { startHQ } from './hq-harness.mjs';
+import { DIGEST, SOUL, startHQ } from './hq-harness.mjs';
 
 const notices = { harnesses: ['test-codex-agent'], pollIntervalMs: 5000, count: 5, leaseSeconds: 60, wakeClass: 'notify', maxMessages: 50, maxBytes: 65536, retentionMs: 8 * 24 * 60 * 60 * 1000 };
 
@@ -18,4 +18,11 @@ test('HQ passes the owner configuration to comms, and leaves ingestion disabled 
     const t = await startHQ({ config, plugins: [comms] });
     try { assert.deepEqual(t.hq.host.provided('agent-comms').notices(), config.notices ?? null); } finally { await t.done(); }
   }
+});
+
+test('HQ keeps exact notice assignments out of the comms ingestion configuration', async () => {
+  const scopes = [{ soul_id: SOUL, definition_digest: DIGEST, member_id: 'm_lead', adapter_id: 'fake-adapter', role: 'lead', harness: 'test-codex-agent', repo: 'true-line/agent-bot-hq' }];
+  const comms = definePlugin({ name: 'agent-comms', version: '1.0.0', hostApi: 1, services: ['config'], async init(ctx) { return { provides: { notices: () => ctx.services.config.get('notices') } }; } });
+  const t = await startHQ({ config: { notices: { ...notices, scopes } }, plugins: [comms] });
+  try { assert.deepEqual(t.hq.host.provided('agent-comms').notices(), notices); } finally { await t.done(); }
 });
