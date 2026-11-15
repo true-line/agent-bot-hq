@@ -44,6 +44,8 @@ assert.ok(r.ok, JSON.stringify(r.results.filter((x) => !x.ok)));
 | `services.mjs` | The host services in memory: store, credentials, identityService, approvals, budgets, launch, events, receipts, log, config, clock, random and profile. | §4.3 |
 | `test-host.mjs` | `createTestHost`, which adds a fake identity service with Ed25519-signed canned responses, a fake signer, a deterministic clock and random, and fake member principals. | §4.6 |
 | `conformance.mjs` | `checkPlugin`, the plugin conformance suite. | §4.6 |
+| `member-query.mjs` | `createMemberQueryPort`, a member-side query capability with immutable per-attempt freshness and bounded opt-in read recovery. [Preparation and driver contract](../docs/hq-member-query-port.md). | #134, parent #131 |
+| `member-query-conformance.mjs` | `checkMemberQueryPort`, portable SDK-port semantic checks using an instrumented private driver. Real-provider authentication and composition remain separate. | #134 |
 | `semver.mjs` | Plugin versions and dependency ranges. | §4.5 |
 | `errors.mjs` | `HostError`, registry codes (wire) and `host.*` codes (in HQ only). `instanceof HostError` holds for an error from any copy of the SDK, so a plugin from another repository is answered with its own refusal code. | §4.7 |
 | `wire/` | RFC 8785 canonical JSON and digests, strict JSON parsing, a JSON Schema validator for the keywords the pinned schemas use (it refuses any other keyword), and N/N−1 version and capability negotiation. | §2.3, §4.5 |
