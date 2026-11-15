@@ -9,6 +9,8 @@ export { TOOL_FIELDS, COMMAND_FIELDS, SUBCOMMAND_FIELDS, TOOL_CLASSES, COMMAND_V
 export { PROFILES, DEVICE_STATES, createCore, testClock, testRandom, fakeIdentityService, fakeSigner } from './services.mjs';
 export { createTestHost } from './test-host.mjs';
 export { checkPlugin } from './conformance.mjs';
+export { createMemberQueryPort } from './member-query.mjs';
+export { checkMemberQueryPort } from './member-query-conformance.mjs';
 export { canonicalize, canonicalBytes, canonicalDigest } from './wire/canonical-json.mjs';
 export { parseStrict } from './wire/strict-json.mjs';
 export { validate, checkSchemaSupported } from './wire/schema.mjs';
