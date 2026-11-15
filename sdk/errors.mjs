@@ -43,6 +43,7 @@ export class HostError extends Error {
 export const REGISTRY_CODES = Object.freeze({
   unsupported_version: false,
   required_capability_missing: false,
+  frame_too_large: false,
   caller_mismatch: false,
   stale_epoch: false,
   lease_expired: true,
