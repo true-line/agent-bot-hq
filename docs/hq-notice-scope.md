@@ -97,3 +97,7 @@ activation remains outside this change.
 assignment/configuration changes, freshness and queue races;
 `tests/hq-enrollment.test.mjs` covers the current enrollment proof; and
 `tests/hq-notices-config.test.mjs` covers separation from ingestion settings.
+
+The inactive [HQ consumer preparation](hq-notice-consumer.md) now provides the
+wire-validation and guarded delegation factory. Its release/pin and real
+mailbox integration remain pending; default loading is unchanged.
