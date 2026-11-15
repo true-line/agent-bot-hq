@@ -27,10 +27,12 @@ export function createMemberQueryPort(driver) {
   return Object.freeze({
     async request(kind, buildPayload, options = {}) {
       if (typeof kind !== 'string' || !KIND.test(kind) || typeof buildPayload !== 'function') throw new TypeError('member query requires a kind and synchronous payload builder');
-      if (!plain(options) || Object.keys(options).some((key) => key !== 'replay') || !['never', 'read-once', undefined].includes(options.replay)) throw new TypeError('member query replay is never or read-once');
+      if (!plain(options) || Object.keys(options).some((key) => key !== 'replay')) throw new TypeError('member query replay is never or read-once');
+      const replay = Object.hasOwn(options, 'replay') ? options.replay : 'never';
+      if (!['never', 'read-once', undefined].includes(replay)) throw new TypeError('member query replay is never or read-once');
       // This fixed allowlist cannot be widened by a caller or driver. In
       // particular, consume-one and task.commit always get one send at most.
-      const canReplay = options.replay === 'read-once' && READS.has(kind);
+      const canReplay = replay === 'read-once' && READS.has(kind);
       let captured = await capture();
       for (let attempt = 0; ; attempt++) {
         const freshness = snapshot(captured);

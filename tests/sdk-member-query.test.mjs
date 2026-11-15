@@ -35,6 +35,34 @@ test('driver and request arguments refuse before any capture or send', async () 
   assert.equal(captures, 0);
 });
 
+test('inherited replay policy cannot opt an omitted policy into recovery', async () => {
+  const previous = Object.getOwnPropertyDescriptor(Object.prototype, 'replay');
+  Object.defineProperty(Object.prototype, 'replay', { value: 'read-once', configurable: true });
+  try {
+    for (const options of [undefined, {}, Object.create(null), { replay: 'never' }, { replay: 'read-once' }]) {
+      const failure = new Error('lost read response');
+      let sends = 0;
+      let classifications = 0;
+      let reconnects = 0;
+      const port = createMemberQueryPort(driver({
+        capture: () => pair(1, () => { sends++; throw failure; }),
+        isRetryableReadFailure: () => { classifications++; return true; },
+        reconnect: () => { reconnects++; return pair(2, () => { sends++; return 'recovered'; }); },
+      }));
+      if (options && Object.hasOwn(options, 'replay') && options.replay === 'read-once') {
+        assert.equal(await port.request('notices.peek', () => ({}), options), 'recovered');
+        assert.deepEqual([sends, classifications, reconnects], [2, 1, 1]);
+      } else {
+        await assert.rejects(port.request('notices.peek', () => ({}), options), (error) => error === failure);
+        assert.deepEqual([sends, classifications, reconnects], [1, 0, 0]);
+      }
+    }
+  } finally {
+    if (previous) Object.defineProperty(Object.prototype, 'replay', previous);
+    else delete Object.prototype.replay;
+  }
+});
+
 test('mutable, malformed and invalid replacement captures refuse without sending', async () => {
   let sends = 0;
   const request = () => { sends++; };
