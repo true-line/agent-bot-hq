@@ -11,6 +11,7 @@ export { createTestHost } from './test-host.mjs';
 export { checkPlugin } from './conformance.mjs';
 export { createMemberQueryPort } from './member-query.mjs';
 export { checkMemberQueryPort } from './member-query-conformance.mjs';
+export { connectMemberQueries } from './member-client.mjs';
 export { canonicalize, canonicalBytes, canonicalDigest } from './wire/canonical-json.mjs';
 export { parseStrict } from './wire/strict-json.mjs';
 export { validate, checkSchemaSupported } from './wire/schema.mjs';

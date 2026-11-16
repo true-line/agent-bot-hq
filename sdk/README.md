@@ -46,6 +46,9 @@ assert.ok(r.ok, JSON.stringify(r.results.filter((x) => !x.ok)));
 | `conformance.mjs` | `checkPlugin`, the plugin conformance suite. | §4.6 |
 | `member-query.mjs` | `createMemberQueryPort`, a member-side query capability with immutable per-attempt freshness and bounded opt-in read recovery. [Preparation and driver contract](../docs/hq-member-query-port.md). | #134, parent #131 |
 | `member-query-conformance.mjs` | `checkMemberQueryPort`, portable SDK-port semantic checks using an instrumented private driver. Real-provider authentication and composition remain separate. | #134 |
+| `local-socket-client.mjs`, `local-socket-lines.mjs` | Existing strict local HQ socket client and bounded UTF-8 line transport, extracted for shared member bootstrapping. [Client contract and provenance](../docs/hq-member-bootstrap-client.md). | #136, parent #131 |
+| `member-client.mjs` | `connectMemberQueries` bootstraps the existing member token/runtime/broker flow and returns only `{queries, close}`. Also exported as `@agent-bot/sdk/member`. | #136 |
+| `member-session.mjs` | Private transport-owner integration facade used by that bootstrap and future Souls adoption; task commitment recovery stays with Souls. | #136 |
 | `semver.mjs` | Plugin versions and dependency ranges. | §4.5 |
 | `errors.mjs` | `HostError`, registry codes (wire) and `host.*` codes (in HQ only). `instanceof HostError` holds for an error from any copy of the SDK, so a plugin from another repository is answered with its own refusal code. | §4.7 |
 | `wire/` | RFC 8785 canonical JSON and digests, strict JSON parsing, a JSON Schema validator for the keywords the pinned schemas use (it refuses any other keyword), and N/N−1 version and capability negotiation. | §2.3, §4.5 |

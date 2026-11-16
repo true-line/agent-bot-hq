@@ -419,6 +419,14 @@ The shape follows agent-bot-identity's in-place MCP registry
 | `when` | no | Distinct condition names, `^[a-z][a-z0-9-]{0,63}$`; the tool is listed only while all hold |
 | `handler` | yes | Function; it resolves to broker queries, never to direct authority |
 
+The SDK's member-side [bootstrap client](hq-member-bootstrap-client.md)
+reuses the existing local socket and challenge-bound session mechanics. It
+returns the narrow query capability to a member surface, while the Soul
+runtime retains token issuance, supervision, renewal/replacement and
+task-specific recovery. This client library adds no HQ authority, IPC kind,
+generic envelope, package loader or host executable inside a Soul. The
+member/MCP composition and consumer pin/removal work remain under HQ #131.
+
 #### 4.2.2 Command declaration
 
 `ctx.commands.register(cmd)` takes exactly these fields, refused the same
