@@ -148,21 +148,21 @@ test('public comms test fetch ignores inherited scoped headers and credential pr
     writeFileSync(system, scoped);
     writeFileSync(global, scoped);
     writeFileSync(join(template, 'config'), scoped);
-    const inherited = { ...process.env, GIT_CONFIG_SYSTEM: system, GIT_CONFIG_GLOBAL: global,
+    const inherited = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_'))), GIT_CONFIG_SYSTEM: system, GIT_CONFIG_GLOBAL: global,
       GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraHeader', GIT_CONFIG_VALUE_0: 'X-Injected: CANARY',
       GIT_CONFIG_PARAMETERS: "'http.https://github.com/.extraHeader=X-Parameter: CANARY'", GIT_TEMPLATE_DIR: template,
       GIT_DIR: join(home, 'untrusted.git'), GIT_WORK_TREE: join(home, 'untrusted-tree'), GIT_COMMON_DIR: join(home, 'untrusted-common'),
       GIT_ASKPASS: 'CANARY-ASKPASS', SSH_ASKPASS: 'CANARY-SSH-ASKPASS' };
+    const isolated = credentialFreeGitEnv(inherited);
+    const init = spawnSync('git', ['-C', home, 'init', '-q', '--template='], { env: isolated, encoding: 'utf8' });
+    assert.equal(init.status, 0, init.stderr);
     const query = (env) => spawnSync('git', ['-C', home, 'config', '--get-urlmatch', 'http.extraHeader', 'https://github.com/true-line/agent-bot-comms.git'], { env, encoding: 'utf8' });
     const { GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR, ...control } = inherited;
     assert.equal(query(control).status, 0, 'control config is readable');
     assert.match(query(control).stdout, /CANARY/, 'control has scoped headers');
-    const isolated = credentialFreeGitEnv(inherited);
     assert.equal(isolated.GIT_ASKPASS, '/bin/false');
     assert.equal(isolated.SSH_ASKPASS, '/bin/false');
     for (const key of ['GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_PARAMETERS', 'GIT_TEMPLATE_DIR', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR']) assert.equal(Object.hasOwn(isolated, key), false, key);
-    const init = spawnSync('git', ['-C', home, 'init', '-q', '--template='], { env: isolated, encoding: 'utf8' });
-    assert.equal(init.status, 0, init.stderr);
     const checked = query(isolated);
     assert.equal(checked.status, 1, checked.stderr);
     assert.equal(checked.stdout, '', 'no global, system, injected or template header remains');
