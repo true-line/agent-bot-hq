@@ -62,6 +62,7 @@ const member = await connectMemberQueries({
   memberToken,   // existing per-member token, held only in memory
   brokerSocket,  // optional existing per-account broker endpoint
   contracts,    // required verified-release validation adapter, as above
+  signal,       // optional AbortSignal created before awaiting bootstrap
 });
 try {
   const result = await member.queries.request('notices.peek', (freshness) => ({
@@ -83,6 +84,23 @@ and reconnect use the reviewed provider's single-flight publication; a late
 failure from a retired pair reuses the newer pair. A failed capture or bind
 publishes nothing. Closing aborts pending entry/bind work and current,
 candidate and retiring connections; repeated close calls share completion.
+
+An optional `signal` also cancels construction before a facade exists. Create
+its controller before awaiting bootstrap, pass the signal, and abort it on
+MCP EOF/shutdown. Every entry and broker socket uses Node's `addAbortSignal`
+stream helper to cancel the native socket; an already-aborted signal opens
+nothing. Aborting rejects
+pending hello/runtime/bind/query work, closes the corresponding connections,
+and prevents later capture, reconnect or publication. The caller's abort
+reason is preserved. Native socket abort listeners are removed on socket
+close, including failed construction and ordinary close without abort.
+Omitting the signal preserves the existing lifecycle. The SDK adds no timeout
+or automatic retry policy.
+
+After successful construction, callers still close the returned facade during
+shutdown; abort and close are safe in either order. Cancellation after a
+destructive request was sent may leave its outcome unknown. It never replays
+that consume, acknowledges delivery or proves that no effect occurred.
 
 The returned object is frozen and has exactly `queries` and `close`.
 `queries` is the existing [query port](hq-member-query-port.md): it exposes
@@ -161,3 +179,7 @@ owner-facade cases check foreign-capture rejection, full runtime redaction and
 the raw-request/generic-invalidation distinction. Full Souls task commitment
 compatibility still needs its consumer to vendor this SDK and remove its
 original mechanics; these tests do not claim that adoption or MCP wiring.
+`tests/sdk-member-cancel.test.mjs` adds real-socket cancellation cases for
+already-aborted construction, silent hello, completion races, runtime/bind and
+retiring/replacement work, pending consume, cancellation before its first send,
+idempotent close and native listener cleanup without requiring an abort.
