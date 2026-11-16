@@ -1,7 +1,5 @@
-// Host-only consumer preparation for PDR-0062 / HQ #130. Production callers
-// must supply digest-verified released schemas, as for tasksPlugin. This factory
-// is deliberately not part of HQ's default plugin set until the release/pin
-// and comms mailbox implementation are reviewed together.
+// Guarded local notice consumer for Accepted PDR-0062; schemas come from
+// the normal digest-verified release loader, as for tasksPlugin.
 import { definePlugin } from '../sdk/plugin.mjs';
 import { fail } from '../sdk/errors.mjs';
 import { validate } from '../sdk/wire/schema.mjs';

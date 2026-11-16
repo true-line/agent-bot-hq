@@ -40,6 +40,7 @@ import { fail } from '../sdk/errors.mjs';
 import { createCore, dropTokens, pushReceipt, revokeDevice } from '../sdk/services.mjs';
 import { admissionPlugin } from './admission.mjs';
 import { tasksPlugin } from './tasks.mjs';
+import { noticesPlugin } from './notices.mjs';
 import { legacyDaemon, legacySigner } from './legacy.mjs';
 import { detectProfile } from './profile.mjs';
 import { backendFromConfig, createSigner, validateSignerConfig } from './signer.mjs';
@@ -295,7 +296,7 @@ export function createHQ({
       harnessAccount: (adapterId) => harnessPlan.accountOf(adapterId),
       callerOf: (connection) => brokerCallers.get(connection),
     });
-    const builtIn = [admission, tasksPlugin({ schemas }), ...plugins];
+    const builtIn = [admission, tasksPlugin({ schemas }), noticesPlugin({ schemas }), ...plugins];
     pluginLoad = [];
     const accepted = [];
     const taken = new Set([CORE_PLUGIN, ...builtIn.map((p) => p.name)]);

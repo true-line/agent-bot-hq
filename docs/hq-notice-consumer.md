@@ -1,13 +1,13 @@
-# Scoped notice consumer preparation
+# Scoped notice consumer
 
-[HQ #130](https://github.com/true-line/agent-bot-hq/issues/130) prepares the
+[HQ #130](https://github.com/true-line/agent-bot-hq/issues/130) tracks the
 host consumer for the shared
-[notice contract](https://github.com/true-line/soul-contracts/blob/60c540ea71a720148f6733afc7b29fa1ec255753/schemas/hq/v1/notices.md).
+[notice contract](https://github.com/true-line/soul-contracts/blob/v0.5.0/schemas/hq/v1/notices.md).
 The contract owns fields, bounds, compatibility and refusal codes;
 [Accepted PDR-0062](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0062-hq-notice-scope-and-legacy-consume-one.md)
 owns the scope and handoff decision.
 
-## Prepared implementation
+## Host integration
 
 `hq/notices.mjs` exports `noticesPlugin({schemas})`, requiring the shared
 `notice-query` and `notice-result` schemas supplied by its host. As with
@@ -46,57 +46,36 @@ or incompatible scoped mailbox is an explicit `host.plugin_degraded` refusal.
 This plugin declares no identity-service routes or network service; there is
 no upstream fallback, automatic replay, directive or lifecycle action.
 
-## Release and integration gate
+## Released contracts and validation
 
-The factory is **not included in HQ's default plugin set or main schema
-loader**. The current exact contract pin remains `v0.4.1`, which lacks these
-notice schemas. No substitute schema, development loader, environment
-override or invented release pin is provided. Production callers must use
-released schemas from normal digest verification.
+The normal HQ schema loader verifies the complete `v0.5.0` release pin in
+`governance/soul-contracts.json`, then loads both notice schemas. Normal host
+construction registers `hq-notices` alongside admission and tasks. It requires
+no owner notice configuration for ordinary admission or task operation.
+Without an existing enrolled, frozen notice scope, requests refuse before any
+mailbox effect. Comms ingestion remains disabled without its existing explicit
+configuration. The production plugin bundle is unchanged.
 
-The following remain open before default activation and closure of #130:
-
-- Publish the reviewed shared contract release, update HQ's complete exact
-  pin, and load the two schemas through the existing verifier.
-- Integrate the reviewed comms scoped mailbox service from
-  [comms #317](https://github.com/true-line/agent-bot-comms/issues/317), then
-  exercise this consumer against that real durable implementation.
-- Provide a supported bound member-query client and replay policy for the
-  [identity compatibility slice](https://github.com/true-line/agent-bot-identity/issues/1441).
-  Existing Soul member read recovery must not automatically replay a
-  destructive consume operation after an unknown transport outcome.
-- Review the upstream dedicated-device custody fence and mixed-version
-  rollout together with the other slices. Local consumer validation does not
-  prove exclusive upstream custody or enable production configuration.
-
-`tests/hq-notices-preparation.test.mjs` confirms missing schemas refuse and
-default HQ registers no notice kinds. The portable suite in
-`tests/support/notice-consumer-cases.mjs` accepts explicit shared schemas and
-fixtures from a test runner and exercises the actual HQ, sockets, broker and
-admission guard with an instrumented mailbox service. It includes refusal
-before effects, full-result preparation before consumption, malformed result
-refusal, source byte boundaries and aggregate peek bounds. It contains no
-schema copies and supplies no production loading path.
-
-The explicitly test-only source runner verifies the clean checkout's full
-reviewed commit and the 154-file `errors`/`fixtures`/`schemas` manifest with
-HQ's existing `sha256-manifest-v1` implementation. It reads verified git blobs
-rather than accepting arbitrary schema files. A fresh reviewer can run:
+`tests/hq-notices.test.mjs` runs the released shared notice corpus and guarded
+consumer cases through default host registration, including malformed records,
+freshness, missing mailbox, source bounds and full-result preparation before
+consumption. `tests/hq-notices-comms.test.mjs` runs the real comms broker and
+mailbox from the immutable test-only dependency in
+`tests/support/comms-checkout.mjs`, with real HQ admission, challenge-bound
+sockets and durable storage. It proves custody before upstream acknowledgment,
+read-only peek, one-at-a-time local consumption, withheld repository metadata,
+refusal before effects, restart/redelivery tombstones, callback rollback and a
+private array that fits while its complete correlated result requires suffix
+trimming. Tests use a signed fake upstream; no live queue is activated.
 
 ```sh
-mkdir -p .cache
-git -c credential.helper= -c core.hooksPath=/dev/null clone --no-checkout https://github.com/true-line/soul-contracts.git .cache/notice-contract-source
-git -C .cache/notice-contract-source -c core.hooksPath=/dev/null checkout --detach 60c540ea71a720148f6733afc7b29fa1ec255753
-node scripts/test-notice-consumer-source.mjs .cache/notice-contract-source
+node scripts/soul-contracts.mjs verify
+npm test
 ```
 
-The public source checkout is test data only; disabling its checkout hooks
-avoids enrolling that cache as a separate agent task. The runner supplies no
-production schema path or environment override and never creates a tag or
-changes `governance/soul-contracts.json`. A wrong commit, dirty checkout or
-manifest mismatch refuses before registering the behavior cases.
-
-This is source-level preparation evidence, **not** released-contract
-verification or default activation. Normal `npm test` does not run the portable
-source cases until release/pin integration explicitly connects them. The
-reviewed source identity here must not be represented as a published release.
+These checks are component integration evidence for
+[HQ #130](https://github.com/true-line/agent-bot-hq/issues/130) and
+[comms #317](https://github.com/true-line/agent-bot-comms/issues/317).
+They do not close those parents or prove actual identity MCP composition,
+exclusive upstream custody, mixed-version rollout, alias parity or T14
+readiness. Production queue activation and owner settings remain separate.
