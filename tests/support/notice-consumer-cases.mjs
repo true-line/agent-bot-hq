@@ -1,11 +1,9 @@
-// Portable cases take exact shared schemas/fixtures supplied by a reviewed
-// test runner. No production loader, schema override or local schema copy.
+// Shared corpus and guarded effects run with the normal verified release loader.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { definePlugin } from '../../sdk/plugin.mjs';
 import { canonicalBytes } from '../../sdk/wire/canonical-json.mjs';
 import { validate } from '../../sdk/wire/schema.mjs';
-import { noticesPlugin } from '../../hq/notices.mjs';
 import { legacySigner } from '../../hq/legacy.mjs';
 import { DIGEST, SOUL, fakeLegacy, hello, startHQ } from '../hq-harness.mjs';
 import { referenceBroker } from '../broker-fixture.mjs';
@@ -32,7 +30,7 @@ export function registerNoticeConsumerCases(schemas, fixtures) {
     } : {};
     const base = referenceBroker({ name: 'agent-comms' });
     const comms = definePlugin({ ...base, async init(ctx) { const output = await base.init(ctx); return { provides: { ...output.provides, ...(mailboxPresent ? { notices: mailbox } : {}) } }; } });
-    const t = await startHQ({ config, enrollment: { ...legacySigner({ run: fakeLegacy().run }), allowsHarness: () => true }, plugins: [comms, noticesPlugin({ schemas })] });
+    const t = await startHQ({ config, enrollment: { ...legacySigner({ run: fakeLegacy().run }), allowsHarness: () => true }, plugins: [comms] });
     const entry = await t.entry();
     const admission = (await entry.request('Hello', hello())).result;
     const [runtime, specialist] = admission.admitted_runtimes;
