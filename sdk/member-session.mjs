@@ -10,6 +10,9 @@ export const BIND_CONTEXT = 'agent-bot-hq/bind/v1';
 const NONCE = /^[0-9a-f]{64}$(?![\s\S])/;
 const RUNTIME_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$(?![\s\S])/;
 const CHANNEL_BINDING = /^[A-Za-z0-9_-]{16,128}$(?![\s\S])/;
+const SOUL_ID = /^agent_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$(?![\s\S])/;
+const MEMBER_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$(?![\s\S])/;
+const ROLE = /^[a-z][a-z0-9-]{0,31}$(?![\s\S])/;
 export function bindProof(channelBinding, nonce, runtimeId) {
   return createHmac('sha256', Buffer.from(channelBinding, 'utf8')).update(`${BIND_CONTEXT}\n${nonce}\n${runtimeId}`).digest('hex');
 }
@@ -22,8 +25,17 @@ export async function openMemberSession({ memberSocket, memberToken, brokerSocke
     || (brokerSocket !== undefined && (typeof brokerSocket !== 'string' || !brokerSocket))) throw new TypeError('member bootstrap needs its existing socket and member token');
   const entry = await connectHq(memberSocket, { contracts });
   let me;
-  try { me = await entry.request('hello', { token: memberToken }); }
-  catch (error) { await entry.close().catch(() => {}); throw error; }
+  try {
+    me = await entry.request('hello', { token: memberToken });
+    if (!me || typeof me !== 'object' || Array.isArray(me)
+      || !Object.hasOwn(me, 'soul_id') || typeof me.soul_id !== 'string' || !SOUL_ID.test(me.soul_id)
+      || !Object.hasOwn(me, 'member_id') || typeof me.member_id !== 'string' || !MEMBER_ID.test(me.member_id)
+      || !Object.hasOwn(me, 'role') || typeof me.role !== 'string' || !ROLE.test(me.role)) throw new Error('entry point returned invalid member identity');
+  } catch (error) {
+    entry.destroy();
+    await entry.close().catch(() => {});
+    throw error;
+  }
   let bound;
   let pending;
   let closed = false;

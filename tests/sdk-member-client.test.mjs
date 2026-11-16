@@ -111,6 +111,90 @@ const bindMember = async (member, world) => {
   return world.state.runtime;
 };
 
+async function helloPeer(t, response) {
+  const root = mkdtempSync(join(tmpdir(), 'hello-'));
+  const path = join(root, 'member.sock');
+  const operations = [];
+  const sockets = new Set();
+  const ended = deferred();
+  // A peer that keeps its writable half open exposes cleanup that merely
+  // waits for graceful close instead of forcibly dropping bootstrap state.
+  const server = createServer({ allowHalfOpen: true }, (socket) => {
+    sockets.add(socket); socket.on('error', () => {});
+    socket.on('end', () => ended.resolve());
+    socket.on('close', () => sockets.delete(socket));
+    readLines(socket, (line) => {
+      const request = JSON.parse(line);
+      operations.push(request.op);
+      writeLine(socket, { id: request.id, ...response });
+    });
+  });
+  await new Promise((resolve) => server.listen(path, resolve));
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(root, { recursive: true, force: true });
+  });
+  return { options: { memberSocket: path, memberToken: 'MEMBER_TOKEN_CANARY', contracts }, operations, ended: ended.promise };
+}
+
+async function refusedHello(peer, options = peer.options) {
+  let timer;
+  try {
+    const deadline = new Promise((resolve) => { timer = setTimeout(() => resolve({ timeout: true }), 500); });
+    const outcome = await Promise.race([
+      connectMemberQueries(options).then((member) => ({ member }), (error) => ({ error })),
+      deadline,
+    ]);
+    if (outcome.member) await outcome.member.close();
+    assert.equal(outcome.timeout, undefined, 'bootstrap must not wait for the malformed peer to close');
+    assert.ok(outcome.error, 'malformed hello must not produce a query capability');
+    assert.equal(await Promise.race([peer.ended.then(() => true), deadline.then(() => false)]), true, 'failed bootstrap must close its entry socket');
+    assert.deepEqual(peer.operations, ['hello'], 'no runtime, bind or query before valid member identity');
+    return outcome.error;
+  } finally { clearTimeout(timer); }
+}
+
+test('bootstrap rejects malformed hello identities and force-closes before any runtime or query', async (t) => {
+  const valid = { soul_id: SOUL, member_id: 'm_lead', role: 'lead' };
+  const malformed = [null, {}, [], ['soul', 'member', 'role']];
+  for (const field of Object.keys(valid)) {
+    const missing = { ...valid }; delete missing[field]; malformed.push(missing);
+    for (const value of [null, 1, '', 'bad value', valid[field] + '\n']) malformed.push({ ...valid, [field]: value });
+  }
+  for (const result of malformed) await t.test(JSON.stringify(result), async (t) => {
+    const peer = await helloPeer(t, { ok: true, result });
+    assert.match((await refusedHello(peer)).message, /invalid member identity/);
+  });
+});
+
+test('hello identity fields must be own properties even when a prototype supplies valid values', async (t) => {
+  const peer = await helloPeer(t, { ok: true, result: {} });
+  const values = { soul_id: SOUL, member_id: 'm_lead', role: 'lead' };
+  const previous = Object.fromEntries(Object.keys(values).map((key) => [key, Object.getOwnPropertyDescriptor(Object.prototype, key)]));
+  try {
+    for (const [key, value] of Object.entries(values)) Object.defineProperty(Object.prototype, key, { value, writable: true, configurable: true });
+    assert.match((await refusedHello(peer)).message, /invalid member identity/);
+  } finally {
+    for (const key of Object.keys(values)) {
+      if (previous[key]) Object.defineProperty(Object.prototype, key, previous[key]);
+      else delete Object.prototype[key];
+    }
+  }
+});
+
+test('bootstrap force-closes an unsuccessful hello and preserves its original validation error', async (t) => {
+  const failure = new Error('original hello refusal validation failure');
+  const peer = await helloPeer(t, { ok: false, refusal: {} });
+  const options = { ...peer.options, contracts: { ...contracts, record() { throw failure; } } };
+  assert.equal(await refusedHello(peer, options), failure);
+  const refusal = await helloPeer(t, { ok: false, host_refusal: { code: 'souls.unknown_member', explanation: 'not a running member token' } });
+  const error = await refusedHello(refusal);
+  assert.equal(error.code, 'souls.unknown_member');
+  assert.equal(error.op, 'hello');
+  assert.equal(error.transport, false);
+});
+
 test('public bootstrap refuses missing inputs and unknown member tokens without a broker bind', async (t) => {
   for (const options of [undefined, {}, { memberSocket: '/missing', memberToken: '' }]) await assert.rejects(connectMemberQueries(options), TypeError);
   const w = await world(t);
