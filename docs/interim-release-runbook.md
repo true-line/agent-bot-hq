@@ -43,18 +43,26 @@ and legacy path remain in use. Do not switch the service signer until all
 targeted clients have the required release or an owner has explicitly resolved
 each exception. Offline clients cannot be counted as updated without evidence.
 
-The current accepted window is [2026-11-17T00:00:00Z,
-2027-02-15T00:00:00Z). There is no confirmed deployment schedule. If the start
-is missed, obtain acceptance of recalculated dates and update both manifests
-before activating. Within the accepted window, deploy the matching server public
+The owner authorized a cloud-workspace pilot on 2026-11-16. Its response-acceptance
+window is [2026-11-16T18:21:50Z, 2027-02-14T18:21:50Z), preserving the existing
+public key and the 90-day duration. Prepare its replacement by
+2027-01-15T18:21:50Z. These are acceptance-policy dates, not the private key's
+creation date. Activation may occur within this window after the artifact and
+inventory gates above; a later start does not silently extend the expiry.
+Harbor's paired public metadata is recorded in
+[deploy/server-response-keys.json](https://github.com/true-line/agent-bot/blob/main/deploy/server-response-keys.json).
+Within the accepted window, deploy the matching server public
 metadata with the verified signer; wait at least 300 seconds for the endpoint
 cache. On a designated enrolled test client, record signed token-grant and
 daemon API success, authenticated refusal, client artifact/pin and observed
 time without recording token, assertion, private key or response secrets.
 
-If checks fail, disable the HQ opt-in, restore the prior server metadata with
-the unchanged uncompromised signer and switch the host back to the retained
-verified release. Verify health and record the outcome after cache expiry.
+If checks fail, stop HQ ingestion and retain any exclusive notice-custody policy
+so the queue remains paused; do not clear custody to re-enable old consumers.
+Disable the HQ opt-in and switch the host back to the retained verified release.
+If server metadata is rolled back with the unchanged uncompromised signer,
+record that removing metadata restores legacy signing without the new server
+expiry enforcement. Verify health and record the outcome after cache expiry.
 Do not extend expiration silently or re-enable a suspected compromised key;
 old offline HQ pins cannot be remotely revoked by publishing retired metadata.
 Issue #122 remains open until release, coverage, success, refusal and rollback

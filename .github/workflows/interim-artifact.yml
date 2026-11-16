@@ -1,0 +1,52 @@
+name: interim artifact reproducibility
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout exact source
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          git init -q .
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          git fetch -q --no-tags --depth 1 origin "$SOURCE"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE"
+      - name: verify contracts and build candidate
+        shell: bash
+        env:
+          SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          node --version
+          git --version
+          tar --version | head -1
+          set -euo pipefail
+          contracts="$RUNNER_TEMP/hq-contracts-$SOURCE"
+          node --input-type=module - "$contracts" <<'JS'
+          import { cpSync, mkdirSync } from 'node:fs';
+          import { join } from 'node:path';
+          import { readPin, verify, verifyVendored } from './scripts/soul-contracts.mjs';
+          const pin = readPin();
+          const source = verify().dir;
+          const target = process.argv[2];
+          mkdirSync(target);
+          for (const path of pin.paths) cpSync(join(source, path), join(target, path), { recursive: true });
+          verifyVendored(target, pin);
+          JS
+          artifact="$RUNNER_TEMP/hq-$SOURCE.tar"
+          node scripts/build-interim-release.mjs "$SOURCE" "$contracts" "$artifact" | tee "$RUNNER_TEMP/hq-build-record.txt"
+          test -s "$artifact"
+          {
+            echo '### Unpublished interim HQ candidate'
+            echo
+            echo 'Compare this digest with an independent Linux build before owner approval and deployment.'
+            echo
+            echo '```text'
+            cat "$RUNNER_TEMP/hq-build-record.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
