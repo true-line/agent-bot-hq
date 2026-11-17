@@ -1,13 +1,13 @@
 // Verify Apple's ES256 output independently against the JWK shape HQ accepts.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createPublicKey, randomBytes, verify } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { publicJwk } from '../hq/signer.mjs';
+import { verifyObservation } from './macos-enclave-observation.mjs';
 
 const darwin = process.platform === 'darwin';
 const required = process.env.HQ_REQUIRE_SECURE_ENCLAVE === '1';
@@ -33,16 +33,7 @@ function checkSignature(source, t) {
     return;
   }
   assert.equal(run.status, 0, run.error?.message ?? run.stderr);
-  const observation = JSON.parse(run.stdout);
-  assert.deepEqual(Object.keys(observation).sort(), ['jwk', 'signature', 'source', 'uid']);
-  assert.equal(observation.source, source);
-  assert.equal(observation.uid, process.geteuid());
-  const jwk = publicJwk(observation.jwk);
-  assert.deepEqual(jwk, observation.jwk);
-  const key = createPublicKey({ key: jwk, format: 'jwk' });
-  const signature = Buffer.from(observation.signature, 'base64url');
-  assert.equal(signature.length, 64);
-  assert.equal(verify('sha256', challenge, { key, dsaEncoding: 'ieee-p1363' }, signature), true);
+  verifyObservation(JSON.parse(run.stdout), source, process.geteuid(), challenge);
 }
 
 test('CryptoKit public key and signature verify with HQ encodings', { skip: !darwin }, (t) => {

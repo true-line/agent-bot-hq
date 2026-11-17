@@ -42,6 +42,11 @@ fixture runs on every macOS job. When a Secure Enclave is available, the probe
 also creates a disposable enclave key and signs after re-opening the device-bound
 representation in memory. The probe leaves the enrolled identity untouched.
 
+The Darwin source-artifact job also runs the native probe as a one-shot
+system LaunchDaemon under its disposable hidden `_agent-bot-hq` account. That
+job requires a zero exit and verifies the expected role UID and the signature
+against its own challenge. Missing enclave access fails the job.
+
 On the declared Mac, run the following as the account and in the launch context
 being measured. Record the host build, UID and run alongside the result.
 

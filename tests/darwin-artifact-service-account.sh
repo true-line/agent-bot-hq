@@ -40,5 +40,6 @@ sudo tar -xf "$archive" -C "$stage"
 # Keep the installed executable next to its native runtime libraries.
 node_bin="$(node -p 'process.execPath')"
 sudo -n -H -u "$name" -- "$node_bin" --version
+bash tests/darwin-enclave-launchd.sh "${2:?compiled enclave probe required}" "$stage" "$name" "$home"
 cd "$stage/hq"
 sudo -n -H -u "$name" -- /bin/bash tests/dedicated-hq-account.sh "$node_bin"

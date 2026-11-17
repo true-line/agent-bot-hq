@@ -57,4 +57,5 @@ jobs:
           archive="$RUNNER_TEMP/hq-darwin.tar"
           bash scripts/ci-build-darwin-artifact.sh "$GITHUB_SHA" "$archive"
           printf '%s  %s\n' "$LINUX_BUILT_SHA256" "$archive" | shasum -a 256 --check
-          bash tests/darwin-artifact-service-account.sh "$archive"
+          xcrun swiftc scripts/check-macos-enclave.swift -o "$RUNNER_TEMP/hq-enclave-check"
+          bash tests/darwin-artifact-service-account.sh "$archive" "$RUNNER_TEMP/hq-enclave-check"
