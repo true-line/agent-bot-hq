@@ -56,7 +56,13 @@ plutil -lint "$plist"
 sudo launchctl bootstrap system "$plist"
 
 # Only the manager runs as root. This normal CLI runs as the designated owner.
-python3 - "$system_node" "$entry" "$owner" "$socket" <<'PY' || { sudo cat "$work/launchd.stderr" >&2; exit 1; }
+stat -f '%N uid=%u gid=%g mode=%Lp type=%HT' /private /private/var /private/var/run "$socket"
+diagnose() {
+  sudo cat "$work/launchd.stderr" >&2
+  sudo launchctl print "system/$label" | awk '/state =|last exit code =|pid =/ { print }' >&2
+  exit 1
+}
+python3 - "$system_node" "$entry" "$owner" "$socket" <<'PY' || diagnose
 import json
 import os
 import stat
@@ -67,7 +73,7 @@ node, entry, owner, path = sys.argv[1:]
 sock = os.lstat(path)
 assert stat.S_ISSOCK(sock.st_mode) and sock.st_uid == 0 and stat.S_IMODE(sock.st_mode) == 0o666
 result = subprocess.run([node, entry, "status", "--owner-control", "--json"],
-                        check=True, capture_output=True, text=True, timeout=45)
+                        check=True, stdout=subprocess.PIPE, text=True, timeout=45)
 status = json.loads(result.stdout)
 control = status["hq"]["sockets"]["ownerControl"]
 assert control["path"] == path and control["peer_check"] == "getpeereid"
