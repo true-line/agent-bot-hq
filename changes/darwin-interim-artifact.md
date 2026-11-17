@@ -1,0 +1,1 @@
+The interim HQ source builder supports a macOS target with offline contract verification. CI compares the Darwin archive built on Linux and macOS and exercises private status as the dedicated macOS HQ account.
