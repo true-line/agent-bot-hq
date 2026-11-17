@@ -33,3 +33,24 @@ Priority: **P0** blocks the security goal or is itself a security property,
 | Relay mode: site then cloud relay, reviewed crypto, sealed content (§9 PR 30) | none yet (planned in PR 30: T12, T13) | none yet | Crypto review is a process gate; tests must prove relays can't mint directives or wake Souls (§3.2) | P1 |
 | Dream workflow: dream member/grant, staged candidate tree, per-cell evaluation, owner digest acceptance (§9 PR 23) | none yet (planned in PR 23: T22, T27–T30) | none yet | Depends on PR 22 package validation; unevaluated-harness exposure in `souls.list` needs an `hq/v1` test | P1 |
 | Move and fork: transfer records, missing host requirements, index rebuild (§9 PR 28) | none yet (planned in PR 28: T15; P5, P6) | none yet | A move refused mid-transfer must leave both hosts consistent — partial-transfer recovery untested by design criteria alone | P1 |
+
+## macOS Secure Enclave signer check
+
+The Apple Silicon job compiles a CryptoKit probe and verifies a fresh ES256
+signature with HQ’s JWK encoding and Node’s independent verifier. Its software
+fixture runs on every macOS job. When a Secure Enclave is available, the probe
+also creates a disposable enclave key and signs after re-opening the device-bound
+representation in memory. The probe leaves the enrolled identity untouched.
+
+On the declared Mac, run the following as the account and in the launch context
+being measured. Record the host build, UID and run alongside the result.
+
+```sh
+HQ_REQUIRE_SECURE_ENCLAVE=1 node --test tests/macos-enclave.test.mjs
+```
+
+Required mode fails if the enclave is unavailable. This checks native signing
+and in-memory reference reuse. The deployed helper’s persistent reference,
+service restart, and the protected T02 observation remain separate checks under
+[HQ #107](https://github.com/true-line/agent-bot-hq/issues/107) and
+[PDR-0085](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0085-macos-first-protected-pilot.md).
