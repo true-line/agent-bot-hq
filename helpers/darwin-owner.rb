@@ -14,9 +14,16 @@ def activation
 end
 
 def listener?(sock)
-  sock.local_address.unix? && sock.local_address.unix_path == CONTROL &&
-    sock.getsockopt(Socket::SOL_SOCKET, Socket::SO_TYPE).int == Socket::SOCK_STREAM &&
-    sock.getsockopt(Socket::SOL_SOCKET, Socket::SO_ACCEPTCONN).int != 0
+  return false unless sock.local_address.unix? && sock.local_address.unix_path == CONTROL &&
+                      sock.getsockopt(Socket::SOL_SOCKET, Socket::SO_TYPE).int == Socket::SOCK_STREAM
+  # Darwin's Unix stream sockets do not implement SO_ACCEPTCONN. A listener
+  # has no remote peer; listen(2) succeeds on this already bound socket.
+  begin
+    sock.getpeername
+    return false
+  rescue Errno::ENOTCONN
+    sock.listen(Socket::SOMAXCONN) == 0
+  end
 end
 
 case ARGV.shift
@@ -46,7 +53,7 @@ when 'peer'
   exit 1 unless ARGV.length == 1 && /\A[0-9]+\z/.match?(ARGV.first)
   socket = UNIXSocket.for_fd(3)
   exit(socket.local_address.unix? && socket.getsockopt(Socket::SOL_SOCKET, Socket::SO_TYPE).int == Socket::SOCK_STREAM &&
-       socket.getsockopt(Socket::SOL_SOCKET, Socket::SO_ACCEPTCONN).int == 0 &&
+       socket.remote_address.unix? &&
        socket.getpeereid.first == Integer(ARGV.first, 10))
 else
   exit 1
