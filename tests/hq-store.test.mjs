@@ -60,8 +60,10 @@ test('a failed persist rolls the write back in memory and raises', async () => {
 test('the state directory must be private and owned by HQ', () => {
   const dir = tempHome();
   try {
-    chmodSync(dir, 0o755);
-    assert.throws(() => openStore(dir), (e) => e instanceof StoreError && /must be 0700/.test(e.message));
+    for (const mode of [0o755, 0o500, 0o1700]) {
+      chmodSync(dir, mode);
+      assert.throws(() => openStore(dir), (e) => e instanceof StoreError && e.message.includes(`has mode ${mode.toString(8)}; HQ's state directory must be 0700`));
+    }
     chmodSync(dir, 0o700);
     assert.throws(() => openStore(dir, { uid: process.getuid() + 1 }), /owned by uid/);
     const fresh = join(dir, 'nested');
