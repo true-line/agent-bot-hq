@@ -74,7 +74,7 @@ function fixture({ server = SERVER, device = generateKeyPairSync('ec', { namedCu
       usedNonces.add(claims.jti);
       if (state.hold) await state.hold;
       if (state.mode === 'advance-clock') clock.advance(301_000);
-      out = signed(state.mode === 'api-revoked' ? 401 : state.mode === 'unauthorized' ? 401 : 200, state.mode === 'api-revoked' ? { error: 'device_revoked', detail: 'SECRET_CANARY' } : state.mode === 'unauthorized' ? { error: 'invalid_token' } : { notices: [], harness: 'codex' }, claims.jti);
+      out = signed(state.mode === 'api-revoked' ? 401 : state.mode === 'unauthorized' ? 401 : 200, state.mode === 'api-revoked' ? { error: 'device_revoked', detail: 'SECRET_CANARY' } : state.mode === 'unauthorized' ? { error: 'invalid_token' } : (state.apiReply ?? { notices: [], harness: 'codex' }), claims.jti);
     }
     return new Response(out.text, { status: out.status, headers: out.headers });
   };
@@ -211,6 +211,34 @@ test('a caller cannot redirect a proof or choose a harness outside enrollment', 
   await assert.rejects(client.call('POST', '/api/daemon/notices/take', { harness: 'other' }), code('host.route_not_allowed'));
   assert.equal(f.state.apiCalls, 0);
   client.close();
+});
+
+test('a plugin can look up credential issuance using the full operation ID', async () => {
+  const f = fixture();
+  const route = '/api/daemon/issuances/';
+  const operation = 'task.1:mint_' + 'a'.repeat(116);
+  assert.equal(operation.length, 128);
+  const probe = definePlugin({
+    name: 'lookup-probe', version: '1.0.0', hostApi: 1,
+    services: ['identityService'], identityServiceRoutes: [route + '*'],
+    async init(ctx) { return { provides: { call: ctx.services.identityService.call } }; },
+  });
+  const hq = await startHQ({ identity: f.make(), plugins: [probe] });
+  try {
+    const { call } = hq.hq.host.provided('lookup-probe');
+    for (const id of ['', '.', '..', 'op/suffix', 'op%3A1', 'op?query', 'op#fragment', 'op\n', operation + 'x']) {
+      await assert.rejects(call('GET', route + id), code('host.invalid_request'));
+    }
+    await assert.rejects(call('POST', route + operation), code('host.invalid_request'));
+    assert.equal(f.state.requests.length, 0);
+    f.state.apiReply = { operation_id: operation, state: 'unknown' };
+    const result = await call('GET', route + operation);
+    assert.deepEqual(result.body, f.state.apiReply);
+    assert.equal(f.state.apiCalls, 1);
+    // The fixture verifies the request's DPoP signature, method, and htu.
+    assert.equal(f.state.requests.at(-1).init.method, 'GET');
+    assert.equal(f.state.requests.at(-1).url, SERVER + route + operation);
+  } finally { await hq.done(); }
 });
 
 test('closing while an API reply is in flight prevents a late credential result', async () => {
