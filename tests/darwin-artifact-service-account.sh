@@ -37,6 +37,8 @@ sudo dscl . -create "$account" IsHidden 1
 sudo install -d -m 0700 -o "$name" -g "$name" "$home"
 sudo chmod 0755 "$stage"
 sudo tar -xf "$archive" -C "$stage"
-sudo install -m 0755 "$(command -v node)" "$stage/node"
+# Keep the installed executable next to its native runtime libraries.
+node_bin="$(node -p 'process.execPath')"
+sudo -n -H -u "$name" -- "$node_bin" --version
 cd "$stage/hq"
-sudo -n -H -u "$name" -- /bin/bash tests/dedicated-hq-account.sh "$stage/node"
+sudo -n -H -u "$name" -- /bin/bash tests/dedicated-hq-account.sh "$node_bin"
