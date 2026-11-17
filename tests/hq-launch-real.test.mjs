@@ -94,6 +94,8 @@ async function withHQ(accounts, fn) {
         env: { AGENT_BOT_SOULS_SOCKET: t.hq.paths.admission, AGENT_BOT_SOULS_MEMBER_TOKEN: 'not-a-real-token', AGENT_BOT_SOULS_MEMBER_ID: rt.member_id, AGENT_BOT_SOULS_ROLE: role },
       });
       assert.equal(res.ok, true, JSON.stringify(res));
+      const account = role === 'lead' ? accounts['adapter-a'] : accounts['adapter-b'];
+      assert.equal(res.result.cwd, join(passwd(account)[5], '.agent-bot-hq', 'souls', SOUL, rt.member_id));
       const conn = await attachTo(t.hq.paths.admission, { launch_id: res.result.launch_id, attach: res.result.attach });
       assert.equal(conn.answer.ok, true, JSON.stringify(conn.answer));
       return { conn, launchId: res.result.launch_id };
