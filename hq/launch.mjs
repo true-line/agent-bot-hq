@@ -35,8 +35,9 @@
 // Two steps on the admission socket (hq/socket.mjs, takeover):
 //   launch        { runtime_id, command, env }  on the connection that owns
 //                 the runtime. Checks, then reserves; nothing runs yet.
-//                 Returns { launch_id, attach, expires_at }; `attach` is a
-//                 one-time token, good for 30 seconds.
+//                 Returns { launch_id, attach, expires_at, cwd }; `attach` is a
+//                 one-time token, good for 30 seconds, and `cwd` is the
+//                 account-private directory the wrapper will enter.
 //   launch.attach { launch_id, attach }  the first and only request on a NEW
 //                 connection. Spends the token, right or wrong, starts the
 //                 agent, answers { launch_id }, and from then on the
@@ -126,6 +127,7 @@
 // agent left running by an HQ that stopped abnormally keeps running.
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { join } from 'node:path';
 import { fail, HostError } from '../sdk/errors.mjs';
 import { pushReceipt, redact } from '../sdk/services.mjs';
 import { takeover } from './socket.mjs';
@@ -172,6 +174,15 @@ const CLOSE_WAIT_MS = 10_000;
 export const STDERR_LINE = 1024;
 export const STDERR_LINES = 100;
 export const STDERR_WINDOW_MS = 10_000;
+
+// The launch shell derives this path from sudo -H's verified account home.
+// Returning the same path lets the entry point give ACP session/new a
+// directory the agent can reach after HQ changes accounts.
+export function launchWorkdir(home, soulId, memberId) {
+  if (typeof home !== 'string' || !home.startsWith('/') || home === '/' || /[\0\r\n]/.test(home)) throw new TypeError('launch workdir needs an absolute account home');
+  if (!SOUL_ID.test(soulId) || !MEMBER_ID.test(memberId)) throw new TypeError('launch workdir needs a valid soul_id and member_id');
+  return join(home, '.agent-bot-hq', 'souls', soulId, memberId);
+}
 
 export function agentArgv(account, soulId, memberId, command) {
   if (!SOUL_ID.test(soulId) || !MEMBER_ID.test(memberId)) throw new TypeError('agentArgv needs a valid soul_id and member_id');
@@ -577,11 +588,12 @@ export function createLauncher({
       const now = core.clock.now();
       const l = {
         launch_id: `ln_${core.random.hex(12)}`, attach: core.random.hex(32), state: 'reserved', expires: now + RESERVE_MS, caller,
-        soul_id: rt.soul_id, member_id: rt.member_id, adapter_id: rt.adapter_id, runtime_id: payload.runtime_id, account: endpoint.account, endpoint: endpoint.path, command, env,
+        soul_id: rt.soul_id, member_id: rt.member_id, adapter_id: rt.adapter_id, runtime_id: payload.runtime_id, account: endpoint.account, endpoint: endpoint.path,
+        cwd: launchWorkdir(endpoint.home, rt.soul_id, rt.member_id), command, env,
       };
       launches.set(l.launch_id, l);
       slots.set(slot, l.launch_id);
-      return { launch_id: l.launch_id, attach: l.attach, expires_at: iso(l.expires) };
+      return { launch_id: l.launch_id, attach: l.attach, expires_at: iso(l.expires), cwd: l.cwd };
     });
   }
 

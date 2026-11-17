@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCore, testClock } from '../sdk/services.mjs';
-import { agentArgv, AGENT_PATH, createLauncher, groupArgv, KILL_WAIT_MS, LAUNCH_SHELL, MAX_PENDING, PGID_MARKER, STDERR_LINE, STDERR_LINES } from '../hq/launch.mjs';
+import { agentArgv, AGENT_PATH, createLauncher, groupArgv, KILL_WAIT_MS, LAUNCH_SHELL, launchWorkdir, MAX_PENDING, PGID_MARKER, STDERR_LINE, STDERR_LINES } from '../hq/launch.mjs';
 import { attachTo, DIGEST, fakeSudo, fakeTimers, harnessLayout, helloOn, SOUL, startHQ } from './hq-harness.mjs';
 
 const A = 'hqm_a';
@@ -71,6 +71,7 @@ test('HQ asks sudo for exactly one form: the harness account, the fixed shell wi
     assert.deepEqual(t.sudo.probes().sort(), [['-n', '-u', A, '--', '/bin/true'], ['-n', '-u', B, '--', '/bin/true']]);
     const { child, launch_id: launchId } = await t.started();
     assert.match(launchId, /^ln_[0-9a-f]{24}$/);
+    assert.equal(launchWorkdir(t.l.homes[A], SOUL, 'm_lead'), join(t.l.homes[A], '.agent-bot-hq', 'souls', SOUL, 'm_lead'));
     assert.equal(child.file, '/usr/bin/sudo');
     assert.deepEqual(child.args, ['-n', '-H', '-u', A, '--', '/bin/sh', '-c', LAUNCH_SHELL, 'sh', SOUL, 'm_lead', NODE, 'adapter.mjs', '--acp']);
     assert.equal(LAUNCH_SHELL, 'read -r _ _ _ _ g _ 2>/dev/null </proc/self/stat && printf \'agent-bot-hq-launch pgid %s\\n\' "$g" >&2; umask 077 && d="$HOME/.agent-bot-hq/souls/$1/$2" && mkdir -p "$d" && chmod 0700 "$d" && cd "$d" && shift 2 && exec "$@"');
@@ -118,6 +119,8 @@ test('the launch shell, run by /bin/sh here: the group marker first, a 0700 dire
   // Only pattern-checked IDs reach it.
   assert.throws(() => agentArgv(A, SOUL, '../x', [NODE]), /valid soul_id and member_id/);
   assert.throws(() => agentArgv(A, 'agent_x', 'm_lead', [NODE]), /valid soul_id and member_id/);
+  assert.throws(() => launchWorkdir('/', SOUL, 'm_lead'), /absolute account home/);
+  assert.throws(() => launchWorkdir('/home/hqm-a', SOUL, '../x'), /valid soul_id and member_id/);
 });
 
 test('signals: the TERM and KILL to one process group, and nothing else; the group ID is a positive integer above 1', () => {
@@ -191,6 +194,7 @@ test('a reservation is single use, lasts 30 seconds, and does not survive a rest
     const attach = (r, token = r.attach) => attachTo(t.hq.paths.admission, { launch_id: r.launch_id, attach: token });
     // Expired.
     const late = (await t.launch()).result;
+    assert.equal(late.cwd, join(t.l.homes[A], '.agent-bot-hq', 'souls', SOUL, 'm_lead'));
     t.clock.advance(30_000);
     refused((await attach(late)).answer, 'caller_mismatch');
     // A wrong token spends it: the right one no longer attaches.
@@ -221,7 +225,7 @@ test('a reservation is single use, lasts 30 seconds, and does not survive a rest
 
 test('the number of reservations waiting for attach is bounded', async () => {
   const n = MAX_PENDING + 1;
-  const endpoints = Array.from({ length: n }, (_, i) => ({ account: `m${i}`, uid: 70000 + i, path: `/run/m${i}/broker.sock` }));
+  const endpoints = Array.from({ length: n }, (_, i) => ({ account: `m${i}`, uid: 70000 + i, path: `/run/m${i}/broker.sock`, home: `/home/m${i}` }));
   const core = createCore({ clock: testClock() });
   const sudo = fakeSudo();
   const launcher = createLauncher({

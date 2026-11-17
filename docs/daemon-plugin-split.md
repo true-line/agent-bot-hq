@@ -1111,8 +1111,9 @@ installs once at provisioning. HQ is not root and gets no other privilege.
   connection that owns the runtime sends `launch { runtime_id, command, env }`.
   HQ checks the caller and the runtime, the platform, the harness account,
   whether the rule covers that account, that nothing else runs for that Soul
-  and agent, and the payload, in that order, and returns a launch ID and a
-  one-time token valid for 30 seconds. Nothing runs yet. Then
+  and agent, and the payload, in that order, and returns a launch ID, the
+  account-private working directory, and a one-time token valid for 30
+  seconds. Nothing runs yet. Then
   `launch.attach { launch_id, attach }` is the first and only request on a
   new connection. HQ spends the token, right or wrong, starts the agent and
   answers. From then on that connection carries the agent's stdin and
