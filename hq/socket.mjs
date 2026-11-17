@@ -84,10 +84,10 @@ export function checkSocketPath(path, platform = process.platform) {
 // `mode` is the socket file's mode: 0600 for HQ's own sockets, 0660 for a
 // harness endpoint whose directory gives it the account's group (hq/harness-accounts.mjs).
 // `takeover` enables the hook above for this listener.
-export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false }) {
+export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false, activated }) {
   if (process.platform === 'win32') throw new Error('HQ on Windows needs a named pipe with an owner DACL, which is not built yet (#89)');
   checkSocketPath(path);
-  if (existsSync(path)) {
+  if (!activated && existsSync(path)) {
     if (!lstatSync(path).isSocket()) throw new Error(`${path} exists and is not a socket; refusing to replace it`);
     if (await live(path)) throw new Error(`another HQ is listening on ${path}`);
     unlinkSync(path);
@@ -140,8 +140,22 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     }
   }
 
-  const server = createServer((socket) => {
+  // An inherited owner listener gates each connection before opening an HQ
+  // session, handling bytes, or dispatching a request. Other listeners keep
+  // their existing framing, including admission's first-request takeover.
+  let pendingChecks = 0;
+  const server = createServer({ pauseOnConnect: Boolean(activated) }, async (socket) => {
     conns.add(socket);
+    socket.once('close', () => conns.delete(socket));
+    socket.on('error', () => {});
+    if (activated) {
+      if (pendingChecks >= 16) { socket.destroy(); return; }
+      pendingChecks++;
+      let accepted = false;
+      try { accepted = await activated.authenticate(socket); } catch { /* refuse */ }
+      finally { pendingChecks--; }
+      if (!accepted || socket.destroyed) { socket.destroy(); return; }
+    }
     const session = newSession();
     // Bytes, not text: a takeover hands the rest of the stream on unchanged.
     // Lines split on 0x0a, which never occurs inside a UTF-8 sequence.
@@ -215,17 +229,17 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
       pump();
     }
     socket.on('data', onData);
-    socket.on('error', () => {});
+    if (activated) socket.resume();
     // The session ends after its queued requests finish, so a request still
     // in flight (a broker bind, say) cannot recreate state after the end.
-    socket.on('close', () => { conns.delete(socket); queue = queue.then(() => endSession(session)).catch(() => {}); });
+    socket.on('close', () => { queue = queue.then(() => endSession(session)).catch(() => {}); });
   });
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(path, () => { server.off('error', reject); resolve(); });
+    server.listen(activated ? { fd: activated.fd } : path, () => { server.off('error', reject); resolve(); });
   });
-  chmodSync(path, mode);
+  if (!activated) chmodSync(path, mode);
 
   return {
     path,
@@ -233,7 +247,7 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     connections: () => conns.size,
     close: () => new Promise((resolve) => {
       for (const s of conns) s.destroy();
-      server.close(() => { try { unlinkSync(path); } catch { /* already gone */ } resolve(); });
+      server.close(() => { if (!activated) { try { unlinkSync(path); } catch { /* already gone */ } } resolve(); });
     }),
   };
 }
