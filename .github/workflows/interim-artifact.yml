@@ -50,3 +50,15 @@ jobs:
             cat "$RUNNER_TEMP/hq-build-record.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run the built artifact as the dedicated Linux HQ account
+        env:
+          SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          stage="$(mktemp -d /tmp/hq-account-artifact.XXXXXXXX)"
+          trap 'rm -rf "$stage"' EXIT
+          tar -xf "$RUNNER_TEMP/hq-$SOURCE.tar" -C "$stage"
+          chmod 0755 "$stage"
+          sudo useradd --system --user-group --create-home --home-dir /var/lib/agent-bot-hq --shell /usr/sbin/nologin agent-bot-hq
+          sudo chmod 0700 /var/lib/agent-bot-hq
+          cd "$stage/hq"
+          sudo -n -H -u agent-bot-hq -- bash tests/dedicated-hq-account.sh "$(command -v node)"

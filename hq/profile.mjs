@@ -31,7 +31,7 @@ export function detectProfile({
   const reasons = [];
   const expected = HQ_ACCOUNTS[platform];
   if (!expected) reasons.push(`platform ${platform} has no HQ account defined yet`);
-  else if (account !== expected) reasons.push(`HQ runs in the ${account ?? 'unknown'} account, not ${expected} (D6; agent-bot-machine has not provisioned it)`);
+  else if (account !== expected) reasons.push(`HQ runs in the ${account ?? 'unknown'} account, not ${expected} (D6)`);
   if (harnessAccounts !== true) reasons.push(typeof harnessAccounts === 'string' && harnessAccounts ? harnessAccounts : 'agents of every harness share one account: no OS account per harness credential (D7)');
   if (!qualified) reasons.push('the host has not passed the hostile-member qualification (T01–T03, T21)');
   if (keyStorage !== 'hardware') reasons.push(`the HQ signer's key is ${keyStorage === 'software' ? 'a key file in HQ state (key_storage=software)' : 'not known to be a hardware key'}, so a process in HQ's account can copy it`);

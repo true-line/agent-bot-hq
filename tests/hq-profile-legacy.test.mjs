@@ -10,7 +10,7 @@ test('HQ in the owner account reports managed-cooperative and every reason prote
   const p = detectProfile({ platform: 'darwin', account: 'user' });
   assert.equal(p.profile, 'managed-cooperative');
   assert.equal(p.reasons.length, 4);
-  assert.match(p.reasons[0], /user account, not _agent-bot-hq \(D6/);
+  assert.equal(p.reasons[0], 'HQ runs in the user account, not _agent-bot-hq (D6)');
   assert.match(p.reasons[1], /share one account: no OS account per harness credential \(D7\)$/);
   assert.match(p.reasons[2], /T01–T03, T21/);
   assert.match(p.reasons[3], /not known to be a hardware key/);
