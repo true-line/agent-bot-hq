@@ -7,7 +7,7 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const darwin = process.platform === 'darwin';
-export const OWNER_CONTROL_PATH = darwin ? '/private/var/run/agent-bot-hq-control.sock' : '/run/agent-bot-hq/control.sock';
+export const OWNER_CONTROL_PATH = darwin ? '/private/var/agent-bot-hq-control.sock' : '/run/agent-bot-hq/control.sock';
 export const OWNER_PEER_CHECK = darwin ? 'getpeereid' : 'SO_PEERCRED';
 const interpreter = darwin ? '/usr/bin/ruby' : '/usr/bin/python3';
 const helper = darwin
@@ -30,7 +30,7 @@ export function checkOwnerControlSupport() {
 }
 
 export function checkOwnerSocketPath(ownerUid) {
-  const ancestry = darwin ? ['/private', '/private/var', '/private/var/run'] : ['/run', dirname(OWNER_CONTROL_PATH)];
+  const ancestry = darwin ? ['/private', '/private/var'] : ['/run', dirname(OWNER_CONTROL_PATH)];
   for (const dir of ancestry) {
     const st = lstatSync(dir);
     if (!st.isDirectory() || st.uid !== 0 || (st.mode & 0o022)) throw new Error(`owner control requires a root-managed directory at ${dir}`);

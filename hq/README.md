@@ -253,7 +253,7 @@ run
 ```
 
 Configure a single launchd `Sockets` dictionary named `owner-control` with
-`SockType=stream`, `SockPathName=/private/var/run/agent-bot-hq-control.sock`
+`SockType=stream`, `SockPathName=/private/var/agent-bot-hq-control.sock`
 and `SockPathMode` integer 438 (0666). Launchd owns the socket in a
 root-controlled directory. The helper checks in with `launch_activate_socket`,
 checks the returned listening stream, and replaces itself with Node. Before

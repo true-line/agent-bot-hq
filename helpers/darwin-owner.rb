@@ -5,7 +5,7 @@ require 'fiddle'
 require 'etc'
 
 abort 'requires macOS' unless RUBY_PLATFORM.include?('darwin')
-CONTROL = '/private/var/run/agent-bot-hq-control.sock'.freeze
+CONTROL = '/private/var/agent-bot-hq-control.sock'.freeze
 
 def activation
   Fiddle::Function.new(Fiddle::Handle::DEFAULT['launch_activate_socket'],

@@ -4,7 +4,7 @@ set -euo pipefail
 [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "$(uname -s)" == Darwin ]]
 label=ai.true-line.agent-bot-hq
 plist="/Library/LaunchDaemons/$label.plist"
-socket=/private/var/run/agent-bot-hq-control.sock
+socket=/private/var/agent-bot-hq-control.sock
 role=_agent-bot-hq
 state=/var/agent-bot-hq/.agent-bot-hq
 owner="$(id -un)"
@@ -56,7 +56,7 @@ plutil -lint "$plist"
 sudo launchctl bootstrap system "$plist"
 
 # Only the manager runs as root. This normal CLI runs as the designated owner.
-stat -f '%N uid=%u gid=%g mode=%Lp type=%HT' /private /private/var /private/var/run "$socket"
+stat -f '%N uid=%u gid=%g mode=%Lp type=%HT' /private /private/var "$socket"
 diagnose() {
   sudo cat "$work/launchd.stderr" >&2
   sudo launchctl print "system/$label" | awk '/state =|last exit code =|pid =/ { print }' >&2
