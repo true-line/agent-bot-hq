@@ -30,7 +30,8 @@ export function ensurePrivateDir(dir, { uid = process.getuid?.() } = {}) {
   const st = statSync(dir);
   if (!st.isDirectory()) throw new StoreError(`${dir} is not a directory`);
   if (uid !== undefined && st.uid !== uid) throw new StoreError(`${dir} is owned by uid ${st.uid}, not HQ's uid ${uid}`);
-  if (st.mode & 0o077) throw new StoreError(`${dir} has mode ${(st.mode & 0o777).toString(8)}; HQ's state directory must be 0700`);
+  const mode = st.mode & 0o7777;
+  if (mode !== 0o700) throw new StoreError(`${dir} has mode ${mode.toString(8)}; HQ's state directory must be 0700`);
   return dir;
 }
 
