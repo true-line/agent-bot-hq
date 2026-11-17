@@ -328,7 +328,12 @@ export function createSigner({ home, backend, enrollment, uid = process.getuid?.
     report() {
       try {
         const p = ready();
-        return { available: true, backend: p.backend, key_storage: p.key_storage, alg: 'ES256', thumbprint: p.thumbprint, generation: p.generation, key_files: backend.keyFiles().length };
+        // A stopped rekey can leave the old transition key after publishing
+        // the hardware pin and before removing the software key file.
+        const keyFiles = new Set(backend.keyFiles());
+        const transitionKey = join(dir, 'device-key.pem');
+        if (p.key_storage === 'hardware' && lstatSync(transitionKey, { throwIfNoEntry: false })) keyFiles.add(transitionKey);
+        return { available: true, backend: p.backend, key_storage: p.key_storage, alg: 'ES256', thumbprint: p.thumbprint, generation: p.generation, key_files: keyFiles.size };
       } catch (e) {
         return { available: false, backend: backend.kind, key_storage: backend.keyStorage, reason: e.message };
       }

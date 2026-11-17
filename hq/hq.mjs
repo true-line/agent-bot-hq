@@ -224,7 +224,14 @@ export function createHQ({
       : legacySigner();
     signer ??= createSigner({ home, backend: backendFromConfig(cfg.signer, { home, uid }), enrollment, uid, clock });
     const signerReport = () => (typeof signer.report === 'function' ? signer.report() : undefined);
-    profileInfo = detectProfile({ platform, account, standalone: cfg.standalone === true, keyStorage: signerReport()?.key_storage });
+    const hostProfile = (harnessAccounts) => {
+      const report = signerReport();
+      return detectProfile({
+        platform, account, standalone: cfg.standalone === true, harnessAccounts,
+        keyStorage: report?.available ? report.key_storage : undefined, keyFiles: report?.key_files,
+      });
+    };
+    profileInfo = hostProfile();
     legacyRunner ??= legacyDaemon({ supervise: cfg.legacy?.supervise === true, clock });
 
     harnessPlan = cfg.harnesses
@@ -282,7 +289,7 @@ export function createHQ({
       if (without.length) return `${bound(`agents whose harness has no account of its own: ${without.slice(0, 5).join(', ')}${without.length > 5 ? ` and ${without.length - 5} more` : ''}`)} (D7)`;
       return true;
     };
-    profileReasons = (pending, unbound) => detectProfile({ platform, account, standalone: cfg.standalone === true, keyStorage: signerReport()?.key_storage, harnessAccounts: harnessAccounts(pending, unbound) }).reasons;
+    profileReasons = (pending, unbound) => hostProfile(harnessAccounts(pending, unbound)).reasons;
     // Sessions left open by a crash are closed now; they cannot be live.
     for (const [id, s] of coreTable(core, 'sessions')) if (!s.closed_at) coreTable(core, 'sessions').set(id, { ...s, closed_at: clock.now(), closed_by: 'restart' });
 
