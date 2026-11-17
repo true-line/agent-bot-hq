@@ -81,3 +81,23 @@ jobs:
           node -e 'const k = (f) => JSON.stringify(JSON.parse(require("node:fs").readFileSync(f, "utf8")).jwk); if (!k(process.argv[1]) || k(process.argv[1]) !== k(process.argv[2])) { console.error("the key at the default handle changed"); process.exit(1); }' "$state/hq-key.json" "$state/hq-key-after.json"
           left="$(tpm2_getcap handles-persistent | tr -d ' \n-')"
           test "$left" = "0x81010020" || { echo "handles left behind: $left"; exit 1; }
+
+  macos-signer:
+    name: macOS arm64 signer protocol
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Checkout the event revision
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git fetch -q --no-tags --depth 1 "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git checkout -q --detach FETCH_HEAD
+      - name: Exercise the signer, custody reporting and enrollment fixture
+        env:
+          TMPDIR: /tmp
+        run: |
+          node -e 'if (process.platform !== "darwin" || process.arch !== "arm64") process.exit(1)'
+          node --test --test-concurrency=1 tests/hq-signer.test.mjs tests/hq-profile-legacy.test.mjs tests/hq-enrollment.test.mjs
