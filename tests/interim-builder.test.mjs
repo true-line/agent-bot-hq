@@ -41,6 +41,18 @@ test('interim artifact is reproducible, runs offline and refuses changed contrac
     for (const out of [one, two]) run(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, out], { cwd: repo });
     const hash = (f) => createHash('sha256').update(readFileSync(f)).digest('hex');
     assert.equal(hash(one), hash(two));
+    const darwin = join(tmp, 'darwin.tar');
+    run(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, darwin, '--target', 'darwin'], { cwd: repo });
+    assert.notEqual(hash(darwin), hash(one));
+    const darwinTree = join(tmp, 'darwin');
+    mkdirSync(darwinTree);
+    run('tar', ['-xf', darwin, '-C', darwinTree]);
+    assert.equal(JSON.parse(readFileSync(join(darwinTree, 'hq/governance/interim-release.json'))).target_platform, 'darwin');
+    if (process.platform === 'linux') {
+      const wrongHost = spawnSync(process.execPath, [join(darwinTree, 'hq/hq/main.mjs')], { encoding: 'utf8' });
+      assert.notEqual(wrongHost.status, 0);
+      assert.match(wrongHost.stderr, /macOS only/);
+    }
     const extracted = join(tmp, 'extract'); mkdirSync(extracted);
     run('tar', ['-xf', one, '-C', extracted]);
     const executable = join(extracted, 'hq/hq/main.mjs');

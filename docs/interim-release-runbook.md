@@ -1,6 +1,6 @@
 # Interim HQ source artifact (proposal)
 
-This is a limited, Linux-only operator-managed HQ source artifact. It is supported only on Linux for both building and running. It does not create the
+This runbook covers operator-managed HQ source artifacts for Linux and macOS. Each tar targets one operating system. It does not create the
 Stage 3 bundled release, an updater, a service unit, or an automatic rollout.
 Do not publish or deploy until the owner approves the exact artifact and target
 inventory. The release operator owns the build and publication record; the
@@ -17,9 +17,17 @@ deployment operator owns client inventory, installation, monitoring and rollback
    release input; the builder verifies directory contents but cannot infer which
    Git commit or tag they came from. Provide its directory to the builder. Do
    not supply private keys.
-3. On two independent Linux build environments with Node 20+, Git and GNU tar,
+3. For Linux, on two independent Linux build environments with Node 20+, Git and GNU tar,
    run `node scripts/build-interim-release.mjs <full-hq-commit> <contracts-dir> <new-output.tar>`,
    with the contracts directory and new output path outside the clean checkout.
+   For macOS, add `--target darwin` and use a separate output file. The Darwin
+   target builds on Linux with GNU tar and on macOS with GNU tar as `gtar`.
+   Native CI runs the resulting tar with Node as `_agent-bot-hq` on a macOS 15
+   hosted runner and compares its SHA-256 with an independent Linux build of
+   that target. The native check covers cooperative status through HQ's private
+   socket in an unenrolled service account. LaunchDaemon installation, owner access
+   from another account, Secure Enclave signing and protected-profile acceptance
+   have separate gates.
    Compare SHA-256 of the two archives. Record source commit, contracts commit,
    contracts digest, artifact SHA-256, builder/tool versions and both results.
    A mismatch blocks publication. Obtain the owner's approval of those bytes.

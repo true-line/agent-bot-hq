@@ -1,0 +1,60 @@
+name: macOS HQ source artifact
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - name: Checkout exact candidate
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE: ${{ github.sha }}
+        run: |
+          git init -q .
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          git fetch -q --no-tags --depth 1 origin "$SOURCE"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE"
+      - name: Cross-build the Darwin target
+        id: build
+        run: |
+          archive="$RUNNER_TEMP/hq-darwin.tar"
+          bash scripts/ci-build-darwin-artifact.sh "$GITHUB_SHA" "$archive"
+          digest="$(sha256sum "$archive")"
+          echo "sha256=${digest%% *}" >> "$GITHUB_OUTPUT"
+  native:
+    needs: linux
+    runs-on: macos-15
+    steps:
+      - name: Checkout exact candidate
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SOURCE: ${{ github.sha }}
+        run: |
+          git init -q .
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          git fetch -q --no-tags --depth 1 origin "$SOURCE"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE"
+      - name: Build and run the matching tar as the macOS role account
+        env:
+          LINUX_BUILT_SHA256: ${{ needs.linux.outputs.sha256 }}
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          command -v gtar >/dev/null || brew install gnu-tar
+          gtar --version | head -1
+          sw_vers
+          uname -m
+          node --version
+          archive="$RUNNER_TEMP/hq-darwin.tar"
+          bash scripts/ci-build-darwin-artifact.sh "$GITHUB_SHA" "$archive"
+          printf '%s  %s\n' "$LINUX_BUILT_SHA256" "$archive" | shasum -a 256 --check
+          bash tests/darwin-artifact-service-account.sh "$archive"

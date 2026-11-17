@@ -2,10 +2,19 @@
 # Run from the unpacked, offline artifact as the CI-created service account.
 set -euo pipefail
 node_bin="${1:?pass the Node executable}"
-test "$(id -un)" = agent-bot-hq
+case "$(uname -s)" in
+  Linux) account=agent-bot-hq ;;
+  Darwin) account=_agent-bot-hq ;;
+  *) echo 'unsupported HQ test platform' >&2; exit 1 ;;
+esac
+test "$(id -un)" = "$account"
 uid="$(id -u)"
 test "$uid" -ne 0
-test "$(stat -c '%u:%a' "$HOME")" = "$uid:700"
+"$node_bin" --input-type=module -e '
+  import {statSync} from "node:fs";
+  const home = statSync(process.env.HOME);
+  if (home.uid !== process.getuid() || (home.mode & 0o7777) !== 0o700) process.exit(1);
+'
 umask 077
 state="$(mktemp -d "$HOME/hq-state.XXXXXXXX")"
 "$node_bin" hq/main.mjs run --home "$state" >"$state/run.log" 2>&1 &
@@ -31,15 +40,15 @@ if [[ "$ready" != true ]]; then
   echo 'HQ did not answer status on the control socket' >&2
   exit 1
 fi
-test "$(stat -c '%u' "/proc/$hq_pid")" = "$uid"
-"$node_bin" --input-type=module - "$state" <<'JS'
+test "$(ps -o uid= -p "$hq_pid" | tr -d ' ')" = "$uid"
+"$node_bin" --input-type=module - "$state" "$account" <<'JS'
 import assert from 'node:assert/strict';
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 const state = process.argv[2];
 const status = JSON.parse(readFileSync(join(state, 'status.json'), 'utf8'));
-assert.equal(status.hq.account, 'agent-bot-hq');
+assert.equal(status.hq.account, process.argv[3]);
 assert.equal(status.hq.sockets.control, join(state, 'control.sock'));
 assert.equal(status.mode, 'safe');
 assert.equal(status.admissions, false);
@@ -49,5 +58,5 @@ for (const [name, mode] of [['.', 0o700], ['control.sock', 0o600], ['store.json'
   assert.equal(entry.uid, process.getuid(), name);
   assert.equal(entry.mode & 0o777, mode, name);
 }
-console.log('HQ served status as agent-bot-hq with private state, store and control socket.');
+console.log(`HQ served status as ${status.hq.account} with private state, store and control socket.`);
 JS
