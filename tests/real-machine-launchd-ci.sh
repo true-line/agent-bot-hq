@@ -3,15 +3,22 @@ set -euo pipefail
 [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$(uname -s)" == Darwin ]]
 sw_vers; uname -m
 owner="$(id -un)"
-expected_src=806f952cd0389e2af9fbb00390e335d760e19d81
+expected_src=bfb9d78595a4fa2c0f601a49b72537278f174cbe
 [[ "$(git -C machine rev-parse HEAD)" == "$expected_src" ]]
+[[ "$(git -C approver rev-parse HEAD)" == "dca5218e0e73b89b43d87486da0641977fc3a53d" ]]
+[[ "$(git -C identity rev-parse HEAD)" == "d7f960e12cefed905115f198036a9822e43d77d7" ]]
 HQ_DIGEST=45c43c574bffc4966481e60d555dca992cd1cc571285dce2b10766f14572efb7
 stage="$(sudo mktemp -d /private/var/hq-integration.XXXXXX)"
 plist=/Library/LaunchDaemons/ai.true-line.agent-bot-hq.plist
 sock=/private/var/agent-bot-hq-control.sock
 [[ ! -e "$plist" && ! -L "$plist" && ! -e "$sock" && ! -L "$sock" ]]
 ! sudo launchctl print system/ai.true-line.agent-bot-hq >/dev/null 2>&1 || exit 1
+daemon_pid=
 cleanup(){
+    if [[ -n "$daemon_pid" ]]; then
+        kill "$daemon_pid" 2>/dev/null || true
+        wait "$daemon_pid" 2>/dev/null || true
+    fi
     sudo launchctl bootout system/ai.true-line.agent-bot-hq 2>/dev/null || true
     sudo rm -f "$plist" "$sock"
     sudo rm -rf "$stage"
@@ -21,6 +28,7 @@ sudo chmod 0755 "$stage"
 cd machine
 go build -o "$RUNNER_TEMP/mm" ./cmd/managed-machine
 cd ..
+( cd approver && go build -o "$RUNNER_TEMP/mm-daemon" ./cmd/managed-machine )
 gzip -dc validation/tests/fixtures/hq-integration-input.tar.gz > "$RUNNER_TEMP/hq.tar"
 printf '%s  %s\n' "$HQ_DIGEST" "$RUNNER_TEMP/hq.tar" | shasum -a 256 --check
 sudo install -o root -g wheel -m 0644 "$RUNNER_TEMP/hq.tar" "$stage/approved.tar"
@@ -43,28 +51,38 @@ otool -L "$stage/node"
 printf 'HQ source=%s tar=%s Machine=%s Node=%s\n' ad66284e258175f89f08e7a4a095c78f36f47aa9 "$HQ_DIGEST" "$expected_src" "$n"
 record="$RUNNER_TEMP/service.json"
 jq -n --arg root "$stage" --arg a "$HQ_DIGEST" --arg n "$n" '{archive:($root+"/approved.tar"),release_dir:($root+"/hq"),artifact_sha256:$a,node:($root+"/node"),node_sha256:$n}' > "$record"
-da="$owner"
-for prefix in /opt/homebrew /usr/local/Homebrew; do
-    if [ -e "$prefix" ]; then da="$(stat -f %Su "$prefix")"; break; fi
+# Use the ordinary Homebrew owner, registered home and shared ARM64 channel.
+[[ "$(stat -f %Su /opt/homebrew)" == "$owner" ]]
+channel=/opt/homebrew/var/agent-machine
+state="$HOME/.config/agent-machine"
+approvals="$state/members/approvals"
+[[ ! -e "$state" && ! -L "$state" && ! -e "$channel" && ! -L "$channel" ]]
+client_home="$(mktemp -d "$RUNNER_TEMP/machine-owner.XXXXXX")"
+"$RUNNER_TEMP/mm-daemon" daemon run > "$RUNNER_TEMP/mm-daemon.log" 2>&1 &
+daemon_pid=$!
+for _ in {1..60}; do
+    [[ ! -S "$channel/daemon.sock" || ! -f "$channel/daemon.pub" ]] || break
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then cat "$RUNNER_TEMP/mm-daemon.log"; exit 1; fi
+    sleep 1
 done
-dh="$(dscl . -read "/Users/$da" NFSHomeDirectory | sed 's/^NFSHomeDirectory: //')"
-approvals="$dh/.config/agent-machine/members/approvals"
-d(){ if [[ "$da" == "$owner" ]]; then "$@"; else sudo -u "$da" "$@"; fi; }
+[[ -S "$channel/daemon.sock" && -f "$channel/daemon.pub" ]] || { cat "$RUNNER_TEMP/mm-daemon.log"; exit 1; }
+paired_client(){ "$stage/node" validation/tests/paired-machine-approval-ci.mjs "$client_home" "$channel" "$@"; }
+key="$(paired_client prepare)"
+pub="$(jq -er .public <<<"$key")"
+fingerprint="$(jq -er .fingerprint <<<"$key")"
+"$RUNNER_TEMP/mm-daemon" daemon pair --enroll "$pub" --fingerprint "$fingerprint" --client agent-daemon --user "$owner" --json |
+    jq -e --arg uid "$(id -u)" '.state=="paired" and .client=="agent-daemon" and (.uid|tostring)==$uid'
 for attempt in 1 2; do
     plan="$("$RUNNER_TEMP/mm" members plan --hq-service "$record")"
     summary="${plan%%$'\n'*}"
     id="$(jq -r .plan_id <<<"$summary")"
     digest="$(jq -r .plan_digest <<<"$summary")"
     if [[ "$attempt" == 2 ]]; then [[ "$(jq -r .changes <<<"$summary")" == 0 ]]; fi
-    # Use the same synthetic approval-record boundary as Machine's disposable
-    # account CI. The real root command consumes it and writes its own receipt.
-    d mkdir -p "$approvals"
-    d chmod 700 "$dh/.config/agent-machine" "$dh/.config/agent-machine/members" "$approvals"
-    jq -n --arg id "$id" --arg dig "$digest" --arg now "$(date -u +%FT%TZ)" --arg exp "$(date -u -v+10M +%FT%TZ)" '{plan_id:$id,plan_digest:$dig,approved_at:$now,expires_at:$exp}' > "$RUNNER_TEMP/approval"
-    chmod 644 "$RUNNER_TEMP/approval"
-    d cp "$RUNNER_TEMP/approval" "$approvals/$id.json"; d chmod 600 "$approvals/$id.json"
+    [[ ! -e "$approvals/$id.json" ]]
+    paired_client approve "$id" "$digest" > "$RUNNER_TEMP/verified-approval.json"
+    jq -e --slurp 'length==2 and .[0]==.[1]' "$RUNNER_TEMP/verified-approval.json" "$approvals/$id.json"
     sudo "$RUNNER_TEMP/mm" members apply "$id"
-    sudo jq -e '.result=="applied"' "/var/db/managed-machine/members/receipts/$id.json"
+    sudo jq -e --arg id "$id" --arg digest "$digest" '.result=="applied" and .plan_id==$id and .plan_digest==$digest' "/var/db/managed-machine/members/receipts/$id.json"
     "$stage/node" "$stage/hq/hq/main.mjs" status --owner-control --json > "$RUNNER_TEMP/status"
     jq -e --arg owner "$owner" --argjson uid "$(id -u)" '.hq.account=="_agent-bot-hq" and .profile=="managed-cooperative" and .hq.sockets.ownerControl.peer_check=="getpeereid" and .hq.sockets.ownerControl.account==$owner and .hq.sockets.ownerControl.uid==$uid' "$RUNNER_TEMP/status"
     pid="$(sudo launchctl print system/ai.true-line.agent-bot-hq | awk '$1=="pid" && $2=="="{print $3}')"

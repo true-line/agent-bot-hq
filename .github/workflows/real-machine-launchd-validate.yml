@@ -17,8 +17,20 @@ jobs:
         with:
           persist-credentials: false
           repository: true-line/agent-bot-machine
-          ref: 806f952cd0389e2af9fbb00390e335d760e19d81
+          ref: bfb9d78595a4fa2c0f601a49b72537278f174cbe
           path: machine
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          repository: true-line/agent-bot-machine
+          ref: dca5218e0e73b89b43d87486da0641977fc3a53d
+          path: approver
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          repository: true-line/agent-bot-identity
+          ref: d7f960e12cefed905115f198036a9822e43d77d7
+          path: identity
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version-file: machine/go.mod
