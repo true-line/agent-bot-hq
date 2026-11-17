@@ -42,3 +42,4 @@ node_bin="$(node -p 'process.execPath')"
 sudo -n -H -u "$name" -- "$node_bin" --version
 cd "$stage/hq"
 sudo -n -H -u "$name" -- /bin/bash tests/dedicated-hq-account.sh "$node_bin"
+bash tests/darwin-launchd-owner-control.sh "$node_bin"
