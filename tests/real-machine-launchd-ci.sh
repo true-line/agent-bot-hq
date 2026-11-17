@@ -3,7 +3,7 @@ set -euo pipefail
 [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$(uname -s)" == Darwin ]]
 sw_vers; uname -m
 owner="$(id -un)"
-expected_src=dbf69e835464e92524ac53bd24f620abc75c20a3
+expected_src=806f952cd0389e2af9fbb00390e335d760e19d81
 [[ "$(git -C machine rev-parse HEAD)" == "$expected_src" ]]
 HQ_DIGEST=45c43c574bffc4966481e60d555dca992cd1cc571285dce2b10766f14572efb7
 stage="$(sudo mktemp -d /private/var/hq-integration.XXXXXX)"

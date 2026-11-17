@@ -17,7 +17,7 @@ jobs:
         with:
           persist-credentials: false
           repository: true-line/agent-bot-machine
-          ref: dbf69e835464e92524ac53bd24f620abc75c20a3
+          ref: 806f952cd0389e2af9fbb00390e335d760e19d81
           path: machine
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
