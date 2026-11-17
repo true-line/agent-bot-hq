@@ -13,13 +13,13 @@ import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCore, testClock } from '../sdk/services.mjs';
-import { agentArgv, AGENT_PATH, createLauncher, groupArgv, KILL_WAIT_MS, LAUNCH_SHELL, launchWorkdir, MAX_PENDING, PGID_MARKER, STDERR_LINE, STDERR_LINES } from '../hq/launch.mjs';
+import { agentArgv, AGENT_PATH, createLauncher, groupArgv, KILL_WAIT_MS, LAUNCH_SHELL, launchMemberSocket, launchWorkdir, MAX_PENDING, MEMBER_SOCKET_ENV, PGID_MARKER, STDERR_LINE, STDERR_LINES } from '../hq/launch.mjs';
 import { attachTo, DIGEST, fakeSudo, fakeTimers, harnessLayout, helloOn, SOUL, startHQ } from './hq-harness.mjs';
 
 const A = 'hqm_a';
 const B = 'hqm_b';
 const NODE = '/usr/bin/node';
-const ENV = { AGENT_BOT_SOULS_SOCKET: '/run/souls/s.sock', AGENT_BOT_SOULS_MEMBER_TOKEN: 'member-token-not-for-receipts', AGENT_BOT_SOULS_MEMBER_ID: 'm_lead', AGENT_BOT_SOULS_ROLE: 'lead' };
+const ENV = { AGENT_BOT_SOULS_MEMBER_TOKEN: 'member-token-not-for-receipts' };
 const tick = () => new Promise((r) => setImmediate(r));
 async function until(fn, what, ms = 5000) {
   for (const end = Date.now() + ms; Date.now() < end;) { if (fn()) return; await tick(); }
@@ -69,9 +69,10 @@ test('HQ asks sudo for exactly one form: the harness account, the fixed shell wi
   try {
     // Readiness: one probe per account, as that account, of /bin/true.
     assert.deepEqual(t.sudo.probes().sort(), [['-n', '-u', A, '--', '/bin/true'], ['-n', '-u', B, '--', '/bin/true']]);
-    const { child, launch_id: launchId } = await t.started();
+    const { child, launch_id: launchId, member_socket: memberSocket } = await t.started();
     assert.match(launchId, /^ln_[0-9a-f]{24}$/);
     assert.equal(launchWorkdir(t.l.homes[A], SOUL, 'm_lead'), join(t.l.homes[A], '.agent-bot-hq', 'souls', SOUL, 'm_lead'));
+    assert.equal(memberSocket, launchMemberSocket(t.endpoint(A), launchId));
     assert.equal(child.file, '/usr/bin/sudo');
     assert.deepEqual(child.args, ['-n', '-H', '-u', A, '--', '/bin/sh', '-c', LAUNCH_SHELL, 'sh', SOUL, 'm_lead', NODE, 'adapter.mjs', '--acp']);
     assert.equal(LAUNCH_SHELL, 'read -r _ _ _ _ g _ 2>/dev/null </proc/self/stat && printf \'agent-bot-hq-launch pgid %s\\n\' "$g" >&2; umask 077 && d="$HOME/.agent-bot-hq/souls/$1/$2" && mkdir -p "$d" && chmod 0700 "$d" && cd "$d" && shift 2 && exec "$@"');
@@ -79,13 +80,14 @@ test('HQ asks sudo for exactly one form: the harness account, the fixed shell wi
     assert.equal(child.opts.cwd, '/');
     assert.equal(child.opts.detached, true, 'its own session and process group');
     // Nothing of HQ's own environment (the canary above is in it): only the
-    // four, HQ's broker path, PATH.
-    assert.deepEqual(child.opts.env, { ...ENV, AGENT_BOT_SOULS_BROKER: t.endpoint(A), PATH: AGENT_PATH });
+    // The caller's token, HQ-derived identity and socket paths, and PATH.
+    assert.deepEqual(child.opts.env, { ...ENV, AGENT_BOT_SOULS_MEMBER_ID: 'm_lead', AGENT_BOT_SOULS_ROLE: 'lead', AGENT_BOT_SOULS_BROKER: t.endpoint(A), [MEMBER_SOCKET_ENV]: memberSocket, PATH: AGENT_PATH });
     assert.equal(Object.getPrototypeOf(child.opts.env), Object.prototype);
     // The specialist's harness is another account; its launch goes there.
-    await t.started(t.spec);
+    const specialist = await t.started(t.spec);
     assert.deepEqual(t.sudo.agents.at(-1).args.slice(0, 11), ['-n', '-H', '-u', B, '--', '/bin/sh', '-c', LAUNCH_SHELL, 'sh', SOUL, 'm_spec']);
     assert.equal(t.sudo.agents.at(-1).opts.env.AGENT_BOT_SOULS_BROKER, t.endpoint(B));
+    assert.equal(t.sudo.agents.at(-1).opts.env[MEMBER_SOCKET_ENV], launchMemberSocket(t.endpoint(B), specialist.launch_id));
     assert.deepEqual(t.receipts('hq.launch').map((r) => [r.member_id, r.adapter_id, r.account]), [['m_lead', 'adapter-a', A], ['m_spec', 'adapter-b', B]]);
   } finally { delete process.env.HQ_LAUNCH_CANARY; await t.cleanup(); }
 });
@@ -152,8 +154,11 @@ test('launch refuses in order, before anything is reserved or started', async ()
         [{ command: [] }, /1 to 64/], [{ command: 'node' }, /1 to 64/], [{ command: Array(65).fill(NODE) }, /1 to 64/],
         [{ command: ['node'] }, /absolute path/], [{ command: [NODE, 'a\0b'] }, /no NUL/], [{ command: [NODE, 7] }, /no NUL/], [{ command: [NODE, 'x'.repeat(4097)] }, /at most 4096/],
         [{ env: { PATH: '/tmp' } }, /not one a launch may set/], [{ env: { LD_PRELOAD: '/tmp/x.so' } }, /not one a launch may set/],
-        [{ env: { AGENT_BOT_SOULS_BROKER: '/tmp/other.sock' } }, /set by HQ to the harness account's own endpoint/],
-        [{ env: { AGENT_BOT_SOULS_ROLE: 'lead\nX=1' } }, /no NUL or newline/], [{ env: { AGENT_BOT_SOULS_ROLE: 3 } }, /no NUL or newline/], [{ env: [] }, /maps variable names/],
+        [{ env: { AGENT_BOT_SOULS_BROKER: '/tmp/other.sock' } }, /set by HQ from the harness account's verified endpoint/],
+        [{ env: { AGENT_BOT_SOULS_SOCKET: '/tmp/other.sock' } }, /set by HQ from the harness account's verified endpoint/],
+        [{ env: { AGENT_BOT_SOULS_MEMBER_ID: 'other' } }, /not one a launch may set/],
+        [{ env: { AGENT_BOT_SOULS_ROLE: 'other' } }, /not one a launch may set/],
+        [{ env: { AGENT_BOT_SOULS_MEMBER_TOKEN: 'token\nX=1' } }, /no NUL or newline/], [{ env: { AGENT_BOT_SOULS_MEMBER_TOKEN: 3 } }, /no NUL or newline/], [{ env: [] }, /maps variable names/],
         [{ extra: 1 }, /launch takes/], [{ runtime_id: 7 }, /launch takes/],
       ];
       for (const [over, why] of cases) assert.match(refused(await s.launch(over), 'host.invalid_request'), why, JSON.stringify(over).slice(0, 80));
@@ -209,7 +214,8 @@ test('a reservation is single use, lasts 30 seconds, and does not survive a rest
     assert.equal(t.sudo.agents.length, 1);
     // No token or environment value in any receipt or log.
     const disk = JSON.stringify([t.hq.core.receipts, t.hq.core.logs]);
-    for (const secret of [late.attach, one.attach, two.attach, ENV.AGENT_BOT_SOULS_MEMBER_TOKEN, ENV.AGENT_BOT_SOULS_SOCKET]) assert.ok(!disk.includes(secret), 'no token or env value is kept');
+    for (const secret of [late.attach, one.attach, two.attach, ENV.AGENT_BOT_SOULS_MEMBER_TOKEN]) assert.ok(!disk.includes(secret), 'no token or secret environment value is kept');
+    for (const path of [late.member_socket, one.member_socket, two.member_socket]) assert.ok(!disk.includes(path), 'the private member socket path is not receipted or logged');
   } finally { await t.cleanup(); }
 
   const first = await setup();
@@ -545,7 +551,7 @@ test('HQ stop stops every agent\'s group before its sockets close, and refuses n
 test('receipts name the launch without its environment or token; stderr reaches the log clipped and rate limited', async () => {
   const t = await setup();
   try {
-    const { child, launch_id: launchId, attach } = await t.started({ command: [NODE, 'adapter.mjs', '--token-in-argv-is-hashed'] });
+    const { child, launch_id: launchId, attach, member_socket: memberSocket } = await t.started({ command: [NODE, 'adapter.mjs', '--token-in-argv-is-hashed'] });
     const [r] = t.receipts('hq.launch');
     assert.deepEqual(Object.keys(r).filter((k) => !['seq', 'at', 'profile', 'plugin', 'kind'].includes(k)).sort(), ['account', 'adapter_id', 'argv0', 'argv_sha256', 'launch_id', 'member_id', 'runtime_id', 'soul_id']);
     assert.deepEqual([r.launch_id, r.account, r.member_id, r.adapter_id, r.argv0], [launchId, A, 'm_lead', 'adapter-a', NODE]);
@@ -573,7 +579,7 @@ test('receipts name the launch without its environment or token; stderr reaches 
     child.exit(0);
     await until(() => t.receipts('hq.launch.exited').length === 1, 'the exit receipt');
     const kept = JSON.stringify([t.hq.core.receipts, t.hq.core.logs]);
-    for (const secret of [attach, ENV.AGENT_BOT_SOULS_MEMBER_TOKEN, ENV.AGENT_BOT_SOULS_SOCKET, '--token-in-argv-is-hashed']) assert.ok(!kept.includes(secret), `${secret} is not kept`);
+    for (const secret of [attach, ENV.AGENT_BOT_SOULS_MEMBER_TOKEN, memberSocket, '--token-in-argv-is-hashed']) assert.ok(!kept.includes(secret), `${secret} is not kept`);
   } finally { await t.cleanup(); }
 });
 

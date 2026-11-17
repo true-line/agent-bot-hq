@@ -17,11 +17,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, copyFileSync, cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
+import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
-import { BROKER_ENV, REQUEST_ENV } from '../hq/launch.mjs';
+import { BROKER_ENV, MEMBER_ID_ENV, MEMBER_SOCKET_ENV, REQUEST_ENV, ROLE_ENV } from '../hq/launch.mjs';
 import { referenceBroker } from './broker-fixture.mjs';
 import { attachTo, DIGEST, helloOn, SOUL, startHQ, tempHome } from './hq-harness.mjs';
 
@@ -80,6 +81,7 @@ async function withHQ(accounts, fn) {
   writeFileSync(join(home, 'config.json'), JSON.stringify(config), { mode: 0o600 });
   process.env.HQ_LAUNCH_CANARY = 'set-in-hqs-environment-only';
   const t = await startHQ({ home, platform: 'linux', config, plugins: [referenceBroker()], launch: { graceMs: 1000 }, realSudo: true });
+  const memberServers = [];
   try {
     const used = [...new Set(Object.values(accounts))];
     assert.deepEqual(t.status.hq.launch.accounts.map((a) => [a.account, a.available, a.reason]), used.map((a) => [a, true, undefined]), 'the job\'s account may start every harness account');
@@ -91,19 +93,28 @@ async function withHQ(accounts, fn) {
       const res = await entry.request('launch', {
         runtime_id: rt.runtime_id,
         command: [process.execPath, join(pub, 'agent-probe.mjs'), JSON.stringify(input)],
-        env: { AGENT_BOT_SOULS_SOCKET: t.hq.paths.admission, AGENT_BOT_SOULS_MEMBER_TOKEN: 'not-a-real-token', AGENT_BOT_SOULS_MEMBER_ID: rt.member_id, AGENT_BOT_SOULS_ROLE: role },
+        env: { AGENT_BOT_SOULS_MEMBER_TOKEN: 'not-a-real-token' },
       });
       assert.equal(res.ok, true, JSON.stringify(res));
       const account = role === 'lead' ? accounts['adapter-a'] : accounts['adapter-b'];
       assert.equal(res.result.cwd, join(passwd(account)[5], '.agent-bot-hq', 'souls', SOUL, rt.member_id));
+      assert.equal(res.result.member_socket.startsWith(join(dir, account, 'member-')), true);
+      const memberServer = createServer((socket) => socket.end());
+      await new Promise((resolve, reject) => { memberServer.once('error', reject); memberServer.listen(res.result.member_socket, resolve); });
+      chmodSync(res.result.member_socket, 0o660);
+      memberServers.push({ server: memberServer, path: res.result.member_socket });
       const conn = await attachTo(t.hq.paths.admission, { launch_id: res.result.launch_id, attach: res.result.attach });
       assert.equal(conn.answer.ok, true, JSON.stringify(conn.answer));
-      return { conn, launchId: res.result.launch_id };
+      return { conn, launchId: res.result.launch_id, memberSocket: res.result.member_socket };
     };
     const exited = () => t.hq.core.receipts.filter((r) => r.kind === 'hq.launch.exited');
     await fn({ t, pub, home, entry, endpoint, start, exited });
   } finally {
     delete process.env.HQ_LAUNCH_CANARY;
+    for (const m of memberServers) {
+      await new Promise((resolve) => m.server.close(resolve));
+      try { unlinkSync(m.path); } catch { /* already gone */ }
+    }
     await t.done();
     rmSync(pub, { recursive: true, force: true });
   }
@@ -117,7 +128,7 @@ test('T02 on real accounts: an agent HQ started works in its own 0700 directory 
     const before = { key: sha(key), config: sha(files['config.json']) };
     const [, , uidA, , , homeA] = passwd(A);
     const [, , , , , homeB] = passwd(B);
-    const { conn } = await start({
+    const { conn, memberSocket } = await start({
       mode: 'probe',
       hq: { home, files, sockets: { 'control.sock': t.hq.paths.control, 'admission.sock': t.hq.paths.admission, 'broker.sock': t.hq.paths.broker }, main: join(pub, 'hq/main.mjs') },
       other: { home: homeB, endpointDir: join(dir, B), endpoint: endpoint(B) },
@@ -134,8 +145,9 @@ test('T02 on real accounts: an agent HQ started works in its own 0700 directory 
     // Its environment: HQ's never reaches it; the launch's variables do.
     assert.ok(!report.env.includes('HQ_LAUNCH_CANARY'), JSON.stringify(report.env));
     assert.deepEqual(report.env.filter((n) => n.startsWith('HQ_')), []);
-    assert.deepEqual(report.env.filter((n) => n.startsWith('AGENT_BOT_')).sort(), [...REQUEST_ENV, BROKER_ENV].sort());
+    assert.deepEqual(report.env.filter((n) => n.startsWith('AGENT_BOT_')).sort(), [...REQUEST_ENV, BROKER_ENV, MEMBER_ID_ENV, MEMBER_SOCKET_ENV, ROLE_ENV].sort());
     assert.equal(report.broker, endpoint(A));
+    assert.equal(report.memberSocket, memberSocket);
     // Every attempt fails, each for want of permission.
     for (const [name, r] of Object.entries(report.attempts)) {
       assert.equal(r.ok, false, `${name}: ${JSON.stringify(r)}`);
@@ -145,10 +157,13 @@ test('T02 on real accounts: an agent HQ started works in its own 0700 directory 
     assert.equal(Object.keys(report.attempts).length, 12);
     // And the controls succeed, so the failures are the boundary, not a broken probe.
     for (const [name, r] of Object.entries(report.controls)) assert.equal(r.ok, true, `${name}: ${JSON.stringify(r)}`);
+    const other = await start({ mode: 'dial', path: memberSocket }, 'specialist');
+    assert.deepEqual(JSON.parse(await other.conn.line()), { ok: false, code: 'EACCES' }, 'the other harness account cannot reach this member socket');
+    await other.conn.closed;
     // HQ's state is as it was.
     assert.deepEqual({ key: sha(key), config: sha(files['config.json']) }, before);
-    await until(() => exited().length === 1, 'the exit receipt', 15_000);
-    const [r] = exited();
+    await until(() => exited().length === 2, 'both exit receipts', 15_000);
+    const r = exited().find((receipt) => receipt.member_id === 'm_lead');
     assert.deepEqual([r.account, r.exit_code, r.reason, r.contained], [A, 0, 'exited', true]);
     // The probe starts nothing outside its group, so nothing is left.
     assert.deepEqual(processesOf(A), [], 'nothing of the account is left');
