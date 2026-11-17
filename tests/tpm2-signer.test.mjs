@@ -121,6 +121,27 @@ test('TPM helper: creates a key in the TPM, signs with it, and HQ holds no key f
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
+// Only use the disposable software TPM this test file owns.
+test('TPM helper refuses to adopt a P-256 signing key with different custody attributes', { skip: skip || Boolean(tcti) }, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hq-key-attributes-'));
+  const context = join(dir, 'primary.ctx');
+  const handle = '0x81010024';
+  const run = (cmd, args) => {
+    const result = spawnSync(cmd, args, { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  try {
+    run('tpm2_createprimary', ['-C', 'o', '-G', 'ecc256:ecdsa-sha256', '-a', 'sensitivedataorigin|userwithauth|sign', '-c', context]);
+    run('tpm2_evictcontrol', ['-C', 'o', '-c', context, handle]);
+    for (const [op, input] of [['status', '{}'], ['sign', '{"message":"aGk"}']]) {
+      const result = spawnSync(process.execPath, [HELPER, '--handle', handle, op], { input, env, encoding: 'utf8' });
+      assert.notEqual(result.status, 0);
+      assert.equal(result.stdout, '');
+      assert.match(result.stderr, /lacks verified TPM signing and custody attributes/);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('TPM helper: re-keying evicts the old key and makes a new one; create without replace is refused', { skip }, () => {
   const home = tempHome();
   const handle = '0x81010021';

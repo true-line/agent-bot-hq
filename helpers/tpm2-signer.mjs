@@ -30,7 +30,8 @@ import { fileURLToPath } from 'node:url';
 const PROTOCOL = 'agent-bot-hq-signer/1';
 const DEFAULT_HANDLE = '0x81010020';
 const MAX_MESSAGE_BYTES = 32 * 1024;
-const KEY_ATTRIBUTES = 'fixedtpm|fixedparent|sensitivedataorigin|userwithauth|sign';
+const REQUIRED_ATTRIBUTES = ['fixedtpm', 'fixedparent', 'sensitivedataorigin', 'sign'];
+const KEY_ATTRIBUTES = [...REQUIRED_ATTRIBUTES, 'userwithauth'].join('|');
 
 function parse(argv) {
   const args = { handle: DEFAULT_HANDLE };
@@ -58,14 +59,18 @@ function present(handle) {
   return tpm('tpm2_getcap', ['handles-persistent']).toLowerCase().split(/\s+/).includes(handle);
 }
 
-function publicJwkOf(handle) {
-  return withScratch((dir) => {
-    const pem = join(dir, 'pub.pem');
-    tpm('tpm2_readpublic', ['-c', handle, '-f', 'pem', '-o', pem]);
-    const { kty, crv, x, y } = createPublicKey(readFileSync(pem, 'utf8')).export({ format: 'jwk' });
-    if (kty !== 'EC' || crv !== 'P-256') throw new Error(`the key at ${handle} is not a P-256 key`);
-    return { kty, crv, x, y };
-  });
+function readSigningKey(handle, dir) {
+  const pem = join(dir, 'pub.pem');
+  // A persistent handle can already hold an independently provisioned key.
+  // Read its custody attributes and PEM in the same TPM ReadPublic response.
+  const description = tpm('tpm2_readpublic', ['-c', handle, '-f', 'pem', '-o', pem]);
+  const attributes = /^attributes:\r?\n  value: ([^\r\n]+)$/m.exec(description)?.[1].trim().split('|') ?? [];
+  if (!REQUIRED_ATTRIBUTES.every((attr) => attributes.includes(attr))) {
+    throw new Error(`the key at ${handle} lacks verified TPM signing and custody attributes`);
+  }
+  const { kty, crv, x, y } = createPublicKey(readFileSync(pem, 'utf8')).export({ format: 'jwk' });
+  if (kty !== 'EC' || crv !== 'P-256') throw new Error(`the key at ${handle} is not a P-256 key`);
+  return { kty, crv, x, y };
 }
 
 function create(handle, replace) {
@@ -90,11 +95,12 @@ function create(handle, replace) {
     flush();
     try { tpm('tpm2_evictcontrol', ['-C', 'o', '-c', f('key.ctx'), handle]); } finally { flush(); }
   });
-  return publicJwkOf(handle);
+  return withScratch((dir) => readSigningKey(handle, dir));
 }
 
 function sign(handle, message) {
   return withScratch((dir) => {
+    readSigningKey(handle, dir); // A persistent handle may change between helper calls.
     const msg = join(dir, 'msg.bin');
     const sig = join(dir, 'sig.bin');
     writeFileSync(msg, message, { mode: 0o600 });
@@ -133,7 +139,7 @@ function main() {
   const body = text.trim() ? JSON.parse(text) : {};
   const base = { protocol: PROTOCOL, key_storage: 'hardware' };
   if (op === 'status') {
-    return present(handle) ? { ...base, present: true, jwk: publicJwkOf(handle) } : { ...base, present: false };
+    return present(handle) ? { ...base, present: true, jwk: withScratch((dir) => readSigningKey(handle, dir)) } : { ...base, present: false };
   }
   if (op === 'create') return { ...base, jwk: create(handle, body.replace === true) };
   if (op === 'sign') {
