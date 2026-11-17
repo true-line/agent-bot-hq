@@ -79,3 +79,5 @@ second_pid="$(systemctl show "$unit.service" -p MainPID --value)"
 [[ "$second_pid" != 0 && "$second_pid" != "$first_pid" ]]
 sudo systemctl stop "$unit.socket" "$unit.service"
 sudo jq -e --arg owner "$owner" --argjson uid "$(id -u)" 'any(.tables[] | select(.[0] == "hq\u0000sessions") | .[1][] | .[1]; .account == $owner and .uid == $uid and .closed_at != null)' "$stage/state/store.json" >/dev/null
+# After both units stop, the HQ account can perform offline key maintenance.
+sudo -u agent-bot-hq -- "$node" "$entry" signer rekey --home "$stage/state" --json | jq -e '.generation >= 1' >/dev/null

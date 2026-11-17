@@ -79,7 +79,11 @@ the configured owner opens an owner session. The owner uses
 `status --owner-control`, `souls --owner-control`, or
 `enroll --owner-control` without traversing HQ's private home.
 The private control socket still serves the HQ account, including the
-running-service check for offline signer rekey. Admission and the broker
+running-service check for offline signer rekey. Before rekeying, stop this
+installation's systemd socket and service together. An active socket can
+restart the service during offline maintenance. Run the rekey command in
+the HQ account against the installation's private state directory, then
+start its socket again. Admission and the broker
 continue to use their existing endpoints. The installer, machine-key
 pairing and retirement of the old key are tracked in issue #88.
 
