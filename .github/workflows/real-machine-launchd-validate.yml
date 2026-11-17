@@ -29,7 +29,7 @@ jobs:
         with:
           persist-credentials: false
           repository: true-line/agent-bot-identity
-          ref: d7f960e12cefed905115f198036a9822e43d77d7
+          ref: 2a6edfe6f52733a7c83bddb738fc3eb420ad41b3
           path: identity
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:

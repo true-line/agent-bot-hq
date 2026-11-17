@@ -6,7 +6,7 @@ owner="$(id -un)"
 expected_src=bfb9d78595a4fa2c0f601a49b72537278f174cbe
 [[ "$(git -C machine rev-parse HEAD)" == "$expected_src" ]]
 [[ "$(git -C approver rev-parse HEAD)" == "dca5218e0e73b89b43d87486da0641977fc3a53d" ]]
-[[ "$(git -C identity rev-parse HEAD)" == "d7f960e12cefed905115f198036a9822e43d77d7" ]]
+[[ "$(git -C identity rev-parse HEAD)" == "2a6edfe6f52733a7c83bddb738fc3eb420ad41b3" ]]
 HQ_DIGEST=45c43c574bffc4966481e60d555dca992cd1cc571285dce2b10766f14572efb7
 stage="$(sudo mktemp -d /private/var/hq-integration.XXXXXX)"
 plist=/Library/LaunchDaemons/ai.true-line.agent-bot-hq.plist

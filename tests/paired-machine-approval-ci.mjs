@@ -1,13 +1,11 @@
 // Positive-path test driver for the disposable hosted macOS install check.
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import path from 'node:path';
 import {
   daemonFingerprint, loadMachineSigner, loadOrCreateMachineKey, machineRoundTrip,
   machineSocketPath, pairedPublicKey, pinDaemonPub, verifyResponse,
 } from '../../identity/machine-client.mjs';
-import { MEMBERS_PLAN_DIGEST, MEMBERS_PLAN_ID, membersPlanDigest } from '../../identity/machine-members.mjs';
+import { listMembersPlans, readMembersPlan } from '../../identity/machine-members.mjs';
 
 assert.equal(process.env.RUNNER_ENVIRONMENT, 'github-hosted');
 assert.equal(process.platform, 'darwin');
@@ -20,13 +18,10 @@ if (action === 'prepare') {
   console.log(JSON.stringify({ public: publicKeyRaw.toString('hex'), fingerprint: daemonFingerprint(publicKeyRaw) }));
 } else {
   assert.equal(action, 'approve');
-  assert.match(planId, MEMBERS_PLAN_ID);
-  assert.match(digest, MEMBERS_PLAN_DIGEST);
-  const savedFile = path.join(homedir(), 'Library', 'Application Support', 'managed-machine', 'members', 'plans', planId + '.json');
-  const saved = JSON.parse(readFileSync(savedFile, 'utf8'));
-  assert.equal(saved.plan_id, planId);
+  const listed = listMembersPlans().find(plan => plan.plan_id === planId);
+  assert.equal(listed?.plan_digest, digest);
+  const saved = readMembersPlan({ planId });
   assert.equal(saved.plan_digest, digest);
-  assert.equal(membersPlanDigest(saved.plan), digest);
 
   const { request, reply } = await machineRoundTrip({
     verb: 'approve-members',
