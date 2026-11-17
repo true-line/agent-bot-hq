@@ -1,0 +1,28 @@
+name: Real Machine and HQ launchd integration
+on:
+  push:
+    branches: [codex/validate-machine-hq-launchd]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: validation
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          repository: true-line/agent-bot-machine
+          ref: dbf69e835464e92524ac53bd24f620abc75c20a3
+          path: machine
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: machine/go.mod
+          cache: false
+      - name: Install and reapply verified Darwin artifacts through Machine
+        shell: bash
+        run: bash validation/tests/real-machine-launchd-ci.sh
