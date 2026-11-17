@@ -3,9 +3,8 @@ set -euo pipefail
 [[ "$RUNNER_ENVIRONMENT" == github-hosted && "$(uname -s)" == Darwin ]]
 sw_vers; uname -m
 owner="$(id -un)"
-expected_src=bfb9d78595a4fa2c0f601a49b72537278f174cbe
+expected_src=15fcb704ee842fb865fd037afd32c1eaacbfac7e
 [[ "$(git -C machine rev-parse HEAD)" == "$expected_src" ]]
-[[ "$(git -C approver rev-parse HEAD)" == "dca5218e0e73b89b43d87486da0641977fc3a53d" ]]
 [[ "$(git -C identity rev-parse HEAD)" == "2a6edfe6f52733a7c83bddb738fc3eb420ad41b3" ]]
 HQ_DIGEST=45c43c574bffc4966481e60d555dca992cd1cc571285dce2b10766f14572efb7
 stage="$(sudo mktemp -d /private/var/hq-integration.XXXXXX)"
@@ -28,7 +27,6 @@ sudo chmod 0755 "$stage"
 cd machine
 go build -o "$RUNNER_TEMP/mm" ./cmd/managed-machine
 cd ..
-( cd approver && go build -o "$RUNNER_TEMP/mm-daemon" ./cmd/managed-machine )
 gzip -dc validation/tests/fixtures/hq-integration-input.tar.gz > "$RUNNER_TEMP/hq.tar"
 printf '%s  %s\n' "$HQ_DIGEST" "$RUNNER_TEMP/hq.tar" | shasum -a 256 --check
 sudo install -o root -g wheel -m 0644 "$RUNNER_TEMP/hq.tar" "$stage/approved.tar"
@@ -58,7 +56,7 @@ state="$HOME/.config/agent-machine"
 approvals="$state/members/approvals"
 [[ ! -e "$state" && ! -L "$state" && ! -e "$channel" && ! -L "$channel" ]]
 client_home="$(mktemp -d "$RUNNER_TEMP/machine-owner.XXXXXX")"
-"$RUNNER_TEMP/mm-daemon" daemon run > "$RUNNER_TEMP/mm-daemon.log" 2>&1 &
+"$RUNNER_TEMP/mm" daemon run > "$RUNNER_TEMP/mm-daemon.log" 2>&1 &
 daemon_pid=$!
 for _ in {1..60}; do
     [[ ! -S "$channel/daemon.sock" || ! -f "$channel/daemon.pub" ]] || break
@@ -70,7 +68,7 @@ paired_client(){ "$stage/node" validation/tests/paired-machine-approval-ci.mjs "
 key="$(paired_client prepare)"
 pub="$(jq -er .public <<<"$key")"
 fingerprint="$(jq -er .fingerprint <<<"$key")"
-"$RUNNER_TEMP/mm-daemon" daemon pair --enroll "$pub" --fingerprint "$fingerprint" --client agent-daemon --user "$owner" --json |
+"$RUNNER_TEMP/mm" daemon pair --enroll "$pub" --fingerprint "$fingerprint" --client agent-daemon --user "$owner" --json |
     jq -e --arg uid "$(id -u)" '.state=="paired" and .client=="agent-daemon" and (.uid|tostring)==$uid'
 for attempt in 1 2; do
     plan="$("$RUNNER_TEMP/mm" members plan --hq-service "$record")"

@@ -17,14 +17,8 @@ jobs:
         with:
           persist-credentials: false
           repository: true-line/agent-bot-machine
-          ref: bfb9d78595a4fa2c0f601a49b72537278f174cbe
+          ref: 15fcb704ee842fb865fd037afd32c1eaacbfac7e
           path: machine
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-          repository: true-line/agent-bot-machine
-          ref: dca5218e0e73b89b43d87486da0641977fc3a53d
-          path: approver
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
