@@ -38,9 +38,10 @@ import { TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES } from './tasks.mjs';
 import { createHQ, readConfig } from './hq.mjs';
 import { backendFromConfig, createSigner, removeSoftwareKey } from './signer.mjs';
 import { readPins } from './plugins.mjs';
+import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { connectSocket } from './socket.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|signer rekey> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|signer rekey|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
@@ -48,7 +49,13 @@ function parse(argv) {
   if (args.cmd === 'signer') args.sub = argv[1];
   for (let i = args.cmd === 'signer' ? 2 : 1; i < argv.length; i++) {
     if (argv[i] === '--home') args.home = argv[++i];
-    else if (argv[i] === '--json') args.json = true;
+    else if (argv[i] === '--owner-account') {
+      args.ownerAccount = argv[++i];
+      if (!args.ownerAccount || args.cmd !== 'run') throw new Error('--owner-account NAME is only for the systemd HQ service');
+    } else if (argv[i] === '--owner-control') {
+      if (!['status', 'souls', 'enroll'].includes(args.cmd)) throw new Error('--owner-control is only for owner socket clients');
+      args.ownerControl = true;
+    } else if (argv[i] === '--json') args.json = true;
     else if (argv[i] === '--harness') (args.harnesses ??= []).push(argv[++i]);
     else if (argv[i] === '--force') args.force = true;
     else if (argv[i] === '--name') args.name = argv[++i];
@@ -66,8 +73,8 @@ function loadSchemas() {
   return Object.fromEntries([...load('hq/v1', [...SCHEMA_NAMES, ...NOTICE_SCHEMA_NAMES]), ...load('task/v1', TASK_SCHEMA_NAMES), ...load('wire/v1', TASK_WIRE_SCHEMA_NAMES)]);
 }
 
-async function ask(home, op) {
-  const client = await connectSocket(join(home, 'control.sock'));
+async function ask(controlPath, op) {
+  const client = await connectSocket(controlPath);
   try { return await client.request(op); } finally { await client.close(); }
 }
 
@@ -107,8 +114,17 @@ function printStatus(s) {
 
 async function main(argv) {
   const args = parse(argv);
+  if (args.cmd === 'check-owner-control') {
+    checkOwnerControlSupport();
+    console.log(JSON.stringify({ capability: 'linux-owner-control/v1' }));
+    return;
+  }
+  const controlPath = args.ownerControl ? OWNER_CONTROL_PATH : join(args.home, 'control.sock');
+  if (args.ownerControl) checkOwnerSocketPath(process.getuid?.());
   if (args.cmd === 'run') {
-    const hq = createHQ({ home: args.home, schemas: loadSchemas(), pins: readPins(PINS), pluginsDir: args.plugins, devPlugins: args.devPlugins });
+    if (process.env.LISTEN_PID === String(process.pid) && !args.ownerAccount) throw new Error('socket activation requires --owner-account NAME');
+    const ownerControl = args.ownerAccount ? activatedOwnerControl(args.ownerAccount) : undefined;
+    const hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins: readPins(PINS), pluginsDir: args.plugins, devPlugins: args.devPlugins });
     // Handlers first, so a signal during start still shuts down cleanly.
     let starting = true;
     const shutdown = (signal) => {
@@ -126,7 +142,7 @@ async function main(argv) {
     return;
   }
   if (args.cmd === 'enroll') {
-    const client = await connectSocket(join(args.home, 'control.sock'));
+    const client = await connectSocket(controlPath);
     try {
       const res = await client.request('device.enroll', { harnesses: args.harnesses ?? [], ...(args.force ? { force: true } : {}), ...(args.name ? { device_name: args.name } : {}) });
       if (!res.ok) { console.error(JSON.stringify(res.refusal ?? res.host_refusal ?? res)); process.exitCode = 1; return; }
@@ -148,7 +164,7 @@ async function main(argv) {
     return;
   }
   if (args.cmd === 'status' || args.cmd === 'souls') {
-    const res = await ask(args.home, args.cmd === 'status' ? 'status' : 'souls.list');
+    const res = await ask(controlPath, args.cmd === 'status' ? 'status' : 'souls.list');
     if (!res.ok) {
       console.error(JSON.stringify(res.refusal ?? res.host_refusal ?? res));
       process.exitCode = 1;
