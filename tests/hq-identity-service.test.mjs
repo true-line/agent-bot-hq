@@ -4,7 +4,12 @@ import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from '
 import { createIdentityService, signatureBytes, validateServerKeys } from '../hq/identity-service.mjs';
 import { testClock } from '../sdk/services.mjs';
 import { definePlugin } from '../sdk/plugin.mjs';
-import { startHQ } from './hq-harness.mjs';
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createEnrollment } from '../hq/enrollment.mjs';
+import { createSigner } from '../hq/signer.mjs';
+import { startHQ, tempHome } from './hq-harness.mjs';
+import { fakeIdentityService } from './identity-service-fixture.mjs';
 
 const SERVER = 'https://identity.example.test';
 const before = '2026-01-01T00:00:00Z', after = '2027-01-01T00:00:00Z';
@@ -12,9 +17,8 @@ const decode = (jwt) => jwt.split('.').slice(0, 2).map((x) => JSON.parse(Buffer.
 const digest = (s) => createHash('sha256').update(s).digest('base64url');
 const code = (want) => (e) => e.code === want;
 
-function fixture() {
+function fixture({ server = SERVER, device = generateKeyPairSync('ec', { namedCurve: 'P-256' }) } = {}) {
   const clock = testClock(Date.UTC(2026, 10, 13));
-  const device = generateKeyPairSync('ec', { namedCurve: 'P-256' });
   const responseKey = generateKeyPairSync('ed25519');
   const keySet = [{ kid: 'release-key-1', x: responseKey.publicKey.export({ format: 'jwk' }).x, notBefore: before, notAfter: after, status: 'active' }];
   let count = 0;
@@ -24,7 +28,7 @@ function fixture() {
     markRevoked() { state.device = 'revoked'; state.revocations++; },
     assertion({ ephemeralJwk }) {
       const header = Buffer.from(JSON.stringify({ alg: 'ES256', typ: 'JWT' })).toString('base64url');
-      const body = Buffer.from(JSON.stringify({ iss: 'dev_hq', sub: 'dev_hq', jti: `assertion_${++count}`, aud: `${SERVER}/oauth/token`, cnf: { jwk: ephemeralJwk }, iat: clock.now() / 1000, exp: clock.now() / 1000 + 120 })).toString('base64url');
+      const body = Buffer.from(JSON.stringify({ iss: 'dev_hq', sub: 'dev_hq', jti: `assertion_${++count}`, aud: `${server}/oauth/token`, cnf: { jwk: ephemeralJwk }, iat: clock.now() / 1000, exp: clock.now() / 1000 + 120 })).toString('base64url');
       return `${header}.${body}.${sign('sha256', Buffer.from(`${header}.${body}`), { key: device.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url')}`;
     },
   };
@@ -39,7 +43,7 @@ function fixture() {
     assert.ok(init.signal instanceof AbortSignal);
     state.requests.push({ url, init });
     let out;
-    if (url === `${SERVER}/oauth/token`) {
+    if (url === `${server}/oauth/token`) {
       state.tokens++;
       if (state.mode === 'token-outage') throw new Error('NETWORK_SECRET_CANARY');
       const form = new URLSearchParams(init.body);
@@ -49,7 +53,7 @@ function fixture() {
       assert.equal(header.alg, 'ES256');
       assert.equal(verify('sha256', Buffer.from(parts.slice(0, 2).join('.')), { key: device.publicKey, dsaEncoding: 'ieee-p1363' }, Buffer.from(parts[2], 'base64url')), true);
       assert.equal(form.get('grant_type'), 'urn:ietf:params:oauth:grant-type:jwt-bearer');
-      assert.equal(claims.aud, `${SERVER}/oauth/token`);
+      assert.equal(claims.aud, `${server}/oauth/token`);
       assert.equal('d' in claims.cnf.jwk, false);
       const accessToken = `access-secret-canary-${state.tokens}`;
       tokenKeys.set(accessToken, claims.cnf.jwk);
@@ -74,7 +78,7 @@ function fixture() {
     }
     return new Response(out.text, { status: out.status, headers: out.headers });
   };
-  const make = (over = {}) => createIdentityService({ server: SERVER, enrollment, keySet, fetchImpl, clock, ...over });
+  const make = (over = {}) => createIdentityService({ server, enrollment, keySet, fetchImpl, clock, ...over });
   return { state, keySet, clock, enrollment, make, fetchImpl };
 }
 
@@ -374,4 +378,84 @@ test('a token that expires between access acquisition and daemon fetch is refuse
     assert.equal(f.state.apiCalls, 0);
     assert.equal(client.status().tokenCached, false);
   } finally { client.close(); }
+});
+
+test('enrollment and a signed daemon-token exchange leave no key or token canaries in the test home', async () => {
+  const root = tempHome();
+  const home = join(root, 'hq');
+  mkdirSync(home, { mode: 0o700 });
+  const savedHome = process.env.HOME;
+  const server = await fakeIdentityService();
+  const device = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const transport = fixture({ server: server.url, device });
+  // A signing-only backend keeps the fixture key in memory. TPM custody has
+  // its own integration tests. Here we exercise what HQ writes around it.
+  const signer = createSigner({
+    home, clock: transport.clock,
+    backend: {
+      kind: 'test-memory', keyStorage: 'software', describe: () => 'in-memory fixture',
+      status: () => ({ present: true, jwk: device.publicKey.export({ format: 'jwk' }) }),
+      keyFiles: () => [],
+      sign: bytes => sign('sha256', bytes, { key: device.privateKey, dsaEncoding: 'ieee-p1363' }),
+    },
+    enrollment: s => createEnrollment({
+      home, signer: s, server: server.url, clock: transport.clock,
+      sleep: () => new Promise(resolve => setTimeout(resolve, 5)),
+    }),
+  });
+  let active;
+  try {
+    process.env.HOME = root;
+    active = await startHQ({ home, signer });
+    const owner = await active.owner();
+    assert.equal((await owner.request('device.enroll', { harnesses: ['codex'] })).result.pending, true);
+    server.decide('approved');
+    await signer.enrollment.settled();
+    assert.equal(await signer.deviceStatus(), 'enrolled');
+    await active.done({ keep: true });
+    active = undefined;
+
+    const client = transport.make({ enrollment: signer.enrollment });
+    active = await startHQ({ home, signer, identity: client });
+    assert.equal(active.status.mode, 'running');
+    const reply = await client.call('GET', '/api/daemon/whoami');
+    assert.equal(reply.status, 200);
+    assert.equal(transport.state.tokens, 1);
+    assert.equal(transport.state.apiCalls, 1);
+
+    const assertion = new URLSearchParams(transport.state.requests[0].init.body).get('assertion');
+    const { authorization, DPoP } = transport.state.requests[1].init.headers;
+    const accessToken = authorization.slice('DPoP '.length);
+    const [deviceCode] = server.state.grants.keys();
+    const canaries = [deviceCode, assertion, accessToken, DPoP, device.privateKey.export({ format: 'jwk' }).d];
+    assert.ok(canaries.every(value => typeof value === 'string' && value.length > 15));
+    const scalar = Buffer.from(canaries.at(-1), 'base64url');
+    const signatures = [...canaries, scalar];
+    const scan = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) return scan(path);
+      if (entry.isSocket()) return [];
+      assert.ok(entry.isFile(), 'unexpected non-regular file in isolated home');
+      const bytes = readFileSync(path);
+      const containsKey = /-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----/.test(bytes.toString('latin1'));
+      return containsKey || signatures.some(value => bytes.includes(value)) ? [path] : [];
+    });
+    assert.deepEqual(scan(root), [], 'while the token is live');
+    await active.done({ keep: true });
+    active = undefined;
+    assert.deepEqual(scan(root), [], 'after shutdown');
+    // Positive controls in a nested hidden tree. Each kind must be found
+    // even when the filename and extension say nothing about its contents.
+    const soul = join(root, '.soul');
+    mkdirSync(soul);
+    const planted = [...signatures, device.privateKey.export({ format: 'pem', type: 'pkcs8' })].map((value, i) => {
+      const path = join(soul, String(i));
+      writeFileSync(path, Buffer.concat([Buffer.from([0xff, 0]), Buffer.from(value)]));
+      return path;
+    });
+    assert.deepEqual(scan(root).sort(), planted.sort());
+  } finally {
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    try { await active?.done(); } finally { await server.close(); rmSync(root, { recursive: true, force: true }); }
+  }
 });
