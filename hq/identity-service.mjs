@@ -28,6 +28,16 @@ function dateMillis(value) {
   return m >= 1 && m <= 12 && d >= 1 && d <= days && h < 24 && min < 60 && sec < 60 ? Date.parse(value) : NaN;
 }
 
+// Issuance reconciliation is a read of one operation. Its ID is a single
+// path segment using the credential service's operation-ID alphabet.
+function validDaemonPath(method, path) {
+  if (typeof path !== 'string') return false;
+  if (path.startsWith('/api/daemon/issuances/')) {
+    return method === 'GET' && /^\/api\/daemon\/issuances\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(path);
+  }
+  return /^\/api\/daemon\/[A-Za-z0-9/_-]+$/.test(path);
+}
+
 export function signatureBytes(status, text, jti) {
   return Buffer.from(`agent-bot-sig-v1\n${status}\n${hash(text).toString('hex')}\n${jti}`);
 }
@@ -239,7 +249,7 @@ export function createIdentityService({
     async call(method, path, body) {
       check();
       if (typeof method !== 'string' || !/^(GET|POST|PUT|PATCH|DELETE)$/.test(method)
-        || typeof path !== 'string' || !/^\/api\/daemon\/[A-Za-z0-9/_-]+$/.test(path)) fail('host.invalid_request', 'the identity link accepts a daemon API method and path only');
+        || !validDaemonPath(method, path)) fail('host.invalid_request', 'the identity link accepts a daemon API method and path only');
       const current = await access();
       const generation = epoch;
       alive(generation);
