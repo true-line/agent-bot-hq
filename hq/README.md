@@ -60,6 +60,29 @@ no dates are invented. Until then identity operations return
 key count and whether a token is cached, never credentials. The legacy default
 is unchanged. Credential-reference resolution is still row 18.
 
+## Linux owner control under the dedicated account
+
+The service manager can pass a Unix stream listener to `hq/main.mjs run
+--owner-account NAME` running as `agent-bot-hq`. The systemd socket unit
+owns the listener lifecycle: `ListenStream=/run/agent-bot-hq/control.sock`,
+`FileDescriptorName=owner-control`, `SocketUser=NAME`, `SocketMode=0600`,
+and `Accept=no`. The parent directory must be root-owned and closed to
+writes from group and others. The service requires one descriptor for its
+own PID. HQ checks its type, listening state, bound path, and the socket
+file's owner and permissions before accepting it.
+
+Run `node hq/main.mjs check-owner-control` to check Linux support. It
+requires the system interpreter at `/usr/bin/python3` with the standard
+socket module. For each incoming connection a short-lived unprivileged
+helper reads `SO_PEERCRED` from the connected stream. Only the UID of
+the configured owner opens an owner session. The owner uses
+`status --owner-control`, `souls --owner-control`, or
+`enroll --owner-control` without traversing HQ's private home.
+The private control socket still serves the HQ account, including the
+running-service check for offline signer rekey. Admission and the broker
+continue to use their existing endpoints. The installer, machine-key
+pairing and retirement of the old key are tracked in issue #88.
+
 ## State directory
 
 `config.json` is optional and written by the owner. HQ refuses it if group or

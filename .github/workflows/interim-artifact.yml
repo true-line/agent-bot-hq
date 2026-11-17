@@ -41,6 +41,7 @@ jobs:
           artifact="$RUNNER_TEMP/hq-$SOURCE.tar"
           node scripts/build-interim-release.mjs "$SOURCE" "$contracts" "$artifact" | tee "$RUNNER_TEMP/hq-build-record.txt"
           test -s "$artifact"
+          bash tests/linux-owner-control-service.sh "$artifact"
           {
             echo '### Unpublished interim HQ candidate'
             echo

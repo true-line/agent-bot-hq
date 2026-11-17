@@ -1,0 +1,1 @@
+The dedicated Linux HQ service can use a systemd-activated owner socket. HQ verifies the connected Unix peer UID before creating an owner session. The owner CLI supports status, Soul listing and enrollment through this endpoint.

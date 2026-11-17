@@ -48,6 +48,7 @@ import { createEnrollment, validateEnrollmentConfig } from './enrollment.mjs';
 import { createIdentityService } from './identity-service.mjs';
 import { createLauncher, LAUNCH_OPERATIONS } from './launch.mjs';
 import { loadPlugins } from './plugins.mjs';
+import { OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { checkSocketPath, listenSocket } from './socket.mjs';
 import { checkHarnessSocket, planHarnessEndpoints, validateHarnessesConfig } from './harness-accounts.mjs';
 import { coreTable, CORE_PLUGIN, ensurePrivateDir, openStore } from './store.mjs';
@@ -139,6 +140,7 @@ export function createHQ({
   random = cryptoRandom(),
   platform = process.platform,
   account = userInfo().username,
+  ownerControl,                    // verified systemd listener from activatedOwnerControl
   uid = process.getuid?.(),
   accounts,                      // how a harness account name resolves to { uid, gid, groupMembers, home }
                                  // (hq/harness-accounts.mjs resolveAccount by default)
@@ -176,9 +178,9 @@ export function createHQ({
 
   const paths = { home, control: join(home, 'control.sock'), admission: join(home, 'admission.sock'), broker: join(home, 'broker.sock') };
 
-  function openSession() {
+  function openSession(sessionAccount = account, ownerUid) {
     const id = `os_${random.hex(12)}`;
-    coreTable(core, 'sessions').set(id, { opened_at: clock.now(), account, auth: 'owner' });
+    coreTable(core, 'sessions').set(id, { opened_at: clock.now(), account: sessionAccount, ...(ownerUid === undefined ? {} : { uid: ownerUid }), auth: 'owner' });
     store.persist().catch((e) => core.logs.push({ level: 'error', plugin: 'hq', at: clock.now(), message: `owner session ${id} not persisted: ${e.message}` }));
     return id;
   }
@@ -334,6 +336,7 @@ export function createHQ({
           sockets: {
             control: paths.control, admission: paths.admission, broker: paths.broker,
             access: 'file mode 0600 in a 0700 directory (no peer-credential check yet)',
+            ...(ownerControl ? { ownerControl: { path: OWNER_CONTROL_PATH, account: ownerControl.account, uid: ownerControl.uid, peer_check: 'SO_PEERCRED' } } : {}),
             ...(harnessPlan.endpoints.length ? { harnesses: harnessPlan.endpoints.map((e) => ({ account: e.account, adapters: e.adapters, path: e.path })), harnessAccess: 'one endpoint per harness account, mode 0660 in a 2750 directory of the account\'s private group; it identifies the account, not one agent in it' } : {}),
           },
           launch: launcher.report(),
@@ -368,6 +371,12 @@ export function createHQ({
           endSession: (connection) => { host.brokerClosed(connection); },
         }),
       ];
+      if (ownerControl) {
+        sockets.push(await listenSocket({
+          path: OWNER_CONTROL_PATH, activated: ownerControl, auth: 'owner', core, dispatch: host.dispatch,
+          newSession: () => openSession(ownerControl.account, ownerControl.uid), endSession: closeSession,
+        }));
+      }
       // One endpoint per harness account. The account is recorded before the
       // connection's first frame and dropped when it closes.
       for (const endpoint of harnessPlan.endpoints) {
