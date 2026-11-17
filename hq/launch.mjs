@@ -18,8 +18,8 @@
 //
 //   /usr/bin/sudo -n -H -u <account> -- /bin/sh -c '<LAUNCH_SHELL>' sh <soul_id> <member_id> <command...>
 //
-// with the four variables a request may name, the account's own broker
-// endpoint as AGENT_BOT_SOULS_BROKER, and a fixed PATH. HQ's own environment
+// with the member token a request may name, the admitted member ID and role,
+// the account's broker and member socket paths, and a fixed PATH set by HQ. Its environment
 // never reaches the child. The account comes from HQ's config for the
 // runtime's adapter, fixed at admission, never from the request. As that
 // account, the shell first reports its process group (below), then makes the
@@ -35,9 +35,10 @@
 // Two steps on the admission socket (hq/socket.mjs, takeover):
 //   launch        { runtime_id, command, env }  on the connection that owns
 //                 the runtime. Checks, then reserves; nothing runs yet.
-//                 Returns { launch_id, attach, expires_at, cwd }; `attach` is a
-//                 one-time token, good for 30 seconds, and `cwd` is the
-//                 account-private directory the wrapper will enter.
+//                 Returns { launch_id, attach, expires_at, cwd, member_socket };
+//                 `attach` is a one-time token, good for 30 seconds, `cwd` is
+//                 the account-private directory the wrapper will enter, and
+//                 `member_socket` is where the entry point listens for it.
 //   launch.attach { launch_id, attach }  the first and only request on a NEW
 //                 connection. Spends the token, right or wrong, starts the
 //                 agent, answers { launch_id }, and from then on the
@@ -127,7 +128,7 @@
 // agent left running by an HQ that stopped abnormally keeps running.
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fail, HostError } from '../sdk/errors.mjs';
 import { pushReceipt, redact } from '../sdk/services.mjs';
 import { takeover } from './socket.mjs';
@@ -141,7 +142,7 @@ export const AGENT_PATH = '/usr/local/bin:/usr/bin:/bin';
 export const PGID_MARKER = 'agent-bot-hq-launch pgid';
 export const LAUNCH_SHELL = `read -r _ _ _ _ g _ 2>/dev/null </proc/self/stat && printf '${PGID_MARKER} %s\\n' "$g" >&2; umask 077 && d="$HOME/.agent-bot-hq/souls/$1/$2" && mkdir -p "$d" && chmod 0700 "$d" && cd "$d" && shift 2 && exec "$@"`;
 const MARKER_LINE = /^agent-bot-hq-launch pgid ([0-9]{1,16})$/;
-export const REQUEST_ENV = Object.freeze(['AGENT_BOT_SOULS_SOCKET', 'AGENT_BOT_SOULS_MEMBER_TOKEN', 'AGENT_BOT_SOULS_MEMBER_ID', 'AGENT_BOT_SOULS_ROLE']);
+export const REQUEST_ENV = Object.freeze(['AGENT_BOT_SOULS_MEMBER_TOKEN']);
 // The request variables whose values are secrets. HQ keeps their values for
 // the life of a launch, in memory only, to redact them from the agent's
 // stderr before it reaches the log; they never go into status, receipts or
@@ -151,6 +152,9 @@ export const REDACTED = '[redacted]';
 // Spawn errors that say sudo itself cannot be run, now or on the next try.
 const SUDO_ABSENT = new Set(['ENOENT', 'EACCES']);
 export const BROKER_ENV = 'AGENT_BOT_SOULS_BROKER';
+export const MEMBER_SOCKET_ENV = 'AGENT_BOT_SOULS_SOCKET';
+export const MEMBER_ID_ENV = 'AGENT_BOT_SOULS_MEMBER_ID';
+export const ROLE_ENV = 'AGENT_BOT_SOULS_ROLE';
 export const LAUNCH_OPERATIONS = Object.freeze(['launch', 'launch.attach', 'launch.stop']);
 const SIGNALS = new Set(['TERM', 'KILL']);
 const SOUL_ID = /^agent_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -182,6 +186,14 @@ export function launchWorkdir(home, soulId, memberId) {
   if (typeof home !== 'string' || !home.startsWith('/') || home === '/' || /[\0\r\n]/.test(home)) throw new TypeError('launch workdir needs an absolute account home');
   if (!SOUL_ID.test(soulId) || !MEMBER_ID.test(memberId)) throw new TypeError('launch workdir needs a valid soul_id and member_id');
   return join(home, '.agent-bot-hq', 'souls', soulId, memberId);
+}
+
+export function launchMemberSocket(endpoint, launchId) {
+  if (typeof endpoint !== 'string' || !endpoint.startsWith('/')) throw new TypeError('launch member socket needs an absolute harness endpoint');
+  if (!LAUNCH_ID.test(launchId)) throw new TypeError('launch member socket needs a launch ID');
+  const path = join(dirname(endpoint), `member-${launchId.slice(3)}.sock`);
+  if (Buffer.byteLength(path) > 107) fail('host.launch_unavailable', `the harness endpoint path leaves no room for the member socket (${Buffer.byteLength(path)} bytes; Linux allows 107)`);
+  return path;
 }
 
 export function agentArgv(account, soulId, memberId, command) {
@@ -219,13 +231,14 @@ export function validCommand(command) {
 }
 
 // The variables a launch may set: exactly REQUEST_ENV. Anything else is
-// refused, never dropped, and AGENT_BOT_SOULS_BROKER is HQ's to set.
+// refused, never dropped. HQ sets the broker and member socket paths from the
+// verified harness endpoint; the caller cannot redirect either one.
 export function validEnv(env) {
   if (env === undefined) return {};
   if (!env || typeof env !== 'object' || Array.isArray(env)) fail('host.invalid_request', 'env maps variable names to strings');
   const out = {};
   for (const [k, v] of Object.entries(env)) {
-    if (k === BROKER_ENV) fail('host.invalid_request', `${BROKER_ENV} is set by HQ to the harness account's own endpoint; a launch may not name it`);
+    if (k === BROKER_ENV || k === MEMBER_SOCKET_ENV) fail('host.invalid_request', `${k} is set by HQ from the harness account's verified endpoint; a launch may not name it`);
     if (!REQUEST_ENV.includes(k)) fail('host.invalid_request', `env ${JSON.stringify(k.slice(0, 64))} is not one a launch may set (${REQUEST_ENV.join(', ')})`);
     if (typeof v !== 'string' || v.length > MAX_ENV_VALUE || /[\0\r\n]/.test(v)) fail('host.invalid_request', `env ${k} is a string of at most ${MAX_ENV_VALUE} characters with no NUL or newline`);
     out[k] = v;
@@ -483,7 +496,7 @@ export function createLauncher({
     let proc;
     try {
       // detached: sudo leads a new session, so HQ's signals and terminal never reach the launch.
-      proc = spawn(SUDO, agentArgv(l.account, l.soul_id, l.member_id, l.command), { stdio: ['pipe', 'pipe', 'pipe'], env: { ...l.env, [BROKER_ENV]: l.endpoint, PATH: AGENT_PATH }, cwd: '/', detached: true });
+      proc = spawn(SUDO, agentArgv(l.account, l.soul_id, l.member_id, l.command), { stdio: ['pipe', 'pipe', 'pipe'], env: { ...l.env, [MEMBER_ID_ENV]: l.member_id, [ROLE_ENV]: l.role, [BROKER_ENV]: l.endpoint, [MEMBER_SOCKET_ENV]: l.member_socket, PATH: AGENT_PATH }, cwd: '/', detached: true });
     } catch (e) {
       release(l);
       fail('host.launch_unavailable', `sudo could not be started: ${e.message}`);
@@ -586,14 +599,20 @@ export function createLauncher({
       const command = validCommand(payload.command);
       const env = validEnv(payload.env);
       const now = core.clock.now();
+      let launchId;
+      for (let tries = 0; tries < 8 && !launchId; tries += 1) {
+        const candidate = `ln_${core.random.hex(12)}`;
+        if (!launches.has(candidate)) launchId = candidate;
+      }
+      if (!launchId) fail('host.launch_busy', 'could not allocate a unique launch ID');
       const l = {
-        launch_id: `ln_${core.random.hex(12)}`, attach: core.random.hex(32), state: 'reserved', expires: now + RESERVE_MS, caller,
-        soul_id: rt.soul_id, member_id: rt.member_id, adapter_id: rt.adapter_id, runtime_id: payload.runtime_id, account: endpoint.account, endpoint: endpoint.path,
-        cwd: launchWorkdir(endpoint.home, rt.soul_id, rt.member_id), command, env,
+        launch_id: launchId, attach: core.random.hex(32), state: 'reserved', expires: now + RESERVE_MS, caller,
+        soul_id: rt.soul_id, member_id: rt.member_id, role: rt.role, adapter_id: rt.adapter_id, runtime_id: payload.runtime_id, account: endpoint.account, endpoint: endpoint.path,
+        cwd: launchWorkdir(endpoint.home, rt.soul_id, rt.member_id), member_socket: launchMemberSocket(endpoint.path, launchId), command, env,
       };
       launches.set(l.launch_id, l);
       slots.set(slot, l.launch_id);
-      return { launch_id: l.launch_id, attach: l.attach, expires_at: iso(l.expires), cwd: l.cwd };
+      return { launch_id: l.launch_id, attach: l.attach, expires_at: iso(l.expires), cwd: l.cwd, member_socket: l.member_socket };
     });
   }
 

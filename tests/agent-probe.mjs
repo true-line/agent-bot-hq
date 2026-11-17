@@ -7,6 +7,7 @@
 //   { "mode": "probe", "hq": { "home", "files": {name: path}, "sockets": {name: path}, "main" },
 //     "other": { "home", "endpointDir", "endpoint" } }
 //   { "mode": "stubborn", "escape"?: true }
+//   { "mode": "dial", "path": "/absolute/socket" }
 // `probe` prints one JSON line on stdout and exits; it reports its working
 // directory and that directory's mode. `stubborn` prints { ready, pid, pgid,
 // escaped } and then ignores SIGTERM and the end of stdin: only a KILL ends
@@ -49,30 +50,36 @@ if (input.mode === 'stubborn') {
       resolve({ ok: !err, code: err ? (err.code ?? err.signal) : 0, stderr: String(stderr).trim().split('\n')[0].slice(0, 200) });
     });
   });
-  const { hq, other } = input;
-  const attempts = {};
-  for (const [name, path] of Object.entries(hq.files)) attempts[`read ${name}`] = attempt(() => readFileSync(path));
-  attempts['list HQ state'] = attempt(() => readdirSync(hq.home));
-  for (const [name, path] of Object.entries(hq.sockets)) attempts[`connect ${name}`] = await dial(path);
-  attempts['list other home'] = attempt(() => readdirSync(other.home));
-  attempts['list other endpoint directory'] = attempt(() => readdirSync(other.endpointDir));
-  attempts['connect other endpoint'] = await dial(other.endpoint);
-  attempts['run HQ status'] = await run([hq.main, 'status', '--home', hq.home]);
-  attempts['run HQ signer rekey'] = await run([hq.main, 'signer', 'rekey', '--home', hq.home]);
-  const controls = {
-    'write own directory': attempt(() => { const f = join(process.cwd(), `.agent-probe-${process.pid}`); writeFileSync(f, 'x', { mode: 0o600 }); rmSync(f); }),
-    'write own home': attempt(() => { const f = join(process.env.HOME, `.agent-probe-${process.pid}`); writeFileSync(f, 'x', { mode: 0o600 }); rmSync(f); }),
-    'connect own endpoint': await dial(process.env.AGENT_BOT_SOULS_BROKER ?? '/nonexistent'),
-  };
-  const report = {
-    uid: process.getuid(),
-    cwd: process.cwd(),
-    cwdMode: statSync(process.cwd()).mode & 0o7777,
-    home: process.env.HOME ?? null,
-    env: Object.keys(process.env).sort(),
-    broker: process.env.AGENT_BOT_SOULS_BROKER ?? null,
-    attempts,
-    controls,
-  };
-  process.stdout.write(`${JSON.stringify(report)}\n`);
+  if (input.mode === 'dial') {
+    process.stdout.write(`${JSON.stringify(await dial(input.path))}\n`);
+  } else {
+    const { hq, other } = input;
+    const attempts = {};
+    for (const [name, path] of Object.entries(hq.files)) attempts[`read ${name}`] = attempt(() => readFileSync(path));
+    attempts['list HQ state'] = attempt(() => readdirSync(hq.home));
+    for (const [name, path] of Object.entries(hq.sockets)) attempts[`connect ${name}`] = await dial(path);
+    attempts['list other home'] = attempt(() => readdirSync(other.home));
+    attempts['list other endpoint directory'] = attempt(() => readdirSync(other.endpointDir));
+    attempts['connect other endpoint'] = await dial(other.endpoint);
+    attempts['run HQ status'] = await run([hq.main, 'status', '--home', hq.home]);
+    attempts['run HQ signer rekey'] = await run([hq.main, 'signer', 'rekey', '--home', hq.home]);
+    const controls = {
+      'write own directory': attempt(() => { const f = join(process.cwd(), `.agent-probe-${process.pid}`); writeFileSync(f, 'x', { mode: 0o600 }); rmSync(f); }),
+      'write own home': attempt(() => { const f = join(process.env.HOME, `.agent-probe-${process.pid}`); writeFileSync(f, 'x', { mode: 0o600 }); rmSync(f); }),
+      'connect own endpoint': await dial(process.env.AGENT_BOT_SOULS_BROKER ?? '/nonexistent'),
+      'connect own member socket': await dial(process.env.AGENT_BOT_SOULS_SOCKET ?? '/nonexistent'),
+    };
+    const report = {
+      uid: process.getuid(),
+      cwd: process.cwd(),
+      cwdMode: statSync(process.cwd()).mode & 0o7777,
+      home: process.env.HOME ?? null,
+      env: Object.keys(process.env).sort(),
+      broker: process.env.AGENT_BOT_SOULS_BROKER ?? null,
+      memberSocket: process.env.AGENT_BOT_SOULS_SOCKET ?? null,
+      attempts,
+      controls,
+    };
+    process.stdout.write(`${JSON.stringify(report)}\n`);
+  }
 }
