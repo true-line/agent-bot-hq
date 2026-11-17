@@ -205,6 +205,14 @@ test('HQ on a helper: hardware custody in status, no key file in the state direc
     assert.doesNotMatch(s.hq.profileReasons.join('\n'), /key_storage|hardware key/);
     assert.equal(s.profile, 'managed-cooperative', 'the other conditions still hold the host at cooperative');
     assert.deepEqual(walk(t.home).filter((f) => /\.pem$/.test(f)), []);
+
+    // Model an interrupted custody transition in the fixture home.
+    // Only the directory entry matters. HQ must never read key material to count it.
+    writeFileSync(join(t.home, 'signer/device-key.pem'), 'fixture', { mode: 0o600 });
+    const interrupted = (await (await t.owner()).request('status')).result;
+    assert.equal(interrupted.hq.signer.key_storage, 'hardware');
+    assert.equal(interrupted.hq.signer.key_files, 1);
+    assert.match(interrupted.hq.profileReasons.join('\n'), /previous software signer key file remains/);
   } finally { await t.done(); rmSync(dirname(chip), { recursive: true, force: true }); }
 });
 

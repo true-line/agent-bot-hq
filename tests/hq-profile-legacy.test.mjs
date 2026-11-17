@@ -27,6 +27,7 @@ test('even in its own account, HQ without harness accounts and qualification is 
   // Everything else in place, a key file still keeps the host out of protected.
   const all = { platform: 'linux', account: 'agent-bot-hq', harnessAccounts: true, qualified: true };
   assert.equal(detectProfile({ ...all, keyStorage: 'hardware' }).profile, 'managed-protected');
+  assert.equal(detectProfile({ ...all, keyStorage: 'hardware', keyFiles: 1 }).profile, 'managed-cooperative');
   assert.equal(detectProfile({ ...all, keyStorage: 'software' }).profile, 'managed-cooperative');
   assert.equal(detectProfile(all).profile, 'managed-cooperative');
   assert.equal(detectProfile({ platform: 'linux', account: 'agent-bot-hq', harnessAccounts: true }).profile, 'managed-cooperative');

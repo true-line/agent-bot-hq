@@ -25,6 +25,7 @@ export function detectProfile({
                                // (PR 16 / PR 29); a string ending "(D7)" says which part is missing (hq/hq.mjs)
   qualified = false,           // hostile-member suite passed on this host
   standalone = false,          // owner config: run standalone, unenforced
+  keyFiles,                    // known signer key files in HQ state
   keyStorage,                  // the HQ signer's custody: hardware | software (hq/signer.mjs)
 } = {}) {
   const reasons = [];
@@ -34,6 +35,7 @@ export function detectProfile({
   if (harnessAccounts !== true) reasons.push(typeof harnessAccounts === 'string' && harnessAccounts ? harnessAccounts : 'agents of every harness share one account: no OS account per harness credential (D7)');
   if (!qualified) reasons.push('the host has not passed the hostile-member qualification (T01–T03, T21)');
   if (keyStorage !== 'hardware') reasons.push(`the HQ signer's key is ${keyStorage === 'software' ? 'a key file in HQ state (key_storage=software)' : 'not known to be a hardware key'}, so a process in HQ's account can copy it`);
+  else if (keyFiles > 0) reasons.push('the previous software signer key file remains in HQ state');
   if (standalone) return { profile: 'standalone-unenforced', reasons: ['the owner chose standalone in HQ config', ...reasons] };
   // Protected only when every condition holds; this skeleton has no way to
   // satisfy the last two, so it falls through to cooperative.
