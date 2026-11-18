@@ -41,5 +41,6 @@ sudo tar -xf "$archive" -C "$stage"
 node_bin="$(node -p 'process.execPath')"
 sudo -n -H -u "$name" -- "$node_bin" --version
 bash tests/darwin-enclave-launchd.sh "${2:?compiled enclave probe required}" "$stage" "$name" "$home"
+bash tests/darwin-enclave-restart.sh "$stage" "$name" "$home"
 cd "$stage/hq"
 sudo -n -H -u "$name" -- /bin/bash tests/dedicated-hq-account.sh "$node_bin"
