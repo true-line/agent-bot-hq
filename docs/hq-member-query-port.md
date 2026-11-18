@@ -1,11 +1,12 @@
-# Bound member-query port preparation
+# Bound member-query port
 
-[HQ #134](https://github.com/true-line/agent-bot-hq/issues/134) prepares the SDK
-part of [#131](https://github.com/true-line/agent-bot-hq/issues/131).
-Ownership follows Accepted
-[PDR-0027](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0027-hq-identity-authority-lives-in-agent-bot-daemon.md);
-notice handoff and the lost-response limitation follow
-[PDR-0062](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0062-hq-notice-scope-and-legacy-consume-one.md).
+The HQ SDK supplies the query capability that Soul members use over an
+authenticated connection. HQ retains authority over admission, scope,
+freshness, grants and credentials. The notice handoff follows the accepted
+lost-response policy.
+[Member-query client (#131)](https://github.com/true-line/agent-bot-hq/issues/131) ·
+[Authority (PDR-0027)](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0027-hq-identity-authority-lives-in-agent-bot-daemon.md) ·
+[Notice handoff (PDR-0062)](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0062-hq-notice-scope-and-legacy-consume-one.md)
 
 ## Member-facing capability
 
@@ -85,7 +86,7 @@ does not establish provenance. Scope, caller, schema, version and capability
 refusals do not recover. A thrown, asynchronous or non-boolean classifier
 result fails closed and preserves the original send failure.
 
-## Evidence and remaining integration
+## Implementation and test evidence
 
 `checkMemberQueryPort(createPort)` runs portable semantic checks using an
 instrumented private driver; omitting `createPort` checks the SDK factory.
@@ -101,12 +102,39 @@ options, classifier exceptions/async results, and capture/reconnect failure.
 A deliberately faulty port that silently opts reads into replay fails the
 portable checks.
 
-This preparation creates no network connection, IPC operation, authority
-service or member-surface executor. It changes no default plugin loading,
-shared schema, error registry or contract release pin. The Soul runtime still
-needs to adapt its existing authenticated transport and distribute the real
-SDK implementation. Identity then needs an actual supported composition path
-that supplies this capability to its member adapter/MCP invocation. Those
-provider and wiring tests remain necessary; registering declarations or
-injecting this pure port into a leaf test does not prove end-to-end wiring.
-Closing #134 alone does not close #131, #130 or the alias tracker #13.
+The SDK port landed in [HQ #135](https://github.com/true-line/agent-bot-hq/pull/135).
+The authenticated bootstrap client binds the port to a concrete connection
+(#137), and the client accepts cancellation during bootstrap and requests
+(#139). Souls adopted that client while retaining ownership of member tokens
+and task commitment recovery.
+[Port tests](https://github.com/true-line/agent-bot-hq/blob/f3c39d2a703085c14bc09f8f0042d048f30525dc/tests/sdk-member-query.test.mjs) ·
+[Authenticated client tests](https://github.com/true-line/agent-bot-hq/blob/69505d72ba30dd6c8129397baadb3b0b3397fbbd/tests/sdk-member-client.test.mjs) ·
+[Cancellation tests](https://github.com/true-line/agent-bot-hq/blob/42d6f5110019f4b7d835e139875b89a75230afe1/tests/sdk-member-cancel.test.mjs) ·
+[Souls adoption](https://github.com/true-line/agent-bot-souls/blob/699ea4a02028a6219695e9a64d4e7cdf3836be01/lib/member.mjs)
+
+Identity #1445 exercised the installed `agent-bot mcp` command with inherited
+Soul member inputs. Its test starts HQ at Identity's SDK pin
+`42d6f5110019f4b7d835e139875b89a75230afe1` and injects the notice consumer.
+The first `take_inbox` returned the notice, the next returned an empty event,
+and the mailbox retained the consumed record. Neither query contacted the
+upstream service.
+[Installed-process test](https://github.com/true-line/agent-bot-identity/blob/843b4433f397d5a3cc746fdc6f9110b6687d9444/tests/integration/hq-inbox-release-gate.test.mjs) ·
+[Passing Identity CI](https://github.com/true-line/agent-bot-identity/actions/runs/43808462724/job/133104594419)
+
+HQ #141 separately verified **default host construction**. HQ registers the
+consumer with the released v0.5.0 notice schemas. The real comms broker tests
+exercise durable custody before acknowledgment, scoped peek and consume, and
+restart with a consumed record.
+[Default-host tests](https://github.com/true-line/agent-bot-hq/blob/dd9480195881912c12c537f6ae49eb221ec18cbc/tests/hq-notices-comms.test.mjs) ·
+[Passing HQ CI](https://github.com/true-line/agent-bot-hq/actions/runs/43793533198)
+
+## Deployment evidence
+
+HQ #13 subsequently recorded live handoff, lost-response and restart checks
+for one Linux `managed-cooperative` cloud pilot with the installed MCP,
+default HQ consumer and service-backed mailbox. Its acceptance applies to
+that host, harness and repository. Additional harnesses and production
+deployments need their own evidence. The platform records Stage 0 acceptance
+separately.
+[Cloud pilot acceptance](https://github.com/true-line/agent-bot-hq/issues/13#issuecomment-6927251608) ·
+[Platform Stage 0](https://github.com/true-line/agent-bot-platform/issues/66)
