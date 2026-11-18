@@ -336,8 +336,9 @@ cooperative. What HQ does with them:
 - `legacy-local-custody` is **off by default** and can be turned on only in
   the standalone profile. `doctor` and `status` flag it, and every receipt
   names it.
-- The Linux reference host qualifies for managed protected first (§9 PR 16);
-  macOS per-member accounts plus a sandbox come second (PR 29, D7).
+- The first operator pilot requires a qualified Mac. Stage 2a row 29 owns
+  the Mac evidence, and row 16 tracks Linux qualification independently.
+  [Platform PDR-0085](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0085-macos-first-protected-pilot.md)
 
 ### 3.4 Rules that keep the split honest
 
@@ -965,6 +966,7 @@ repository that does the work; this repository tracks only its own rows.
 | 16b | agent-bot-daemon | WP2 | **Harness accounts and HQ-controlled launch:** HQ starts every agent in the OS account of its harness (D7 as amended by platform PDR-0053) through a launcher HQ cannot widen; each agent works in a 0700 directory of its own in that account; HQ's state directory admits only the HQ account. **Built in HQ** (`hq/launch.mjs`): a two-step launch on the admission socket, after which the attached connection is the agent's stdin and stdout; stop signals the launch's own process group, learned from a marker the launch wrapper prints, and nothing else; a launch HQ cannot confirm stopped is held as uncontained; homes are verified at start. Still to come: the entry point in agent-bot-souls starts agents through it, agent-bot-machine installs the rule, the agent's working directory is captured into the Soul's package, a launch is stopped when its runtime's lease expires or is superseded, HQ cleans up after its own crash, and a process that leaves its group (setsid) is contained, which needs a cgroup and so root | An agent reads neither another harness account's state nor any file in HQ's state directory, and cannot run HQ's signer or credential tooling; stopping one launch leaves another launch in the same account running (T02) |
 | 16c | agent-bot-daemon | WP2 | **Exits:** a member account has no network route of its own. The member broker socket and its workspace view are the only ways out | A member's direct connection to a provider or service is blocked by the host, while the same request through the broker socket is delivered (T03) |
 | 16d | agent-bot-daemon | WP2 | **Qualification and the label:** the hostile-member suite (T01–T03, T21) as one suite that row 29 reuses on macOS; a qualification record for the host; `managed-protected` reported only when the record, member accounts, the HQ account and a hardware key all hold | The suite passes on the Linux reference host under `managed-protected`; run under `managed-cooperative`, every receipt names cooperative and each protected claim is `profile_insufficient` (T21) |
+| 29 | agent-bot-daemon | WP2 | **Qualify the pilot Mac.** Run HQ under its dedicated account and isolate harness credentials in separate OS accounts (D6 and amended D7). | On the designated Mac, T01–T03 pass under protected enforcement, including a verified Secure Enclave signature for T02. On the cooperative configuration, T21 verifies cooperative receipts and refusal of a protected claim. Record the host and report in [#56](https://github.com/true-line/agent-bot-hq/issues/56). |
 
 **The hardware signer is a feature flag (`features.hardwareSigner`, off by
 default).** The TPM and Secure Enclave helpers cannot be tested as thoroughly
@@ -1019,8 +1021,10 @@ reports what the other three enforce.
 - **The label still needs a hardware key.** With `features.hardwareSigner`
   off, a host can pass all of row 16 and still report `managed-cooperative`,
   with the software key as the stated reason (row 15).
-- **macOS is unaffected.** Every slice is refused or inert off Linux, and
-  macOS keeps reporting `managed-cooperative` until row 29.
+- **Mac qualification runs in parallel.** Row 16 covers Linux enforcement.
+  Row 29 covers the Mac implementation and evidence in this stage. HQ
+  reports `managed-cooperative` on the Mac until its protected boundary
+  has been verified.
 
 **Decided by the owner on 2026-11-10 (16a).** The account check is the gate,
 and a signature is added to it, not used instead of it. A signature proves a
@@ -1216,6 +1220,8 @@ that needs it:
 
 ### Stage 3: operator pilot (WP5, WP6)
 
+The first pilot starts on the Mac accepted at the [Stage 2a gate](https://github.com/true-line/agent-bot-platform/issues/68).
+
 | # | Repo | WP | PR | Done when |
 | --- | --- | --- | --- | --- |
 | 21 | agent-bot-daemon | WP6 | **Owner interface:** `hq/v1` owner operations, approval records, enrollment and receipts in the HQ CLI; GeniusBar moves to `hq/v1` | T24; the pilot rubric runs through terminal chat and ACP only |
@@ -1231,7 +1237,6 @@ that needs it:
 | # | Repo | WP | PR | Done when |
 | --- | --- | --- | --- | --- |
 | 28 | agent-bot-daemon, soul-package | WP5 | **Coordinated move and fork** with transfer records | T15; P5, P6 |
-| 29 | agent-bot-daemon | WP2 | **macOS protected profile** (per-member accounts plus a sandbox; HQ in its own account) | Same hostile-member suite as Linux |
 | 30 | agent-comms | WP4 | **Relay mode:** site relay, then cloud relay. The crypto profile stays a candidate, and public federation stays off, until it is reviewed (Q8) | T12, T13 |
 
 **Post-MVP:** the installation authority (partition-tolerant moves), hosted
