@@ -23,9 +23,9 @@ private func privateEntry(_ path: String, uid: uid_t, directory: Bool) throws ->
     // POSIX bits do not reflect macOS extended ACLs. Refuse any extra ACE
     // rather than trying to interpret a principal or inherited permission.
     if let acl = acl_get_link_np(path, ACL_TYPE_EXTENDED) {
-        defer { acl_free(acl) }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
         var entry: acl_entry_t?
-        guard acl_get_entry(acl, ACL_FIRST_ENTRY, &entry) == -1, errno == EINVAL else {
+        guard acl_get_entry(acl, ACL_FIRST_ENTRY.rawValue, &entry) == -1, errno == EINVAL else {
             throw SignerFailure.accessControl
         }
     } else if errno != ENOENT {

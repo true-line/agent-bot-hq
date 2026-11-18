@@ -1,6 +1,7 @@
 // Run twice by the same disposable system LaunchDaemon. Each helper operation
 // is a separate process; the second Node process has no cached signer state.
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -10,7 +11,11 @@ const [, , helper, fixtureHome, expectedUid] = process.argv;
 assert.equal(process.getuid(), Number(expectedUid));
 const home = join(fixtureHome, 'restart-hq');
 const saved = join(fixtureHome, 'restart-observation.json');
-const backend = helperKeyBackend({ command: [helper] });
+const backend = helperKeyBackend({ command: [helper], run(argv, input) {
+  const result = spawnSync(argv[0], argv.slice(1), { input, encoding: 'utf8', timeout: 30000 });
+  if (result.status !== 0) process.stderr.write(result.stderr || String(result.error ?? result.signal));
+  return { code: result.status ?? -1, stdout: result.stdout };
+} });
 const challenge = () => randomBytes(32);
 if (!existsSync(saved)) {
   mkdirSync(home, { mode: 0o700 });
