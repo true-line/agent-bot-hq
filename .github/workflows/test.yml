@@ -101,3 +101,8 @@ jobs:
         run: |
           node -e 'if (process.platform !== "darwin" || process.arch !== "arm64") process.exit(1)'
           node --test --test-concurrency=1 tests/hq-signer.test.mjs tests/hq-profile-legacy.test.mjs tests/hq-enrollment.test.mjs
+      - name: Check CryptoKit signatures and available Secure Enclave support
+        env:
+          HQ_TEST_SECURE_ENCLAVE: '1'
+          TMPDIR: /tmp
+        run: node --test tests/macos-enclave.test.mjs
