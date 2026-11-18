@@ -230,3 +230,34 @@ peer-credential check and a service unit, is #88.
 - A soul-contracts schema for the hq/v1 request envelope and for the
   Ready/Lease reply. The framing here is HQ's until soul-contracts specifies
   them.
+
+## macOS LaunchDaemon owner control
+
+The Darwin source artifact supports `check-owner-control`, which prints
+`{"capability":"darwin-owner-control/v1"}` when the system Ruby can load the
+native launchd API and read a kernel peer UID on a Unix socket. A system
+LaunchDaemon under `_agent-bot-hq` takes these program arguments in order:
+
+```text
+/usr/bin/ruby
+--disable-gems
+<verified HQ artifact>/helpers/darwin-owner.rb
+launch
+<approved absolute Node path>
+<verified HQ artifact>/hq/main.mjs
+run
+--home
+<private HQ state>
+--owner-account
+<owner login>
+```
+
+Configure a single launchd `Sockets` dictionary named `owner-control` with
+`SockType=stream`, `SockPathName=/private/var/agent-bot-hq-control.sock`
+and `SockPathMode` integer 438 (0666). Launchd owns the socket in a
+root-controlled directory. The helper checks in with `launch_activate_socket`,
+checks the returned listening stream, and replaces itself with Node. Before
+accepting an owner session or reading its requests, HQ checks the connected
+peer with Darwin `getpeereid` against the configured owner UID. The owner can
+run `status --owner-control --json` and inspect `hq.sockets.ownerControl`.
+The dedicated account retains its private state directory and control socket.

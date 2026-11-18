@@ -48,7 +48,7 @@ import { createEnrollment, validateEnrollmentConfig } from './enrollment.mjs';
 import { createIdentityService } from './identity-service.mjs';
 import { createLauncher, LAUNCH_OPERATIONS } from './launch.mjs';
 import { loadPlugins } from './plugins.mjs';
-import { OWNER_CONTROL_PATH } from './owner-control.mjs';
+import { OWNER_CONTROL_PATH, OWNER_PEER_CHECK } from './owner-control.mjs';
 import { checkSocketPath, listenSocket } from './socket.mjs';
 import { checkHarnessSocket, planHarnessEndpoints, validateHarnessesConfig } from './harness-accounts.mjs';
 import { coreTable, CORE_PLUGIN, ensurePrivateDir, openStore } from './store.mjs';
@@ -140,7 +140,7 @@ export function createHQ({
   random = cryptoRandom(),
   platform = process.platform,
   account = userInfo().username,
-  ownerControl,                    // verified systemd listener from activatedOwnerControl
+  ownerControl,                    // verified system manager listener from activatedOwnerControl
   uid = process.getuid?.(),
   accounts,                      // how a harness account name resolves to { uid, gid, groupMembers, home }
                                  // (hq/harness-accounts.mjs resolveAccount by default)
@@ -336,7 +336,7 @@ export function createHQ({
           sockets: {
             control: paths.control, admission: paths.admission, broker: paths.broker,
             access: 'file mode 0600 in a 0700 directory (no peer-credential check yet)',
-            ...(ownerControl ? { ownerControl: { path: OWNER_CONTROL_PATH, account: ownerControl.account, uid: ownerControl.uid, peer_check: 'SO_PEERCRED' } } : {}),
+            ...(ownerControl ? { ownerControl: { path: OWNER_CONTROL_PATH, account: ownerControl.account, uid: ownerControl.uid, peer_check: OWNER_PEER_CHECK } } : {}),
             ...(harnessPlan.endpoints.length ? { harnesses: harnessPlan.endpoints.map((e) => ({ account: e.account, adapters: e.adapters, path: e.path })), harnessAccess: 'one endpoint per harness account, mode 0660 in a 2750 directory of the account\'s private group; it identifies the account, not one agent in it' } : {}),
           },
           launch: launcher.report(),

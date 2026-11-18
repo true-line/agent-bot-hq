@@ -115,14 +115,13 @@ function printStatus(s) {
 async function main(argv) {
   const args = parse(argv);
   if (args.cmd === 'check-owner-control') {
-    checkOwnerControlSupport();
-    console.log(JSON.stringify({ capability: 'linux-owner-control/v1' }));
+    console.log(JSON.stringify({ capability: checkOwnerControlSupport() }));
     return;
   }
   const controlPath = args.ownerControl ? OWNER_CONTROL_PATH : join(args.home, 'control.sock');
   if (args.ownerControl) checkOwnerSocketPath(process.getuid?.());
   if (args.cmd === 'run') {
-    if (process.env.LISTEN_PID === String(process.pid) && !args.ownerAccount) throw new Error('socket activation requires --owner-account NAME');
+    if ([process.env.LISTEN_PID, process.env.HQ_LAUNCHD_OWNER_PID].includes(String(process.pid)) && !args.ownerAccount) throw new Error('socket activation requires --owner-account NAME');
     const ownerControl = args.ownerAccount ? activatedOwnerControl(args.ownerAccount) : undefined;
     const hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins: readPins(PINS), pluginsDir: args.plugins, devPlugins: args.devPlugins });
     // Handlers first, so a signal during start still shuts down cleanly.

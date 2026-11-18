@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { authenticateOwner, checkOwnerControlSupport } from '../hq/owner-control.mjs';
 
-test('owner control compares the connected peer UID with the configured owner', { skip: process.platform !== 'linux' }, async (t) => {
+test('owner control compares the connected peer UID with the configured owner', { skip: !['linux', 'darwin'].includes(process.platform) }, async (t) => {
   checkOwnerControlSupport();
   const dir = mkdtempSync(join(tmpdir(), 'hq-peer-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
