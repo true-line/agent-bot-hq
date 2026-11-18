@@ -1,0 +1,1 @@
+HQ has an opt-in native Secure Enclave signer for the macOS service account. It keeps a device-bound reference in a dedicated Keychain across service restarts. Deployment requires the provisioned Developer ID helper bundle.

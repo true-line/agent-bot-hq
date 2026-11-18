@@ -59,3 +59,25 @@ and in-memory reference reuse. The deployed helper’s persistent reference,
 service restart, and the protected T02 observation remain separate checks under
 [HQ #107](https://github.com/true-line/agent-bot-hq/issues/107) and
 [PDR-0085](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0085-macos-first-protected-pilot.md).
+
+The Darwin artifact job also boots the same disposable system LaunchDaemon
+twice. Both executions use the native HQ helper's role check, dedicated file
+Keychain and hardware signer protocol. The item holds only CryptoKit's
+device-bound Secure Enclave representation. HQ's signer directory holds its
+public pin. The restarted service must present the same key, verify the first
+signature, sign a new challenge and explicitly rekey. The test executable
+links an independent test main. The production executable must refuse on
+the unprovisioned runner.
+
+Production source is under `helpers/macos-enclave/`. Build all three Swift
+files into the native executable of the provisioned Developer ID bundle
+`ai.true-line.hq.signer`, and supply the installed executable's absolute path
+to the existing `features.hardwareSigner` and `signer.backend: helper`
+configuration. The entry point checks the Developer ID requirement and signed
+application and access-group entitlements. The helper runs only as the
+dedicated HQ user, uses the role account's private home from the account
+database, and unlocks its own file Keychain without UI. The interactive
+owner's Keychain and the data-protection login context are separate from
+this service. See [Apple TN3137](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains).
+Packaging, provisioned installation and physical-Mac T02 remain in
+[HQ #107](https://github.com/true-line/agent-bot-hq/issues/107).
