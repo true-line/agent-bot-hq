@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createSigner, helperKeyBackend } from '../hq/signer.mjs';
 
@@ -19,6 +19,13 @@ const backend = helperKeyBackend({ command: [helper], run(argv, input) {
 const challenge = () => randomBytes(32);
 if (!existsSync(saved)) {
   mkdirSync(home, { mode: 0o700 });
+  const dbPath = join(fixtureHome, 'hq-device-signer.keychain-db');
+  const sentinel = join(home, 'sentinel');
+  writeFileSync(sentinel, 'fixture', { flag: 'wx', mode: 0o600 });
+  symlinkSync(sentinel, dbPath);
+  assert.throws(() => backend.create({ replace: false }));
+  assert.equal(readFileSync(sentinel, 'utf8'), 'fixture');
+  unlinkSync(dbPath);
   assert.equal(backend.status().present, false);
   const signer = createSigner({ home, backend });
   const before = signer.report();

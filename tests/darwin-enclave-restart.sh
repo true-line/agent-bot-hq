@@ -18,6 +18,10 @@ if sudo -n -H -u "$role" "$stage/release-signer" status <<< '{}' >"$RUNNER_TEMP/
 fi
 test ! -s "$RUNNER_TEMP/hq-release-status"
 sudo install -o root -g wheel -m 0555 "$probe" "$stage/fixture-signer"
+if "$stage/fixture-signer" status <<< '{}' >"$RUNNER_TEMP/hq-foreign-status"; then
+  echo 'A foreign UID was allowed to use the HQ signer' >&2; exit 1
+fi
+test ! -s "$RUNNER_TEMP/hq-foreign-status"
 label=ai.true-line.hq.ci-restart-enclave
 plist="$stage/enclave-restart.plist"
 sudo /usr/bin/tee "$plist" >/dev/null <<PLIST
