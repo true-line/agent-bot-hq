@@ -16,6 +16,9 @@ test "$uid" -ne 0
   if (home.uid !== process.getuid() || (home.mode & 0o7777) !== 0o700) process.exit(1);
 '
 umask 077
+if [[ "${2:-}" == --disposable-machine-role ]]; then
+  HQ_TEST_MACHINE_ROLE=1 "$node_bin" --test --test-name-pattern='status validates' tests/machine-channel.test.mjs
+fi
 state="$(mktemp -d "$HOME/hq-state.XXXXXXXX")"
 "$node_bin" hq/main.mjs run --home "$state" >"$state/run.log" 2>&1 &
 hq_pid=$!

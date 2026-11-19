@@ -75,3 +75,30 @@ Do not extend expiration silently or re-enable a suspected compromised key;
 old offline HQ pins cannot be remotely revoked by publishing retired metadata.
 Issue #122 remains open until release, coverage, success, refusal and rollback
 evidence is recorded.
+
+## Verify the HQ-to-Machine channel
+
+For [HQ #56](https://github.com/true-line/agent-bot-hq/issues/56), provision
+the dedicated HQ account and stage the verified HQ artifact and Node runtime
+using [Machine’s HQ service installation](https://github.com/true-line/agent-bot-machine/blob/main/docs/plans/member-accounts.md).
+Run the following HQ commands with those absolute executable and entrypoint
+paths, as `_agent-bot-hq` on macOS or `agent-bot-hq` on Linux.
+
+1. Run `node hq/main.mjs machine identity` as the HQ role. It returns
+   `public_key` (Ed25519 hex) and `fingerprint` (SHA-256 hex) for the prefix
+   owner. Repeating the command returns the same identity. The seed stays
+   under the provisioned HQ role's private home.
+2. As the prefix owner, enroll those public values as `agent-daemon`. On macOS
+   follow [Machine's owner approval procedure](https://github.com/true-line/agent-bot-machine/blob/main/docs/plans/macos-signing.md#owner-approval-for-a-new-hq-pairing).
+   Keep the verified public `machine_key` from the approved challenge for the
+   first status check. On Linux obtain the prefix owner's published raw
+   Ed25519 `daemon.pub` as 64 hex digits directly from that administrator.
+3. As the HQ role, run `node hq/main.mjs machine status --socket PATH --daemon-key HEX`.
+   Use the prefix owner's absolute `var/agent-machine/daemon.sock` path and
+   the verified Machine public key. HQ persists the pin after a fresh,
+   authenticated, successful reply. Later checks use
+   `node hq/main.mjs machine status --socket PATH`. A different key is refused.
+
+Record the returned `channel`, `state` and `daemon_fingerprint` as channel
+evidence. Secure Enclave custody and protected-profile qualification have
+separate checks.

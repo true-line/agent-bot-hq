@@ -40,8 +40,9 @@ import { backendFromConfig, createSigner, removeSoftwareKey } from './signer.mjs
 import { readPins } from './plugins.mjs';
 import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { connectSocket } from './socket.mjs';
+import { machineRoleCommand } from './machine-channel.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|signer rekey|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|signer rekey|machine identity|machine status|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
@@ -113,6 +114,10 @@ function printStatus(s) {
 }
 
 async function main(argv) {
+  if (argv[0] === 'machine') {
+    console.log(JSON.stringify(await machineRoleCommand(argv.slice(1))));
+    return;
+  }
   const args = parse(argv);
   if (args.cmd === 'check-owner-control') {
     console.log(JSON.stringify({ capability: checkOwnerControlSupport() }));
