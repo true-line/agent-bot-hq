@@ -12,12 +12,19 @@ Dir.mktmpdir('hq-listener-', '/private/tmp') do |dir|
     listener.listen(Socket::SOMAXCONN)
     File.rename(name, path)
     Socket.unix_server_socket(other) do |unrelated|
+      copy = listener.dup
+      begin
+        raise 'inherited duplicate refused' unless duplicate_socket?(listener, copy)
+        raise 'different listener matched duplicate' if duplicate_socket?(listener, unrelated)
+      ensure
+        copy.close
+      end
       expected = listener.local_address.unix_path
       raise 'renamed listener lost its original bound address' unless expected == name
       raise 'published path did not reach the listener' unless published_peer?(path, expected)
       raise 'a different socket matched' if published_peer?(other, expected)
       raise 'unreachable public path matched' if published_peer?(name, expected)
-      raise 'ordinary bound address accepted as a launchd address' if renamed_launchd_listener?(listener, expected, path)
+      raise 'ordinary bound address accepted as a launchd address' if launchd_address?(listener, expected)
       # Each probe closes without data. The next waiting client stays queued.
       listener.accept.first.close
       unrelated.accept.first.close

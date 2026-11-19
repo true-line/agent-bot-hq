@@ -1,6 +1,7 @@
 // The system manager owns the listener. HQ authenticates every accepted
 // stream independently of the socket inode's permissions.
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { createServer } from 'node:net';
 import { lstatSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname } from 'node:path';
@@ -15,9 +16,9 @@ const helper = darwin
   : ['-I', '-S', fileURLToPath(new URL('../helpers/linux-owner-peer.py', import.meta.url))];
 const helperOptions = { env: {}, timeout: 2000, killSignal: 'SIGKILL' };
 
-function check(args, fd) {
+function check(args, ...fds) {
   const result = spawnSync(interpreter, [...helper, ...args], {
-    ...helperOptions, stdio: ['ignore', 'ignore', 'ignore', ...(fd === undefined ? [] : [fd])],
+    ...helperOptions, stdio: ['ignore', 'ignore', 'ignore', ...fds],
   });
   return !result.error && result.status === 0;
 }
@@ -43,7 +44,7 @@ export function checkOwnerSocketPath(ownerUid) {
   }
 }
 
-export function activatedOwnerControl(account) {
+export async function activatedOwnerControl(account) {
   checkOwnerControlSupport();
   const service = darwin ? '_agent-bot-hq' : 'agent-bot-hq';
   if (userInfo().username !== service || process.getuid() === 0) throw new Error(`owner control requires the dedicated ${service} service account`);
@@ -71,15 +72,59 @@ export function activatedOwnerControl(account) {
   }
   const fd = 3;
   checkOwnerSocketPath(uid);
-  if (!check(['listener', OWNER_CONTROL_PATH], fd)) throw new Error('owner-control fd is not the expected listening Unix stream socket');
-  return { fd, account, uid, authenticate: (socket) => authenticateOwner(socket, uid) };
+  const phase = darwin ? 'descriptor' : 'listener';
+  if (!check([phase, OWNER_CONTROL_PATH], ...(darwin ? [fd, 4] : [fd]))) throw new Error('owner-control fd is not the expected listening Unix stream socket');
+  const listener = darwin ? await prepareOwnerListener(4, () => socketCheck(['listener', OWNER_CONTROL_PATH], fd)) : undefined;
+  return { fd, account, uid, listener, authenticate: (socket) => authenticateOwner(socket, uid) };
+}
+
+// launchd can retain pending requests across a restart. Accept paused streams
+// before probing the public path, so the probe can complete even while a
+// legitimate owner is waiting. No stream enters HQ until verification succeeds.
+export async function prepareOwnerListener(fd, verifyPublic) {
+  const waiting = new Set();
+  const acceptor = createServer({ pauseOnConnect: true }, (socket) => {
+    socket.on('error', () => {});
+    waiting.add(socket);
+    socket.once('close', () => waiting.delete(socket));
+    // Stop accepting from the duplicate at HQ's existing peer-check limit.
+    // The manager and fd 3 retain every remaining queued connection.
+    if (waiting.size >= 16) acceptor.close();
+  });
+  await new Promise((resolve, reject) => {
+    acceptor.once('error', reject);
+    acceptor.listen({ fd }, () => { acceptor.off('error', reject); resolve(); });
+  });
+  function closeUnused() {
+    if (acceptor.listening) acceptor.close();
+    for (const socket of waiting) socket.destroy();
+    waiting.clear();
+  }
+  try {
+    if (!await verifyPublic()) throw new Error('owner-control fd does not match the published Unix stream socket');
+  } catch (e) {
+    closeUnused();
+    throw e;
+  }
+  if (acceptor.listening) acceptor.close();
+  return {
+    closeUnused,
+    adopt(onConnection) {
+      for (const socket of waiting) if (!socket.destroyed) onConnection(socket);
+      waiting.clear();
+    },
+  };
 }
 
 // Node passes the connected stream to fd 3 in the helper using the public
 // child_process stdio API. The helper only reads credentials from the kernel.
 export function authenticateOwner(socket, uid) {
+  return socketCheck(['peer', String(uid)], socket);
+}
+
+function socketCheck(args, socket) {
   return new Promise((resolve) => {
-    const probe = spawn(interpreter, [...helper, 'peer', String(uid)], { ...helperOptions, stdio: ['ignore', 'ignore', 'ignore', socket] });
+    const probe = spawn(interpreter, [...helper, ...args], { ...helperOptions, stdio: ['ignore', 'ignore', 'ignore', socket] });
     probe.once('error', () => resolve(false));
     probe.once('close', (code) => resolve(code === 0));
   });

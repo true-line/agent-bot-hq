@@ -33,3 +33,7 @@ test('owner control compares the connected peer UID with the configured owner', 
 test('Darwin matches a renamed listener to the published socket with a bounded probe', { skip: process.platform !== 'darwin' }, () => {
   execFileSync('/usr/bin/ruby', ['--disable-gems', fileURLToPath(new URL('darwin-owner-listener.rb', import.meta.url))], { timeout: 5000 });
 });
+
+test('Darwin preserves pending owner status requests across listener restarts', { skip: process.platform !== 'darwin' }, () => {
+  execFileSync('/usr/bin/ruby', ['--disable-gems', fileURLToPath(new URL('darwin-owner-restart.rb', import.meta.url)), process.execPath], { timeout: 20000 });
+});

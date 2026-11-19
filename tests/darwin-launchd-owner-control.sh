@@ -100,3 +100,41 @@ pid="$(sudo launchctl print "system/$label" | awk '$1 == "pid" && $2 == "=" { pr
 [[ "$pid" =~ ^[1-9][0-9]*$ ]]
 [[ "$(ps -o uid= -p "$pid" | tr -d ' ')" == "$(id -u "$role")" ]]
 echo "The owner CLI reached the launchd service running as $role with getpeereid authentication."
+
+# launchd retains the listening socket while restarting HQ. Queue a normal
+# request from the designated owner while the dedicated CI service is paused.
+python3 - "$label" "$pid" "$socket" "$owner" <<'PY' || diagnose
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+label, pid, path, owner = sys.argv[1:]
+service = "system/" + label
+before = os.lstat(path)
+subprocess.run(["/usr/bin/sudo", "-n", "/bin/launchctl", "kill", "SIGSTOP", service], check=True)
+deadline = time.monotonic() + 5
+while "T" not in subprocess.check_output(["/bin/ps", "-o", "state=", "-p", pid], text=True):
+    if time.monotonic() >= deadline:
+        raise RuntimeError("CI HQ process did not pause")
+    time.sleep(0.05)
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as pending:
+    pending.settimeout(40)
+    pending.connect(path)
+    pending.sendall(b'{"id":37,"op":"status"}\n')
+    subprocess.run(["/usr/bin/sudo", "-n", "/bin/launchctl", "kill", "SIGKILL", service], check=True)
+    with pending.makefile("rb") as reply:
+        response = json.loads(reply.readline(1024 * 1024))
+assert response["id"] == 37 and response["ok"] is True
+report = response["result"]["hq"]
+assert report["account"] == "_agent-bot-hq"
+control = report["sockets"]["ownerControl"]
+assert control["uid"] == os.getuid() and control["account"] == owner and control["peer_check"] == "getpeereid"
+after = os.lstat(path)
+assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+PY
+restarted_pid="$(sudo launchctl print "system/$label" | awk '$1 == "pid" && $2 == "=" { print $3 }')"
+[[ "$restarted_pid" =~ ^[1-9][0-9]*$ && "$restarted_pid" != "$pid" ]]
+echo "A pending owner status request reached the restarted HQ through the same launchd socket."

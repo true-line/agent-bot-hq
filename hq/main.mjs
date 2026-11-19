@@ -128,22 +128,24 @@ async function main(argv) {
   if (args.ownerControl) checkOwnerSocketPath(process.getuid?.());
   if (args.cmd === 'run') {
     if ([process.env.LISTEN_PID, process.env.HQ_LAUNCHD_OWNER_PID].includes(String(process.pid)) && !args.ownerAccount) throw new Error('socket activation requires --owner-account NAME');
-    const ownerControl = args.ownerAccount ? activatedOwnerControl(args.ownerAccount) : undefined;
-    const hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins: readPins(PINS), pluginsDir: args.plugins, devPlugins: args.devPlugins });
-    // Handlers first, so a signal during start still shuts down cleanly.
-    let starting = true;
-    const shutdown = (signal) => {
-      const wait = starting ? new Promise((r) => { const i = setInterval(() => { if (!starting) { clearInterval(i); r(); } }, 50); }) : Promise.resolve();
-      wait.then(() => hq.stop({ reason: signal })).then(() => process.exit(0), (e) => { console.error(e.message); process.exit(1); });
-    };
-    process.once('SIGINT', shutdown);
-    process.once('SIGTERM', shutdown);
+    const ownerControl = args.ownerAccount ? await activatedOwnerControl(args.ownerAccount) : undefined;
     try {
-      printStatus(await hq.start());
-    } finally {
-      starting = false;
-    }
-    console.log(`listening: ${hq.paths.control} (owner), ${hq.paths.admission} (entry points), ${hq.paths.broker} (members)`);
+      const hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins: readPins(PINS), pluginsDir: args.plugins, devPlugins: args.devPlugins });
+      // Handlers first, so a signal during start still shuts down cleanly.
+      let starting = true;
+      const shutdown = (signal) => {
+        const wait = starting ? new Promise((r) => { const i = setInterval(() => { if (!starting) { clearInterval(i); r(); } }, 50); }) : Promise.resolve();
+        wait.then(() => hq.stop({ reason: signal })).then(() => process.exit(0), (e) => { console.error(e.message); process.exit(1); });
+      };
+      process.once('SIGINT', shutdown);
+      process.once('SIGTERM', shutdown);
+      try {
+        printStatus(await hq.start());
+      } finally {
+        starting = false;
+      }
+      console.log(`listening: ${hq.paths.control} (owner), ${hq.paths.admission} (entry points), ${hq.paths.broker} (members)`);
+    } finally { await ownerControl?.listener?.closeUnused(); }
     return;
   }
   if (args.cmd === 'enroll') {
