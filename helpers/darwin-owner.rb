@@ -13,18 +13,57 @@ def activation
                        Fiddle::TYPE_INT)
 end
 
+def published_control?
+  return false unless ['/private', '/private/var'].all? do |path|
+    dir = File.lstat(path)
+    dir.directory? && dir.uid.zero? && (dir.mode & 0o022).zero?
+  end
+  socket = File.lstat(CONTROL)
+  socket.socket? && socket.uid.zero? && (socket.mode & 0o7777) == 0o666
+end
+
+def published_peer?(path, name)
+  Socket.open(Socket::AF_UNIX, Socket::SOCK_STREAM) do |peer|
+    result = peer.connect_nonblock(Socket.sockaddr_un(path), exception: false)
+    if result == :wait_writable
+      return false unless IO.select(nil, [peer], nil, 0.5)
+      return false unless peer.getsockopt(Socket::SOL_SOCKET, Socket::SO_ERROR).int.zero?
+    end
+    peer.remote_address.unix_path == name
+  end
+rescue SystemCallError, SocketError
+  false
+end
+
+def renamed_launchd_listener?(sock, name, path)
+  # launchd may publish a renamed socket. Darwin keeps its original bound
+  # address in both the listening fd and the peer seen at the public path.
+  manager = %r{\A(?:/private)?/var/run/(com\.apple\.launchd\.[a-zA-Z0-9]+)/owner-control\z}.match(name)
+  return false unless manager && sock.stat.uid.zero?
+  dir = File.lstat("/private/var/run/#{manager[1]}")
+  return false unless dir.directory? && dir.uid.zero? && (dir.mode & 0o7777) == 0o700
+  published_peer?(path, name)
+end
+
 def listener?(sock)
-  return false unless sock.local_address.unix? && sock.local_address.unix_path == CONTROL &&
+  return false unless sock.local_address.unix? &&
                       sock.getsockopt(Socket::SOL_SOCKET, Socket::SO_TYPE).int == Socket::SOCK_STREAM
-  # Darwin's Unix stream sockets do not implement SO_ACCEPTCONN. A listener
-  # has no remote peer; listen(2) succeeds on this already bound socket.
+  # Darwin's Unix stream sockets do not implement SO_ACCEPTCONN.
   begin
     sock.getpeername
     return false
   rescue Errno::ENOTCONN
-    sock.listen(Socket::SOMAXCONN) == 0
+    # A listening stream has no peer.
   end
+  return false unless published_control?
+  name = sock.local_address.unix_path
+  return false unless name == CONTROL || renamed_launchd_listener?(sock, name, CONTROL)
+  sock.listen(Socket::SOMAXCONN) == 0
+rescue SystemCallError, SocketError
+  false
 end
+
+return unless __FILE__ == $PROGRAM_NAME
 
 case ARGV.shift
 when 'probe'
