@@ -79,9 +79,9 @@ async function ask(controlPath, op) {
 }
 
 function signerLine(g) {
-  if (!g.available) return `signer: unavailable (${g.reason})`;
-  const custody = g.key_storage === 'hardware' ? 'hardware key (experimental feature hardwareSigner)' : 'software key file (transition custody)';
-  return `signer: ${custody}, ${g.backend} backend, key ${g.thumbprint.slice(0, 12)}, generation ${g.generation}`;
+  const backend = g.backend === 'machine' ? 'paired Machine/keyd' : g.backend;
+  if (!g.available) return `signer: ${backend} unavailable (${g.reason})`;
+  return `signer: ${g.key_storage} key, ${backend} backend, key ${g.thumbprint.slice(0, 12)}, generation ${g.generation}`;
 }
 
 function printStatus(s) {

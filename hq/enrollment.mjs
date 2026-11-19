@@ -213,6 +213,9 @@ export function createEnrollment({
         signer.verifyEnrollmentReceipt(receipt, server);
         return { receipt };
       }
+      // The receipt issuer can refuse a poll before it consumes the approved code.
+      if (signer.bindEnrollment && response.status === 503 &&
+          (body.error === 'credential_unavailable' || body.error === 'temporarily_unavailable')) continue;
       if (body.error === 'slow_down') interval += 5;
       else if (body.error !== 'authorization_pending') throw new Error(oauthMessage('enrollment was refused', body));
     }

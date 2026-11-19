@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { createHash, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from 'node:crypto';
 import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
@@ -104,10 +107,18 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   let active = await open();
   t.after(async () => { try { await active?.close(); } finally { for (const dir of [home, role]) rmSync(dir, { recursive: true, force: true }); } });
   assert.equal(active.status.mode, 'safe');
+  const consoleStatus = async () => (await promisify(execFile)(process.execPath, [
+    fileURLToPath(new URL('../hq/main.mjs', import.meta.url)), 'status', '--home', home,
+  ])).stdout;
   const offer = () => active.owner.request('device.enroll', { harnesses: ['codex'] });
   assert.equal((await offer()).result.pending, true);
+  const [grant] = service.state.grants.values();
+  grant.receiptErrors = ['credential_unavailable', 'temporarily_unavailable'];
   service.decide('approved');
   await active.hq.core.signer.enrollment.settled();
+  assert.deepEqual(grant.receiptErrors, []);
+  assert.equal(service.state.grants.size, 1);
+  assert.equal(service.state.devices.length, 1);
   assert.equal(existsSync(join(home, 'identity/device.json')), false);
   assert.equal(existsSync(join(home, 'identity/pending-receipt.json')), true);
   await active.close(); active = null;
@@ -120,6 +131,10 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.equal(active.status.mode, 'running');
   assert.equal(active.status.profile, 'managed-cooperative');
   assert.equal(active.status.hq.signer.backend, 'machine');
+  assert.equal(active.status.hq.features.hardwareSigner, false);
+  const statusText = await consoleStatus();
+  assert.match(statusText, /^signer: hardware key, paired Machine\/keyd backend, key /m);
+  assert.doesNotMatch(statusText, /hardwareSigner|experimental feature/);
   assert.equal(existsSync(join(home, 'signer')), false);
   await assert.rejects(active.hq.core.identity.call('GET', '/api/daemon/issuances/example-op'), /no authorized DPoP action/);
   assert.ok(options.includes('access-assertion') && options.includes('bind-access'));
@@ -152,6 +167,7 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   active = await open();
   assert.equal(active.status.mode, 'safe');
   assert.match(active.status.hq.signer.reason, /MM_DAEMON_UNKNOWN_KEY/);
+  assert.match(await consoleStatus(), /^signer: paired Machine\/keyd unavailable \(.*MM_DAEMON_UNKNOWN_KEY/m);
   await checkNoFallback();
   await active.close(); active = null;
   revoked = false;

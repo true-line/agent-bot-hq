@@ -145,6 +145,45 @@ test('a denied or refused grant enrolls nothing and says why; a redirect and a b
   } finally { rmSync(home2, { recursive: true, force: true }); }
 });
 
+test('receipt polling stops at expiry or an explicit refusal; ordinary grants do not retry receipt errors', async (t) => {
+  for (const [label, receipt, status, error, reason, polls] of [
+    ['receipt signer remains unavailable', true, 503, 'credential_unavailable', /expired/, 2],
+    ['issuer denies approval', true, 400, 'access_denied', /access_denied/, 1],
+    ['unrecognized refusal', true, 503, 'access_denied', /access_denied/, 1],
+    ['ordinary grant', false, 503, 'credential_unavailable', /credential_unavailable/, 1],
+  ]) await t.test(label, async () => {
+    const home = tempHome();
+    t.after(() => rmSync(home, { recursive: true, force: true }));
+    let now = 0, attempts = 0;
+    const signer = {
+      report: () => ({ available: true, generation: 1, thumbprint: 'fixture', key_storage: 'hardware' }),
+      enrollmentProof: async () => 'fixture',
+      ...(receipt && { bindEnrollment: () => assert.fail('a refusal must never bind') }),
+    };
+    const enrollment = createEnrollment({
+      home, signer, deviceName: 'test-device', clock: { now: () => now },
+      sleep: async (ms) => { now += ms; },
+      fetchImpl: async (url) => {
+        const path = new URL(url).pathname;
+        if (path === '/.well-known/agent-bot-server-key') return Response.json({
+          keys: [{ kty: 'OKP', crv: 'Ed25519', x: Buffer.alloc(32).toString('base64url') }],
+        });
+        if (path === '/oauth/device_authorization') return Response.json({
+          device_code: 'fixture', user_code: 'TEST', expires_in: 5, interval: 2,
+        });
+        assert.equal(path, '/oauth/token');
+        attempts++;
+        return Response.json({ error }, { status });
+      },
+    });
+    assert.equal((await enrollment.enroll({ harnesses: ['codex'] })).pending, true);
+    await enrollment.settled();
+    assert.equal(attempts, polls);
+    assert.match(enrollment.progress().grant.reason, reason);
+    assert.equal(await enrollment.deviceStatus(), 'unenrolled');
+  });
+});
+
 test('enrollment config: legacy by default, hq with an https origin', () => {
   assert.doesNotThrow(() => validateConfig({ enrollment: { source: 'hq' } }));
   assert.doesNotThrow(() => validateConfig({ enrollment: { source: 'hq', server: 'https://id.example' } }));

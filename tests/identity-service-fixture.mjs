@@ -58,6 +58,7 @@ export async function fakeIdentityService({ issuer } = {}) {
         if (form.grant_type !== 'urn:ietf:params:oauth:grant-type:device_code' || !g) return json(res, 400, { error: 'invalid_grant' });
         if (g.decision === 'pending') return json(res, 400, { error: g.slow ? 'slow_down' : 'authorization_pending' });
         if (g.decision === 'denied') return json(res, 400, { error: 'access_denied', error_description: 'the owner denied this device' });
+        if (g.receiptErrors?.length) return json(res, 503, { error: g.receiptErrors.shift() });
         const device_id = `dev_${state.devices.length + 1}`;
         state.devices.push({ device_id, jkt: g.jkt, key_storage: g.form.key_storage, device_name: g.form.device_name, platform: g.form.platform, harnesses: g.form.harnesses.split(' ') });
         const body = { token_type: 'N_A', device_id, jkt: g.jkt, read_only: false, harnesses: g.form.harnesses.split(' ') };
