@@ -9,15 +9,20 @@ uid="$(id -u "$role")"
 [[ "$uid" != 0 && "$uid" != "$(id -u)" ]]
 node_bin="$(node -p 'process.execPath')"
 probe="$RUNNER_TEMP/hq-fixture-signer"
+installation=helpers/macos-enclave/MachineInstallation.swift
 sources=(helpers/macos-enclave/Signer.swift helpers/macos-enclave/RoleStore.swift)
+xcrun swiftc -parse-as-library "$installation" tests/fixtures/machine-installation/main.swift -o "$RUNNER_TEMP/hq-machine-presence-test"
+"$RUNNER_TEMP/hq-machine-presence-test"
+sudo install -o root -g wheel -m 0555 "$RUNNER_TEMP/hq-machine-presence-test" "$stage/presence-test"
+reason="$(sudo -n -H -u "$role" "$stage/presence-test" standard-reason)"
 xcrun swiftc "${sources[@]}" tests/fixtures/enclave-keychain/main.swift -o "$probe"
-xcrun swiftc "${sources[@]}" helpers/macos-enclave/main.swift -o "$RUNNER_TEMP/hq-release-signer"
+xcrun swiftc "${sources[@]}" "$installation" helpers/macos-enclave/main.swift -o "$RUNNER_TEMP/hq-release-signer"
 sudo install -o root -g wheel -m 0555 "$RUNNER_TEMP/hq-release-signer" "$stage/release-signer"
 if sudo -n -H -u "$role" "$stage/release-signer" status <<< '{}' >"$RUNNER_TEMP/hq-release-status" 2>"$RUNNER_TEMP/hq-release-error"; then
   echo 'Unprovisioned production helper accepted a signer operation' >&2; exit 1
 fi
 test ! -s "$RUNNER_TEMP/hq-release-status"
-grep -Fxq 'HQ standalone installation is unverified' "$RUNNER_TEMP/hq-release-error"
+grep -Fxq -- "$reason" "$RUNNER_TEMP/hq-release-error"
 sudo install -o root -g wheel -m 0555 "$probe" "$stage/fixture-signer"
 if "$stage/fixture-signer" status <<< '{}' >"$RUNNER_TEMP/hq-foreign-status"; then
   echo 'A foreign UID was allowed to use the HQ signer' >&2; exit 1

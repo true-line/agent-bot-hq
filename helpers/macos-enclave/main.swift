@@ -1,16 +1,10 @@
 import Foundation
 import Security
 
-// A signed executable and the dedicated role authenticate the signer. Neither
-// establishes that Machine is absent or that this host has no pairing history.
-enum StandaloneInstallationFailure: Error {
-    case unverified
-}
-
 func requireStandaloneInstallation() throws {
-    // No product installer currently supplies this evidence to the native
-    // helper. A config flag, stopped daemon or missing path cannot supply it.
-    throw StandaloneInstallationFailure.unverified
+    // The native guard collects positive evidence. Neither a clean search
+    // nor an HQ-owned setting supplies an authoritative standalone install.
+    throw MachineInstallationProbe.standard.inspect()
 }
 
 do {
@@ -28,8 +22,8 @@ do {
           let groups = SecTaskCopyValueForEntitlement(task, "keychain-access-groups" as CFString, nil) as? [String],
           groups.contains(app) else { throw SignerFailure.accessControl }
     try runSigner()
-} catch StandaloneInstallationFailure.unverified {
-    FileHandle.standardError.write(Data("HQ standalone installation is unverified\n".utf8))
+} catch let evidence as MachineInstallationEvidence {
+    FileHandle.standardError.write(Data((evidence.refusal + "\n").utf8))
     exit(1)
 } catch {
     FileHandle.standardError.write(Data("HQ Secure Enclave signer unavailable\n".utf8))

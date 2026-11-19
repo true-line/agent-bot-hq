@@ -1,0 +1,37 @@
+name: Paired device protocol
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  protocol:
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      MACHINE_REVISION: ad1b0219fe93e8523b000246cdacb4a09f79e5be
+    steps:
+      - name: Check out the exact HQ revision
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git fetch -q --no-tags --depth=1 "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Build the pinned Machine test binary
+        run: |
+          machine="$RUNNER_TEMP/machine"
+          git init -q "$machine"
+          git -C "$machine" fetch -q --no-tags --depth=1 https://github.com/true-line/agent-bot-machine.git "$MACHINE_REVISION"
+          git -C "$machine" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$machine" rev-parse HEAD)" = "$MACHINE_REVISION"
+          cd "$machine"
+          test -f internal/daemon/hq_device_interop_test.go
+          test -f tests/fixtures/build-keyd-device-interop.sh
+          go test -c -o "$RUNNER_TEMP/machine-fixture" ./internal/daemon
+      - name: Exercise paired HQ and keyd with disposable keys
+        run: |
+          node --version
+          node tests/machine-device-interop.mjs "$RUNNER_TEMP/machine-fixture" "$RUNNER_TEMP/machine/tests/fixtures/build-keyd-device-interop.sh"
