@@ -99,6 +99,22 @@ paths, as `_agent-bot-hq` on macOS or `agent-bot-hq` on Linux.
    authenticated, successful reply. Later checks use
    `node hq/main.mjs machine status --socket PATH`. A different key is refused.
 
+Once the daemon pin is saved, the dedicated HQ role can retrieve the prefix
+administrator's saved members plans from a Machine with paired plan lookup.
+List up to 64 plan IDs per page. If the reply includes `next_after`, pass
+that exact value as the next cursor.
+
+```sh
+node hq/main.mjs machine members-plans list --socket "$socket"
+node hq/main.mjs machine members-plans list --socket "$socket" --after "$next_after"
+node hq/main.mjs machine members-plans get "$plan_id" --socket "$socket"
+```
+
+The lookup returns `plan_id`, `plan_digest` and `plan_canonical`. HQ verifies
+the Machine signature, request nonce and digest of the complete canonical
+plan, including its final newline. These commands read the saved plan for
+review. Applying it requires a separate owner approval and human root apply.
+
 Record the returned `channel`, `state` and `daemon_fingerprint` as channel
 evidence. Secure Enclave custody and protected-profile qualification have
 separate checks.

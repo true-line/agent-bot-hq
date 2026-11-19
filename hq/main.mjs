@@ -42,7 +42,7 @@ import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, 
 import { connectSocket } from './socket.mjs';
 import { machineRoleCommand } from './machine-channel.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|signer rekey|machine identity|machine status|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|signer rekey|machine identity|machine status|machine members-plans|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {

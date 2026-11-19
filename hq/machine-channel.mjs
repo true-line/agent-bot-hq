@@ -1,5 +1,8 @@
 // HQ's agent-daemon client of Machine's daemon-machine-channel. The private
 // seed belongs to the service account. It is independent of the HQ signer.
+import { isUtf8 } from 'node:buffer';
+import { parseStrict } from '../sdk/wire/strict-json.mjs';
+import { membersPlanResult, validPlanId } from './machine-members-plans.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash, createPrivateKey, createPublicKey, randomBytes, sign, verify } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -103,7 +106,7 @@ function clientIdentity(dir, uid, create) {
 // Go signs body as json.RawMessage, including the original escapes and
 // number spellings. Find spans at top level after validating the entire line.
 function responseFields(line) {
-  const value = JSON.parse(line);
+  const value = parseStrict(line);
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid Machine response');
   const fields = new Map();
   let depth = 0;
@@ -125,19 +128,22 @@ function responseFields(line) {
   return { value, body: fields.get('body') ?? '' };
 }
 
-function authenticatedStatus(line, nonce, pinned) {
+function authenticatedResponse(line, nonce, pinned, verb) {
   const { value: r, body } = responseFields(line);
   const singleLine = (s) => typeof s === 'string' && !/[\r\n]/.test(s);
   if (typeof r.ok !== 'boolean' || !Number.isSafeInteger(r.timestamp) ||
       Math.abs(Date.now() / 1000 - r.timestamp) > 300 || r.request_nonce !== nonce ||
-      !singleLine(r.nonce) || !r.nonce || ![r.state ?? '', r.diagnostic ?? '', r.message ?? ''].every(singleLine) ||
-      typeof r.signature !== 'string') throw new Error('invalid or stale Machine status response');
+      !singleLine(r.nonce) || !r.nonce || Buffer.byteLength(r.nonce) > 128 || ![r.state ?? '', r.diagnostic ?? '', r.message ?? ''].every(singleLine) ||
+      typeof r.signature !== 'string') throw new Error(`invalid or stale Machine ${verb} response`);
   const bytes = Buffer.from([r.ok, r.diagnostic ?? '', r.message ?? '', r.state ?? '', body, r.timestamp, r.nonce, nonce].join('\n'));
   const key = createPublicKey({ key: Buffer.concat([SPKI, pinned]), type: 'spki', format: 'der' });
-  if (!verify(null, bytes, key, Buffer.from(r.signature, 'base64'))) throw new Error('Machine status signature does not match the daemon pin');
-  if (!r.ok) throw new Error(`Machine refused signed status: ${r.diagnostic || 'unspecified'}`);
-  if (!r.state) throw new Error('signed Machine status is missing its state');
-  return r.state;
+  const signature = Buffer.from(r.signature, 'base64');
+  if (signature.length !== 64 || signature.toString('base64') !== r.signature || !verify(null, bytes, key, signature)) {
+    throw new Error(`Machine ${verb} signature does not match the daemon pin`);
+  }
+  if (!r.ok) throw new Error(`Machine refused signed ${verb}: ${r.diagnostic || 'unspecified'}`);
+  if (!r.state) throw new Error(`signed Machine ${verb} is missing its state`);
+  return r;
 }
 
 function exchange(socketPath, request) {
@@ -145,17 +151,17 @@ function exchange(socketPath, request) {
     const stream = connect({ path: socketPath });
     const chunks = [];
     let size = 0;
-    const timer = setTimeout(() => stream.destroy(new Error('Machine status timed out')), 10000);
+    const timer = setTimeout(() => stream.destroy(new Error('Machine request timed out')), 10000);
     stream.once('connect', () => stream.write(JSON.stringify(request) + '\n'));
     stream.on('error', reject);
-    stream.on('close', () => { clearTimeout(timer); reject(new Error('Machine closed without a status response')); });
+    stream.on('close', () => { clearTimeout(timer); reject(new Error('Machine closed without a response')); });
     stream.on('data', (chunk) => {
       size += chunk.length;
-      if (size > MAX_MESSAGE + 1) return stream.destroy(new Error('Machine status response exceeds its size limit'));
+      if (size > MAX_MESSAGE + 1) return stream.destroy(new Error('Machine response exceeds its size limit'));
       chunks.push(chunk);
       if (chunk.includes(10)) {
         const data = Buffer.concat(chunks);
-        if (data.indexOf(10) !== data.length - 1) return stream.destroy(new Error('invalid Machine status framing'));
+        if (data.indexOf(10) !== data.length - 1 || !isUtf8(data)) return stream.destroy(new Error('invalid Machine response framing'));
         resolve(data.subarray(0, -1).toString('utf8'));
         stream.destroy();
       }
@@ -171,7 +177,7 @@ export function machineRoleCommand(argv) {
   if ((!mac && process.platform !== 'linux') || account.username !== role || !homes.includes(account.homedir) ||
       account.uid <= 0 || account.uid !== process.getuid() || account.uid !== process.geteuid() ||
       (mac && (account.uid < 300 || account.uid > 399 || account.gid !== account.uid))) {
-    throw new Error('Machine identity and signed status require the dedicated HQ service account');
+    throw new Error('Machine channel commands require the dedicated HQ service account');
   }
   return machineCommandInHome(argv, account.homedir, account.uid);
 }
@@ -179,11 +185,26 @@ export function machineRoleCommand(argv) {
 // Also exercised with a temporary private home in the protocol tests. The CLI
 // always obtains its home and UID from the kernel-backed account lookup above.
 export async function machineCommandInHome(argv, home, uid) {
-  const [verb, socketFlag, socket, keyFlag, hex] = argv;
-  const identity = argv.length === 1 && verb === 'identity';
-  const status = verb === 'status' && socketFlag === '--socket' && socket && isAbsolute(socket) &&
-    (argv.length === 3 || (argv.length === 5 && keyFlag === '--daemon-key' && HEX_KEY.test(hex)));
-  if (!identity && !status) throw new Error('usage: machine identity | machine status --socket PATH [--daemon-key HEX]');
+  const [verb, ...args] = argv;
+  const identity = verb === 'identity' && !args.length;
+  let socket, hex, option = '', planID = '';
+  if (verb === 'status' && args[0] === '--socket' &&
+      (args.length === 2 || (args.length === 4 && args[2] === '--daemon-key' && HEX_KEY.test(args[3])))) {
+    [, socket, , hex] = args;
+  } else if (verb === 'members-plans') {
+    option = args[0];
+    if (option === 'list' && args[1] === '--socket' &&
+        (args.length === 3 || (args.length === 5 && args[3] === '--after' && validPlanId(args[4])))) {
+      socket = args[2];
+      planID = args[4] ?? '';
+    } else if (option === 'get' && args.length === 4 && validPlanId(args[1]) && args[2] === '--socket') {
+      planID = args[1];
+      socket = args[3];
+    }
+  }
+  if (!identity && (!socket || !isAbsolute(socket))) {
+    throw new Error('usage: machine identity | status --socket PATH [--daemon-key HEX] | members-plans list --socket PATH [--after PLAN_ID] | members-plans get PLAN_ID --socket PATH');
+  }
   roleDir(home, uid, false);
   const config = join(home, '.config');
   const dir = join(config, 'agent-machine');
@@ -196,14 +217,18 @@ export async function machineCommandInHome(argv, home, uid) {
   const given = hex && Buffer.from(hex, 'hex');
   if (existing && given && !existing.equals(given)) throw new Error('the supplied daemon key differs from the existing pin');
   const daemon = existing || given;
-  if (!daemon) throw new Error('first signed status requires the prefix owner’s verified --daemon-key HEX');
+  if (!daemon) {
+    if (verb === 'members-plans') throw new Error('members-plans requires the daemon pin saved by verified Machine status');
+    throw new Error('first signed status requires the prefix owner’s verified --daemon-key HEX');
+  }
   const timestamp = Math.floor(Date.now() / 1000);
   const nonce = randomBytes(16).toString('base64url');
-  // Machine's status request leaves name, option, target, plan_id, soul,
-  // harness and session_id empty in the ten-field canonical payload.
-  const bytes = Buffer.from(['status', '', '', '', '', '', '', '', timestamp, nonce].join('\n'));
-  const request = { verb: 'status', timestamp, nonce, public_key: pub.toString('base64'), signature: sign(null, bytes, key).toString('base64') };
-  const state = authenticatedStatus(await exchange(socket, request), nonce, daemon);
+  const bytes = Buffer.from([verb, '', option, '', planID, '', '', '', timestamp, nonce].join('\n'));
+  const request = { verb, ...(option && { option }), ...(planID && { plan_id: planID }), timestamp, nonce,
+    public_key: pub.toString('base64'), signature: sign(null, bytes, key).toString('base64') };
+  const r = authenticatedResponse(await exchange(socket, request), nonce, daemon, verb);
+  const result = { client: 'agent-daemon', channel: 'signed', state: r.state, daemon_fingerprint: fingerprint(daemon) };
+  if (verb === 'members-plans') return { ...result, ...membersPlanResult(option, planID, r) };
   if (!existing && !publish(dir, 'daemon.pub', daemon, uid).equals(daemon)) throw new Error('a different daemon key was pinned concurrently');
-  return { client: 'agent-daemon', channel: 'signed', state, daemon_fingerprint: fingerprint(daemon) };
+  return result;
 }
