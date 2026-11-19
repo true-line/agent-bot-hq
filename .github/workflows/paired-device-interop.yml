@@ -10,7 +10,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 15
     env:
-      MACHINE_REVISION: ad1b0219fe93e8523b000246cdacb4a09f79e5be
+      MACHINE_REVISION: b8cbfbfaa8e6cc7fe9a002d3ebe51d0607d24dfa
     steps:
       - name: Check out the exact HQ revision
         env:

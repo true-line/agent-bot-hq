@@ -35,7 +35,11 @@ export async function fakeIdentityService({ issuer } = {}) {
           const jkt = createHash('sha256').update(JSON.stringify({ crv, kty, x, y })).digest('base64url');
           const device_code = randomBytes(16).toString('hex');
           state.grants.set(device_code, { jkt, form, decision: 'pending' });
-          return json(res, 200, { device_code, user_code: 'WXYZ-1234', verification_uri: `${state.url}/device`, verification_uri_complete: `${state.url}/device?code=WXYZ-1234`, expires_in: 600, interval: state.interval });
+          return json(res, 200, {
+            device_code, user_code: 'WXYZ-1234', verification_uri: `${state.url}/device`,
+            verification_uri_complete: `${state.url}/device?code=WXYZ-1234`, expires_in: 600, interval: state.interval,
+            ...(form.enrollment_receipt === 'agent-bot-sig-v1' && { enrollment_receipt: 'agent-bot-sig-v1' }),
+          });
         } catch { return json(res, 400, { error: 'invalid_proof' }); }
       }
       if (req.method === 'POST' && req.url === '/oauth/token') {

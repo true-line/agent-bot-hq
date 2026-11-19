@@ -145,6 +145,42 @@ test('a denied or refused grant enrolls nothing and says why; a redirect and a b
   } finally { rmSync(home2, { recursive: true, force: true }); }
 });
 
+test('Machine enrollment withholds the owner code and never polls without the exact receipt acknowledgment', async (t) => {
+  for (const ack of [undefined, 'unsupported']) await t.test(ack ?? 'legacy server', async () => {
+    const home = tempHome();
+    t.after(() => rmSync(home, { recursive: true, force: true }));
+    const events = [];
+    const requests = [];
+    const enrollment = createEnrollment({
+      home,
+      signer: {
+        report: () => ({ available: true, generation: 1, thumbprint: 'fixture', key_storage: 'hardware' }),
+        enrollmentProof: async () => 'fixture',
+        bindEnrollment: () => assert.fail('no receipt may bind'),
+      },
+      onEvent: (event) => events.push(event),
+      sleep: async () => {},
+      fetchImpl: async (url, init) => {
+        const path = new URL(url).pathname;
+        requests.push(path);
+        if (path === '/.well-known/agent-bot-server-key') return Response.json({
+          keys: [{ kty: 'OKP', crv: 'Ed25519', x: Buffer.alloc(32).toString('base64url') }],
+        });
+        assert.equal(path, '/oauth/device_authorization');
+        assert.equal(new URLSearchParams(init.body).get('enrollment_receipt'), 'agent-bot-sig-v1');
+        return Response.json({ device_code: 'fixture', user_code: 'TEST', enrollment_receipt: ack });
+      },
+    });
+    await assert.rejects(enrollment.enroll({ harnesses: ['codex'] }), /did not confirm signed enrollment receipts/);
+    await enrollment.settled();
+    assert.deepEqual(requests, ['/.well-known/agent-bot-server-key', '/oauth/device_authorization']);
+    assert.deepEqual(events, []);
+    assert.equal(enrollment.progress().grant, undefined);
+    assert.equal(existsSync(join(home, 'identity/device.json')), false);
+    assert.equal(existsSync(join(home, 'identity/pending-receipt.json')), false);
+  });
+});
+
 test('receipt polling stops at expiry or an explicit refusal; ordinary grants do not retry receipt errors', async (t) => {
   for (const [label, receipt, status, error, reason, polls] of [
     ['receipt signer remains unavailable', true, 503, 'credential_unavailable', /expired/, 2],
@@ -170,6 +206,7 @@ test('receipt polling stops at expiry or an explicit refusal; ordinary grants do
         });
         if (path === '/oauth/device_authorization') return Response.json({
           device_code: 'fixture', user_code: 'TEST', expires_in: 5, interval: 2,
+          ...(receipt && { enrollment_receipt: 'agent-bot-sig-v1' }),
         });
         assert.equal(path, '/oauth/token');
         attempts++;

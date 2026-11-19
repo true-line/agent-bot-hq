@@ -44,6 +44,7 @@ export const DEFAULT_IDENTITY_SERVICE = 'https://agents.true-line.ai';
 export const GRANT_DEVICE_CODE = 'urn:ietf:params:oauth:grant-type:device_code';
 export const GRANT_JWT_BEARER = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
 
+const ENROLLMENT_RECEIPT = 'agent-bot-sig-v1';
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_BODY_BYTES = 64 * 1024;
 const HARNESS = /^[a-z0-9][a-z0-9-]{0,63}$/;
@@ -272,9 +273,12 @@ export function createEnrollment({
     const aud = `${server}/oauth/device_authorization`;
     const name = payload.device_name ?? deviceName;
     const proof = await signer.enrollmentProof(aud);
-    const { ok, body: auth } = await request('/oauth/device_authorization', { ...(signer.bindEnrollment && { enrollment_receipt: 'agent-bot-sig-v1' }), device_name: name, platform, key_storage: k.key_storage, tags: '', harnesses: harnesses.join(' '), proof });
+    const { ok, body: auth } = await request('/oauth/device_authorization', { ...(signer.bindEnrollment && { enrollment_receipt: ENROLLMENT_RECEIPT }), device_name: name, platform, key_storage: k.key_storage, tags: '', harnesses: harnesses.join(' '), proof });
     if (!ok || typeof auth.user_code !== 'string' || typeof auth.device_code !== 'string') throw new Error(oauthMessage('device authorization failed', auth));
 
+    if (signer.bindEnrollment && auth.enrollment_receipt !== ENROLLMENT_RECEIPT) {
+      throw new Error('the identity service did not confirm signed enrollment receipts');
+    }
     const started = clock.now();
     grant = {
       state: 'pending',
