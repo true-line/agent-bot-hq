@@ -147,6 +147,14 @@ struct MachineInstallationProbe {
             }
         }
         if identity { return .priorIdentity }
+        // A stopped or partially installed Machine may leave its shared
+        // channel behind before a public pin is available.
+        for prefix in prefixes {
+            switch observePath(prefix + "/var/agent-machine", followLeaf: false) {
+            case .missing: continue
+            case .present, .invalid: return .indeterminate
+            }
+        }
         return uncertain ? .indeterminate : .noStandardEvidence
     }
 }
