@@ -155,3 +155,31 @@ command as the paired HQ role.
 ```sh
 node hq/main.mjs machine hq-service-recovery cancel --challenge-file "$challenge_file" --socket "$socket"
 ```
+
+### Upgrade a paired macOS service
+
+Run the upgrade-capable HQ CLI as the existing dedicated role. Use the saved
+Machine plan for replacing the installed v2 service. Its unchanged account
+and service owner, current plan ID and digest, previous and next release
+records, and both LaunchDaemon plists are covered by the challenge.
+
+```sh
+node hq/main.mjs machine hq-service-upgrade export "$plan_id" --socket "$socket" > "$challenge_file"
+```
+
+Transfer the original signed line to the daily owner's upgrade reviewer.
+Confirm the independently trusted Machine fingerprint and both release records.
+Return the operation-specific proof to the paired role within the challenge
+lifetime. An approved reply records the normal short-lived members approval
+for the exact replacement plan. Machine applies the saved plan separately.
+
+```sh
+node hq/main.mjs machine hq-service-upgrade approve --challenge-file "$challenge_file" --proof-file "$proof_file" --socket "$socket"
+```
+
+To discard a pending upgrade, return its original challenge to Machine as
+the paired role.
+
+```sh
+node hq/main.mjs machine hq-service-upgrade cancel --challenge-file "$challenge_file" --socket "$socket"
+```

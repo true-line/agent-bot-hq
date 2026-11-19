@@ -1,0 +1,1 @@
+The dedicated macOS HQ role can transfer a running service upgrade for owner review. The client verifies both releases, their launch configurations and the existing Machine pairing before it returns the one-time proof.
