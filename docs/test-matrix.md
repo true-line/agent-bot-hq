@@ -60,6 +60,13 @@ service restart, and the protected T02 observation remain separate checks under
 [HQ #107](https://github.com/true-line/agent-bot-hq/issues/107) and
 [PDR-0085](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0085-macos-first-protected-pilot.md).
 
+The macOS signer protocol job runs `tests/hq-enrollment.test.mjs` with a
+disposable software helper. Two successive HQ processes receive an ordinary
+owner `device.enroll` request. A loopback receiver verifies both ES256 proofs
+for its own audience, observes fresh request IDs and matches the signing key
+to the original owner-status thumbprint. It declines each request before
+issuing a device code. HQ reports the cooperative profile throughout.
+
 The Darwin artifact job also boots the same disposable system LaunchDaemon
 twice. Both executions use the native HQ helper's role check, dedicated file
 Keychain and hardware signer protocol. The item holds only CryptoKit's
@@ -69,11 +76,27 @@ signature, sign a new challenge and explicitly rekey. The test executable
 links an independent test main. The production executable must refuse on
 the unprovisioned runner.
 
-Production source is under `helpers/macos-enclave/`. Build all three Swift
-files into the native executable of the provisioned Developer ID bundle
-`ai.true-line.hq.signer`, and supply the installed executable's absolute path
-to the existing `features.hardwareSigner` and `signer.backend: helper`
-configuration. The entry point checks the Developer ID requirement and signed
+Build the Apple Silicon macOS 15+ production signer from a reviewed HQ checkout or its Darwin source archive. Run the following from the directory containing `helpers/`.
+
+```sh
+sh helpers/macos-enclave/build.sh /absolute/path/to/new-output
+```
+
+The new directory contains `AgentBotHQSigner.app` and the separate `HQSigner.entitlements.in` release template. Given the same Swift compiler, SDK and target, the native CI job compares the outputs built in two directories. The arm64 linker may apply its own ad hoc signature. The unprovisioned app refuses signer operations.
+
+For a private provisioned build, the release operator needs a Developer ID Application identity matching the production requirement in `helpers/macos-enclave/main.swift` and a distribution profile authorizing `ai.true-line.hq.signer`. The signing step must resolve the template's team and application-identifier prefix from the approved signing inputs. Apple's `AppIdentifierPrefix` includes the trailing period and can differ from the team identifier. The final application's identifier and sole Keychain group must match the authorized application identifier. The bundle's code identifier must be `ai.true-line.hq.signer`. After signing, notarization and protected installation, configure `features.hardwareSigner` and `signer.backend: helper` with the absolute path to `AgentBotHQSigner.app/Contents/MacOS/agent-bot-hq-signer`.
+
+During private release verification, take the approved team ID and fully qualified HQ App ID from the independently validated provisioning inputs. Compare them with the entitlements embedded in the signed app:
+
+```sh
+set -o pipefail
+/usr/bin/codesign --display --entitlements - --xml "$HQ_SIGNER_APP" |
+  /usr/bin/python3 helpers/macos-enclave/verify-entitlements.py "$APPROVED_TEAM_ID" "$APPROVED_APP_ID"
+```
+
+This offline check compares the team, application identifier and sole Keychain group. Keep the release’s Developer ID signature, provisioning and notarization checks in place.
+
+The entry point checks the Developer ID requirement and signed
 application and access-group entitlements. The helper runs only as the
 dedicated HQ user, uses the role account's private home from the account
 database, and unlocks its own file Keychain without UI. The interactive

@@ -11,12 +11,21 @@ node_bin="$(node -p 'process.execPath')"
 probe="$RUNNER_TEMP/hq-fixture-signer"
 sources=(helpers/macos-enclave/Signer.swift helpers/macos-enclave/RoleStore.swift)
 xcrun swiftc "${sources[@]}" tests/fixtures/enclave-keychain/main.swift -o "$probe"
-xcrun swiftc "${sources[@]}" helpers/macos-enclave/main.swift -o "$RUNNER_TEMP/hq-release-signer"
-sudo install -o root -g wheel -m 0555 "$RUNNER_TEMP/hq-release-signer" "$stage/release-signer"
-if sudo -n -H -u "$role" "$stage/release-signer" status <<< '{}' >"$RUNNER_TEMP/hq-release-status"; then
-  echo 'Unprovisioned production helper accepted a signer operation' >&2; exit 1
+# Use the same bundle builder as the private release operator, from the unpacked tar.
+build="$RUNNER_TEMP/hq-release-signer"
+bash "$stage/hq/helpers/macos-enclave/build.sh" "$build"
+sudo cp -R "$build/AgentBotHQSigner.app" "$stage/"
+signer="$stage/AgentBotHQSigner.app/Contents/MacOS/agent-bot-hq-signer"
+if [[ ! -f "$signer" || -L "$signer" || ! "$(/usr/bin/stat -f '%u:%Lp' "$signer")" =~ ^0:(555|755)$ ]]; then
+  echo 'Expected a root-owned, executable production signer' >&2; exit 1
 fi
-test ! -s "$RUNNER_TEMP/hq-release-status"
+result=0
+sudo -n -H -u "$role" -- "$signer" status <<< '{}' \
+  >"$RUNNER_TEMP/hq-release-status" 2>"$RUNNER_TEMP/hq-release-error" || result=$?
+if [[ "$result" != 1 || -s "$RUNNER_TEMP/hq-release-status" ]] ||
+   ! cmp -s "$RUNNER_TEMP/hq-release-error" <(printf '%s\n' 'HQ Secure Enclave signer unavailable'); then
+  echo 'Expected the unprovisioned production signer to refuse status under the HQ role' >&2; exit 1
+fi
 sudo install -o root -g wheel -m 0555 "$probe" "$stage/fixture-signer"
 if "$stage/fixture-signer" status <<< '{}' >"$RUNNER_TEMP/hq-foreign-status"; then
   echo 'A foreign UID was allowed to use the HQ signer' >&2; exit 1
