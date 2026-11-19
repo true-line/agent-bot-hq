@@ -4,7 +4,8 @@ set -euo pipefail
 [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "$(uname -s)" == Darwin ]]
 label=ai.true-line.agent-bot-hq
 plist="/Library/LaunchDaemons/$label.plist"
-socket=/private/var/agent-bot-hq-control.sock
+runtime='/Library/Application Support/ai.true-line.agent-bot-hq'
+socket="$runtime/owner-control.sock"
 role=_agent-bot-hq
 state=/var/agent-bot-hq/.agent-bot-hq
 owner="$(id -un)"
@@ -14,25 +15,34 @@ helper="$archive/helpers/darwin-owner.rb"
 system_node="${1:?node executable required}"
 
 [[ "$(id -u)" != 0 && "$(id -u)" != "$(id -u "$role")" ]]
-[[ ! -e "$plist" && ! -L "$plist" && ! -e "$socket" && ! -L "$socket" ]]
+[[ ! -e "$plist" && ! -L "$plist" && ! -e "$runtime" && ! -L "$runtime" ]]
 if sudo launchctl print "system/$label" >/dev/null 2>&1; then
   echo "a system HQ job already exists" >&2
   exit 1
 fi
 work="$(sudo mktemp -d /Library/hq-owner-ci.XXXXXXXX)"
+runtime_created=false
 cleanup() {
   sudo launchctl bootout "system/$label" >/dev/null 2>&1 || true
   sudo rm -f "$plist"
-  if [[ -S "$socket" ]]; then sudo rm -f "$socket"; fi
+  if [[ "$runtime_created" == true ]]; then
+    if [[ -S "$socket" ]]; then sudo rm -f "$socket"; fi
+    sudo rmdir "$runtime"
+  fi
   sudo rm -rf "$work"
 }
 trap cleanup EXIT
+sudo mkdir -m 0755 "$runtime"
+runtime_created=true
+sudo chown root:wheel "$runtime"
 sudo chmod 0755 "$work"
 # This test runner keeps its Node next to its native runtime libraries.
 sudo install -m 0600 -o "$role" -g "$role" /dev/null "$work/launchd.stderr"
 sudo -n -H -u "$role" "$system_node" --version
 "$system_node" --test tests/hq-owner-control.test.mjs
-"$system_node" "$entry" check-owner-control | jq -e '.capability == "darwin-owner-control/v1"' >/dev/null
+capability="$(jq -er '.owner_control_capability | select(. == "darwin-owner-control/v2")' "$archive/governance/interim-release.json")"
+"$system_node" "$entry" check-owner-control | jq -e --arg expected "$capability" \
+  '.capability == $expected and .launch_diagnostics == "darwin-hq-launch-exits/v2"' >/dev/null
 
 # Generate typed launchd properties with the same service, socket and CLI
 # arguments that Machine installs. launchd owns the listener.

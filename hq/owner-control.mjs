@@ -8,7 +8,7 @@ import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const darwin = process.platform === 'darwin';
-export const OWNER_CONTROL_PATH = darwin ? '/private/var/agent-bot-hq-control.sock' : '/run/agent-bot-hq/control.sock';
+export const OWNER_CONTROL_PATH = darwin ? '/Library/Application Support/ai.true-line.agent-bot-hq/owner-control.sock' : '/run/agent-bot-hq/control.sock';
 export const OWNER_PEER_CHECK = darwin ? 'getpeereid' : 'SO_PEERCRED';
 const interpreter = darwin ? '/usr/bin/ruby' : '/usr/bin/python3';
 const helper = darwin
@@ -27,11 +27,11 @@ export function checkOwnerControlSupport() {
   if ((!darwin && process.platform !== 'linux') || !check(['probe'])) {
     throw new Error(`owner control requires a working ${OWNER_PEER_CHECK} helper on this platform`);
   }
-  return darwin ? 'darwin-owner-control/v1' : 'linux-owner-control/v1';
+  return darwin ? 'darwin-owner-control/v2' : 'linux-owner-control/v1';
 }
 
 export function checkOwnerSocketPath(ownerUid) {
-  const ancestry = darwin ? ['/private', '/private/var'] : ['/run', dirname(OWNER_CONTROL_PATH)];
+  const ancestry = darwin ? ['/', '/Library', '/Library/Application Support', dirname(OWNER_CONTROL_PATH)] : ['/run', dirname(OWNER_CONTROL_PATH)];
   for (const dir of ancestry) {
     const st = lstatSync(dir);
     if (!st.isDirectory() || st.uid !== 0 || (st.mode & 0o022)) throw new Error(`owner control requires a root-managed directory at ${dir}`);

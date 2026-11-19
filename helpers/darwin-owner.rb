@@ -5,8 +5,8 @@ require 'fiddle'
 require 'etc'
 
 abort 'requires macOS' unless RUBY_PLATFORM.include?('darwin')
-CONTROL = '/private/var/agent-bot-hq-control.sock'.freeze
-# darwin-hq-launch-exits/v1 describes launcher stages only. Keep helper CLI
+CONTROL = '/Library/Application Support/ai.true-line.agent-bot-hq/owner-control.sock'.freeze
+# darwin-hq-launch-exits/v2 describes launcher stages only. Keep helper CLI
 # boolean refusals and unrelated Ruby failures outside this mapping.
 LAUNCH_ROLE = 80
 LAUNCH_CHECKIN = 81
@@ -15,6 +15,7 @@ LAUNCH_DESCRIPTOR = 83
 LAUNCH_PUBLIC_PATH = 84
 LAUNCH_ADDRESS = 85
 LAUNCH_EXEC = 86
+LAUNCH_CHECKIN_159 = 88
 
 def stop_launch(code, message)
   warn message
@@ -30,7 +31,7 @@ end
 def published_control?(wait: 0)
   deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + wait
   loop do
-    ['/private', '/private/var'].each do |path|
+    ['/', '/Library', '/Library/Application Support', File.dirname(CONTROL)].each do |path|
       dir = File.lstat(path)
       return false unless dir.directory? && dir.uid.zero? && (dir.mode & 0o022).zero?
     end
@@ -124,6 +125,7 @@ def activated_socket
   rescue Fiddle::DLError
     stop_launch(LAUNCH_CHECKIN, 'launchd socket activation unavailable')
   end
+  stop_launch(LAUNCH_CHECKIN_159, 'launchd socket activation returned 159') if result == 159
   stop_launch(LAUNCH_CHECKIN, 'launchd socket activation failed') unless result == 0
   stop_launch(LAUNCH_COUNT, 'expected exactly one owner-control descriptor') unless count[0, Fiddle::SIZEOF_SIZE_T].unpack1('J') == 1
   descriptors = Fiddle::Pointer.new(list[0, Fiddle::SIZEOF_VOIDP].unpack1('J'))

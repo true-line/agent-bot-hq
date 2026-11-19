@@ -10,7 +10,7 @@ def expect_exit(code)
     yield
     raise 'unexpected success'
   rescue SystemExit => e
-    raise "unexpected exit #{e.status}" unless e.status == code
+    raise "unexpected exit #{e.status}" unless Array(code).include?(e.status)
     raise 'private path entered stderr' if $stderr.string.include?('private-probe-marker')
   ensure
     $stderr = saved
@@ -18,9 +18,13 @@ def expect_exit(code)
 end
 
 # This test process is outside launchd, so a real check-in must fail.
-expect_exit(81) { activated_socket }
+expect_exit([81, 88]) { activated_socket }
 
 fixture = Object.new
+[[159, 88], [Errno::ENOENT::Errno, 81], [Errno::ESRCH::Errno, 81], [118, 81]].each do |result, expected_exit|
+  fixture.define_singleton_method(:activation) { ->(_name, _list, _count) { result } }
+  expect_exit(expected_exit) { fixture.send(:activated_socket) }
+end
 def fixture.activation
   lambda { |_name, _list, count| count[0, Fiddle::SIZEOF_SIZE_T] = [2].pack('J'); 0 }
 end
@@ -61,7 +65,7 @@ good = stats.new(:socket, 0, 0666)
 File.singleton_class.prepend(Module.new do
   def lstat(path)
     sample = Thread.current[:hq_publication_lstat]
-    sample && ['/private', '/private/var', CONTROL].include?(path) ? sample.call(path) : super
+    sample && ['/', '/Library', '/Library/Application Support', File.dirname(CONTROL), CONTROL].include?(path) ? sample.call(path) : super
   end
 end)
 
@@ -71,7 +75,7 @@ def check_samples(parent_stat, leaves, wait, expected, parent_failure: nil)
   Thread.current[:hq_publication_lstat] = lambda do |path|
     unless path == CONTROL
       parents += 1
-      raise parent_failure if path == '/private/var' && parent_failure
+      raise parent_failure if path == File.dirname(CONTROL) && parent_failure
       next parent_stat
     end
     sample = leaves.fetch([calls, leaves.length - 1].min)
@@ -86,8 +90,10 @@ ensure
   Thread.current[:hq_publication_lstat] = nil
 end
 
+raise 'unexpected public endpoint' unless CONTROL == '/Library/Application Support/ai.true-line.agent-bot-hq/owner-control.sock'
+
 calls, parents, = check_samples(dir, [Errno::ENOENT, good], 0.5, true)
-raise 'did not recheck exact leaf and ancestry' unless calls == 2 && parents == 4
+raise 'did not recheck exact leaf and ancestry' unless calls == 2 && parents == 8
 calls, _, elapsed = check_samples(dir, [Errno::ENOENT], 0.05, false)
 raise 'unbounded or busy wait' unless calls.between?(2, 5) && elapsed.between?(0.045, 1)
 [stats.new(:socket, 0, 0600), stats.new(:socket, 501, 0666), stats.new(:symlink, 0, 0777),
@@ -99,7 +105,7 @@ calls, = check_samples(dir, [Errno::ENOENT, stats.new(:symlink, 0, 0777), good],
 raise 'invalid replacement retried after absence' unless calls == 2
 [Errno::ENOENT, Errno::EACCES].each do |err|
   calls, parents, = check_samples(dir, [good], 0.5, false, parent_failure: err)
-  raise 'invalid ancestry retried' unless calls.zero? && parents == 2
+  raise 'invalid ancestry retried' unless calls.zero? && parents == 4
 end
 calls, parents, = check_samples(stats.new(:dir, 0, 0775), [good], 0.5, false)
 raise 'unsafe parent accepted' unless calls.zero? && parents == 1

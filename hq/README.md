@@ -234,9 +234,13 @@ peer-credential check and a service unit, is #88.
 ## macOS LaunchDaemon owner control
 
 The Darwin source artifact supports `check-owner-control`, which prints
-`{"capability":"darwin-owner-control/v1","launch_diagnostics":"darwin-hq-launch-exits/v1"}`
+`{"capability":"darwin-owner-control/v2","launch_diagnostics":"darwin-hq-launch-exits/v2"}`
 when the system Ruby can load the native launchd API and read a kernel peer UID
-on a Unix socket. Older artifacts can return just `capability`. A system
+on a Unix socket. The Darwin archive records the same transport version in
+`governance/interim-release.json` under `owner_control_capability`. Version 1
+artifacts use `/private/var/agent-bot-hq-control.sock`. Use the matching
+release’s owner CLI for an installed service. The launch diagnostics
+version is independent of the transport version. A system
 LaunchDaemon under `_agent-bot-hq` takes these program arguments in order:
 
 ```text
@@ -254,10 +258,12 @@ run
 ```
 
 Configure a single launchd `Sockets` dictionary named `owner-control` with
-`SockType=stream`, `SockPathName=/private/var/agent-bot-hq-control.sock`
-and `SockPathMode` integer 438 (0666). Launchd owns the socket in a
-root-controlled directory. The helper checks in with `launch_activate_socket`,
-checks the returned listening stream, and replaces itself with Node. Before
+`SockType=stream`, `SockPathName=/Library/Application Support/ai.true-line.agent-bot-hq/owner-control.sock`
+and `SockPathMode` integer 438 (0666). The installer provides the
+`ai.true-line.agent-bot-hq` directory as root:wheel, mode 0755. HQ verifies
+the root-managed ancestry before using the launchd-owned socket. The helper
+checks in with `launch_activate_socket`, validates the returned listening stream,
+and replaces itself with Node. Before
 accepting an owner session or reading its requests, HQ checks the connected
 peer with Darwin `getpeereid` against the configured owner UID. The owner can
 run `status --owner-control --json` and inspect `hq.sockets.ownerControl`.
@@ -266,8 +272,10 @@ The dedicated account retains its private state directory and control socket.
 
 ### macOS launch exit statuses
 
-When the verified artifact advertises `darwin-hq-launch-exits/v1`, Machine can
+When the verified artifact advertises `darwin-hq-launch-exits/v2`, Machine can
 interpret the approved job's `launchctl print` last exit code using this table.
+Version 1 covers exits 80 through 87. Version 2 also distinguishes native
+socket activation result 159.
 Each value identifies the startup check that failed. It contains no login,
 key, path, or child output.
 
@@ -281,6 +289,7 @@ key, path, or child output.
 | 85 | The native launcher could not verify the launchd-bound address and its provenance. |
 | 86 | The native launcher could not execute the approved Node runtime. |
 | 87 | After exec, HQ could not activate the inherited owner-control listener. |
+| 88 | Native socket activation returned 159. On macOS 27.0.1 (26A434), `launchctl error posix 159` reports `Sandbox restriction`. |
 
 At launch, the helper waits up to three seconds if the exact public socket
 is initially absent under its verified root-owned directories. Every sample

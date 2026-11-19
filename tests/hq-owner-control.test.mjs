@@ -7,7 +7,7 @@ import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { authenticateOwner, checkOwnerControlSupport } from '../hq/owner-control.mjs';
+import { authenticateOwner, checkOwnerControlSupport, OWNER_CONTROL_PATH } from '../hq/owner-control.mjs';
 
 test('owner control compares the connected peer UID with the configured owner', { skip: !['linux', 'darwin'].includes(process.platform) }, async (t) => {
   checkOwnerControlSupport();
@@ -44,8 +44,9 @@ test('Darwin reports only versioned launch failures and keeps ordinary CLI exits
   execFileSync('/usr/bin/ruby', ['--disable-gems', fileURLToPath(new URL('darwin-owner-exits.rb', import.meta.url))]);
   const status = (error, expected) => error.status === expected && !error.stderr.includes('private-probe-marker');
   assert.throws(() => execFileSync('/usr/bin/ruby', ['--disable-gems', helper, 'launch', 'private-probe-marker'], { stdio: 'pipe' }), (e) => status(e, 80));
+  assert.equal(OWNER_CONTROL_PATH, '/Library/Application Support/ai.true-line.agent-bot-hq/owner-control.sock');
   assert.deepEqual(JSON.parse(execFileSync(process.execPath, [entry, 'check-owner-control'])), {
-    capability: 'darwin-owner-control/v1', launch_diagnostics: 'darwin-hq-launch-exits/v1',
+    capability: 'darwin-owner-control/v2', launch_diagnostics: 'darwin-hq-launch-exits/v2',
   });
   // Invalid account syntax fails before any socket access. In an explicitly
   // marked launch, the post-exec activation boundary has its own status.

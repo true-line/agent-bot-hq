@@ -123,7 +123,7 @@ async function main(argv) {
   if (args.cmd === 'check-owner-control') {
     const capability = checkOwnerControlSupport();
     const report = { capability };
-    if (capability === 'darwin-owner-control/v1') report.launch_diagnostics = 'darwin-hq-launch-exits/v1';
+    if (process.platform === 'darwin') report.launch_diagnostics = 'darwin-hq-launch-exits/v2';
     console.log(JSON.stringify(report));
     return;
   }
