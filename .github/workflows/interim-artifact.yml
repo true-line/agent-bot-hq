@@ -62,4 +62,4 @@ jobs:
           sudo useradd --system --user-group --create-home --home-dir /var/lib/agent-bot-hq --shell /usr/sbin/nologin agent-bot-hq
           sudo chmod 0700 /var/lib/agent-bot-hq
           cd "$stage/hq"
-          sudo -n -H -u agent-bot-hq -- bash tests/dedicated-hq-account.sh "$(command -v node)"
+          sudo -n -H -u agent-bot-hq -- bash tests/dedicated-hq-account.sh "$(command -v node)" --disposable-machine-role
