@@ -234,8 +234,9 @@ peer-credential check and a service unit, is #88.
 ## macOS LaunchDaemon owner control
 
 The Darwin source artifact supports `check-owner-control`, which prints
-`{"capability":"darwin-owner-control/v1"}` when the system Ruby can load the
-native launchd API and read a kernel peer UID on a Unix socket. A system
+`{"capability":"darwin-owner-control/v1","launch_diagnostics":"darwin-hq-launch-exits/v1"}`
+when the system Ruby can load the native launchd API and read a kernel peer UID
+on a Unix socket. Older artifacts can return just `capability`. A system
 LaunchDaemon under `_agent-bot-hq` takes these program arguments in order:
 
 ```text
@@ -261,3 +262,26 @@ accepting an owner session or reading its requests, HQ checks the connected
 peer with Darwin `getpeereid` against the configured owner UID. The owner can
 run `status --owner-control --json` and inspect `hq.sockets.ownerControl`.
 The dedicated account retains its private state directory and control socket.
+
+
+### macOS launch exit statuses
+
+When the verified artifact advertises `darwin-hq-launch-exits/v1`, Machine can
+interpret the approved job's `launchctl print` last exit code using this table.
+Each value identifies the startup check that failed. It contains no login,
+key, path, or child output.
+
+| Exit | Startup check |
+| --- | --- |
+| 80 | The native launcher could not verify the dedicated role or its launch arguments. |
+| 81 | The native launcher could not complete launchd socket check-in. |
+| 82 | Launchd returned a descriptor count other than one. |
+| 83 | The native launcher could not open or verify the inherited Unix stream descriptor. |
+| 84 | The native launcher could not verify the protected public socket or its directory metadata. |
+| 85 | The native launcher could not verify the launchd-bound address and its provenance. |
+| 86 | The native launcher could not execute the approved Node runtime. |
+| 87 | After exec, HQ could not activate the inherited owner-control listener. |
+
+Use the numeric observation alone for an unknown code, an unrecognized
+diagnostics version, or an older artifact. Exit 1 can come from several
+startup or runtime failures. A launchd signal is a separate observation.

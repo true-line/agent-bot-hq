@@ -121,14 +121,27 @@ async function main(argv) {
   }
   const args = parse(argv);
   if (args.cmd === 'check-owner-control') {
-    console.log(JSON.stringify({ capability: checkOwnerControlSupport() }));
+    const capability = checkOwnerControlSupport();
+    const report = { capability };
+    if (capability === 'darwin-owner-control/v1') report.launch_diagnostics = 'darwin-hq-launch-exits/v1';
+    console.log(JSON.stringify(report));
     return;
   }
   const controlPath = args.ownerControl ? OWNER_CONTROL_PATH : join(args.home, 'control.sock');
   if (args.ownerControl) checkOwnerSocketPath(process.getuid?.());
   if (args.cmd === 'run') {
     if ([process.env.LISTEN_PID, process.env.HQ_LAUNCHD_OWNER_PID].includes(String(process.pid)) && !args.ownerAccount) throw new Error('socket activation requires --owner-account NAME');
-    const ownerControl = args.ownerAccount ? await activatedOwnerControl(args.ownerAccount) : undefined;
+    let ownerControl;
+    try {
+      if (args.ownerAccount) ownerControl = await activatedOwnerControl(args.ownerAccount);
+    } catch (error) {
+      if (process.platform !== 'darwin' || process.env.HQ_LAUNCHD_OWNER_PID !== String(process.pid)) throw error;
+      // Only this inherited owner-control startup boundary has a versioned
+      // post-exec exit status. Later service failures retain normal handling.
+      console.error('HQ could not activate the inherited macOS owner-control listener');
+      process.exitCode = 87;
+      return;
+    }
     try {
       const hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins: readPins(PINS), pluginsDir: args.plugins, devPlugins: args.devPlugins });
       // Handlers first, so a signal during start still shuts down cleanly.
