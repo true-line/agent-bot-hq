@@ -60,6 +60,13 @@ service restart, and the protected T02 observation remain separate checks under
 [HQ #107](https://github.com/true-line/agent-bot-hq/issues/107) and
 [PDR-0085](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0085-macos-first-protected-pilot.md).
 
+The macOS signer protocol job runs `tests/hq-enrollment.test.mjs` with a
+disposable software helper. Two successive HQ processes receive an ordinary
+owner `device.enroll` request. A loopback receiver verifies both ES256 proofs
+for its own audience, observes fresh request IDs and matches the signing key
+to the original owner-status thumbprint. It declines each request before
+issuing a device code. HQ reports the cooperative profile throughout.
+
 The Darwin artifact job also boots the same disposable system LaunchDaemon
 twice. Both executions use the native HQ helper's role check, dedicated file
 Keychain and hardware signer protocol. The item holds only CryptoKit's

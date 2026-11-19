@@ -1,6 +1,10 @@
 // HQ's own enrollment (plan §9 row 15c; hq/enrollment.mjs): the device-code
 // grant against a stand-in identity service, signed by the HQ signer's key.
 import { test } from 'node:test';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { createPublicKey, generateKeyPairSync, verify as cryptoVerify } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -8,6 +12,7 @@ import { join } from 'node:path';
 import { validateConfig } from '../hq/hq.mjs';
 import { createEnrollment, validateServiceUrl } from '../hq/enrollment.mjs';
 import { createSigner, softwareKeyBackend } from '../hq/signer.mjs';
+import { connectSocket } from '../hq/socket.mjs';
 import { startHQ, tempHome } from './hq-harness.mjs';
 import { fakeIdentityService } from './identity-service-fixture.mjs';
 
@@ -206,6 +211,66 @@ test('HQ configured with enrollment.source hq: the grant runs from config alone 
     assert.ok(kinds.indexOf('device.enroll.started') < kinds.indexOf('device.enrolled'));
     assert.equal(t.hq.core.receipts.find((r) => r.kind === 'device.enrolled').key_storage, 'software');
   } finally { await t.done(); await svc.close(); }
+});
+
+test('two HQ processes use the same helper pin for independently verified owner enrollment requests', { skip: !['darwin', 'linux'].includes(process.platform) }, async (t) => {
+  const home = tempHome();
+  const helperHome = tempHome();
+  const observations = [];
+  const service = await fakeIdentityService({ observeProof: (record) => observations.push(record) });
+  t.after(async () => {
+    await service.close();
+    for (const dir of [home, helperHome]) rmSync(dir, { recursive: true, force: true });
+  });
+  // The helper emulates device custody with a disposable software key outside HQ.
+  const helper = fileURLToPath(new URL('signer-helper-fixture.mjs', import.meta.url));
+  const main = fileURLToPath(new URL('../hq/main.mjs', import.meta.url));
+  writeFileSync(join(home, 'config.json'), JSON.stringify({
+    features: { hardwareSigner: true },
+    signer: { backend: 'helper', command: [process.execPath, helper, join(helperHome, 'fixture.pem')] },
+    enrollment: { source: 'hq', server: service.url },
+  }), { mode: 0o600 });
+
+  let firstPin;
+  for (const round of [1, 2]) {
+    const child = spawn(process.execPath, [main, 'run', '--home', home], {
+      env: { HOME: home, PATH: '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 30000, killSignal: 'SIGKILL',
+    });
+    const exited = once(child, 'exit');
+    const output = createInterface({ input: child.stdout });
+    let owner;
+    try {
+      let listening = false;
+      for await (const line of output) {
+        if (line.startsWith('listening:')) { listening = true; break; }
+      }
+      assert.ok(listening, 'HQ must start its ordinary owner socket');
+      owner = await connectSocket(join(home, 'control.sock'));
+      const status = (await owner.request('status')).result;
+      const signer = status.hq.signer;
+      assert.equal(status.profile, 'managed-cooperative');
+      assert.deepEqual([signer.available, signer.backend, signer.key_files, signer.generation], [true, 'helper', 0, 1]);
+      if (round === 1) firstPin = signer.thumbprint;
+      else assert.equal(signer.thumbprint, firstPin);
+
+      const response = await owner.request('device.enroll', { harnesses: ['test-harness'], device_name: 't02-fixture' });
+      assert.equal(response.ok, false);
+      assert.equal(observations.length, round, 'the receiver verified an ES256 device proof for its own audience');
+      assert.equal(observations[round - 1].thumbprint, firstPin);
+      assert.match(observations[round - 1].requestID, /^[A-Za-z0-9_-]{22}$/);
+      assert.equal((await owner.request('device.status')).result.device, 'unenrolled');
+    } finally {
+      await owner?.close();
+      child.kill('SIGTERM');
+      const [code] = await exited;
+      assert.equal(code, 0, 'HQ must shut down cleanly');
+    }
+  }
+  assert.notEqual(observations[0].requestID, observations[1].requestID);
+  assert.equal(service.state.requests.length, 0, 'raw request forms are never retained in observation mode');
+  assert.equal(service.state.grants.size, 0);
+  assert.equal(service.state.devices.length, 0);
 });
 
 test('notice harness membership is secret-free and tied to the current enrolled record, server and signer key', async () => {
