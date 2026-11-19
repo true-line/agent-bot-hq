@@ -69,11 +69,17 @@ signature, sign a new challenge and explicitly rekey. The test executable
 links an independent test main. The production executable must refuse on
 the unprovisioned runner.
 
-Production source is under `helpers/macos-enclave/`. Build all three Swift
-files into the native executable of the provisioned Developer ID bundle
-`ai.true-line.hq.signer`, and supply the installed executable's absolute path
-to the existing `features.hardwareSigner` and `signer.backend: helper`
-configuration. The entry point checks the Developer ID requirement and signed
+Build the Apple Silicon macOS 15+ production signer from a reviewed HQ checkout or its Darwin source archive. Run the following from the directory containing `helpers/`.
+
+```sh
+sh helpers/macos-enclave/build.sh /absolute/path/to/new-output
+```
+
+The new directory contains `AgentBotHQSigner.app` and the separate `HQSigner.entitlements.in` release template. Given the same Swift compiler, SDK and target, the native CI job compares the outputs built in two directories. The arm64 linker may apply its own ad hoc signature. The unprovisioned app refuses signer operations.
+
+For a private provisioned build, the release operator needs a Developer ID Application identity matching the production requirement in `helpers/macos-enclave/main.swift` and a distribution profile authorizing `ai.true-line.hq.signer`. The signing step must resolve the template's team and application-identifier prefix from the approved signing inputs. Apple's `AppIdentifierPrefix` includes the trailing period and can differ from the team identifier. The final application's identifier and sole Keychain group must match the authorized application identifier. The bundle's code identifier must be `ai.true-line.hq.signer`. After signing, notarization and protected installation, configure `features.hardwareSigner` and `signer.backend: helper` with the absolute path to `AgentBotHQSigner.app/Contents/MacOS/agent-bot-hq-signer`.
+
+The entry point checks the Developer ID requirement and signed
 application and access-group entitlements. The helper runs only as the
 dedicated HQ user, uses the role account's private home from the account
 database, and unlocks its own file Keychain without UI. The interactive

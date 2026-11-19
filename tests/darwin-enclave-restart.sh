@@ -11,9 +11,11 @@ node_bin="$(node -p 'process.execPath')"
 probe="$RUNNER_TEMP/hq-fixture-signer"
 sources=(helpers/macos-enclave/Signer.swift helpers/macos-enclave/RoleStore.swift)
 xcrun swiftc "${sources[@]}" tests/fixtures/enclave-keychain/main.swift -o "$probe"
-xcrun swiftc "${sources[@]}" helpers/macos-enclave/main.swift -o "$RUNNER_TEMP/hq-release-signer"
-sudo install -o root -g wheel -m 0555 "$RUNNER_TEMP/hq-release-signer" "$stage/release-signer"
-if sudo -n -H -u "$role" "$stage/release-signer" status <<< '{}' >"$RUNNER_TEMP/hq-release-status"; then
+# Use the same bundle builder as the private release operator, from the unpacked tar.
+build="$RUNNER_TEMP/hq-release-signer"
+bash "$stage/hq/helpers/macos-enclave/build.sh" "$build"
+sudo cp -R "$build/AgentBotHQSigner.app" "$stage/"
+if sudo -n -H -u "$role" "$stage/AgentBotHQSigner.app/Contents/MacOS/agent-bot-hq-signer" status <<< '{}' >"$RUNNER_TEMP/hq-release-status"; then
   echo 'Unprovisioned production helper accepted a signer operation' >&2; exit 1
 fi
 test ! -s "$RUNNER_TEMP/hq-release-status"
