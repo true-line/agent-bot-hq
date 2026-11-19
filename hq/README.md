@@ -26,22 +26,15 @@ node hq/main.mjs souls    # admitted Souls and their runtimes
 | Profile reporting: the profile in force, with the reasons a stronger one is not. Never `managed-protected` before §9 PR 16. | `profile.mjs` | §3.3, R8 |
 | Task service ([§9 PR 13](../docs/daemon-plugin-split.md#stage-1-local-vertical-slice-wp2wp4), #40): `task/v1` records in the store, the `task-v1` provider (platform PDR-0024). Members commit through `task.commit` with their runtime, over the admission connection or brokered with their bound runtime; only the task Soul's current lead at the current epoch and lease commits, and a specialist's request is recorded as a proposal (T20). CAS on the expected revision (`revision_conflict`), one commit per operation ID with the stored receipt for an exact repeat (T05), write-scope exclusion (`write_scope_conflict`, unless listed in `concurrentWriters`), and offers whose requester is their authenticated source (T04). The owner offers a task with `tasks.offer` and reads `tasks.list` and `tasks.get`. A bound member reads its Soul's waiting directives with the `task.directives` kind, each a wire/v1 directive-or-query record for a task the owner or HQ offered, and one of its Soul's tasks with `task.get`. A peer's offer is never a directive. | `tasks.mjs` | §4.2, 0.4 §7 |
 | hq/v1 Hello (with the admission result), Admit, Equip, Ready and Lease, checked against the pinned schemas in both directions. Versions are N/N−1 (T14). The owner's config holds the accepted definitions, there is one current installation epoch per Soul (T15), and leases have generations and renewal sequences. Runtimes are bound to the admitting connection. | `admission.mjs` | §4.2, 0.4 §5 |
-| Bootstrap per §4.4 through the SDK host. Device status comes from the legacy enrollment, so an unenrolled device or an unreadable signer is safe mode, and a revoked device is `device_revoked`. With legacy enrollment, credentials refuse with `credential_unavailable`. HQ enrollment selects the hardened link below; credential-reference resolution still waits for row 18. | `hq.mjs`, `legacy.mjs` | §4.4, §4.7 |
+| Bootstrap requires the paired HQ channel and a current device record bound by Machine. HQ enters safe mode if verification fails. | `hq.mjs`, `machine-device.mjs` | §4.4, §4.7 |
 | Installed plugins: one directory per plugin, with `plugin.json` (static fields) and `plugin.mjs`. Before any plugin code runs, the tree's sha256-manifest-v1 digest must match its pin in [`governance/plugins.json`](../governance/plugins.json), and the set must resolve from `plugin.json` alone. The code's `definePlugin` fields must then equal `plugin.json`. Symlinks are refused. A refused plugin gets a `hq.plugin.refused` receipt and a reason in status, and its dependents are refused with it. `--dev-plugins` skips the pin and status always names it. Core names (`hq`, `hq-admission`, `hq-tasks`, `hq-notices`) cannot be taken. | `plugins.mjs` | §4.1, §4.5 |
-| The HQ signer ([§9 row 15a](../docs/daemon-plugin-split.md#stage-2a-member-isolation-wp2)): one pinned P-256 key, used only through `sign`. Approval records carry its ES256 signature. The `software` backend keeps a key file in `signer/` (transition custody, `key_storage=software`); the `helper` backend runs an external helper that holds a hardware key and HQ keeps no key file (`key_storage=hardware`). HQ pins the public key's thumbprint, verifies every signature against it, and treats a missing or changed key as an unavailable signer, which is safe mode. `status` names the backend and custody, and a software key is a stated reason the profile is not `managed-protected`. `signer rekey` replaces the key while HQ is stopped. | `signer.mjs` | §3.2, §4.4 |
-| HQ's own enrollment ([§9 row 15c](../docs/daemon-plugin-split.md#stage-2a-member-isolation-wp2)), when `enrollment.source` is `hq`: the identity service's device-code grant with the proof signed by the signer's key, so the device record names that key and its `key_storage`. `device.enroll` returns the code to approve and HQ polls in the background; `device.status` and `status` show pending, approved or failed, and the outcome is a receipt. Re-enrollment makes a fresh key first, and a revoked record is never reused. It also builds the jwt-bearer assertion the identity-service link sends. | `enrollment.mjs` | §4.4, §4.7 |
+| Machine supplies the public P-256 identity and purpose-specific signatures. HQ verifies the pinned channel reply and the corresponding device signature before use. | `machine-channel.mjs`, `machine-device.mjs` | §3.2, §4.4 |
+| HQ starts the device-code grant over HTTPS, verifies the issuer-signed approved response and forwards the exact receipt for durable admin binding. The owner can retry a verified pending receipt after a lost reply. | `enrollment.mjs` | §4.4, §4.7 |
 | The existing daemon is probed and reported. It is started only when `legacy.supervise` is on, and never stopped. | `legacy.mjs` | §8.2 |
 
 ## Identity-service link (row 10)
 
-With `enrollment.source: "hq"`, `identity-service.mjs` uses the enrollment's
-signer assertion to request a DPoP-bound access token. The token and its fresh
-P-256 key stay in memory. Every request refuses redirects, bounds the entire
-response read, and checks the response's signature, key ID and request nonce
-before parsing JSON, including error replies. The same checks apply to the
-JWT-bearer token reply, using the assertion's nonce. Stop and verified device
-revocation discard credentials; an in-flight reply cannot restore them. A
-401 invalidates its token without replaying the operation.
+HQ owns HTTPS. Machine/keyd holds the administrator's device and DPoP signing keys. HQ verifies the issuer's response signature, key ID and exact request nonce before parsing each response. The token exchange binds the sender-constrained token to an administrator-owned session. The API client refuses operations without a matching purpose-specific proof. The first candidate reconciliation operation is an issuance lookup for a specific authorized task and operation. A verified token alone grants no lookup, notice access or credential issue. SDK approval records can be checked against the current public device key. A new approval decision stays pending when the administrator has no independently verified owner decision. A verified 401 invalidates the cached session token without replaying the request.
 
 [`governance/server-keys.json`](../governance/server-keys.json) is a release
 pin, separate from enrollment's transitional `identity/server-key.json`.
@@ -50,15 +43,6 @@ The transport never learns trust from the network. Each public key has one
 or `retired`). A pre-published next key is usable only inside its interval;
 retired, unknown and out-of-window keys refuse. Deploying rotation requires
 the reviewed release pin first.
-
-**Production activation is blocked.** The release pin currently has no keys.
-The service's public well-known response observed on 2026-11-13 has a key ID
-and public key but no operator-approved validity interval or rotation status.
-Those fields must be supplied and reviewed before the release pin is filled;
-no dates are invented. Until then identity operations return
-`credential_unavailable` and local work continues. Status reports the link,
-key count and whether a token is cached, never credentials. The legacy default
-is unchanged. Credential-reference resolution is still row 18.
 
 ## Linux owner control under the dedicated account
 
@@ -78,12 +62,7 @@ helper reads `SO_PEERCRED` from the connected stream. Only the UID of
 the configured owner opens an owner session. The owner uses
 `status --owner-control`, `souls --owner-control`, or
 `enroll --owner-control` without traversing HQ's private home.
-The private control socket still serves the HQ account, including the
-running-service check for offline signer rekey. Before rekeying, stop this
-installation's systemd socket and service together. An active socket can
-restart the service during offline maintenance. Run the rekey command in
-the HQ account against the installation's private state directory, then
-start its socket again. Admission and the broker
+HQ cannot rotate the Machine device key through its control socket or offline CLI. Admission and the broker
 continue to use their existing endpoints. The installer, machine-key
 pairing and retirement of the old key are tracked in issue #88.
 
@@ -100,17 +79,11 @@ others can write it, and refuses unknown keys:
   "standalone": false,
   "legacy": { "supervise": false, "probeIntervalMs": 30000 },
   "enrollment": { "source": "hq", "server": "https://agents.true-line.ai" },
-  "features": { "hardwareSigner": true },
-  "signer": { "backend": "helper", "command": ["/usr/local/libexec/hq-signer"] }
+  "signer": { "backend": "machine" }
 }
 ```
 
-`enrollment.source` says where device status and enrollment come from.
-`legacy` (the default) is the existing agent-bot's enrollment, read through
-its CLI. `hq` is HQ's own enrollment with the identity service at
-`enrollment.server`, on the signer's key: `node hq/main.mjs enroll --harness
-NAME` starts the device-code grant, prints the code to approve, and waits.
-HQ is enrolled from its next start. `--force` re-enrolls with a fresh key.
+`node hq/main.mjs enroll --harness NAME` starts the grant and displays the code to approve. The enrollment server must match the administrator-configured origin. The service must support the signed enrollment receipt. Legacy local enrollment records cannot authorize the Machine-held identity.
 
 `notices` opts the agent-comms broker plugin into explicit identity-service
 queues, for example `{ "harnesses": ["example-codex-agent"] }`. HQ validates
@@ -124,39 +97,13 @@ remote harness and repository, frozen per runtime. Those mappings stay with
 admission; see [HQ notice scope](../docs/hq-notice-scope.md) for configuration,
 the trusted guard and rollout dependencies.
 
-`features` holds feature flags, all off by default. `hardwareSigner` gates
-the `helper` signer backend: with it off, HQ refuses a config that names a
-helper, and everything else runs on the `software` backend. The hardware
-path is experimental until its helpers are qualified on real hardware (§9
-row 15b), and no other work waits on it. `status` reports the flag.
+The default custody provider uses the local signed Machine channel. The dedicated HQ account is preferred. An ordinary account requires its own explicit Machine pairing for the exact UID and remains cooperative. Only the dedicated account can read members plans or perform paired service recovery. A role's channel key authenticates its calls. It is separate from the administrator's P-256 device key.
 
-[`helpers/tpm2-signer.mjs`](../helpers/tpm2-signer.mjs) is the TPM 2.0
-helper for Linux. It needs `tpm2-tools` and access to the TPM device, keeps
-the key at a persistent handle inside the TPM, and is tested in CI against a
-software TPM only. Its header states its limits. To run the same tests on a
-host with a real or virtual TPM, name the TPM in `HQ_TPM_TCTI`:
+The owner permits HQ-local Secure Enclave **signing only** for an explicitly standalone installation in a dedicated HQ account with verified absence of Agent Machine. Production activation of that exception awaits a trusted installation check. Machine outage, revoked pairing and an absent socket leave paired custody unavailable. The native release helper also refuses direct invocation before opening the Keychain. Its Developer ID signature and dedicated-account checks establish executable and account identity. Neither the HQ nor Machine installer provides a trusted host inventory that establishes Machine absence and prior pairing history. The software and hardware qualification fixtures do not establish installation eligibility. Preserve existing pairing and custody state for authorized migration.
 
-```sh
-HQ_REQUIRE_TPM=1 HQ_TPM_TCTI=device:/dev/tpmrm0 node --test tests/tpm2-signer.test.mjs
-```
+The paired integration test uses the real HQ client, Machine handler and keyd protocol with generated software keys and a local test issuer. From the matching Machine source, run `go test -c -o "$fixture_dir/machine-fixture" ./internal/daemon` with an existing private temporary directory. From HQ, run `node tests/machine-device-interop.mjs "$fixture_dir/machine-fixture" "$machine_src/tests/fixtures/build-keyd-device-interop.sh"`. The test covers enrollment, signed token binding, unavailable operation authority, outage, restart, and revocation. Physical hardware and standalone installation remain separate qualification steps.
 
-The tests then use persistent handles `0x8101002e`, `0x8101002f` and
-`0x81010021` to `0x81010023`, evict them before and after, and never touch
-the helper's default handle `0x81010020`. That run is done by hand on the
-host: this repository is public and its CI uses hosted runners only.
-
-`signer` is optional. Without it the backend is `software`. A `helper` is
-named by absolute path and speaks `agent-bot-hq-signer/1`, described at the
-top of [`signer.mjs`](signer.mjs). Changing the backend of a pinned key needs
-`node hq/main.mjs signer rekey` with HQ stopped; until then HQ starts in safe
-mode and says why.
-
-The directory also holds `store.json`, `control.sock`, `admission.sock` and
-`broker.sock`, all 0600, and `signer/` (0700) with the signer's pin and,
-under the `software` backend only, its key file. With `enrollment.source`
-`hq` it also holds `identity/` (0700): the device record, the record a
-re-enrollment replaced, and the pinned response-signing key. None of those
-is a secret.
+The HQ state directory includes `control.sock`, `admission.sock` and `broker.sock`. Public enrollment records live in `identity/`. Existing local signer state requires an administrator-reviewed migration.
 
 `harnesses` (Linux only) gives each harness its OS account, one per harness
 credential ([platform PDR-0053](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0053-soul-life-and-agent-replace-member.md)):
@@ -177,14 +124,7 @@ then covers HQ too: any process in `user` can read HQ's store and connect
 to every socket, and so can every agent that runs in `user`, which is
 every agent unless HQ starts it in a harness account (row 16b). The file mode is the only access check,
 because Node has no peer-credential API. HQ reports `managed-cooperative`
-and names the account as a reason. The skeleton holds no credentials and no
-grants. Under the default `software` signer backend it does hold one secret:
-the signer's key file, which any process in that account can copy. That key
-signs approval records only; it is not the enrolled device key yet, and
-`status` and the profile reasons say it is a key file. The `helper` backend
-keeps no key file. This is
-HQ-RISK-07 in plan §10.3. Moving HQ to its own account, with a
-peer-credential check and a service unit, is #88.
+and names the account as a reason. Machine keeps the privileged device key under administrator custody. Same-account processes share the role-channel trust boundary. The protected-host qualification remains pending.
 
 ## Not in this slice
 
@@ -211,20 +151,7 @@ peer-credential check and a service unit, is #88.
   is agent-bot-machine's.
 - Signed plugin packages and plugin upgrade. The pins file is the only
   trust anchor, and changing it is a reviewed change to this repository.
-- The rest of the signer row (§9 rows 15b to 15d): the Secure Enclave
-  helper and qualification of the TPM helper on real hardware, and soul
-  tokens without `vouch-key.pem`.
-- Making HQ's enrollment the default. On 2026-11-10 a throwaway HQ on macOS
-  enrolled with the real identity service on a software key: the service
-  accepted the signed proof, the owner approved the code, and HQ came up
-  enrolled after a restart. That device has not been used for anything
-  since. The row 10 transport can ask for access tokens, but production use
-  waits for reviewed release key metadata, so `enrollment.source` stays
-  `legacy`. Unlike the legacy
-  client, a forced re-enrollment does not keep the old enrollment alive
-  while the new grant is pending.
-- Production release signing-key metadata (row 10), credential resolution (row 18), grants and credential references in Equip (PRs 18 and 21), and
-  `accept-revision` (PR 21).
+- Physical qualification of administrator-held keys, authorized device rotation, and operation-scoped protected credential use. The standalone Secure Enclave exception requires independently verified installation evidence.
 - The HQ account, the peer-credential check and the service unit (#88,
   after agent-bot-machine S6), and the Windows named pipe (#89).
 - A soul-contracts schema for the hq/v1 request envelope and for the

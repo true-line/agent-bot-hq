@@ -35,14 +35,13 @@ import { verify } from '../scripts/soul-contracts.mjs';
 import { SCHEMA_NAMES } from './admission.mjs';
 import { NOTICE_SCHEMA_NAMES } from './notices.mjs';
 import { TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES } from './tasks.mjs';
-import { createHQ, readConfig } from './hq.mjs';
-import { backendFromConfig, createSigner, removeSoftwareKey } from './signer.mjs';
+import { createHQ } from './hq.mjs';
 import { readPins } from './plugins.mjs';
 import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { connectSocket } from './socket.mjs';
 import { machineRoleCommand } from './machine-channel.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|signer rekey|machine identity|machine status|machine members-plans|machine hq-service-recovery|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
@@ -83,19 +82,6 @@ function signerLine(g) {
   if (!g.available) return `signer: unavailable (${g.reason})`;
   const custody = g.key_storage === 'hardware' ? 'hardware key (experimental feature hardwareSigner)' : 'software key file (transition custody)';
   return `signer: ${custody}, ${g.backend} backend, key ${g.thumbprint.slice(0, 12)}, generation ${g.generation}`;
-}
-
-// Replace the signer's key while HQ is stopped. A running HQ holds the old
-// pin in memory, so it is refused rather than left signing with a dead key.
-export async function rekeySigner(home) {
-  let live = false;
-  try { const c = await connectSocket(join(home, 'control.sock')); live = true; await c.close(); } catch { /* not running */ }
-  if (live) throw new Error('HQ is running: stop it before replacing the signer key');
-  const cfg = readConfig(home);
-  const signer = createSigner({ home, backend: backendFromConfig(cfg.signer, { home }) });
-  const made = signer.createKey({ replace: true });
-  const removed = made.key_storage === 'hardware' ? removeSoftwareKey({ home }) : undefined;
-  return { ...made, ...(removed === undefined ? {} : { software_key_removed: removed }) };
 }
 
 function printStatus(s) {
@@ -179,9 +165,7 @@ async function main(argv) {
   }
   if (args.cmd === 'signer') {
     if (args.sub !== 'rekey') throw new Error(USAGE);
-    const made = await rekeySigner(args.home);
-    console.log(args.json ? JSON.stringify(made, null, 2) : `signer key replaced: ${made.key_storage} key ${made.thumbprint.slice(0, 12)}, generation ${made.generation}`);
-    return;
+    throw new Error('Device key rotation requires administrator action in Machine/keyd');
   }
   if (args.cmd === 'status' || args.cmd === 'souls') {
     const res = await ask(controlPath, args.cmd === 'status' ? 'status' : 'souls.list');

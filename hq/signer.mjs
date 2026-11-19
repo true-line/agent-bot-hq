@@ -39,7 +39,7 @@
 // - Re-keying is explicit. createKey({ replace: true }) makes a fresh key
 //   and a new generation; signatures from the old key stop verifying, as a
 //   re-enrollment requires (§4.7: a revoked device record is never revived).
-import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign as cryptoSign, verify as cryptoVerify } from 'node:crypto';
+import { createHash, randomBytes, createPrivateKey, createPublicKey, generateKeyPairSync, sign as cryptoSign, verify as cryptoVerify } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
@@ -304,6 +304,16 @@ export function createSigner({ home, backend, enrollment, uid = process.getuid?.
         if (sig.length !== 64) return false;
         return cryptoVerify('sha256', Buffer.from(bytes), { key: publicKey, dsaEncoding: 'ieee-p1363' }, sig);
       } catch { return false; }
+    },
+    enrollmentProof(aud) {
+      return signer.signJws({ typ: 'ab-enroll+jwt', jwk: signer.publicJwk() }, {
+        aud, iat: Math.floor(clock.now() / 1000), jti: b64url(randomBytes(16)),
+      }, { kid: false });
+    },
+    accessAssertion({ server, deviceId, ephemeralJwk }) {
+      const iat = Math.floor(clock.now() / 1000);
+      return signer.signJws({ typ: 'JWT' }, { iss: deviceId, sub: deviceId, aud: server + '/oauth/token',
+        iat, exp: iat + 120, jti: b64url(randomBytes(16)), cnf: { jwk: ephemeralJwk } }, { kid: false });
     },
     // A compact ES256 JWS, for the identity-service assertion (§4.7).
     // `kid` (the key thumbprint) is in the header unless the caller turns it off.

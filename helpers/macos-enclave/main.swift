@@ -1,9 +1,20 @@
 import Foundation
 import Security
 
-// Require the provisioned Developer ID application at the installed entry
-// point. The dedicated role and its file Keychain are checked by roleStore.
+// A signed executable and the dedicated role authenticate the signer. Neither
+// establishes that Machine is absent or that this host has no pairing history.
+enum StandaloneInstallationFailure: Error {
+    case unverified
+}
+
+func requireStandaloneInstallation() throws {
+    // No product installer currently supplies this evidence to the native
+    // helper. A config flag, stopped daemon or missing path cannot supply it.
+    throw StandaloneInstallationFailure.unverified
+}
+
 do {
+    try requireStandaloneInstallation()
     var code: SecCode?
     var requirement: SecRequirement?
     let expression = #"anchor apple generic and identifier "ai.true-line.hq.signer" and certificate leaf[subject.OU] = "Z5DM34QS5U" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"#
@@ -17,6 +28,9 @@ do {
           let groups = SecTaskCopyValueForEntitlement(task, "keychain-access-groups" as CFString, nil) as? [String],
           groups.contains(app) else { throw SignerFailure.accessControl }
     try runSigner()
+} catch StandaloneInstallationFailure.unverified {
+    FileHandle.standardError.write(Data("HQ standalone installation is unverified\n".utf8))
+    exit(1)
 } catch {
     FileHandle.standardError.write(Data("HQ Secure Enclave signer unavailable\n".utf8))
     exit(1)

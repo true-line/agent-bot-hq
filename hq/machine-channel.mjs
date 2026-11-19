@@ -17,14 +17,14 @@ const HEX_KEY = /^[0-9a-f]{64}$/i;
 const MAX_MESSAGE = 64 * 1024;
 const fingerprint = (raw) => createHash('sha256').update(raw).digest('hex');
 
-function checkAcl(path) {
+function checkAcl(path, allowDeny = false) {
   if (process.platform === 'darwin') {
     const listing = execFileSync('/bin/ls', ['-led', path], { encoding: 'utf8', env: { LC_ALL: 'C' } });
-    if (/^\s*\d+:/m.test(listing)) throw new Error(`unexpected ACL on ${path}`);
+    if (listing.split('\n').filter((line) => /^\s*\d+:/.test(line)).some((line) => !allowDeny || !/^\s*\d+:.*\sdeny\s[\w,]+$/.test(line))) throw new Error(`unexpected ACL on ${path}`);
   }
 }
 
-function roleDir(path, uid, create, { allowReadTraverse = false } = {}) {
+function roleDir(path, uid, create, { allowReadTraverse = false, allowDeny = false } = {}) {
   if (create) {
     try { mkdirSync(path, { mode: 0o700 }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
   }
@@ -36,7 +36,7 @@ function roleDir(path, uid, create, { allowReadTraverse = false } = {}) {
   if (!entry.isDirectory() || entry.uid !== uid || requiredMode !== 0o700) {
     throw new Error(`invalid role directory at ${path} (uid ${entry.uid}, mode ${mode.toString(8)})`);
   }
-  checkAcl(path);
+  checkAcl(path, allowDeny);
 }
 
 function readKey(path, uid) {
@@ -131,9 +131,9 @@ function responseFields(line) {
 
 function authenticatedResponse(line, nonce, pinned, verb) {
   const { value: r, body } = responseFields(line);
-  if (verb === 'hq-service-recovery' && Object.keys(r).some((field) =>
+  if (['hq-service-recovery', 'hq-device'].includes(verb) && Object.keys(r).some((field) =>
     !['ok', 'diagnostic', 'message', 'state', 'body', 'timestamp', 'nonce', 'request_nonce', 'signature'].includes(field))) {
-    throw new Error('unexpected Machine service recovery response field');
+    throw new Error('unexpected Machine ' + verb + ' response field');
   }
   const singleLine = (s) => typeof s === 'string' && !/[\r\n]/.test(s);
   if (typeof r.ok !== 'boolean' || !Number.isSafeInteger(r.timestamp) ||
@@ -175,29 +175,49 @@ function exchange(socketPath, request) {
   });
 }
 
-export function machineRoleCommand(argv) {
-  const account = userInfo();
-  const mac = process.platform === 'darwin';
+export function machineAccountLayout(account, platform, uid, euid, dedicatedOnly) {
+  const mac = platform === 'darwin';
   const role = mac ? '_agent-bot-hq' : 'agent-bot-hq';
   const homes = mac ? ['/var/agent-bot-hq', '/private/var/agent-bot-hq'] : ['/var/lib/agent-bot-hq'];
-  if ((!mac && process.platform !== 'linux') || account.username !== role || !homes.includes(account.homedir) ||
-      account.uid <= 0 || account.uid !== process.getuid() || account.uid !== process.geteuid() ||
-      (mac && (account.uid < 300 || account.uid > 399 || account.gid !== account.uid))) {
-    throw new Error('Machine channel commands require the dedicated HQ service account');
+  const dedicated = account.username === role;
+  if ((!mac && platform !== 'linux') || account.uid <= 0 || account.uid !== uid || account.uid !== euid
+      || !isAbsolute(account.homedir) || (dedicatedOnly && !dedicated)
+      || (dedicated && (!homes.includes(account.homedir) || (mac && (account.uid < 300 || account.uid > 399 || account.gid !== account.uid))))) {
+    throw new Error('Machine channel command requires its authorized local account or dedicated HQ service account');
   }
-  if (argv[0] === 'hq-service-recovery' && !mac) throw new Error('paired HQ service recovery requires macOS');
-  return machineCommandInHome(argv, account.homedir, account.uid);
+  return { account, ordinary: !dedicated };
+}
+
+function roleAccount(dedicatedOnly) {
+  return machineAccountLayout(userInfo(), process.platform, process.getuid?.(), process.geteuid?.(), dedicatedOnly);
+}
+
+export function machineRoleDevice(option, fields) {
+  const { account, ordinary } = roleAccount(false);
+  const prefix = process.platform === 'darwin' && process.arch === 'arm64' ? '/opt/homebrew'
+    : process.platform === 'linux' && ['x64', 'arm64'].includes(process.arch) ? '/home/linuxbrew/.linuxbrew' : null;
+  if (!prefix) throw new Error('Machine device custody is unavailable on this platform');
+  return machineCommandInHome(['hq-device', option, '--socket', join(prefix, 'var/agent-machine/daemon.sock')], account.homedir, account.uid, fields, ordinary);
+}
+
+export function machineRoleCommand(argv) {
+  const { account, ordinary } = roleAccount(!['identity', 'status'].includes(argv[0]));
+  if (argv[0] === 'hq-device') throw new Error('the device port is internal to HQ enrollment');
+  if (argv[0] === 'hq-service-recovery' && process.platform !== 'darwin') throw new Error('paired HQ service recovery requires macOS');
+  return machineCommandInHome(argv, account.homedir, account.uid, undefined, ordinary);
 }
 
 // Also exercised with a temporary private home in the protocol tests. The CLI
 // always obtains its home and UID from the kernel-backed account lookup above.
-export async function machineCommandInHome(argv, home, uid) {
+export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false) {
   const [verb, ...args] = argv;
   const identity = verb === 'identity' && !args.length;
   let socket, hex, recovery, option = '', planID = '';
   if (verb === 'status' && args[0] === '--socket' &&
       (args.length === 2 || (args.length === 4 && args[2] === '--daemon-key' && HEX_KEY.test(args[3])))) {
     [, socket, , hex] = args;
+  } else if (verb === 'hq-device' && args.length === 3 && ['identity', 'enrollment-proof', 'bind-enrollment', 'access-assertion', 'bind-access'].includes(args[0]) && args[1] === '--socket') {
+    [option, , socket] = args;
   } else if (verb === 'hq-service-recovery') {
     recovery = recoveryArgs(args);
     socket = recovery.socket;
@@ -215,7 +235,8 @@ export async function machineCommandInHome(argv, home, uid) {
   if (!identity && (!socket || !isAbsolute(socket))) {
     throw new Error('usage: machine identity | status --socket PATH [--daemon-key HEX] | members-plans list --socket PATH [--after PLAN_ID] | members-plans get PLAN_ID --socket PATH');
   }
-  roleDir(home, uid, false);
+  if (ordinary && !['identity', 'status', 'hq-device'].includes(verb)) throw new Error('operation requires the dedicated HQ service account');
+  roleDir(home, uid, false, { allowReadTraverse: ordinary, allowDeny: ordinary });
   const config = join(home, '.config');
   const dir = join(config, 'agent-machine');
   roleDir(config, uid, identity, { allowReadTraverse: true });
@@ -235,7 +256,7 @@ export async function machineCommandInHome(argv, home, uid) {
     const timestamp = Math.floor(Date.now() / 1000);
     const nonce = randomBytes(16).toString('base64url');
     const parts = [fields.verb, '', fields.option ?? '', '', fields.plan_id ?? '', '', '', '', timestamp, nonce];
-    for (const field of ['plan_digest', 'challenge_nonce', 'owner_signature']) {
+    for (const field of ['plan_digest', 'challenge_nonce', 'owner_signature', 'hq_epoch', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature']) {
       if (fields[field] !== undefined) parts.push(field, fields[field]);
     }
     const request = { ...fields, timestamp, nonce, public_key: pub.toString('base64'),
@@ -245,8 +266,14 @@ export async function machineCommandInHome(argv, home, uid) {
   }
   if (recovery) return serviceRecovery(recovery, daemon.toString('hex'), pub.toString('hex'), send,
     (line) => authenticatedResponse(line, null, daemon, verb));
-  const { response: r } = await send({ verb, ...(option && { option }), ...(planID && { plan_id: planID }) });
+  if (verb === 'hq-device' && option !== 'identity') {
+    const keys = ['bind-enrollment', 'bind-access'].includes(option) ? ['hq_epoch', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature'] : ['hq_epoch'];
+    if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))
+      || Object.keys(deviceFields).length !== keys.length || !/^(legacy|[a-f0-9]{64})$/.test(deviceFields.hq_epoch)) throw new Error('invalid Machine device fields');
+  } else if (deviceFields !== undefined) throw new Error('unexpected Machine device fields');
+  const { response: r } = await send({ verb, ...deviceFields, ...(option && { option }), ...(planID && { plan_id: planID }) });
   const result = { client: 'agent-daemon', channel: 'signed', state: r.state, daemon_fingerprint: fingerprint(daemon) };
+  if (verb === 'hq-device') return r;
   if (verb === 'members-plans') return { ...result, ...membersPlanResult(option, planID, r) };
   if (!existing && !publish(dir, 'daemon.pub', daemon, uid).equals(daemon)) throw new Error('a different daemon key was pinned concurrently');
   return result;

@@ -1,7 +1,8 @@
 // HQ's identity-service link (plan §4.7 / row 10). Device assertions stay
 // with enrollment's signer. Access tokens and their ephemeral DPoP keys live
 // only in this process; replies are authenticated before JSON is parsed.
-import { createHash, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from 'node:crypto';
+import { createHash, createPublicKey, randomBytes, verify } from 'node:crypto';
+import { isUtf8 } from 'node:buffer';
 import { readFileSync } from 'node:fs';
 import { fail, HostError } from '../sdk/errors.mjs';
 import { GRANT_JWT_BEARER, validateServiceUrl } from './enrollment.mjs';
@@ -72,6 +73,7 @@ export function releaseServerKeys(server, file = new URL('../governance/server-k
 export function createIdentityService({
   server,
   enrollment,
+  custody,
   keySet = releaseServerKeys(server),
   fetchImpl = globalThis.fetch,
   clock = { now: () => Date.now() },
@@ -79,7 +81,7 @@ export function createIdentityService({
   maxBodyBytes = MAX_BODY_BYTES,
 } = {}) {
   validateServiceUrl(server);
-  if (!enrollment || typeof enrollment.assertion !== 'function' || typeof enrollment.deviceStatus !== 'function') throw new TypeError('the identity-service link needs HQ enrollment');
+  if (!enrollment || typeof enrollment.deviceStatus !== 'function') throw new TypeError('the identity-service link needs HQ enrollment');
   keySet = validateServerKeys({ server, keys: keySet }, server);
   if (!(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_SKEW_MS)) throw new TypeError('identity-service timeout is at most five minutes');
   if (!(Number.isSafeInteger(maxBodyBytes) && maxBodyBytes > 0 && maxBodyBytes <= MAX_BODY_BYTES)) throw new TypeError('identity-service body cap is at most one MiB');
@@ -176,6 +178,7 @@ export function createIdentityService({
         if (response.headers.get('agent-bot-request-jti') !== jti || typeof signature !== 'string' || !B64URL.test(signature)
           || Buffer.from(signature, 'base64url').length !== 64
           || !verify(null, signatureBytes(response.status, bytes, jti), createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: key.x }, format: 'jwk' }), Buffer.from(signature, 'base64url'))) unavailable('response signature or request nonce did not verify');
+        if (!isUtf8(bytes)) unavailable('authenticated response is not UTF-8 JSON');
         let body;
         try { body = JSON.parse(bytes.toString('utf8')); } catch { unavailable('authenticated response is not JSON'); }
         link = 'ok';
@@ -209,9 +212,8 @@ export function createIdentityService({
     const generation = epoch;
     const pending = (async () => {
       const started = clock.now();
-      const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
-      const ephemeralJwk = publicKey.export({ format: 'jwk' });
-      const assertion = enrollment.assertion({ ephemeralJwk });
+      if (!custody) unavailable('Machine has no authorized DPoP session');
+      const { session, ephemeralJwk, assertion } = await custody.openSession();
       let claims;
       try { claims = JSON.parse(Buffer.from(assertion.split('.')[1], 'base64url')); } catch { unavailable('HQ assertion is malformed'); }
       if (typeof claims.jti !== 'string' || claims.jti.length < 8) unavailable('HQ assertion has no request nonce');
@@ -224,7 +226,10 @@ export function createIdentityService({
       if (out.status >= 500) unavailable('access token service is temporarily unavailable', true);
       if (out.status !== 200 || result?.token_type !== 'DPoP' || typeof result.access_token !== 'string' || !result.access_token
         || !Number.isSafeInteger(result.expires_in) || result.expires_in <= 0 || result.expires_in > 900) unavailable('access token was refused or malformed');
-      const candidate = { value: result.access_token, expiresAt: started + result.expires_in * 1000, privateKey, publicJwk: ephemeralJwk, harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string') : [] };
+      const binding = await custody.bindAccess({ session, body: out.text, headers: out.headers });
+      alive(generation);
+      if (!Number.isSafeInteger(binding.expiresAt) || binding.expiresAt <= clock.now()) unavailable('administrator access session expired');
+      const candidate = { value: result.access_token, expiresAt: Math.min(started + result.expires_in * 1000, binding.expiresAt), session, publicJwk: ephemeralJwk, harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string') : [] };
       // expires_in is measured conservatively from the request's start.
       // A slow but authenticated response must not cache an expired token.
       freshAccess(candidate);
@@ -250,6 +255,10 @@ export function createIdentityService({
       check();
       if (typeof method !== 'string' || !/^(GET|POST|PUT|PATCH|DELETE)$/.test(method)
         || !validDaemonPath(method, path)) fail('host.invalid_request', 'the identity link accepts a daemon API method and path only');
+      const allowed = method === 'GET' && (path === '/api/daemon/whoami' || path === '/api/daemon/notices' || path.startsWith('/api/daemon/issuances/'))
+        || method === 'POST' && ['/api/daemon/notices/take', '/api/daemon/notices/ack', '/api/daemon/notices/release'].includes(path);
+      if (!allowed) unavailable('this route requires administrator-side credential use');
+      custody?.checkOperation?.(method, path);
       const current = await access();
       const generation = epoch;
       alive(generation);
@@ -258,10 +267,22 @@ export function createIdentityService({
       // a queue outside this enrolled device's current scope before sending.
       if (body?.harness !== undefined && !current.harnesses.includes(body.harness)) fail('host.route_not_allowed', 'the harness is outside this device enrollment');
       const jti = nonce();
-      const header = Buffer.from(JSON.stringify({ alg: 'ES256', typ: 'dpop+jwt', jwk: current.publicJwk })).toString('base64url');
-      const payload = Buffer.from(JSON.stringify({ htm: method, htu: `${server}${path}`, iat: Math.floor(clock.now() / 1000), jti, ath: hash(current.value).toString('base64url') })).toString('base64url');
-      const unsigned = `${header}.${payload}`;
-      const proof = `${unsigned}.${sign('sha256', Buffer.from(unsigned), { key: current.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url')}`;
+      const ath = hash(current.value).toString('base64url');
+      const proof = await custody.requestProof({ session: current.session, method, path, body, ath, jti });
+      const parts = typeof proof === 'string' && proof.split('.');
+      let header, claims;
+      try {
+        if (!parts || parts.length !== 3) throw new Error();
+        header = JSON.parse(Buffer.from(parts[0], 'base64url'));
+        claims = JSON.parse(Buffer.from(parts[1], 'base64url'));
+        if (header.alg !== 'ES256' || header.typ !== 'dpop+jwt' || !header.jwk || 'd' in header.jwk
+          || header.jwk.kty !== 'EC' || header.jwk.crv !== 'P-256' || header.jwk.x !== current.publicJwk.x || header.jwk.y !== current.publicJwk.y
+          || claims.htm !== method || claims.htu !== server + path || claims.ath !== ath || claims.jti !== jti
+          || !Number.isSafeInteger(claims.iat) || Math.abs(clock.now() / 1000 - claims.iat) > 120
+          || !verify('sha256', Buffer.from(parts.slice(0, 2).join('.')), { key: createPublicKey({ key: current.publicJwk, format: 'jwk' }),
+            dsaEncoding: 'ieee-p1363' }, Buffer.from(parts[2], 'base64url'))) throw new Error();
+      } catch { unavailable('Machine returned an invalid DPoP request proof'); }
+      alive(generation);
       const reply = await request(path, { method, headers: { accept: 'application/json', authorization: `DPoP ${current.value}`, DPoP: proof, ...(body !== undefined ? { 'content-type': 'application/json' } : {}) }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) }, jti, current);
       alive(generation);
       if (reply.status === 401) drop(); // Never replay an external write automatically.
