@@ -23,10 +23,13 @@ Dir.mktmpdir('hq-listener-', '/private/tmp') do |dir|
       unrelated.accept.first.close
       Addrinfo.unix(path).connect do |client|
         client.write('ready')
-        listener.accept.first.tap do |connection|
+        connection, = listener.accept
+        begin
           raise 'the waiting client was consumed' unless connection.read(5) == 'ready'
           raise 'connected fd accepted as listener' if listener?(connection)
-        end.close
+        ensure
+          connection.close
+        end
       end
 
       # A full listener queue must refuse or time out before the parent helper's

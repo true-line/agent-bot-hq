@@ -31,6 +31,7 @@ sudo chmod 0755 "$work"
 # This test runner keeps its Node next to its native runtime libraries.
 sudo install -m 0600 -o "$role" -g "$role" /dev/null "$work/launchd.stderr"
 sudo -n -H -u "$role" "$system_node" --version
+"$system_node" --test tests/hq-owner-control.test.mjs
 "$system_node" "$entry" check-owner-control | jq -e '.capability == "darwin-owner-control/v1"' >/dev/null
 
 # Generate typed launchd properties with the same service, socket and CLI

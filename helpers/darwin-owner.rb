@@ -1,5 +1,5 @@
 # The system LaunchDaemon checks in under its own PID, then replaces this
-# process with HQ. The peer and listener operations inspect fd 3 only.
+# process with HQ. The peer and listener operations receive a socket on fd 3.
 require 'socket'
 require 'fiddle'
 require 'etc'
@@ -14,9 +14,9 @@ def activation
 end
 
 def published_control?
-  return false unless ['/private', '/private/var'].all? do |path|
+  ['/private', '/private/var'].each do |path|
     dir = File.lstat(path)
-    dir.directory? && dir.uid.zero? && (dir.mode & 0o022).zero?
+    return false unless dir.directory? && dir.uid.zero? && (dir.mode & 0o022).zero?
   end
   socket = File.lstat(CONTROL)
   socket.socket? && socket.uid.zero? && (socket.mode & 0o7777) == 0o666
