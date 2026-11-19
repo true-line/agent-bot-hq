@@ -1,0 +1,1 @@
+After native launchd check-in, the macOS HQ launcher allows up to three seconds for the protected owner-control socket to appear. Existing unsafe entries and inaccessible directories still fail immediately.

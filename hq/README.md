@@ -282,6 +282,12 @@ key, path, or child output.
 | 86 | The native launcher could not execute the approved Node runtime. |
 | 87 | After exec, HQ could not activate the inherited owner-control listener. |
 
+At launch, the helper waits up to three seconds if the exact public socket
+is initially absent under its verified root-owned directories. Every sample
+checks those directories again. Other errors and existing entries with
+unexpected metadata fail immediately. Later descriptor checks still use a
+single metadata sample.
+
 Use the numeric observation alone for an unknown code, an unrecognized
 diagnostics version, or an older artifact. Exit 1 can come from several
 startup or runtime failures. A launchd signal is a separate observation.

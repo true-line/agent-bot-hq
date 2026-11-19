@@ -27,13 +27,23 @@ def activation
                        Fiddle::TYPE_INT)
 end
 
-def published_control?
-  ['/private', '/private/var'].each do |path|
-    dir = File.lstat(path)
-    return false unless dir.directory? && dir.uid.zero? && (dir.mode & 0o022).zero?
+def published_control?(wait: 0)
+  deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + wait
+  loop do
+    ['/private', '/private/var'].each do |path|
+      dir = File.lstat(path)
+      return false unless dir.directory? && dir.uid.zero? && (dir.mode & 0o022).zero?
+    end
+    begin
+      socket = File.lstat(CONTROL)
+    rescue Errno::ENOENT
+      remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      return false unless remaining.positive?
+      sleep [remaining, 0.025].min
+      next
+    end
+    return socket.socket? && socket.uid.zero? && (socket.mode & 0o7777) == 0o666
   end
-  socket = File.lstat(CONTROL)
-  socket.socket? && socket.uid.zero? && (socket.mode & 0o7777) == 0o666
 rescue SystemCallError
   false
 end
@@ -70,7 +80,7 @@ rescue SystemCallError, SocketError
   false
 end
 
-def listener_status(sock, verify_public: true)
+def listener_status(sock, verify_public: true, publication_wait: 0)
   return LAUNCH_DESCRIPTOR unless sock.local_address.unix? &&
                                  sock.getsockopt(Socket::SOL_SOCKET, Socket::SO_TYPE).int == Socket::SOCK_STREAM
   # Darwin's Unix stream sockets do not implement SO_ACCEPTCONN.
@@ -80,7 +90,7 @@ def listener_status(sock, verify_public: true)
   rescue Errno::ENOTCONN
     # A listening stream has no peer.
   end
-  return LAUNCH_PUBLIC_PATH unless published_control?
+  return LAUNCH_PUBLIC_PATH unless published_control?(wait: publication_wait)
   name = sock.local_address.unix_path
   unless name == CONTROL
     return LAUNCH_ADDRESS unless launchd_address?(sock, name)
@@ -149,7 +159,9 @@ when 'launch'
     node && node.start_with?('/') && entry && entry.start_with?('/') && arguments.first == 'run'
   socket = activated_socket
   # HQ verifies the public peer after it can accept paused streams.
-  code = listener_status(socket, verify_public: false)
+  # Machine also waits up to three seconds for launchd to publish the leaf.
+  # Missing ancestors and unsafe existing entries still fail immediately.
+  code = listener_status(socket, verify_public: false, publication_wait: 3)
   stop_launch(code, 'unexpected launchd listener') unless code.zero?
   exec_hq(node, entry, arguments, socket)
 when 'descriptor'
