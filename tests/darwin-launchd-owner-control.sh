@@ -63,6 +63,53 @@ diagnose() {
   sudo launchctl print "system/$label" | awk '/state =|last exit code =|pid =/ { print }' >&2
   exit 1
 }
+job_pid() {
+  sudo launchctl print "system/$label" | awk '$1 == "pid" && $2 == "=" { print $3 }'
+}
+check_console_profile() {
+  local profile
+  profile="$("$system_node" "$entry" status --owner-control | awk '/^profile:/ { print }')"
+  [[ "$profile" == 'profile: managed-cooperative' ]]
+}
+# Read only the fixture role's private store. A length and digest carry the
+# verified receipt prefix across the restart without exposing receipt contents.
+receipt_checkpoint() {
+  sudo -n -H -u "$role" "$system_node" --input-type=module - "$state/store.json" "$@" <<'JS'
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { setTimeout } from 'node:timers/promises';
+
+const [file, previous] = process.argv.slice(2);
+const [length, digest] = previous ? previous.split(':') : ['0'];
+const start = Number(length);
+const hash = (rows) => createHash('sha256').update(JSON.stringify(rows)).digest('hex');
+const deadline = performance.now() + 5000;
+for (;;) {
+  let rows;
+  try { rows = JSON.parse(readFileSync(file, 'utf8')).receipts; }
+  catch (err) { if (err.code !== 'ENOENT' || previous) throw err; }
+  if (rows) {
+    assert.ok(Array.isArray(rows) && rows.length >= start, 'missing receipt history');
+    if (previous) assert.equal(hash(rows.slice(0, start)), digest, 'receipt history changed');
+    const added = rows.slice(start);
+    for (const [index, row] of added.entries()) {
+      assert.equal(row.seq, start + index + 1, 'unexpected receipt sequence');
+      assert.equal(row.profile, 'managed-cooperative', 'incorrect receipt profile');
+    }
+    const starts = added.filter((row) => row.plugin === 'hq' && row.kind === 'hq.started');
+    assert.ok(starts.length <= 1, 'more than one HQ start in this observation');
+    if (starts.length === 1) {
+      console.log(rows.length + ':' + hash(rows));
+      break;
+    }
+  }
+  // An owner status call may finish just before hq.started reaches disk.
+  assert.ok(performance.now() < deadline, 'HQ startup receipt did not reach disk');
+  await setTimeout(50);
+}
+JS
+}
 python3 - "$system_node" "$entry" "$owner" "$socket" <<'PY' || diagnose
 import json
 import os
@@ -96,9 +143,12 @@ assert control["uid"] == os.getuid() and control["account"] == owner
 assert status["hq"]["account"] == "_agent-bot-hq" and status["profile"] == "managed-cooperative"
 PY
 [[ "$(sudo stat -f '%u:%Lp' "$state")" == "$(id -u "$role"):700" ]]
-pid="$(sudo launchctl print "system/$label" | awk '$1 == "pid" && $2 == "=" { print $3 }')"
+pid="$(job_pid)"
 [[ "$pid" =~ ^[1-9][0-9]*$ ]]
 [[ "$(ps -o uid= -p "$pid" | tr -d ' ')" == "$(id -u "$role")" ]]
+check_console_profile
+first_receipts="$(receipt_checkpoint)"
+[[ "$(job_pid)" == "$pid" ]]
 echo "The owner CLI reached the launchd service running as $role with getpeereid authentication."
 
 # launchd retains the listening socket while restarting HQ. Queue a normal
@@ -128,6 +178,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as pending:
     with pending.makefile("rb") as reply:
         response = json.loads(reply.readline(1024 * 1024))
 assert response["id"] == 37 and response["ok"] is True
+assert response["result"]["profile"] == "managed-cooperative"
 report = response["result"]["hq"]
 assert report["account"] == "_agent-bot-hq"
 control = report["sockets"]["ownerControl"]
@@ -135,6 +186,11 @@ assert control["uid"] == os.getuid() and control["account"] == owner and control
 after = os.lstat(path)
 assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
 PY
-restarted_pid="$(sudo launchctl print "system/$label" | awk '$1 == "pid" && $2 == "=" { print $3 }')"
+restarted_pid="$(job_pid)"
 [[ "$restarted_pid" =~ ^[1-9][0-9]*$ && "$restarted_pid" != "$pid" ]]
+[[ "$(ps -o uid= -p "$restarted_pid" | tr -d ' ')" == "$(id -u "$role")" ]]
+check_console_profile
+receipt_checkpoint "$first_receipts" >/dev/null
+[[ "$(job_pid)" == "$restarted_pid" ]]
+echo "Both dedicated HQ processes reported managed-cooperative in the owner console and persisted receipts."
 echo "A pending owner status request reached the restarted HQ through the same launchd socket."
