@@ -226,7 +226,10 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
       } catch { return false; }
     },
     get enrollment() { return enrollment; },
-    enrollmentProgress: () => enrollment.progress?.(),
+    enrollmentProgress() {
+      try { checkLegacy(home); } catch { return undefined; }
+      return enrollment.progress?.();
+    },
   };
   enrollment = enrollment(signer);
   return signer;

@@ -212,8 +212,11 @@ test('paired upgrade reports prior signer and enrollment files through HQ status
   assert.match(first.hq.signer.reason, /No local entry for identity\/device.json, identity\/device.previous.json, identity\/pending-receipt.json\./);
   assert.match(first.hq.signer.reason, /Verify enrollment history/);
   const noRequest = () => assert.fail('legacy state must refuse before delegating');
-  const signer = createMachineSigner({ home, request: noRequest, enrollment: () => ({}) });
+  const signer = createMachineSigner({ home, request: noRequest, enrollment: () => ({
+    progress: () => assert.fail('paused status must not read the historical enrollment record'),
+  }) });
   await assert.rejects(signer.deviceStatus(), /Paired custody upgrade paused/);
+  assert.equal(signer.enrollmentProgress(), undefined);
 
   mkdirSync(join(home, 'identity'), { mode: 0o700 });
   // The issuer key can be pinned before the service grants enrollment.
@@ -222,7 +225,9 @@ test('paired upgrade reports prior signer and enrollment files through HQ status
   for (const f of [grant, past, pending]) writeFileSync(f, 'private fixture contents', { mode: 0 });
   const owner = await connectSocket(hq.paths.control);
   try {
-    const report = (await owner.request('status')).result.hq.signer;
+    const status = (await owner.request('status')).result.hq;
+    assert.equal(status.enrollment, undefined);
+    const report = status.signer;
     assert.equal(report.available, false);
     assert.match(report.reason, /Found signer\/device-key.pem, signer\/pin.json, identity\/device.json, identity\/device.previous.json, identity\/pending-receipt.json/);
     assert.ok(!report.reason.includes(home) && !report.reason.includes('private fixture contents'));
