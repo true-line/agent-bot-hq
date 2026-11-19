@@ -148,10 +148,11 @@ test('T02 on real accounts: an agent HQ started works in its own 0700 directory 
     assert.deepEqual(report.env.filter((n) => n.startsWith('AGENT_BOT_')).sort(), [...REQUEST_ENV, BROKER_ENV, MEMBER_ID_ENV, MEMBER_SOCKET_ENV, ROLE_ENV].sort());
     assert.equal(report.broker, endpoint(A));
     assert.equal(report.memberSocket, memberSocket);
-    // Every attempt fails, each for want of permission.
+    // Rekey requires Machine administration. Files and sockets enforce their OS permissions.
     for (const [name, r] of Object.entries(report.attempts)) {
       assert.equal(r.ok, false, `${name}: ${JSON.stringify(r)}`);
-      if (name.startsWith('run ')) assert.match(r.stderr, /EACCES|permission denied/i, `${name}: ${JSON.stringify(r)}`);
+      if (name === 'run HQ signer rekey') assert.equal(r.stderr, 'Device key rotation requires administrator action in Machine/keyd');
+      else if (name.startsWith('run ')) assert.match(r.stderr, /EACCES|permission denied/i, `${name}: ${JSON.stringify(r)}`);
       else assert.equal(r.code, 'EACCES', `${name}: ${JSON.stringify(r)}`);
     }
     assert.equal(Object.keys(report.attempts).length, 12);
