@@ -1297,20 +1297,23 @@ These are this repository's decisions, and the platform's [decision log](https:/
     refuses unsigned policy, keeps the last signed version, and alerts.
   - **Owner presence is enforced at the client and verified at the
     sandbox.** The owner's client (the `agent-bot` CLI, the local web UI,
-    or the daemon acting for the owner) holds a non-exportable Secure
-    Enclave key with a user-presence access control, so every signature
-    needs Touch ID or the login password. Policy changes, pairing, adding
-    an App and owner-gated actions carry that signature over the exact
+    or the daemon acting for the owner) needs proof from a non-exportable
+    Secure Enclave key in the owner's session. Its access control requires
+    Touch ID or the login password for each signature. Policy changes, pairing,
+    adding an App and owner-gated actions carry that signature over the exact
     action digest, fresh and single-use. agent-machine pins the public
     key at pairing and refuses a privileged request without a valid
     signature, even when it is validly signed by the daemon. agent-machine
     never shows a prompt itself.
-  - **keyd splits.** Key custody and signing move into agent-bot-machine
-    (`admin`). What stays in the owner's session is the presence prompt and
-    its Secure Enclave key, which hold nothing readable. keyd no longer
-    depends on GeniusBar, which is a GUI only: both pieces get their own
-    Developer ID-signed, notarized releases and Homebrew packages, and
-    `agent-bot keyd install` points at them.
+  - **Host custody and owner consent.** Homebrew installs Machine's
+    signed, notarized CLI and keyd. Keyd runs under the prefix administrator,
+    signs device operations and runs independently of GeniusBar.
+    The owner's session requests fresh consent for the exact
+    Machine challenge. The owner rejected a separate macOS owner-presence
+    app. An approved unbundled provider for that proof is still missing.
+    The admin device key signs without an owner prompt, and keyd's
+    general `owner/presence` assertion uses a different key and signed
+    message.
   - **Residual risk, stated:** while members share the owner's `user`
     account, any process there can use the daemon's machine-client key, so
     routine brokered operations (status, receipts, a credential-backed
@@ -1324,21 +1327,12 @@ These are this repository's decisions, and the platform's [decision log](https:/
     names (agent-bot-daemon, agent-bot-identity, agent-bot-souls,
     agent-comms, agent-bot-machine). Work lands in the current `qwts`
     repositories, and the owner transfers them when no install breaks.
-  - **Signing team:** for now the same Developer ID team that signs
-    GeniusBar, `Z5DM34QS5U` (identifier `agent-bot-keyd`, confirmed with
-    `codesign -dv` on 2026-10-31; hosts pin it as `settings.keydTeamId`);
-    later True-Line AI LLC's own team. The presence helper must ship as a
-    bundle carrying an embedded Developer ID provisioning profile that
-    grants `keychain-access-groups` (`$(AppIdentifierPrefix)<bundle-id>`),
-    because macOS requires a provisioning profile to use the
-    data-protection keychain and Secure Enclave keys under a Developer ID
-    signature. The team change is a
-    planned rotation, not a silent swap: a Secure Enclave key lives in its
-    team's keychain access group, so the new build makes a new presence
-    key; the old key signs a statement naming the new public key; the
-    owner approves the re-pin at agent-machine and the agent-bot signer pin
-    (`presence.signer`) changes through the owner gate. Until that
-    statement is accepted, a build from the new team is refused.
+  - **Pin continuity.** Machine keeps the independently verified owner
+    public key it accepted at pairing. If a signing-team change requires
+    a new key, the old key signs a statement naming the new public key.
+    The owner approves the re-pin at Machine and updates the agent-bot
+    signer pin (`presence.signer`) through the owner gate. Until that
+    statement is accepted, Machine refuses proofs from the new key.
 - **D5. The WP1 contracts live in `true-line/soul-contracts`, not in
   this repository. Accepted 2026-11-07.**
   §3.1 and §9 row 1 had put the WP1 schemas and fixtures here, while the
