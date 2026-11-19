@@ -34,6 +34,9 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   const clientKey = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(client.public_key, 'hex')]), type: 'spki', format: 'der' });
   let binding, lostReply = true, receiptJti, accessJti, session, revoked = false;
   const options = [];
+  // Simulate an administrator changing the pair between the identity read
+  // and the next normal operation on this running HQ.
+  let refuseAssertion, holdIdentity;
   const handler = createServer((stream) => {
     let line = '';
     stream.setEncoding('utf8');
@@ -84,9 +87,13 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
       assert.equal(r.public_key, Buffer.from(client.public_key, 'hex').toString('base64'));
       assert.ok(verify(null, Buffer.from(parts.join('\n')), clientKey, Buffer.from(r.signature, 'base64')));
       if (r.option === 'bind-enrollment' && lostReply) { lostReply = false; stream.destroy(); return; }
-      const response = { ok: !revoked, ...(revoked && { diagnostic: 'MM_DAEMON_UNKNOWN_KEY' }), state, body, timestamp: r.timestamp, nonce: randomBytes(16).toString('base64url'), request_nonce: r.nonce };
+      if (refuseAssertion === 'offline' && r.option === 'access-assertion') { stream.destroy(); return; }
+      const diagnostic = revoked ? 'MM_DAEMON_UNKNOWN_KEY' : (r.option === 'access-assertion' ? refuseAssertion : undefined);
+      const response = { ok: !diagnostic, ...(diagnostic && { diagnostic }), state, body, timestamp: r.timestamp, nonce: randomBytes(16).toString('base64url'), request_nonce: r.nonce };
       response.signature = sign(null, Buffer.from([response.ok, response.diagnostic ?? '', '', state, JSON.stringify(body), r.timestamp, response.nonce, r.nonce].join('\n')), machine.privateKey).toString('base64');
-      stream.end(JSON.stringify(response) + '\n');
+      const send = () => stream.end(JSON.stringify(response) + '\n');
+      if (r.option === 'identity' && holdIdentity) { holdIdentity(send); holdIdentity = undefined; }
+      else send();
     });
   });
   await new Promise((resolve, reject) => handler.once('error', reject).listen(socket, resolve));
@@ -140,6 +147,30 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.ok(options.includes('access-assertion') && options.includes('bind-access'));
   assert.equal(service.state.requests.filter((r) => r.url.includes('/api/daemon/')).length, 0);
   await assert.rejects(active.hq.core.identity.call('POST', '/api/daemon/credentials', {}), /administrator-side credential use/);
+  const deviceRecord = readFileSync(join(home, 'identity/device.json'));
+  const enrollmentState = async () => (await active.owner.request('device.status')).result.device;
+  for (const refusal of ['MM_DAEMON_UNKNOWN_KEY', 'offline']) {
+    // An identity reply signed before the refusal can arrive afterwards.
+    const queued = new Promise(resolve => { holdIdentity = resolve; });
+    const pending = active.hq.core.signer.deviceStatus();
+    const deliver = await queued;
+    refuseAssertion = refusal;
+    await assert.rejects(active.hq.core.signer.custody.openSession());
+    deliver();
+    await assert.rejects(pending, /custody changed/);
+    const status = (await active.owner.request('status')).result;
+    assert.equal(status.hq.signer.available, false, refusal);
+    assert.equal(await enrollmentState(), 'enrolled');
+    assert.deepEqual(readFileSync(join(home, 'identity/device.json')), deviceRecord);
+    refuseAssertion = undefined;
+    assert.equal(await active.hq.core.signer.deviceStatus(), 'enrolled');
+    assert.equal(active.hq.core.signer.report().available, true);
+  }
+  refuseAssertion = 'MM_DAEMON_UNIMPLEMENTED';
+  await assert.rejects(active.hq.core.signer.custody.openSession(), /UNIMPLEMENTED/);
+  assert.deepEqual(options.slice(-3), ['identity', 'access-assertion', 'identity']);
+  assert.equal(active.hq.core.signer.report().available, true, 'signed request-specific refusal is followed by fresh identity');
+  refuseAssertion = undefined;
   const trap = join(home, 'standalone-invoked');
   const localHelper = { backend: 'helper', command: [process.execPath, '-e',
     "require('node:fs').appendFileSync(process.argv[1], 'called\\n')", trap] };

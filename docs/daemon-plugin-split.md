@@ -532,6 +532,11 @@ not a plugin (PDR-0027), so it is ready before any plugin code runs:
 that registers one is refused. If a plugin fails, it is marked `degraded`,
 its dependents don't start, and `status` reports why.
 
+For paired HQ, `device.status.device` records the enrollment state learned
+from Identity. `status.hq.signer.available` reports whether HQ could verify
+the Machine signer on its latest check. A local pairing refusal or Machine
+outage leaves the existing enrollment record in place.
+
 ### 4.5 Versioning and compatibility
 
 - **Plugin semver** and an integer **`hostApi`** (N and N-1 supported).

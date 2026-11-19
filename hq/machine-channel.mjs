@@ -147,7 +147,11 @@ function authenticatedResponse(line, nonce, pinned, verb) {
   if (signature.length !== 64 || signature.toString('base64') !== r.signature || !verify(null, bytes, key, signature)) {
     throw new Error(`Machine ${verb} signature does not match the daemon pin`);
   }
-  if (!r.ok) throw new Error(`Machine refused signed ${verb}: ${r.diagnostic || 'unspecified'}`);
+  if (!r.ok) {
+    const error = new Error(`Machine refused signed ${verb}: ${r.diagnostic || 'unspecified'}`);
+    error.machineDiagnostic = r.diagnostic || 'unspecified';
+    throw error;
+  }
   if (!r.state) throw new Error(`signed Machine ${verb} is missing its state`);
   return r;
 }

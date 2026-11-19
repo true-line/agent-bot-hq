@@ -19,6 +19,7 @@ const decode = (s) => {
   return bytes;
 };
 const unavailable = (reason) => fail('credential_unavailable', reason);
+const channelRefusals = new Set(['MM_DAEMON_UNKNOWN_KEY', 'MM_DAEMON_PEER_REFUSED', 'MM_DAEMON_CALLER_REFUSED']);
 
 // Only inspect names and types. A role's existing key or enrollment record
 // must never be opened while diagnosing adoption of Machine custody.
@@ -58,6 +59,7 @@ function checkLegacy(home) {
 export function createMachineSigner({ home, enrollment, request = machineRoleDevice, keysFor = releaseServerKeys, clock = { now: Date.now } }) {
   let current;
   let reason = 'Machine device identity has not been verified';
+  let revision = 0;
   function checkReply(response, state) {
     const b = response.body;
     const bound = state === 'bound' || (state === 'identity' && Object.hasOwn(b ?? {}, 'device_id'));
@@ -75,15 +77,41 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
     return { jwk: publicJwk(b.jwk), epoch: b.hq_epoch, generation: b.generation, thumbprint: b.thumbprint,
       ...(bound && { device_id: b.device_id, receipt_jti: b.receipt_jti, receipt_sha256: b.receipt_sha256 }) };
   }
+  function unavailableIdentity(error) {
+    current = undefined;
+    reason = error.message;
+    revision++;
+  }
   async function refresh() {
+    const started = revision;
     try {
       checkLegacy(home);
-      current = checkReply(await request('identity'), 'identity');
+      const identity = checkReply(await request('identity'), 'identity');
+      if (started !== revision) throw new Error('Machine custody changed during the identity check');
+      current = identity;
     } catch (error) {
-      current = undefined;
-      reason = error.message;
+      if (started === revision) unavailableIdentity(error);
       throw error;
     }
+  }
+  async function requestPurpose(option, fields) {
+    const started = revision;
+    let response;
+    try {
+      response = await request(option, fields);
+    } catch (error) {
+      if (started === revision) {
+        unavailableIdentity(error);
+        // A verified, operation-specific refusal can be independent of the
+        // key's availability. Only a fresh identity reply restores its report.
+        if (error.machineDiagnostic && !channelRefusals.has(error.machineDiagnostic)) {
+          try { await refresh(); } catch { /* refresh records the identity failure */ }
+        }
+      }
+      throw error;
+    }
+    if (started !== revision) unavailable('Machine custody changed during this operation');
+    return response;
   }
   function report() {
     try { checkLegacy(home); } catch (error) { return { available: false, backend: 'machine', reason: error.message }; }
@@ -106,7 +134,7 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
       checkLegacy(home);
       const expected = current;
       if (!expected) unavailable('Machine device identity is unavailable');
-      const response = await request('enrollment-proof', { hq_epoch: expected.epoch });
+      const response = await requestPurpose('enrollment-proof', { hq_epoch: expected.epoch });
       const actual = checkReply(response, 'proved');
       if (actual.epoch !== expected.epoch || actual.thumbprint !== expected.thumbprint || actual.generation !== expected.generation) throw new Error('Machine device identity changed during enrollment');
       const proof = response.body.proof;
@@ -160,7 +188,7 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
     async bindEnrollment(receipt, server) {
       const body = signer.verifyEnrollmentReceipt(receipt, server);
       const bytes = decode(receipt.receipt_body);
-      const result = await request('bind-enrollment', { hq_epoch: current.epoch, ...receipt });
+      const result = await requestPurpose('bind-enrollment', { hq_epoch: current.epoch, ...receipt });
       const bound = checkReply(result, 'bound');
       if (bound.epoch !== current.epoch || bound.generation !== current.generation || bound.thumbprint !== current.thumbprint
         || body.device_id !== bound.device_id || receipt.receipt_jti !== bound.receipt_jti
@@ -177,7 +205,7 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
         await refresh();
         const expected = current;
         if (!expected?.device_id || await enrollment.deviceStatus() !== 'enrolled') unavailable('Machine has no current administrator-bound device enrollment');
-        const response = await request('access-assertion', { hq_epoch: expected.epoch });
+        const response = await requestPurpose('access-assertion', { hq_epoch: expected.epoch });
         const identity = checkReply(response, 'asserted');
         const assertion = response.body.assertion;
         const parts = typeof assertion === 'string' && assertion.split('.');
@@ -202,7 +230,7 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
         const receipt = { receipt_body: Buffer.from(body).toString('base64url'), receipt_jti: headers['agent-bot-request-jti'],
           receipt_kid: headers['agent-bot-key-id'], receipt_signature: headers['agent-bot-signature'] };
         const epoch = current.epoch;
-        const response = await request('bind-access', { hq_epoch: epoch, ...receipt });
+        const response = await requestPurpose('bind-access', { hq_epoch: epoch, ...receipt });
         const b = response.body;
         if (response.state !== 'access-bound' || !only(b, ['session', 'expires_at', 'hq_epoch'])
           || b.session !== session || b.hq_epoch !== epoch || !Number.isSafeInteger(b.expires_at)
