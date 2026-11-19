@@ -79,6 +79,16 @@ The new directory contains `AgentBotHQSigner.app` and the separate `HQSigner.ent
 
 For a private provisioned build, the release operator needs a Developer ID Application identity matching the production requirement in `helpers/macos-enclave/main.swift` and a distribution profile authorizing `ai.true-line.hq.signer`. The signing step must resolve the template's team and application-identifier prefix from the approved signing inputs. Apple's `AppIdentifierPrefix` includes the trailing period and can differ from the team identifier. The final application's identifier and sole Keychain group must match the authorized application identifier. The bundle's code identifier must be `ai.true-line.hq.signer`. After signing, notarization and protected installation, configure `features.hardwareSigner` and `signer.backend: helper` with the absolute path to `AgentBotHQSigner.app/Contents/MacOS/agent-bot-hq-signer`.
 
+During private release verification, take the approved team ID and fully qualified HQ App ID from the independently validated provisioning inputs. Compare them with the entitlements embedded in the signed app:
+
+```sh
+set -o pipefail
+/usr/bin/codesign --display --entitlements - --xml "$HQ_SIGNER_APP" |
+  /usr/bin/python3 helpers/macos-enclave/verify-entitlements.py "$APPROVED_TEAM_ID" "$APPROVED_APP_ID"
+```
+
+This offline check compares the team, application identifier and sole Keychain group. Keep the release’s Developer ID signature, provisioning and notarization checks in place.
+
 The entry point checks the Developer ID requirement and signed
 application and access-group entitlements. The helper runs only as the
 dedicated HQ user, uses the role account's private home from the account

@@ -56,3 +56,38 @@ test('the Apple Silicon HQ signer builds reproducibly before provisioning', { sk
   assert.notEqual(build(copy, incomplete).status, 0);
   assert.equal(existsSync(incomplete), false);
 });
+
+test('the final HQ signer entitlements match the authorized team, App ID and sole group', { skip: !native }, () => {
+  const team = 'TESTTEAM01';
+  const prefix = 'PREFIX0001';
+  const app = prefix + '.ai.true-line.hq.signer';
+  const teamKey = 'com.apple.developer.team-identifier';
+  const appKey = 'com.apple.application-identifier';
+  const groupKey = 'keychain-access-groups';
+  const signed = { [teamKey]: team, [appKey]: app, [groupKey]: [app] };
+  const xml = (obj) => execFileSync('/usr/bin/plutil', ['-convert', 'xml1', '-o', '-', '-'], { input: JSON.stringify(obj) });
+  const check = (input, approvedApp = app) => spawnSync('/usr/bin/python3', [join(source, 'verify-entitlements.py'), team, approvedApp], { input, encoding: 'utf8' });
+
+  assert.equal(check(xml(signed)).status, 0, 'an authorized App ID prefix can differ from the team');
+  const different = team + '.ai.true-line.hq.signer';
+  for (const entry of [
+    { ...signed, [teamKey]: prefix },
+    { ...signed, [appKey]: different, [groupKey]: [different] },
+    { ...signed, [appKey]: prefix + '.*' },
+    { ...signed, [groupKey]: [app, prefix + '.other'] },
+    { ...signed, [groupKey]: [app, app] },
+    { ...signed, [groupKey]: [] },
+    { ...signed, [groupKey]: app },
+    { [teamKey]: team, [appKey]: app },
+  ]) {
+    const result = check(xml(entry));
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, '');
+  }
+  assert.equal(check(xml(signed), prefix + '.*').status, 1);
+  for (const malformed of ['', '<?xml version="1.0"?><plist><dict>']) {
+    const result = check(malformed);
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr.trim(), 'invalid signed entitlement plist');
+  }
+});
