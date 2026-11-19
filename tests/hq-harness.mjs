@@ -12,6 +12,7 @@ import { testClock } from '../sdk/services.mjs';
 import { SCHEMA_NAMES } from '../hq/admission.mjs';
 import { NOTICE_SCHEMA_NAMES } from '../hq/notices.mjs';
 import { TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES } from '../hq/tasks.mjs';
+import { createSigner, softwareKeyBackend } from '../hq/signer.mjs';
 import { createHQ } from '../hq/hq.mjs';
 import { legacyDaemon, legacySigner } from '../hq/legacy.mjs';
 import { connectSocket } from '../hq/socket.mjs';
@@ -59,9 +60,9 @@ export async function startHQ({ device = 'enrolled', daemon = 'running', supervi
     home,
     schemas,
     config: config ?? { acceptedDefinitions: { [SOUL]: [DIGEST] } },
-    // null: let HQ pick the enrollment source from its config.
     ...(enrollment === null ? {} : { enrollment: enrollment ?? legacySigner({ run: legacy.run }) }),
-    ...(signer ? { signer } : {}),
+    signer,
+    createDeviceSigner: (options) => createSigner({ ...options, backend: softwareKeyBackend({ dir: join(home, 'signer') }) }),
     ...(identity ? { identity } : {}),
     legacy: legacyDaemon({ run: legacy.run, supervise, clock }),
     clock,

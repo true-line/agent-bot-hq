@@ -13,10 +13,11 @@ sources=(helpers/macos-enclave/Signer.swift helpers/macos-enclave/RoleStore.swif
 xcrun swiftc "${sources[@]}" tests/fixtures/enclave-keychain/main.swift -o "$probe"
 xcrun swiftc "${sources[@]}" helpers/macos-enclave/main.swift -o "$RUNNER_TEMP/hq-release-signer"
 sudo install -o root -g wheel -m 0555 "$RUNNER_TEMP/hq-release-signer" "$stage/release-signer"
-if sudo -n -H -u "$role" "$stage/release-signer" status <<< '{}' >"$RUNNER_TEMP/hq-release-status"; then
+if sudo -n -H -u "$role" "$stage/release-signer" status <<< '{}' >"$RUNNER_TEMP/hq-release-status" 2>"$RUNNER_TEMP/hq-release-error"; then
   echo 'Unprovisioned production helper accepted a signer operation' >&2; exit 1
 fi
 test ! -s "$RUNNER_TEMP/hq-release-status"
+grep -Fxq 'HQ standalone installation is unverified' "$RUNNER_TEMP/hq-release-error"
 sudo install -o root -g wheel -m 0555 "$probe" "$stage/fixture-signer"
 if "$stage/fixture-signer" status <<< '{}' >"$RUNNER_TEMP/hq-foreign-status"; then
   echo 'A foreign UID was allowed to use the HQ signer' >&2; exit 1

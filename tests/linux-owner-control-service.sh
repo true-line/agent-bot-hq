@@ -68,7 +68,7 @@ PY
 if sudo -u agent-bot-hq -- "$node" "$entry" signer rekey --home "$stage/state" > /dev/null 2>"$RUNNER_TEMP/hq-rekey-check"; then
   echo "unexpected rekey while service was active"; exit 1
 fi
-grep -F 'HQ is running' "$RUNNER_TEMP/hq-rekey-check" >/dev/null
+grep -F 'administrator action in Machine/keyd' "$RUNNER_TEMP/hq-rekey-check" >/dev/null
 first_pid="$(systemctl show "$unit.service" -p MainPID --value)"
 [[ "$first_pid" != 0 ]]
 sudo systemctl stop "$unit.service"
@@ -79,5 +79,8 @@ second_pid="$(systemctl show "$unit.service" -p MainPID --value)"
 [[ "$second_pid" != 0 && "$second_pid" != "$first_pid" ]]
 sudo systemctl stop "$unit.socket" "$unit.service"
 sudo jq -e --arg owner "$owner" --argjson uid "$(id -u)" 'any(.tables[] | select(.[0] == "hq\u0000sessions") | .[1][] | .[1]; .account == $owner and .uid == $uid and .closed_at != null)' "$stage/state/store.json" >/dev/null
-# After both units stop, the HQ account can perform offline key maintenance.
-sudo -u agent-bot-hq -- "$node" "$entry" signer rekey --home "$stage/state" --json | jq -e '.generation >= 1' >/dev/null
+# Stopping both units still grants the HQ account no key-maintenance authority.
+if sudo -u agent-bot-hq -- "$node" "$entry" signer rekey --home "$stage/state" 2>"$RUNNER_TEMP/hq-rekey-check"; then
+  exit 1
+fi
+grep -F 'administrator action in Machine/keyd' "$RUNNER_TEMP/hq-rekey-check" >/dev/null

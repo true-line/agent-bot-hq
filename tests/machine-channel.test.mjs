@@ -9,7 +9,7 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { membersPlanResult } from '../hq/machine-members-plans.mjs';
-import { machineCommandInHome } from '../hq/machine-channel.mjs';
+import { machineAccountLayout, machineCommandInHome } from '../hq/machine-channel.mjs';
 
 const moduleUrl = new URL('../hq/machine-channel.mjs', import.meta.url);
 const main = fileURLToPath(new URL('../hq/main.mjs', import.meta.url));
@@ -21,15 +21,35 @@ function fixture(t) {
   return { home, run: (...args) => machineCommandInHome(args, home, process.getuid()), dir: join(home, '.config', 'agent-machine') };
 }
 
-test('the operator CLI refuses a non-role caller even with a self-selected HOME', opts, (t) => {
+test('dedicated-only plan operations refuse a non-role caller even with a self-selected HOME', opts, (t) => {
   if (['agent-bot-hq', '_agent-bot-hq'].includes(userInfo().username)) return t.skip('this account is the role');
   const { home, dir } = fixture(t);
-  for (const args of [['identity'], ['members-plans', 'list', '--socket', join(home, 'machine.sock')]]) {
+  for (const args of [['hq-service-recovery'], ['members-plans', 'list', '--socket', join(home, 'machine.sock')]]) {
     assert.throws(() => execFileSync(process.execPath, [main, 'machine', ...args], {
       env: { ...process.env, HOME: home, AGENT_BOT_HQ_HOME: home }, stdio: 'pipe',
     }), /dedicated HQ service account/);
   }
   assert.equal(existsSync(dir), false);
+});
+
+test('dedicated and explicitly selected ordinary UIDs use one channel, with service operations reserved for the role', opts, async (t) => {
+  const user = { username: 'fixture', uid: 502, gid: 20, homedir: '/test/fixture' };
+  const role = { username: '_agent-bot-hq', uid: 330, gid: 330, homedir: '/var/agent-bot-hq' };
+  assert.equal(machineAccountLayout(role, 'darwin', 330, 330, true).ordinary, false);
+  assert.equal(machineAccountLayout(user, 'darwin', 502, 502, false).ordinary, true);
+  assert.throws(() => machineAccountLayout(user, 'darwin', 502, 502, true), /dedicated HQ/);
+  assert.throws(() => machineAccountLayout(user, 'darwin', 502, 0, false), /authorized local account/);
+  assert.throws(() => machineAccountLayout({ ...role, homedir: user.homedir }, 'darwin', 330, 330, false), /authorized local account/);
+  const { home } = fixture(t);
+  chmodSync(home, 0o755);
+  const run = (...args) => machineCommandInHome(args, home, process.getuid(), undefined, true);
+  const id = await run('identity');
+  assert.ok(id.public_key);
+  assert.equal(statSync(join(home, '.config/agent-machine/client.key')).mode & 0o777, 0o600);
+  await assert.rejects(run('hq-device', 'identity', '--socket', join(home, 'machine.sock')), /requires the daemon pin/);
+  await assert.rejects(run('members-plans', 'list', '--socket', join(home, 'machine.sock')), /dedicated HQ/);
+  chmodSync(home, 0o775);
+  await assert.rejects(run('identity'), /invalid role directory/);
 });
 
 test('a role home can contain a read/traverse-only .config while Machine custody stays private', opts, async (t) => {

@@ -78,7 +78,27 @@ function fixture({ server = SERVER, device = generateKeyPairSync('ec', { namedCu
     }
     return new Response(out.text, { status: out.status, headers: out.headers });
   };
-  const make = (over = {}) => createIdentityService({ server, enrollment, keySet, fetchImpl, clock, ...over });
+  const make = (over = {}) => {
+    const sessions = new Map();
+    const custody = {
+      openSession() {
+        const id = String(sessions.size + 1);
+        const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+        const ephemeralJwk = publicKey.export({ format: 'jwk' });
+        sessions.set(id, { privateKey, ephemeralJwk });
+        return { session: id, ephemeralJwk, assertion: (over.enrollment ?? enrollment).assertion({ ephemeralJwk }) };
+      },
+      bindAccess({ session }) { assert.ok(sessions.has(session)); return { expiresAt: clock.now() + 900_000 }; },
+      requestProof({ session, method, path, ath, jti }) {
+        const { privateKey, ephemeralJwk } = sessions.get(session);
+        const header = { alg: 'ES256', typ: 'dpop+jwt', jwk: ephemeralJwk };
+        const payload = { htm: method, htu: server + path, iat: Math.floor(clock.now() / 1000), jti, ath };
+        const unsigned = [header, payload].map((v) => Buffer.from(JSON.stringify(v)).toString('base64url')).join('.');
+        return unsigned + '.' + sign('sha256', Buffer.from(unsigned), { key: privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url');
+      },
+    };
+    return createIdentityService({ server, enrollment, keySet, fetchImpl, clock, custody, ...over });
+  };
   return { state, keySet, clock, enrollment, make, fetchImpl };
 }
 
