@@ -34,7 +34,7 @@
 // (§9 row 10); credential resolution is row 18. `assertion()` builds the
 // assertion the link sends. This enrollment record retains its transitional
 // first-use server key; the link trusts only its separate release pin.
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';

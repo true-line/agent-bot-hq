@@ -120,8 +120,8 @@ def activated_socket
   # exec releases the allocation. Both inherited descriptors refer to this stream.
   list = Fiddle::Pointer.malloc(Fiddle::SIZEOF_VOIDP)
   count = Fiddle::Pointer.malloc(Fiddle::SIZEOF_SIZE_T)
-  begin
-    result = activation.call("owner-control\0", list, count)
+  result = begin
+    activation.call("owner-control\0", list, count)
   rescue Fiddle::DLError
     stop_launch(LAUNCH_CHECKIN, 'launchd socket activation unavailable')
   end
@@ -152,8 +152,8 @@ when 'probe'
   exit(left.getpeereid.first == Process.euid && right.getpeereid.first == Process.euid)
 when 'launch'
   node, entry, *arguments = ARGV
-  begin
-    role = Etc.getpwuid(Process.euid).name
+  role = begin
+    Etc.getpwuid(Process.euid).name
   rescue ArgumentError
     stop_launch(LAUNCH_ROLE, 'cannot resolve the dedicated HQ account')
   end
