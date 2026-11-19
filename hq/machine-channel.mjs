@@ -10,6 +10,7 @@ import { closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, mkdirS
 import { connect } from 'node:net';
 import { userInfo } from 'node:os';
 import { isAbsolute, join } from 'node:path';
+import { HostError } from '../sdk/errors.mjs';
 
 const PKCS8 = Buffer.from('302e020100300506032b657004220420', 'hex');
 const SPKI = Buffer.from('302a300506032b6570032100', 'hex');
@@ -79,11 +80,15 @@ function syncDir(path) {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
+function missingDevicePair() {
+  throw new HostError('credential_unavailable', "Check this account's Machine pairing with the prefix owner before enrolling HQ. Device signing requires the daemon pin saved by verified Machine status.");
+}
+
 function clientIdentity(dir, uid, create) {
   const keyPath = join(dir, 'client.key');
   let seed = readKey(keyPath, uid);
   if (!seed) {
-    if (!create) throw new Error('initialize the HQ Machine identity first');
+    if (!create) return null;
     // A published identity without its seed requires recovery. A concurrent
     // initializer may just have completed, so re-read before reporting loss.
     if (readKey(join(dir, 'client.pub'), uid) || readKey(join(dir, 'daemon.pub'), uid)) {
@@ -148,7 +153,9 @@ function authenticatedResponse(line, nonce, pinned, verb) {
     throw new Error(`Machine ${verb} signature does not match the daemon pin`);
   }
   if (!r.ok) {
-    const error = new Error(`Machine refused signed ${verb}: ${r.diagnostic || 'unspecified'}`);
+    const error = verb === 'hq-device' && r.diagnostic === 'MM_DAEMON_UNKNOWN_KEY'
+      ? new HostError('credential_unavailable', "Machine could not verify this account's pairing for device signing (MM_DAEMON_UNKNOWN_KEY). Check its pairing with the prefix owner.")
+      : new Error(`Machine refused signed ${verb}: ${r.diagnostic || 'unspecified'}`);
     error.machineDiagnostic = r.diagnostic || 'unspecified';
     throw error;
   }
@@ -243,16 +250,27 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   roleDir(home, uid, false, { allowReadTraverse: ordinary, allowDeny: ordinary });
   const config = join(home, '.config');
   const dir = join(config, 'agent-machine');
-  roleDir(config, uid, identity, { allowReadTraverse: true });
-  roleDir(dir, uid, identity);
+  try {
+    roleDir(config, uid, identity, { allowReadTraverse: true });
+    roleDir(dir, uid, identity);
+  } catch (error) {
+    if (verb === 'hq-device' && error.code === 'ENOENT' && (error.path === config || error.path === dir)) missingDevicePair();
+    throw error;
+  }
   if (identity) { syncDir(home); syncDir(config); }
-  const { key, pub } = clientIdentity(dir, uid, identity);
+  const client = clientIdentity(dir, uid, identity);
+  if (!client) {
+    if (verb === 'hq-device') missingDevicePair();
+    throw new Error('initialize the HQ Machine identity first');
+  }
+  const { key, pub } = client;
   if (identity) return { client: 'agent-daemon', public_key: pub.toString('hex'), fingerprint: fingerprint(pub) };
   const existing = readKey(join(dir, 'daemon.pub'), uid);
   const given = hex && Buffer.from(hex, 'hex');
   if (existing && given && !existing.equals(given)) throw new Error('the supplied daemon key differs from the existing pin');
   const daemon = existing || given;
   if (!daemon) {
+    if (verb === 'hq-device') missingDevicePair();
     if (verb !== 'status') throw new Error(`${verb} requires the daemon pin saved by verified Machine status`);
     throw new Error('first signed status requires the prefix owner’s verified --daemon-key HEX');
   }

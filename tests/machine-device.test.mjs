@@ -21,6 +21,47 @@ import { schemas, fakeLegacy, tempHome } from './hq-harness.mjs';
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const b64 = (v) => Buffer.from(JSON.stringify(v)).toString('base64url');
 
+test('enroll tells an unpaired account which Machine prerequisite is missing', async (t) => {
+  const home = tempHome(), role = tempHome();
+  const config = join(role, '.config'), dir = join(config, 'agent-machine');
+  const service = await fakeIdentityService();
+  const request = (option, fields) => machineCommandInHome(
+    ['hq-device', option, '--socket', join(role, 'machine.sock')], role, process.getuid(), fields, true);
+  const hq = createHQ({ home, schemas, config: { enrollment: { source: 'hq', server: service.url } },
+    serverKeys: [service.key], createDeviceSigner: (opts) => createMachineSigner({ ...opts, request }),
+    legacy: legacyDaemon({ run: fakeLegacy().run }) });
+  t.after(async () => {
+    await hq.stop(); await service.close();
+    for (const folder of [home, role]) rmSync(folder, { recursive: true, force: true });
+  });
+  await hq.start();
+  const enroll = () => promisify(execFile)(process.execPath, [
+    fileURLToPath(new URL('../hq/main.mjs', import.meta.url)), 'enroll', '--harness', 'codex', '--home', home,
+  ]);
+  const refused = async () => {
+    await assert.rejects(enroll(), (error) => {
+      const response = JSON.parse(error.stderr);
+      assert.equal(error.code, 1);
+      assert.equal(response.error, 'credential_unavailable');
+      assert.match(response.explanation, /this account.s Machine pairing/);
+      assert.ok(!response.explanation.includes(role));
+      return true;
+    });
+  };
+  await refused();
+  assert.equal(existsSync(config), false);
+  mkdirSync(config, { mode: 0o700 });
+  await refused();
+  assert.equal(existsSync(dir), false);
+  mkdirSync(dir, { mode: 0o700 });
+  await refused();
+  assert.equal(existsSync(join(dir, 'client.key')), false);
+  await machineCommandInHome(['identity'], role, process.getuid(), undefined, true);
+  await refused();
+  assert.equal(existsSync(join(dir, 'daemon.pub')), false);
+  assert.equal(service.state.requests.length, 0);
+});
+
 test('paired HQ enrolls through admin custody, retries lost binding, and authenticates its saved grant on restart', async (t) => {
   const role = tempHome(), home = tempHome();
   const service = await fakeIdentityService();
@@ -199,6 +240,17 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.equal(active.status.mode, 'safe');
   assert.match(active.status.hq.signer.reason, /MM_DAEMON_UNKNOWN_KEY/);
   assert.match(await consoleStatus(), /^signer: paired Machine\/keyd unavailable \(.*MM_DAEMON_UNKNOWN_KEY/m);
+  const callsBeforeRefusal = service.state.requests.length;
+  await assert.rejects(promisify(execFile)(process.execPath, [
+    fileURLToPath(new URL('../hq/main.mjs', import.meta.url)), 'enroll', '--harness', 'codex', '--home', home,
+  ]), (error) => {
+    const response = JSON.parse(error.stderr);
+    assert.equal(error.code, 1);
+    assert.equal(response.error, 'credential_unavailable');
+    assert.match(response.explanation, /MM_DAEMON_UNKNOWN_KEY.*prefix owner/);
+    return true;
+  });
+  assert.equal(service.state.requests.length, callsBeforeRefusal);
   await checkNoFallback();
   await active.close(); active = null;
   revoked = false;
