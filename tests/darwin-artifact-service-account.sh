@@ -3,6 +3,9 @@
 set -euo pipefail
 [[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "$(uname -s)" == Darwin ]]
 archive="${1:?macOS target tar required}"
+if [[ "$archive" == --socket-parent-comparison ]]; then
+  [[ "${GITHUB_REPOSITORY:-}" == true-line/agent-bot-hq && "$(uname -m)" == arm64 && "$(sw_vers -productVersion)" == 27.* ]]
+fi
 name=_agent-bot-hq
 account="/Users/$name"
 group="/Groups/$name"
@@ -36,6 +39,11 @@ sudo dscl . -create "$account" Password '*'
 sudo dscl . -create "$account" IsHidden 1
 sudo install -d -m 0700 -o "$name" -g "$name" "$home"
 sudo chmod 0755 "$stage"
+if [[ "$archive" == --socket-parent-comparison ]]; then
+  sudo install -m 0644 helpers/darwin-owner.rb tests/darwin-socket-parent-probe.rb "$stage/"
+  /usr/bin/python3 -I tests/darwin-socket-parents.py "$stage"
+  exit
+fi
 sudo tar -xf "$archive" -C "$stage"
 # Keep the installed executable next to its native runtime libraries.
 node_bin="$(node -p 'process.execPath')"
