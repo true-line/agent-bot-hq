@@ -20,14 +20,44 @@ const decode = (s) => {
 };
 const unavailable = (reason) => fail('credential_unavailable', reason);
 
+// Only inspect names and types. A role's existing key or enrollment record
+// must never be opened while diagnosing adoption of Machine custody.
+function inspectFiles(home, dir, names) {
+  const folder = join(home, dir);
+  let parentState;
+  try {
+    const parent = lstatSync(folder, { throwIfNoEntry: false });
+    parentState = !parent ? 'absent' : parent.isDirectory() ? 'directory' : 'unknown';
+  } catch { parentState = 'unknown'; }
+  return names.map(name => {
+    const path = dir + '/' + name;
+    let state = parentState;
+    if (state === 'directory') {
+      try {
+        const entry = lstatSync(join(folder, name), { throwIfNoEntry: false });
+        state = !entry ? 'absent' : entry.isFile() ? 'present' : 'unknown';
+      } catch { state = 'unknown'; }
+    }
+    return { path, state };
+  });
+}
+
+function checkLegacy(home) {
+  const signer = inspectFiles(home, 'signer', ['device-key.pem', 'pin.json']);
+  if (signer.every(file => file.state === 'absent')) return;
+  const files = [...signer, ...inspectFiles(home, 'identity', ['device.json', 'device.previous.json', 'pending-receipt.json'])];
+  const details = [];
+  for (const [state, label] of [['present', 'Found'], ['absent', 'No local entry for'], ['unknown', 'Could not safely inspect']]) {
+    const names = files.filter(file => file.state === state).map(file => file.path);
+    if (names.length) details.push(label + ' ' + names.join(', ') + '.');
+  }
+  throw new Error('Paired custody upgrade paused. ' + details.join(' ') +
+    ' Verify enrollment history before authorizing a custody change.');
+}
+
 export function createMachineSigner({ home, enrollment, request = machineRoleDevice, keysFor = releaseServerKeys, clock = { now: Date.now } }) {
   let current;
   let reason = 'Machine device identity has not been verified';
-  const checkLegacy = () => {
-    for (const name of ['device-key.pem', 'pin.json']) {
-      if (lstatSync(join(home, 'signer', name), { throwIfNoEntry: false })) throw new Error('previous HQ signer state requires administrator custody migration');
-    }
-  };
   function checkReply(response, state) {
     const b = response.body;
     const bound = state === 'bound' || (state === 'identity' && Object.hasOwn(b ?? {}, 'device_id'));
@@ -47,7 +77,7 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
   }
   async function refresh() {
     try {
-      checkLegacy();
+      checkLegacy(home);
       current = checkReply(await request('identity'), 'identity');
     } catch (error) {
       current = undefined;
@@ -56,7 +86,7 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
     }
   }
   function report() {
-    try { checkLegacy(); } catch (error) { return { available: false, backend: 'machine', reason: error.message }; }
+    try { checkLegacy(home); } catch (error) { return { available: false, backend: 'machine', reason: error.message }; }
     return current ? { available: true, backend: 'machine', key_storage: 'hardware', alg: 'ES256',
       thumbprint: current.thumbprint, generation: current.generation, key_files: 0 }
       : { available: false, backend: 'machine', reason };
@@ -73,7 +103,7 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
       return enrollment.enroll(payload);
     },
     async enrollmentProof(aud) {
-      checkLegacy();
+      checkLegacy(home);
       const expected = current;
       if (!expected) unavailable('Machine device identity is unavailable');
       const response = await request('enrollment-proof', { hq_epoch: expected.epoch });
@@ -106,7 +136,7 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
       } catch { return false; }
     },
     verifyEnrollmentReceipt(receipt, server) {
-      checkLegacy();
+      checkLegacy(home);
       const bytes = decode(receipt.receipt_body);
       if (bytes.length > 8192 || !isUtf8(bytes) || !/^enroll-v1:[a-f0-9]{64}$/.test(receipt.receipt_jti)
         || !/^[A-Za-z0-9._:-]{1,128}$/.test(receipt.receipt_kid) || decode(receipt.receipt_signature).length !== 64) {

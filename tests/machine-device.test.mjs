@@ -4,13 +4,13 @@ import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createHash, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from 'node:crypto';
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { createHQ } from '../hq/hq.mjs';
 import { legacyDaemon } from '../hq/legacy.mjs';
 import { connectSocket } from '../hq/socket.mjs';
-import { jwkThumbprint } from '../hq/signer.mjs';
+import { backendFromConfig, createSigner, jwkThumbprint } from '../hq/signer.mjs';
 import { signatureBytes } from '../hq/identity-service.mjs';
 import { machineCommandInHome } from '../hq/machine-channel.mjs';
 import { createMachineSigner } from '../hq/machine-device.mjs';
@@ -187,4 +187,62 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   active.hq.core.approvals.set('pending', { id: 'pending', digest: 'digest', state: 'pending' });
   assert.throws(() => decideApproval(active.hq.core, 'pending', 'approved'), /Machine approval-record/);
   assert.equal(active.hq.core.approvals.get('pending').state, 'pending');
+});
+
+test('paired upgrade reports prior signer and enrollment files through HQ status without opening them', async t => {
+  const home = tempHome();
+  let hq;
+  t.after(async () => { try { await hq?.stop(); } finally { rmSync(home, { recursive: true, force: true }); } });
+  // The earlier HQ default created this key and pin on its first status report.
+  const previous = createSigner({ home, backend: backendFromConfig({}, { home }) });
+  assert.equal(previous.report().backend, 'software');
+  const key = join(home, 'signer/device-key.pem');
+  const pin = join(home, 'signer/pin.json');
+  const grant = join(home, 'identity/device.json');
+  const pending = join(home, 'identity/pending-receipt.json');
+  const past = join(home, 'identity/device.previous.json');
+  const oldKey = lstatSync(key);
+  // Presence detection must work even when the probe cannot open the key.
+  chmodSync(key, 0);
+  hq = createHQ({ home, schemas, legacy: legacyDaemon({ run: fakeLegacy().run }) });
+  const first = await hq.start();
+  assert.equal(first.mode, 'safe');
+  assert.equal(first.hq.signer.available, false);
+  assert.match(first.hq.signer.reason, /Found signer\/device-key.pem, signer\/pin.json\./);
+  assert.match(first.hq.signer.reason, /No local entry for identity\/device.json, identity\/device.previous.json, identity\/pending-receipt.json\./);
+  assert.match(first.hq.signer.reason, /Verify enrollment history/);
+  const noRequest = () => assert.fail('legacy state must refuse before delegating');
+  const signer = createMachineSigner({ home, request: noRequest, enrollment: () => ({}) });
+  await assert.rejects(signer.deviceStatus(), /Paired custody upgrade paused/);
+
+  mkdirSync(join(home, 'identity'), { mode: 0o700 });
+  // The issuer key can be pinned before the service grants enrollment.
+  writeFileSync(join(home, 'identity/server-key.json'), '{}', { mode: 0o600 });
+  assert.equal(signer.report().reason, first.hq.signer.reason);
+  for (const f of [grant, past, pending]) writeFileSync(f, 'private fixture contents', { mode: 0 });
+  const owner = await connectSocket(hq.paths.control);
+  try {
+    const report = (await owner.request('status')).result.hq.signer;
+    assert.equal(report.available, false);
+    assert.match(report.reason, /Found signer\/device-key.pem, signer\/pin.json, identity\/device.json, identity\/device.previous.json, identity\/pending-receipt.json/);
+    assert.ok(!report.reason.includes(home) && !report.reason.includes('private fixture contents'));
+  } finally { await owner.close(); }
+
+  if (process.getuid?.() > 0) {
+    const dir = join(home, 'identity');
+    chmodSync(dir, 0);
+    try {
+      const report = signer.report();
+      assert.match(report.reason, /Could not safely inspect identity\/device.json, identity\/device.previous.json, identity\/pending-receipt.json/);
+      assert.doesNotMatch(report.reason, /No local entry for identity/);
+    } finally { chmodSync(dir, 0o700); }
+    const keyDir = join(home, 'signer');
+    chmodSync(keyDir, 0);
+    try {
+      await assert.rejects(signer.deviceStatus(), /Could not safely inspect signer\/device-key.pem, signer\/pin.json/);
+    } finally { chmodSync(keyDir, 0o700); }
+  }
+  assert.equal(lstatSync(key).ino, oldKey.ino);
+  assert.equal(lstatSync(key).mtimeMs, oldKey.mtimeMs);
+  assert.equal(lstatSync(pin).isFile(), true);
 });

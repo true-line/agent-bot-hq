@@ -1,0 +1,1 @@
+HQ status identifies existing local signer and enrollment files that need review before adopting paired Machine custody. It distinguishes missing files from inspection failures and preserves the existing pairing and keys.
