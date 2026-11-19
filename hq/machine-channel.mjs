@@ -20,13 +20,17 @@ function checkAcl(path) {
   }
 }
 
-function privateDir(path, uid, create) {
+function roleDir(path, uid, create, { allowReadTraverse = false } = {}) {
   if (create) {
     try { mkdirSync(path, { mode: 0o700 }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
   }
   const entry = lstatSync(path);
-  if (!entry.isDirectory() || entry.uid !== uid || (entry.mode & 0o7777) !== 0o700) {
-    throw new Error(`expected private role directory at ${path}`);
+  const mode = entry.mode & 0o7777;
+  // useradd can pre-create .config at 0755 beneath the private role home.
+  // Only this intermediate directory may grant read/traverse to others.
+  const requiredMode = allowReadTraverse ? mode & ~0o055 : mode;
+  if (!entry.isDirectory() || entry.uid !== uid || requiredMode !== 0o700) {
+    throw new Error(`invalid role directory at ${path} (uid ${entry.uid}, mode ${mode.toString(8)})`);
   }
   checkAcl(path);
 }
@@ -180,11 +184,11 @@ export async function machineCommandInHome(argv, home, uid) {
   const status = verb === 'status' && socketFlag === '--socket' && socket && isAbsolute(socket) &&
     (argv.length === 3 || (argv.length === 5 && keyFlag === '--daemon-key' && HEX_KEY.test(hex)));
   if (!identity && !status) throw new Error('usage: machine identity | machine status --socket PATH [--daemon-key HEX]');
-  privateDir(home, uid, false);
+  roleDir(home, uid, false);
   const config = join(home, '.config');
   const dir = join(config, 'agent-machine');
-  privateDir(config, uid, identity);
-  privateDir(dir, uid, identity);
+  roleDir(config, uid, identity, { allowReadTraverse: true });
+  roleDir(dir, uid, identity);
   if (identity) { syncDir(home); syncDir(config); }
   const { key, pub } = clientIdentity(dir, uid, identity);
   if (identity) return { client: 'agent-daemon', public_key: pub.toString('hex'), fingerprint: fingerprint(pub) };

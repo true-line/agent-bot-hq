@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +27,25 @@ test('the operator CLI refuses a non-role caller even with a self-selected HOME'
     env: { ...process.env, HOME: home, AGENT_BOT_HQ_HOME: home }, stdio: 'pipe',
   }), /dedicated HQ service account/);
   assert.equal(existsSync(dir), false);
+});
+
+test('a role home can contain a read/traverse-only .config while Machine custody stays private', opts, async (t) => {
+  const { home, dir, run } = fixture(t);
+  const config = join(home, '.config');
+  mkdirSync(config);
+  chmodSync(config, 0o775);
+  await assert.rejects(run('identity'), /invalid role directory/);
+  assert.equal(existsSync(dir), false);
+  chmodSync(config, 0o755);
+  const id = await run('identity');
+  assert.equal(id.client, 'agent-daemon');
+  assert.equal(statSync(config).mode & 0o777, 0o755);
+  assert.equal(statSync(dir).mode & 0o777, 0o700);
+  chmodSync(dir, 0o755);
+  await assert.rejects(run('identity'), /invalid role directory/);
+  chmodSync(dir, 0o700);
+  chmodSync(home, 0o755);
+  await assert.rejects(run('identity'), /invalid role directory/);
 });
 
 test('first-use races publish one identity and preserve broken existing custody', opts, async (t) => {
