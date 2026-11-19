@@ -95,6 +95,7 @@ test('interim artifact is reproducible, runs offline and refuses changed contrac
     const extracted = join(tmp, 'extract'); mkdirSync(extracted);
     run('tar', ['-xf', one, '-C', extracted]);
     const executable = join(extracted, 'hq/hq/main.mjs');
+    assert.equal(JSON.parse(readFileSync(join(extracted, 'hq/governance/interim-release.json'))).target_platform, undefined);
     return { extracted, executable };
   }
 });
