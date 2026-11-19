@@ -20,7 +20,7 @@ jobs:
           git fetch -q --no-tags --depth=1 "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
           git checkout -q --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-      - name: Build the pinned Machine test binary
+      - name: Fetch the pinned Machine test source
         run: |
           machine="$RUNNER_TEMP/machine"
           git init -q "$machine"
@@ -30,6 +30,14 @@ jobs:
           cd "$machine"
           test -f internal/daemon/hq_device_interop_test.go
           test -f tests/fixtures/build-keyd-device-interop.sh
+      - name: Install Machine's Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: ${{ runner.temp }}/machine/go.mod
+          cache: false
+      - name: Build the Machine test binary
+        working-directory: ${{ runner.temp }}/machine
+        run: |
           go test -c -o "$RUNNER_TEMP/machine-fixture" ./internal/daemon
       - name: Exercise paired HQ and keyd with disposable keys
         run: |
