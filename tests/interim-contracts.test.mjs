@@ -36,6 +36,25 @@ test('vendored contracts verify exact content and refuse tampering and symlinks'
   } finally { rmSync(dir, { recursive:true, force:true }); }
 });
 
+test('importing the verifier from stdin, eval or print leaves CLI execution to the caller', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const entry = fileURLToPath(new URL('../scripts/soul-contracts.mjs', import.meta.url));
+  const expression = "import(process.argv.at(-1)).then(() => console.log('imported verifier'))";
+  for (const args of [
+    ['--input-type=module', '-', entry],
+    ['-e', expression, entry], ['--eval', expression, entry], [`--eval=${expression}`, entry],
+    ['-p', expression, entry], ['--print', expression, entry], ['--print=true', expression, entry], ['-pe', expression, entry],
+  ]) {
+    const result = spawnSync(process.execPath, args, {
+      encoding: 'utf8', input: expression, env: { ...process.env, PATH: '/nonexistent', HQ_INTERIM_OFFLINE: '1' },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^imported verifier$/m);
+    assert.doesNotMatch(result.stdout, /ok soul-contracts/);
+  }
+});
+
 test('interim mode verifies offline and missing payload never falls back to git', async () => {
   const { copyFileSync } = await import('node:fs');
   const { spawnSync } = await import('node:child_process');

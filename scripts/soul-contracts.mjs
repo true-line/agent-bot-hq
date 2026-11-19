@@ -168,8 +168,11 @@ export function repin(tag, pin = readPin()) {
 
 function isCommandEntry() {
   if (typeof import.meta.main === 'boolean') return import.meta.main;
+  // In eval and print modes argv[1] is caller data, which may be the very
+  // file the expression imports. Stdin has no script entry either.
+  const expressionMode = process.execArgv.some((arg) => /^(?:-e|-p|-pe|--eval|--print)(?:=|$)/.test(arg));
+  if (!process.argv[1] || process.argv[1] === '-' || expressionMode) return false;
   // Node 20 can retain a symlink in argv while the module loader resolves it.
-  if (!process.argv[1]) return false;
   try {
     return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
   } catch {
