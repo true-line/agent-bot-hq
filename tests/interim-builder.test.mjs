@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,7 +12,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const run = (cmd, args, options = {}) => execFileSync(cmd, args, { encoding: 'utf8', ...options });
 
 test('interim artifact is reproducible, runs offline and refuses changed contracts', () => {
-  const tmp = mkdtempSync(join(tmpdir(), 'hq-builder-test-'));
+  const tmp = mkdtempSync(join(realpathSync(tmpdir()), 'hq-builder-test-'));
   const darwinHost = process.platform === 'darwin';
   const nativeTarget = darwinHost ? ['--target', 'darwin'] : [];
   const tarCommand = darwinHost ? 'gtar' : 'tar';

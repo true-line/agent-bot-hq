@@ -12,7 +12,7 @@
 // the digest is the SHA-256 of the manifest's RFC 8785 (JCS) bytes.
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -166,7 +166,19 @@ export function repin(tag, pin = readPin()) {
   return { ...pin, tag, commit, digest: got.digest, files: got.files };
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isCommandEntry() {
+  if (typeof import.meta.main === 'boolean') return import.meta.main;
+  // Node 20 can retain a symlink in argv while the module loader resolves it.
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    // REPL and stdin imports can supply an argv entry without a file.
+    return false;
+  }
+}
+
+if (isCommandEntry()) {
   const [cmd = 'verify', tag] = process.argv.slice(2);
   try {
     if (cmd === 'verify') {
