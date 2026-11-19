@@ -252,10 +252,12 @@ export function createSigner({ home, backend, enrollment, uid = process.getuid?.
   // Load the pinned key, creating the first one. Throws when the backend's
   // key is missing or is not the pinned one: that signer is unavailable.
   function ready() {
-    if (pin) return pin;
-    const pinned = readPin();
+    if (pin && !backend.requiresCurrentKey) return pin;
+    const pinned = pin ?? readPin();
     const seen = backend.status();
     if (!pinned) {
+      if (backend.requiresCurrentKey && (seen.present || ['signer/device-key.pem', 'identity/device.json', 'identity/device.previous.json', 'identity/pending-receipt.json']
+        .some((file) => lstatSync(join(home, file), { throwIfNoEntry: false })))) throw new SignerError('existing custody or enrollment requires administrator review');
       if (seen.present) return writePin(seen.jwk, 1); // adopt a key the backend already holds
       return writePin(backend.create({ replace: false }).jwk, 1);
     }

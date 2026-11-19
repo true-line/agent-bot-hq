@@ -300,7 +300,26 @@ pairing is unavailable, the operation is unavailable.
 The owner approved local Secure Enclave signing only for explicitly configured
 standalone HQ in its dedicated account on a Mac without Machine installed.
 Stopping Machine or revoking pairing never enables this mode. Standalone
-signing remains unavailable while installation history is uncertain.
+signing requires an administrator declaration for the dedicated account's UID
+and local Directory Services UUID, including an inventory of custom Machine
+installations. Configure `standalone: true` and `signer.backend: secure-enclave`
+only after installing a verified release helper at the fixed administrator-owned
+standalone path. The helper checks the declaration, the pinned executable,
+current Machine installations, prior pairing and permanent retirement before
+each key operation. A purpose-specific lock readable only by root and the
+dedicated account covers the operation and its bounded reply. A pending
+declaration or retirement marker prevents release of a result. A protected
+retirement entry survives uninstall and
+revocation. Missing or uncertain evidence leaves the signer unavailable.
+Build the native entry point from the full HQ source on macOS with
+`bash scripts/build-macos-standalone-signer.sh /path/to/new/hq-signer`.
+The output is a standalone Mach-O executable. The administrator installs a
+release with the established HQ Developer ID Application signature and
+identifier, and records the independently verified release digest. The running
+helper verifies its own signature and signing hash at the installed path. The
+Secure Enclave key's wrapped reference stays in the dedicated role's private
+file Keychain, with a per-executable Keychain ACL. A production-signed binary
+and native hardware qualification are release prerequisites.
 [Standalone decision](https://github.com/true-line/agent-bot-platform/discussions/93)
 
 | Piece | Domain | Why |

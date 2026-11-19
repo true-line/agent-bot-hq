@@ -10,9 +10,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { decideApproval } from '../sdk/services.mjs';
-import { validateConfig } from '../hq/hq.mjs';
+import { createHQ, validateConfig } from '../hq/hq.mjs';
+import { legacyDaemon } from '../hq/legacy.mjs';
+import { standaloneKeyBackend } from '../hq/standalone-signer.mjs';
 import { backendFromConfig, createSigner, helperKeyBackend, helperRunner, jwkThumbprint, publicJwk, softwareKeyBackend, SIGNER_PROTOCOL } from '../hq/signer.mjs';
-import { startHQ, tempHome } from './hq-harness.mjs';
+import { fakeLegacy, schemas, startHQ, tempHome } from './hq-harness.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HELPER = join(HERE, 'signer-helper-fixture.mjs');
@@ -157,7 +159,7 @@ test('a helper that misbehaves is refused: wrong protocol, a software claim, a p
 
 test('runtime configuration allows only paired Machine custody', () => {
   assert.doesNotThrow(() => validateConfig({ signer: { backend: 'machine' } }));
-  assert.throws(() => validateConfig({ standalone: true, signer: { backend: 'secure-enclave' } }), /verified dedicated-account installation/);
+  assert.doesNotThrow(() => validateConfig({ standalone: true, signer: { backend: 'secure-enclave' } }));
   assert.throws(() => validateConfig({ signer: { backend: 'secure-enclave' } }), /paired Machine backend/);
   for (const signer of [{ backend: 'software' }, { backend: 'helper', command: ['/example/fixture'] },
     { backend: 'machine', command: ['/example/fixture'] }]) {
@@ -228,4 +230,55 @@ test('the stopped HQ CLI cannot create or replace a device key', () => {
     assert.match(result.stderr, /administrator action in Machine\/keyd/);
     assert.equal(existsSync(join(home, 'signer')), false);
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('configured standalone custody rechecks each signing operation and cannot reuse a cached enrollment key after retirement', async () => {
+  const home = tempHome();
+  const chip = outside();
+  let eligible = true;
+  const operations = [];
+  const run = helperRunner();
+  const backend = standaloneKeyBackend(() => {
+    if (!eligible) throw new Error('standalone declaration retired');
+  }, ([path, operation], input) => {
+    assert.equal(path, '/Library/Application Support/ai.true-line.agent-bot-hq/standalone/hq-signer');
+    assert.match(operation, /^standalone-v1-(status|create|sign)$/);
+    operations.push(operation);
+    return run([...helperCommand(chip), operation.slice('standalone-v1-'.length)], input);
+  });
+  const hq = createHQ({
+    home, schemas, enrollment,
+    config: { standalone: true, signer: { backend: 'secure-enclave' } },
+    legacy: legacyDaemon({ run: fakeLegacy().run }),
+    createStandaloneDeviceSigner: options => createSigner({ ...options, backend }),
+    createDeviceSigner: () => assert.fail('standalone declaration does not select paired custody'),
+  });
+  try {
+    const state = await hq.start();
+    assert.equal(state.hq.signer.backend, 'secure-enclave');
+    const signer = hq.core.signer;
+    assert.equal(await signer.deviceStatus(), 'enrolled');
+    const message = Buffer.from('disposable approval bytes');
+    const signature = signer.sign(message);
+    assert.equal(signer.verify(message, signature), true);
+    assert.equal(signer.enrollmentProof('https://example.invalid/oauth/device_authorization').split('.').length, 3);
+    const assertion = { server: 'https://example.invalid', deviceId: 'fixture', ephemeralJwk: signer.publicJwk() };
+    assert.equal(signer.accessAssertion(assertion).split('.').length, 3);
+    assert.equal(operations.filter(op => op === 'standalone-v1-create').length, 1);
+    assert.equal(operations.filter(op => op === 'standalone-v1-sign').length, 3);
+    assert.equal(existsSync(join(home, 'signer/device-key.pem')), false);
+    const before = operations.length;
+    eligible = false;
+    assert.equal(signer.report().available, false);
+    await assert.rejects(signer.deviceStatus(), /retired/);
+    assert.throws(() => signer.enrollmentProof('https://example.invalid'), /retired/);
+    assert.throws(() => signer.accessAssertion(assertion), /retired/);
+    assert.throws(() => signer.sign(message), /retired/);
+    assert.equal(signer.verify(message, signature), false);
+    assert.equal(operations.length, before);
+  } finally {
+    await hq.stop();
+    rmSync(home, { recursive: true, force: true });
+    rmSync(dirname(chip), { recursive: true, force: true });
+  }
 });

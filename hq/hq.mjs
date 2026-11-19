@@ -45,6 +45,7 @@ import { legacyDaemon } from './legacy.mjs';
 import { detectProfile } from './profile.mjs';
 import { createIdentityService } from './identity-service.mjs';
 import { createMachineSigner } from './machine-device.mjs';
+import { createStandaloneSigner } from './standalone-signer.mjs';
 import { createEnrollment, DEFAULT_IDENTITY_SERVICE, validateEnrollmentConfig } from './enrollment.mjs';
 import { createLauncher, LAUNCH_OPERATIONS } from './launch.mjs';
 import { loadPlugins } from './plugins.mjs';
@@ -111,12 +112,8 @@ export function validateConfig(c) {
   if (c.notices !== undefined) validateNoticesConfig(c.notices);
   if (c.harnesses !== undefined) validateHarnessesConfig(c.harnesses);
   if (c.signer !== undefined) {
-    if (c.signer?.backend === 'secure-enclave' && c.standalone === true && Object.keys(c.signer).length === 1) {
-      // A configured offline installation needs trustworthy inventory before
-      // it can use local signing. A missing Machine socket proves no such thing.
-      throw new Error('standalone Secure Enclave signing requires verified dedicated-account installation without Agent Machine');
-    }
-    if (Object.keys(c.signer ?? {}).length !== 1 || c.signer?.backend !== 'machine') {
+    const standaloneEnclave = c.standalone === true && c.signer?.backend === 'secure-enclave';
+    if (Object.keys(c.signer ?? {}).length !== 1 || (!standaloneEnclave && c.signer?.backend !== 'machine')) {
       throw new Error('HQ device key custody requires the paired Machine backend');
     }
   }
@@ -135,6 +132,7 @@ export function createHQ({
   config,                        // defaults to <home>/config.json
   signer,                        // explicit signer for isolated component tests
   createDeviceSigner = createMachineSigner,
+  createStandaloneDeviceSigner = createStandaloneSigner,
   enrollment,                    // where device status and enrollment come from: the config's source by
                                  // default (legacy bridge, or hq/enrollment.mjs); may be a function of the signer
   serverKeys,                    // immutable issuer key set injected by an isolated server fixture
@@ -226,7 +224,8 @@ export function createHQ({
     // Enrollment events become receipts (an enrollment only starts once HQ is up).
     const onEnrollmentEvent = (e) => { if (core) pushReceipt(core, { plugin: 'hq', ...e }).catch(() => {}); };
     enrollment ??= (s) => createEnrollment({ home, signer: s, server: cfg.enrollment?.server, uid, clock, onEvent: onEnrollmentEvent });
-    signer ??= createDeviceSigner({ home, enrollment, clock });
+    const factory = cfg.signer?.backend === 'secure-enclave' ? createStandaloneDeviceSigner : createDeviceSigner;
+    signer ??= factory({ home, enrollment, clock });
     const signerReport = () => (typeof signer.report === 'function' ? signer.report() : undefined);
     const hostProfile = (harnessAccounts) => {
       const report = signerReport();

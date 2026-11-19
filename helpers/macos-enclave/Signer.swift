@@ -83,18 +83,22 @@ private struct Request: Decodable {
     let message: String?
 }
 
-func runSigner() throws {
+func signerInput() throws -> Data {
     guard CommandLine.arguments.count == 2 else { throw SignerFailure.invalidRequest }
     // The host provides exactly one bounded JSON object and closes stdin.
     let input = FileHandle.standardInput.readData(ofLength: 48 * 1024 + 1)
     guard input.count <= 48 * 1024 else { throw SignerFailure.invalidRequest }
+    return input
+}
+
+func signerReply(operation: String, input: Data) throws -> Data {
     let request = try JSONDecoder().decode(Request.self, from: input)
     guard SecureEnclave.isAvailable else { throw SignerFailure.enclaveUnavailable }
-    let store = try roleStore(create: CommandLine.arguments[1] == "create")
+    let store = try roleStore(create: operation == "create")
     let context = LAContext()
     context.interactionNotAllowed = true
     var reply: [String: Any] = ["protocol": "agent-bot-hq-signer/1"]
-    switch CommandLine.arguments[1] {
+    switch operation {
     case "status":
         reply["key_storage"] = "hardware"
         if let reference = try store?.load() {
@@ -123,5 +127,5 @@ func runSigner() throws {
     default:
         throw SignerFailure.invalidRequest
     }
-    FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: reply))
+    return try JSONSerialization.data(withJSONObject: reply)
 }
