@@ -13,6 +13,9 @@ const run = (cmd, args, options = {}) => execFileSync(cmd, args, { encoding: 'ut
 
 test('interim artifact is reproducible, runs offline and refuses changed contracts', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'hq-builder-test-'));
+  const darwinHost = process.platform === 'darwin';
+  const nativeTarget = darwinHost ? ['--target', 'darwin'] : [];
+  const tarCommand = darwinHost ? 'gtar' : 'tar';
   try {
     const repo = join(tmp, 'repo'), contracts = join(tmp, 'contracts');
     for (const d of ['scripts', 'hq', 'governance']) mkdirSync(join(repo, d), { recursive: true });
@@ -38,23 +41,29 @@ test('interim artifact is reproducible, runs offline and refuses changed contrac
     run('git', ['-C', repo, 'update-ref', 'HEAD', fixtureCommit]);
     const sha = run('git', ['-C', repo, 'rev-parse', 'HEAD']).trim();
     const one = join(tmp, 'one.tar'), two = join(tmp, 'two.tar');
-    for (const out of [one, two]) run(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, out], { cwd: repo });
+    for (const out of [one, two]) run(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, out, ...nativeTarget], { cwd: repo });
     const hash = (f) => createHash('sha256').update(readFileSync(f)).digest('hex');
     assert.equal(hash(one), hash(two));
-    const darwin = join(tmp, 'darwin.tar');
-    run(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, darwin, '--target', 'darwin'], { cwd: repo });
-    assert.notEqual(hash(darwin), hash(one));
-    const darwinTree = join(tmp, 'darwin');
-    mkdirSync(darwinTree);
-    run('tar', ['-xf', darwin, '-C', darwinTree]);
-    assert.equal(JSON.parse(readFileSync(join(darwinTree, 'hq/governance/interim-release.json'))).target_platform, 'darwin');
-    if (process.platform === 'linux') {
+    if (darwinHost) {
+      const linux = spawnSync(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, join(tmp, 'linux.tar')], { cwd: repo, encoding: 'utf8' });
+      assert.notEqual(linux.status, 0);
+      assert.match(linux.stderr, /build the Linux target on Linux/);
+    } else {
+      const darwin = join(tmp, 'darwin.tar');
+      run(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, darwin, '--target', 'darwin'], { cwd: repo });
+      assert.notEqual(hash(darwin), hash(one));
+      const darwinTree = join(tmp, 'darwin');
+      mkdirSync(darwinTree);
+      run('tar', ['-xf', darwin, '-C', darwinTree]);
+      assert.equal(JSON.parse(readFileSync(join(darwinTree, 'hq/governance/interim-release.json'))).target_platform, 'darwin');
       const wrongHost = spawnSync(process.execPath, [join(darwinTree, 'hq/hq/main.mjs')], { encoding: 'utf8' });
       assert.notEqual(wrongHost.status, 0);
       assert.match(wrongHost.stderr, /macOS only/);
     }
     const extracted = join(tmp, 'extract'); mkdirSync(extracted);
     run('tar', ['-xf', one, '-C', extracted]);
+    const metadata = JSON.parse(readFileSync(join(extracted, 'hq/governance/interim-release.json')));
+    assert.equal(metadata.target_platform, darwinHost ? 'darwin' : undefined);
     const executable = join(extracted, 'hq/hq/main.mjs');
     assert.match(run(process.execPath, [executable], { env: { PATH: '' } }), /offline-ok/);
     writeFileSync(join(extracted, 'hq/vendor/soul-contracts/errors/one.json'), 'tampered');
@@ -62,12 +71,12 @@ test('interim artifact is reproducible, runs offline and refuses changed contrac
     assert.notEqual(refused.status, 0);
     assert.match(refused.stderr, /digest/);
     const dangling = join(tmp, 'dangling.tar'); symlinkSync(join(tmp, 'absent'), dangling);
-    assert.notEqual(spawnSync(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, dangling], { cwd: repo }).status, 0);
+    assert.notEqual(spawnSync(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, dangling, ...nativeTarget], { cwd: repo }).status, 0);
     const fakeBin = join(tmp, 'bin'); mkdirSync(fakeBin);
     symlinkSync(run('which', ['git']).trim(), join(fakeBin, 'git'));
-    writeFileSync(join(fakeBin, 'tar'), '#!/bin/sh\nexit 17\n', { mode: 0o755 });
+    writeFileSync(join(fakeBin, tarCommand), '#!/bin/sh\nexit 17\n', { mode: 0o755 });
     const failed = join(tmp, 'failed.tar');
-    assert.notEqual(spawnSync(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, failed], { cwd: repo, env: { ...process.env, PATH: fakeBin } }).status, 0);
+    assert.notEqual(spawnSync(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, failed, ...nativeTarget], { cwd: repo, env: { ...process.env, PATH: fakeBin } }).status, 0);
     assert.equal(existsSync(failed), false);
     // Even a reviewed Git tree must be inspected before any archive extraction.
     symlinkSync('hq/main.mjs', join(repo, 'source-link'));
@@ -76,8 +85,8 @@ test('interim artifact is reproducible, runs offline and refuses changed contrac
     const symlinkCommit = run('git', ['-C', repo, 'commit-tree', symlinkTree, '-p', sha, '-m', 'symlink fixture'], { env: ident }).trim();
     run('git', ['-C', repo, 'update-ref', 'HEAD', symlinkCommit]);
     const tarMarker = join(tmp, 'tar-invoked');
-    writeFileSync(join(fakeBin, 'tar'), '#!/bin/sh\nprintf invoked > "$MARKER"\nexit 17\n', { mode: 0o755 });
-    const unsafe = spawnSync(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), symlinkCommit, contracts, join(tmp, 'unsafe.tar')], { cwd: repo, env: { ...process.env, PATH: fakeBin, MARKER: tarMarker }, encoding: 'utf8' });
+    writeFileSync(join(fakeBin, tarCommand), '#!/bin/sh\nprintf invoked > "$MARKER"\nexit 17\n', { mode: 0o755 });
+    const unsafe = spawnSync(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), symlinkCommit, contracts, join(tmp, 'unsafe.tar'), ...nativeTarget], { cwd: repo, env: { ...process.env, PATH: fakeBin, MARKER: tarMarker }, encoding: 'utf8' });
     assert.notEqual(unsafe.status, 0);
     assert.match(unsafe.stderr, /unsupported source tree entry/);
     assert.equal(existsSync(tarMarker), false);
