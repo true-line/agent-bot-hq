@@ -42,7 +42,7 @@ import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, 
 import { connectSocket } from './socket.mjs';
 import { machineRoleCommand } from './machine-channel.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|signer rekey|machine identity|machine status|machine members-plans|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|signer rekey|machine identity|machine status|machine members-plans|machine hq-service-recovery|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
@@ -115,7 +115,8 @@ function printStatus(s) {
 
 async function main(argv) {
   if (argv[0] === 'machine') {
-    console.log(JSON.stringify(await machineRoleCommand(argv.slice(1))));
+    const result = await machineRoleCommand(argv.slice(1));
+    console.log(typeof result === 'string' ? result : JSON.stringify(result));
     return;
   }
   const args = parse(argv);

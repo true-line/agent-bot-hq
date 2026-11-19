@@ -2,6 +2,7 @@
 // seed belongs to the service account. It is independent of the HQ signer.
 import { isUtf8 } from 'node:buffer';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
+import { recoveryArgs, serviceRecovery } from './machine-service-recovery.mjs';
 import { membersPlanResult, validPlanId } from './machine-members-plans.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash, createPrivateKey, createPublicKey, randomBytes, sign, verify } from 'node:crypto';
@@ -130,12 +131,17 @@ function responseFields(line) {
 
 function authenticatedResponse(line, nonce, pinned, verb) {
   const { value: r, body } = responseFields(line);
+  if (verb === 'hq-service-recovery' && Object.keys(r).some((field) =>
+    !['ok', 'diagnostic', 'message', 'state', 'body', 'timestamp', 'nonce', 'request_nonce', 'signature'].includes(field))) {
+    throw new Error('unexpected Machine service recovery response field');
+  }
   const singleLine = (s) => typeof s === 'string' && !/[\r\n]/.test(s);
   if (typeof r.ok !== 'boolean' || !Number.isSafeInteger(r.timestamp) ||
-      Math.abs(Date.now() / 1000 - r.timestamp) > 300 || r.request_nonce !== nonce ||
+      Math.abs(Date.now() / 1000 - r.timestamp) > 300 ||
+      (nonce === null ? typeof r.request_nonce !== 'string' || !/^[A-Za-z0-9_-]{22}$/.test(r.request_nonce) : r.request_nonce !== nonce) ||
       !singleLine(r.nonce) || !r.nonce || Buffer.byteLength(r.nonce) > 128 || ![r.state ?? '', r.diagnostic ?? '', r.message ?? ''].every(singleLine) ||
       typeof r.signature !== 'string') throw new Error(`invalid or stale Machine ${verb} response`);
-  const bytes = Buffer.from([r.ok, r.diagnostic ?? '', r.message ?? '', r.state ?? '', body, r.timestamp, r.nonce, nonce].join('\n'));
+  const bytes = Buffer.from([r.ok, r.diagnostic ?? '', r.message ?? '', r.state ?? '', body, r.timestamp, r.nonce, r.request_nonce].join('\n'));
   const key = createPublicKey({ key: Buffer.concat([SPKI, pinned]), type: 'spki', format: 'der' });
   const signature = Buffer.from(r.signature, 'base64');
   if (signature.length !== 64 || signature.toString('base64') !== r.signature || !verify(null, bytes, key, signature)) {
@@ -179,6 +185,7 @@ export function machineRoleCommand(argv) {
       (mac && (account.uid < 300 || account.uid > 399 || account.gid !== account.uid))) {
     throw new Error('Machine channel commands require the dedicated HQ service account');
   }
+  if (argv[0] === 'hq-service-recovery' && !mac) throw new Error('paired HQ service recovery requires macOS');
   return machineCommandInHome(argv, account.homedir, account.uid);
 }
 
@@ -187,10 +194,13 @@ export function machineRoleCommand(argv) {
 export async function machineCommandInHome(argv, home, uid) {
   const [verb, ...args] = argv;
   const identity = verb === 'identity' && !args.length;
-  let socket, hex, option = '', planID = '';
+  let socket, hex, recovery, option = '', planID = '';
   if (verb === 'status' && args[0] === '--socket' &&
       (args.length === 2 || (args.length === 4 && args[2] === '--daemon-key' && HEX_KEY.test(args[3])))) {
     [, socket, , hex] = args;
+  } else if (verb === 'hq-service-recovery') {
+    recovery = recoveryArgs(args);
+    socket = recovery.socket;
   } else if (verb === 'members-plans') {
     option = args[0];
     if (option === 'list' && args[1] === '--socket' &&
@@ -218,15 +228,24 @@ export async function machineCommandInHome(argv, home, uid) {
   if (existing && given && !existing.equals(given)) throw new Error('the supplied daemon key differs from the existing pin');
   const daemon = existing || given;
   if (!daemon) {
-    if (verb === 'members-plans') throw new Error('members-plans requires the daemon pin saved by verified Machine status');
+    if (verb !== 'status') throw new Error(`${verb} requires the daemon pin saved by verified Machine status`);
     throw new Error('first signed status requires the prefix owner’s verified --daemon-key HEX');
   }
-  const timestamp = Math.floor(Date.now() / 1000);
-  const nonce = randomBytes(16).toString('base64url');
-  const bytes = Buffer.from([verb, '', option, '', planID, '', '', '', timestamp, nonce].join('\n'));
-  const request = { verb, ...(option && { option }), ...(planID && { plan_id: planID }), timestamp, nonce,
-    public_key: pub.toString('base64'), signature: sign(null, bytes, key).toString('base64') };
-  const r = authenticatedResponse(await exchange(socket, request), nonce, daemon, verb);
+  async function send(fields) {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const nonce = randomBytes(16).toString('base64url');
+    const parts = [fields.verb, '', fields.option ?? '', '', fields.plan_id ?? '', '', '', '', timestamp, nonce];
+    for (const field of ['plan_digest', 'challenge_nonce', 'owner_signature']) {
+      if (fields[field] !== undefined) parts.push(field, fields[field]);
+    }
+    const request = { ...fields, timestamp, nonce, public_key: pub.toString('base64'),
+      signature: sign(null, Buffer.from(parts.join('\n')), key).toString('base64') };
+    const line = await exchange(socket, request);
+    return { line, response: authenticatedResponse(line, nonce, daemon, fields.verb) };
+  }
+  if (recovery) return serviceRecovery(recovery, daemon.toString('hex'), pub.toString('hex'), send,
+    (line) => authenticatedResponse(line, null, daemon, verb));
+  const { response: r } = await send({ verb, ...(option && { option }), ...(planID && { plan_id: planID }) });
   const result = { client: 'agent-daemon', channel: 'signed', state: r.state, daemon_fingerprint: fingerprint(daemon) };
   if (verb === 'members-plans') return { ...result, ...membersPlanResult(option, planID, r) };
   if (!existing && !publish(dir, 'daemon.pub', daemon, uid).equals(daemon)) throw new Error('a different daemon key was pinned concurrently');

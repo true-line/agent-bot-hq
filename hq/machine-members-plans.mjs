@@ -31,7 +31,9 @@ function validMembers(plan) {
       service.target === 'ai.true-line.agent-bot-hq'));
 }
 
-function validateCanonical(body, id) {
+export function validatedMembersPlan(id, response) {
+  const body = response.body;
+  if (!object(body) || response.state !== 'found') throw new Error('unexpected Machine members-plans lookup state');
   const { plan_id, plan_digest, plan_canonical } = body;
   if (Object.keys(body).length !== 3 || plan_id !== id || typeof plan_digest !== 'string' ||
       !/^[0-9a-f]{64}$/.test(plan_digest) || typeof plan_canonical !== 'string' || !plan_canonical.endsWith('\n') ||
@@ -49,14 +51,14 @@ function validateCanonical(body, id) {
   if (JSON.stringify(p).replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029') + '\n' !== plan_canonical) {
     throw new Error('Machine members plan is not in canonical form');
   }
+  return p;
 }
 
 export function membersPlanResult(option, id, response) {
   const body = response.body;
   if (!object(body)) throw new Error('Machine members-plans response is missing its body');
   if (option === 'get') {
-    if (response.state !== 'found') throw new Error('unexpected Machine members-plans lookup state');
-    validateCanonical(body, id);
+    validatedMembersPlan(id, response);
   } else {
     const ids = body.plan_ids;
     if (response.state !== 'listed' || Object.keys(body).some((k) => k !== 'plan_ids' && k !== 'next_after') ||

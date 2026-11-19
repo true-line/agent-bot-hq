@@ -118,3 +118,40 @@ review. Applying it requires a separate owner approval and human root apply.
 Record the returned `channel`, `state` and `daemon_fingerprint` as channel
 evidence. Secure Enclave custody and protected-profile qualification have
 separate checks.
+
+### Repair the macOS service after pairing
+
+When the dedicated HQ account is healthy and its service is down, the
+paired role can request owner approval of one saved repair
+plan. The eligible plan contains only the unchanged `_agent-bot-hq` account
+and the create or write step for `ai.true-line.agent-bot-hq`. As the paired
+HQ role, export the challenge to a transfer file. The file contains the
+original signed Machine response and the complete canonical plan.
+
+```sh
+node hq/main.mjs machine hq-service-recovery export "$plan_id" --socket "$socket" > "$challenge_file"
+```
+
+Transfer the file intact to the daily owner. On the owner's device, verify
+the Machine fingerprint against the independently trusted SHA-256 fingerprint
+of its raw Ed25519 public key. Check the intended HQ, exact plan and digest,
+and confirm the local hardware key matches the pinned owner key. Signing
+returns a proof file containing `public_key` and `signature`. The challenge
+expires within two minutes. Exporting another challenge replaces the old one.
+
+Return the proof to the paired role and submit it alongside the original
+challenge. HQ checks the Machine signature against its saved pin and verifies
+the owner's P-256 signature before contacting Machine.
+
+```sh
+node hq/main.mjs machine hq-service-recovery approve --challenge-file "$challenge_file" --proof-file "$proof_file" --socket "$socket"
+```
+
+An `approved` reply includes the plan ID, digest and approval expiry. The
+administrator can then run `sudo managed-machine members apply "$plan_id"`
+within that window. To cancel a pending challenge instead, run the following
+command as the paired HQ role.
+
+```sh
+node hq/main.mjs machine hq-service-recovery cancel --challenge-file "$challenge_file" --socket "$socket"
+```
