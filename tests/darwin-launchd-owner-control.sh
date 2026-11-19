@@ -31,6 +31,7 @@ sudo chmod 0755 "$work"
 # This test runner keeps its Node next to its native runtime libraries.
 sudo install -m 0600 -o "$role" -g "$role" /dev/null "$work/launchd.stderr"
 sudo -n -H -u "$role" "$system_node" --version
+"$system_node" --test tests/hq-owner-control.test.mjs
 "$system_node" "$entry" check-owner-control | jq -e '.capability == "darwin-owner-control/v1"' >/dev/null
 
 # Generate typed launchd properties with the same service, socket and CLI
@@ -42,7 +43,7 @@ import sys
 label, role, socket, node, entry, helper, state, owner, stderr = sys.argv[1:]
 plistlib.dump({
     "Label": label,
-    "UserName": role, "GroupName": role,
+    "UserName": role, "GroupName": role, "Umask": 0o077,
     "ProgramArguments": ["/usr/bin/ruby", "--disable-gems", helper, "launch",
                          node, entry, "run", "--home", state, "--owner-account", owner],
     "Sockets": {"owner-control": {"SockPathName": socket, "SockPathMode": 0o666,
@@ -50,13 +51,13 @@ plistlib.dump({
     "StandardErrorPath": stderr,
 }, sys.stdout.buffer)
 PY
-sudo install -d -m 0700 -o "$role" -g "$role" "$state"
+# A first install provides an empty role home. HQ creates its own private state.
+sudo -n -u "$role" test ! -e "$state"
 sudo install -m 0644 -o root -g wheel "$work/launch.plist" "$plist"
 plutil -lint "$plist"
 sudo launchctl bootstrap system "$plist"
 
 # Only the manager runs as root. This normal CLI runs as the designated owner.
-stat -f '%N uid=%u gid=%g mode=%Lp type=%HT' /private /private/var "$socket"
 diagnose() {
   sudo cat "$work/launchd.stderr" >&2
   sudo launchctl print "system/$label" | awk '/state =|last exit code =|pid =/ { print }' >&2
@@ -68,18 +69,33 @@ import os
 import stat
 import subprocess
 import sys
+import time
 
 node, entry, owner, path = sys.argv[1:]
-sock = os.lstat(path)
+deadline = time.monotonic() + 3
+while True:
+    try:
+        sock = os.lstat(path)
+        break
+    except FileNotFoundError:
+        if time.monotonic() >= deadline:
+            raise
+        time.sleep(0.05)
 assert stat.S_ISSOCK(sock.st_mode) and sock.st_uid == 0 and stat.S_IMODE(sock.st_mode) == 0o666
-result = subprocess.run([node, entry, "status", "--owner-control", "--json"],
-                        check=True, stdout=subprocess.PIPE, text=True, timeout=45)
+# Machine apply runs as root with this small environment and invokes the
+# CLI as the approved owner. Hosted CI itself starts as the ordinary owner.
+result = subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/env", "-i",
+                         "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C",
+                         "/usr/bin/sudo", "-n", "-H", "-u", owner, "--",
+                         node, entry, "status", "--owner-control", "--json"],
+                        check=True, stdout=subprocess.PIPE, text=True, timeout=30)
 status = json.loads(result.stdout)
 control = status["hq"]["sockets"]["ownerControl"]
 assert control["path"] == path and control["peer_check"] == "getpeereid"
 assert control["uid"] == os.getuid() and control["account"] == owner
 assert status["hq"]["account"] == "_agent-bot-hq" and status["profile"] == "managed-cooperative"
 PY
+[[ "$(sudo stat -f '%u:%Lp' "$state")" == "$(id -u "$role"):700" ]]
 pid="$(sudo launchctl print "system/$label" | awk '$1 == "pid" && $2 == "=" { print $3 }')"
 [[ "$pid" =~ ^[1-9][0-9]*$ ]]
 [[ "$(ps -o uid= -p "$pid" | tr -d ' ')" == "$(id -u "$role")" ]]

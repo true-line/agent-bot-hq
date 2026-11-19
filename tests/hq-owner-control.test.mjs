@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
 import { once } from 'node:events';
@@ -26,4 +28,8 @@ test('owner control compares the connected peer UID with the configured owner', 
       client.destroy();
     }
   } finally { await new Promise((resolve) => server.close(resolve)); }
+});
+
+test('Darwin matches a renamed listener to the published socket with a bounded probe', { skip: process.platform !== 'darwin' }, () => {
+  execFileSync('/usr/bin/ruby', ['--disable-gems', fileURLToPath(new URL('darwin-owner-listener.rb', import.meta.url))], { timeout: 5000 });
 });
