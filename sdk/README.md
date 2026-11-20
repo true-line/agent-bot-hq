@@ -56,17 +56,19 @@ assert.ok(r.ok, JSON.stringify(r.results.filter((x) => !x.ok)));
 ## Identity is HQ core
 
 Per [PDR-0027](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0027-hq-identity-authority-lives-in-agent-bot-daemon.md),
-enrollment, the identity-service link, the device key and signer, credential
-references, grants and approvals are built into HQ, not a plugin. The host
-reads device status from the signer before any plugin runs, and no plugin can
-register `status`, `device.status` or `device.enroll`. agent-bot-identity's
+HQ core owns enrollment, the identity-service link, credential references,
+grants and approvals. The host obtains device status through Machine before
+any plugin runs, and no plugin can register `status`, `device.status` or `device.enroll`. agent-bot-identity's
 plugin registers member surfaces only: `ctx.tools`, `ctx.commands` and
 `ctx.hooks`.
 
 ## Credential custody
 
-HQ holds the device key and short-lived credentials only in memory (D4 and
-the platform's trust-domains page). The SDK keeps to that in four ways:
+HQ requests authorized device operations over its paired Machine channel.
+Machine and keyd keep the device and DPoP private keys in the secure
+administrative account. HQ handles the HTTPS exchange and holds short-lived
+credentials in memory. [Platform custody decision](https://github.com/true-line/agent-bot-platform/discussions/91)
+
 
 - `credentials.resolve` mints one token per task and operation. It holds
   the token in memory until the operation finishes, the token expires or

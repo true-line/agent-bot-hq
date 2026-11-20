@@ -13,7 +13,7 @@ test('HQ in the owner account reports managed-cooperative and every reason prote
   assert.equal(p.reasons[0], 'HQ runs in the user account, not _agent-bot-hq (D6)');
   assert.match(p.reasons[1], /share one account: no OS account per harness credential \(D7\)$/);
   assert.match(p.reasons[2], /T01–T03, T21/);
-  assert.match(p.reasons[3], /not known to be a hardware key/);
+  assert.equal(p.reasons[3], 'HQ could not verify hardware custody of the device key');
   assert.match(detectProfile({ platform: 'darwin', account: 'user', keyStorage: 'software' }).reasons[3], /key_storage=software/);
   assert.equal(detectProfile({ platform: 'darwin', account: 'user', keyStorage: 'hardware' }).reasons.length, 3);
 });

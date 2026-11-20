@@ -69,15 +69,13 @@ signature, sign a new challenge and explicitly rekey. The test executable
 links an independent test main. The production executable must refuse on
 the unprovisioned runner.
 
-Production source is under `helpers/macos-enclave/`. Build all three Swift
-files into the native executable of the provisioned Developer ID bundle
-`ai.true-line.hq.signer`, and supply the installed executable's absolute path
-to the existing `features.hardwareSigner` and `signer.backend: helper`
-configuration. The entry point checks the Developer ID requirement and signed
-application and access-group entitlements. The helper runs only as the
-dedicated HQ user, uses the role account's private home from the account
-database, and unlocks its own file Keychain without UI. The interactive
-owner's Keychain and the data-protection login context are separate from
-this service. See [Apple TN3137](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains).
+The native standalone candidate is built from the Swift sources under
+`helpers/macos-enclave/`. Its entry point checks standard Homebrew paths
+and unlinked kegs using the Machine release signing requirement. Existing
+Machine identity evidence, an invalid candidate, and unreadable paths all
+block local signing. A clean search leaves standalone eligibility unverified.
+The normal HQ runtime uses the paired Machine channel. The executable with
+the independent test main exercises the dedicated-role Keychain protocol.
+See [Apple TN3137](https://developer.apple.com/documentation/technotes/tn3137-on-mac-keychains).
 Packaging, provisioned installation and physical-Mac T02 remain in
 [HQ #107](https://github.com/true-line/agent-bot-hq/issues/107).

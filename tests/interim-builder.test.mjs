@@ -47,7 +47,9 @@ test('interim artifact is reproducible, runs offline and refuses changed contrac
     const darwinTree = join(tmp, 'darwin');
     mkdirSync(darwinTree);
     run('tar', ['-xf', darwin, '-C', darwinTree]);
-    assert.equal(JSON.parse(readFileSync(join(darwinTree, 'hq/governance/interim-release.json'))).target_platform, 'darwin');
+    const darwinMetadata = JSON.parse(readFileSync(join(darwinTree, 'hq/governance/interim-release.json')));
+    assert.equal(darwinMetadata.target_platform, 'darwin');
+    assert.equal(darwinMetadata.owner_control_capability, 'darwin-owner-control/v2');
     if (process.platform === 'linux') {
       const wrongHost = spawnSync(process.execPath, [join(darwinTree, 'hq/hq/main.mjs')], { encoding: 'utf8' });
       assert.notEqual(wrongHost.status, 0);
@@ -55,6 +57,7 @@ test('interim artifact is reproducible, runs offline and refuses changed contrac
     }
     const extracted = join(tmp, 'extract'); mkdirSync(extracted);
     run('tar', ['-xf', one, '-C', extracted]);
+    assert.equal(Object.hasOwn(JSON.parse(readFileSync(join(extracted, 'hq/governance/interim-release.json'))), 'owner_control_capability'), false);
     const executable = join(extracted, 'hq/hq/main.mjs');
     assert.match(run(process.execPath, [executable], { env: { PATH: '' } }), /offline-ok/);
     writeFileSync(join(extracted, 'hq/vendor/soul-contracts/errors/one.json'), 'tampered');

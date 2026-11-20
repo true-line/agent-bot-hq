@@ -1,15 +1,11 @@
-// The TPM 2.0 signer helper (plan §9 row 15b; helpers/tpm2-signer.mjs),
+// The TPM 2.0 signer helper (plan §9 row 15b; tests/fixtures/tpm2-signer.mjs),
 // run against a software TPM (swtpm) with tpm2-tools. A software TPM proves
 // the helper and the tpm2-tools calls, not hardware custody: qualification
 // on a real TPM is separate and is what changes the feature flag's default.
 //
 // The tests skip where swtpm or tpm2-tools is missing. CI sets
 // HQ_REQUIRE_TPM=1, which turns that skip into a failure.
-// HQ_TPM_TCTI (for example device:/dev/tpmrm0) runs the same tests against a
-// TPM that already exists instead of spawning swtpm: a real or virtual TPM on
-// a host, run there by hand, or the persistent swtpm CI starts for this mode.
-// That TPM keeps its state, so the tests evict their own handles before and
-// after, and never use the helper's default handle.
+// HQ_TPM_TCTI may select an existing loopback swtpm for the persistent-state test.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -23,19 +19,23 @@ import { fileURLToPath } from 'node:url';
 import { createSigner, helperKeyBackend, helperRunner } from '../hq/signer.mjs';
 import { startHQ, tempHome } from './hq-harness.mjs';
 
-const HELPER = join(dirname(fileURLToPath(import.meta.url)), '../helpers/tpm2-signer.mjs');
+const dir = dirname(fileURLToPath(import.meta.url));
+const HELPER = join(dir, 'fixtures/tpm2-signer.mjs');
+const releaseHelper = join(dir, '../helpers/tpm2-signer.mjs');
 const has = (cmd) => spawnSync('sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
 const tcti = process.env.HQ_TPM_TCTI || '';
-const device = tcti.startsWith('device:') ? tcti.slice('device:'.length) : '';
+if (tcti && !/^swtpm:host=127\.0\.0\.1,port=[1-9][0-9]{0,4}$/.test(tcti)) {
+  throw new Error('HQ_TPM_TCTI must select a loopback software TPM');
+}
 const tools = has('tpm2_sign') && has('tpm2_createprimary');
-const available = process.platform === 'linux' && tools && (tcti ? !device || existsSync(device) : has('swtpm'));
+const available = process.platform === 'linux' && tools && (Boolean(tcti) || has('swtpm'));
 const required = process.env.HQ_REQUIRE_TPM === '1';
-const missing = tcti ? `tpm2-tools${device ? ` or ${device}` : ''} is missing` : 'swtpm and tpm2-tools are not installed';
+const missing = tcti ? 'tpm2-tools is missing' : 'swtpm and tpm2-tools are not installed';
 const skip = available ? false : missing;
 const PORT = 23210 + (process.pid % 500) * 2;
 const env = { ...process.env, TPM2TOOLS_TCTI: tcti || `swtpm:host=127.0.0.1,port=${PORT}` };
 // Every persistent handle these tests create; cleared on a persistent TPM.
-// None is the helper's default (0x81010020), which HQ itself uses on a real host.
+// Leave the default handle untouched when reusing a software TPM.
 const TEST_HANDLES = ['0x8101002e', '0x8101002f', '0x81010021', '0x81010022', '0x81010023'];
 const evictTestHandles = () => {
   const listed = spawnSync('tpm2_getcap', ['handles-persistent'], { env, encoding: 'utf8' });
@@ -171,17 +171,17 @@ test('TPM helper: bad input and a missing key fail without output HQ could mista
   }
 });
 
-test('HQ runs on the TPM helper when the hardwareSigner feature is on', { skip }, async () => {
-  const saved = process.env.TPM2TOOLS_TCTI;
-  process.env.TPM2TOOLS_TCTI = env.TPM2TOOLS_TCTI; // HQ's default helper runner inherits the environment
-  const t = await startHQ({ config: { features: { hardwareSigner: true }, signer: { backend: 'helper', command: command('0x81010023') } } });
-  try {
-    const s = (await (await t.owner()).request('status')).result;
-    assert.equal(s.mode, 'running');
-    assert.deepEqual([s.hq.signer.available, s.hq.signer.key_storage, s.hq.signer.key_files], [true, 'hardware', 0]);
-    assert.deepEqual(walk(t.home).filter((f) => /\.pem$/.test(f)), []);
-  } finally {
-    await t.done();
-    if (saved === undefined) delete process.env.TPM2TOOLS_TCTI; else process.env.TPM2TOOLS_TCTI = saved;
+test('HQ refuses the local TPM helper, including direct requests to its release entry point', async () => {
+  for (const op of ['status', 'create', 'sign']) {
+    const refused = spawnSync(process.execPath, [releaseHelper, op], { input: '{}', encoding: 'utf8' });
+    assert.equal(refused.status, 1);
+    assert.equal(refused.stdout, '');
+    assert.match(refused.stderr, /requires the paired Machine/);
   }
+  const home = tempHome();
+  try {
+    await assert.rejects(startHQ({ home, config: { features: { hardwareSigner: true },
+      signer: { backend: 'helper', command: [process.execPath, releaseHelper] } } }), /paired Machine backend/);
+    assert.equal(existsSync(join(home, 'signer')), false);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });

@@ -144,7 +144,7 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
   // session, handling bytes, or dispatching a request. Other listeners keep
   // their existing framing, including admission's first-request takeover.
   let pendingChecks = 0;
-  const server = createServer({ pauseOnConnect: Boolean(activated) }, async (socket) => {
+  async function onConnection(socket) {
     conns.add(socket);
     socket.once('close', () => conns.delete(socket));
     socket.on('error', () => {});
@@ -233,12 +233,14 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     // The session ends after its queued requests finish, so a request still
     // in flight (a broker bind, say) cannot recreate state after the end.
     socket.on('close', () => { queue = queue.then(() => endSession(session)).catch(() => {}); });
-  });
+  }
 
+  const server = createServer({ pauseOnConnect: Boolean(activated) }, onConnection);
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(activated ? { fd: activated.fd } : path, () => { server.off('error', reject); resolve(); });
   });
+  activated?.listener?.adopt(onConnection);
   if (!activated) chmodSync(path, mode);
 
   return {

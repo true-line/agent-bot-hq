@@ -41,11 +41,11 @@ import { createCore, dropTokens, pushReceipt, revokeDevice } from '../sdk/servic
 import { admissionPlugin } from './admission.mjs';
 import { tasksPlugin } from './tasks.mjs';
 import { noticesPlugin } from './notices.mjs';
-import { legacyDaemon, legacySigner } from './legacy.mjs';
+import { legacyDaemon } from './legacy.mjs';
 import { detectProfile } from './profile.mjs';
-import { backendFromConfig, createSigner, validateSignerConfig } from './signer.mjs';
-import { createEnrollment, validateEnrollmentConfig } from './enrollment.mjs';
 import { createIdentityService } from './identity-service.mjs';
+import { createMachineSigner } from './machine-device.mjs';
+import { createEnrollment, DEFAULT_IDENTITY_SERVICE, validateEnrollmentConfig } from './enrollment.mjs';
 import { createLauncher, LAUNCH_OPERATIONS } from './launch.mjs';
 import { loadPlugins } from './plugins.mjs';
 import { OWNER_CONTROL_PATH, OWNER_PEER_CHECK } from './owner-control.mjs';
@@ -66,7 +66,7 @@ export const cryptoRandom = () => ({ bytes: (n) => randomBytes(n), hex: (n = 16)
 // HQ resolves credential references in PR 18. Until then every
 // credential waits with credential_unavailable, as an outage would (R9).
 export function unlinkedIdentity() {
-  const refuse = () => fail('credential_unavailable', 'HQ has no identity-service link yet (§9 PRs 10 and 18)');
+  const refuse = () => fail('credential_unavailable', 'HQ has no identity-service link for this credential operation');
   return { link: 'not-linked', keySet: [], check: refuse, call: async () => refuse(), mint: async () => refuse(), onRevoke() {} };
 }
 
@@ -99,9 +99,7 @@ export function validateConfig(c) {
     || !c.concurrentWriters.every((w) => typeof w === 'string' && w.length > 0 && w.length <= 256))) {
     throw new Error('HQ config: concurrentWriters is a list of workspaces');
   }
-  // Feature flags, all off by default. hardwareSigner gates the helper
-  // backend (a TPM or Secure Enclave key): it is experimental until its
-  // helpers are qualified on real hardware, and nothing else waits on it.
+  // Preserve the reporting flag from older configurations. It grants no signing authority.
   if (c.features !== undefined) {
     if (!c.features || typeof c.features !== 'object' || Array.isArray(c.features)) throw new Error('HQ config: features is an object');
     for (const [k, v] of Object.entries(c.features)) {
@@ -113,9 +111,13 @@ export function validateConfig(c) {
   if (c.notices !== undefined) validateNoticesConfig(c.notices);
   if (c.harnesses !== undefined) validateHarnessesConfig(c.harnesses);
   if (c.signer !== undefined) {
-    validateSignerConfig(c.signer);
-    if (c.signer.backend === 'helper' && c.features?.hardwareSigner !== true) {
-      throw new Error('HQ config: the helper signer backend is behind a feature flag; set features.hardwareSigner to true to use it');
+    if (c.signer?.backend === 'secure-enclave' && c.standalone === true && Object.keys(c.signer).length === 1) {
+      // A configured offline installation needs trustworthy inventory before
+      // it can use local signing. A missing Machine socket proves no such thing.
+      throw new Error('standalone Secure Enclave signing requires verified dedicated-account installation without Agent Machine');
+    }
+    if (Object.keys(c.signer ?? {}).length !== 1 || c.signer?.backend !== 'machine') {
+      throw new Error('HQ device key custody requires the paired Machine backend');
     }
   }
   if (c.legacy !== undefined) {
@@ -131,9 +133,11 @@ export function createHQ({
   home,
   schemas,                       // pinned schemas by name: hq/v1 (admission.mjs SCHEMA_NAMES), task/v1 and wire/v1 (tasks.mjs TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES)
   config,                        // defaults to <home>/config.json
-  signer,                        // defaults to the HQ signer on the config's key backend (hq/signer.mjs)
+  signer,                        // explicit signer for isolated component tests
+  createDeviceSigner = createMachineSigner,
   enrollment,                    // where device status and enrollment come from: the config's source by
                                  // default (legacy bridge, or hq/enrollment.mjs); may be a function of the signer
+  serverKeys,                    // immutable issuer key set injected by an isolated server fixture
   identity,                      // identity-service transport; tests inject a canned signed service
   legacy,                        // defaults to legacyDaemon with the config's supervise flag
   clock = { now: () => Date.now() },
@@ -221,10 +225,8 @@ export function createHQ({
     const cfg = validateConfig(config ?? readConfig(home, { uid }));
     // Enrollment events become receipts (an enrollment only starts once HQ is up).
     const onEnrollmentEvent = (e) => { if (core) pushReceipt(core, { plugin: 'hq', ...e }).catch(() => {}); };
-    enrollment ??= cfg.enrollment?.source === 'hq'
-      ? (s) => createEnrollment({ home, signer: s, ...(cfg.enrollment.server ? { server: cfg.enrollment.server } : {}), uid, clock, onEvent: onEnrollmentEvent })
-      : legacySigner();
-    signer ??= createSigner({ home, backend: backendFromConfig(cfg.signer, { home, uid }), enrollment, uid, clock });
+    enrollment ??= (s) => createEnrollment({ home, signer: s, server: cfg.enrollment?.server, uid, clock, onEvent: onEnrollmentEvent });
+    signer ??= createDeviceSigner({ home, enrollment, clock });
     const signerReport = () => (typeof signer.report === 'function' ? signer.report() : undefined);
     const hostProfile = (harnessAccounts) => {
       const report = signerReport();
@@ -244,8 +246,8 @@ export function createHQ({
     core = createCore({
       clock, random, signer,
       profile: profileInfo.profile,
-      identity: identity ?? (cfg.enrollment?.source === 'hq'
-        ? createIdentityService({ server: cfg.enrollment.server ?? 'https://agents.true-line.ai', enrollment: signer.enrollment, clock })
+      identity: identity ?? (signer.custody || cfg.enrollment?.source === 'hq'
+        ? createIdentityService({ server: cfg.enrollment?.server ?? DEFAULT_IDENTITY_SERVICE, enrollment: signer.enrollment, custody: signer.custody, keySet: serverKeys, clock })
         : unlinkedIdentity()),
       persist: () => store.persist(),
       config: {
@@ -300,7 +302,7 @@ export function createHQ({
     // receipt say why.
     const admission = admissionPlugin({
       schemas,
-      allowsNoticeHarness: (harness) => signer.enrollment?.allowsHarness?.(harness) === true,
+      allowsNoticeHarness: (harness) => signer.allowsHarness ? signer.allowsHarness(harness) : signer.enrollment?.allowsHarness?.(harness) === true,
       profileReasons: (pending, unbound) => profileReasons(pending, unbound),
       harnessAccount: (adapterId) => harnessPlan.accountOf(adapterId),
       callerOf: (connection) => brokerCallers.get(connection),

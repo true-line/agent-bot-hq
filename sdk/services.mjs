@@ -387,7 +387,12 @@ function approvalsService(core, plugin) {
       if (!r || r.plugin !== plugin || r.state !== 'approved') fail('approval_mismatch', `no owner approval ${id}`);
       if (r.expiry !== undefined && core.clock.now() >= r.expiry) fail('approval_mismatch', `approval ${id} expired`);
       if (canonicalDigest(action) !== r.digest) fail('approval_mismatch', 'the action changed after approval', { approved: r.digest });
-      if (!core.signer.verify(Buffer.from(`${r.id}\n${r.digest}\n${r.state}`), r.signature)) fail('approval_mismatch', `approval ${id} signature does not verify`);
+      const signature = r.signature;
+      const signed = Buffer.from(`${r.id}\n${r.digest}\n${r.state}`);
+      if (!(await core.signer.verify(signed, signature)) || core.approvals.get(id) !== r || r.signature !== signature || r.state !== 'approved') {
+        fail('approval_mismatch', `approval ${id} signature does not verify`);
+      }
+      if (r.expiry !== undefined && core.clock.now() >= r.expiry) fail('approval_mismatch', `approval ${id} expired`);
       return true;
     },
   });
@@ -398,9 +403,10 @@ export function decideApproval(core, id, decision) {
   const r = core.approvals.get(id);
   if (!r) throw new TypeError(`no approval ${id}`);
   if (!['approved', 'denied'].includes(decision)) throw new TypeError('decision is approved or denied');
+  const signature = core.signer.sign(Buffer.from(`${r.id}\n${r.digest}\n${decision}`));
   r.state = decision;
   r.decidedAt = core.clock.now();
-  r.signature = core.signer.sign(Buffer.from(`${r.id}\n${r.digest}\n${r.state}`));
+  r.signature = signature;
   return clone(r);
 }
 

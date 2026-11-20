@@ -34,7 +34,8 @@ export function detectProfile({
   else if (account !== expected) reasons.push(`HQ runs in the ${account ?? 'unknown'} account, not ${expected} (D6)`);
   if (harnessAccounts !== true) reasons.push(typeof harnessAccounts === 'string' && harnessAccounts ? harnessAccounts : 'agents of every harness share one account: no OS account per harness credential (D7)');
   if (!qualified) reasons.push('the host has not passed the hostile-member qualification (T01–T03, T21)');
-  if (keyStorage !== 'hardware') reasons.push(`the HQ signer's key is ${keyStorage === 'software' ? 'a key file in HQ state (key_storage=software)' : 'not known to be a hardware key'}, so a process in HQ's account can copy it`);
+  if (keyStorage === 'software') reasons.push('the signer reports software key storage (key_storage=software)');
+  else if (keyStorage !== 'hardware') reasons.push('HQ could not verify hardware custody of the device key');
   else if (keyFiles > 0) reasons.push('the previous software signer key file remains in HQ state');
   if (standalone) return { profile: 'standalone-unenforced', reasons: ['the owner chose standalone in HQ config', ...reasons] };
   // Protected only when every condition holds; this skeleton has no way to

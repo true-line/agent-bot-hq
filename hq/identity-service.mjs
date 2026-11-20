@@ -1,14 +1,19 @@
 // HQ's identity-service link (plan §4.7 / row 10). Device assertions stay
 // with enrollment's signer. Access tokens and their ephemeral DPoP keys live
 // only in this process; replies are authenticated before JSON is parsed.
-import { createHash, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from 'node:crypto';
+import { createHash, createPublicKey, randomBytes, verify } from 'node:crypto';
+import { isUtf8 } from 'node:buffer';
 import { readFileSync } from 'node:fs';
+import { parseStrict } from '../sdk/wire/strict-json.mjs';
 import { fail, HostError } from '../sdk/errors.mjs';
 import { GRANT_JWT_BEARER, validateServiceUrl } from './enrollment.mjs';
 
 const TIMEOUT_MS = 20_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_SKEW_MS = 5 * 60_000;
+const WHOAMI_PROOF_WINDOW_SECONDS = 60;
+const WHOAMI = '/api/daemon/whoami';
+const ISSUANCE_LOOKUP = '/api/daemon/issuances/';
 const B64URL = /^[A-Za-z0-9_-]+$/;
 const nonce = () => randomBytes(24).toString('base64url');
 const hash = (bytes) => createHash('sha256').update(bytes).digest();
@@ -18,6 +23,11 @@ const unavailable = (reason, transient = false) => {
   if (transient) error[TRANSIENT] = true;
   throw error;
 };
+function proofSegment(segment) {
+  const bytes = Buffer.from(segment, 'base64url');
+  if (bytes.toString('base64url') !== segment || !isUtf8(bytes)) throw new Error();
+  return parseStrict(bytes.toString());
+}
 const ownObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
 function dateMillis(value) {
   if (typeof value !== 'string') return NaN;
@@ -32,7 +42,7 @@ function dateMillis(value) {
 // path segment using the credential service's operation-ID alphabet.
 function validDaemonPath(method, path) {
   if (typeof path !== 'string') return false;
-  if (path.startsWith('/api/daemon/issuances/')) {
+  if (path.startsWith(ISSUANCE_LOOKUP)) {
     return method === 'GET' && /^\/api\/daemon\/issuances\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(path);
   }
   return /^\/api\/daemon\/[A-Za-z0-9/_-]+$/.test(path);
@@ -72,6 +82,7 @@ export function releaseServerKeys(server, file = new URL('../governance/server-k
 export function createIdentityService({
   server,
   enrollment,
+  custody,
   keySet = releaseServerKeys(server),
   fetchImpl = globalThis.fetch,
   clock = { now: () => Date.now() },
@@ -79,7 +90,7 @@ export function createIdentityService({
   maxBodyBytes = MAX_BODY_BYTES,
 } = {}) {
   validateServiceUrl(server);
-  if (!enrollment || typeof enrollment.assertion !== 'function' || typeof enrollment.deviceStatus !== 'function') throw new TypeError('the identity-service link needs HQ enrollment');
+  if (!enrollment || typeof enrollment.deviceStatus !== 'function') throw new TypeError('the identity-service link needs HQ enrollment');
   keySet = validateServerKeys({ server, keys: keySet }, server);
   if (!(Number.isSafeInteger(timeoutMs) && timeoutMs > 0 && timeoutMs <= MAX_SKEW_MS)) throw new TypeError('identity-service timeout is at most five minutes');
   if (!(Number.isSafeInteger(maxBodyBytes) && maxBodyBytes > 0 && maxBodyBytes <= MAX_BODY_BYTES)) throw new TypeError('identity-service body cap is at most one MiB');
@@ -176,11 +187,21 @@ export function createIdentityService({
         if (response.headers.get('agent-bot-request-jti') !== jti || typeof signature !== 'string' || !B64URL.test(signature)
           || Buffer.from(signature, 'base64url').length !== 64
           || !verify(null, signatureBytes(response.status, bytes, jti), createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: key.x }, format: 'jwk' }), Buffer.from(signature, 'base64url'))) unavailable('response signature or request nonce did not verify');
+        if (!isUtf8(bytes)) unavailable('authenticated response is not UTF-8 JSON');
         let body;
         try { body = JSON.parse(bytes.toString('utf8')); } catch { unavailable('authenticated response is not JSON'); }
+        if (path === WHOAMI && response.status === 200 && body?.device?.id !== accessToken.deviceId) {
+          unavailable('identity lookup returned a different or missing device');
+        }
         link = 'ok';
-        if (body?.error === 'device_revoked' || (path === '/oauth/token' && body?.error === 'invalid_grant')) { revoke(); fail('device_revoked', 'device revoked: re-enroll'); }
+        // The token endpoint also uses invalid_grant for an expired or replayed assertion.
+        const grantRevoked = path === '/oauth/token' && response.status === 400
+          && body?.error === 'invalid_grant' && body.error_description === 'device_revoked';
+        if (grantRevoked || body?.error === 'device_revoked') { revoke(); fail('device_revoked', 'device revoked: re-enroll'); }
         if (body?.error === 'profile_insufficient') fail('profile_insufficient', 'the identity service refused this device key storage under owner policy');
+        if (response.status === 200 && path.startsWith(ISSUANCE_LOOKUP) && body?.operation_id !== path.slice(ISSUANCE_LOOKUP.length)) {
+          unavailable('issuance reply does not match the requested operation');
+        }
         return { status: response.status, headers: Object.fromEntries(response.headers.entries()), text: bytes.toString('utf8'), body };
       })();
       return await Promise.race([work, deadline]);
@@ -198,20 +219,42 @@ export function createIdentityService({
     }
   }
 
+  async function reuseAccess(current, generation) {
+    await withCustodyCheck(() => current.recheck?.());
+    alive(generation);
+    freshAccess(current);
+    return current;
+  }
+
+  async function withCustodyCheck(operation) {
+    const previous = token;
+    try { return await operation(); }
+    catch (error) {
+      if (previous?.recheck && token === previous) token = undefined;
+      throw error;
+    }
+  }
+
   async function access() {
     check();
-    const state = await enrollment.deviceStatus();
-    if (state === 'revoked') { revoke(); fail('device_revoked', 'device revoked: re-enroll'); }
-    if (state !== 'enrolled') unavailable('HQ is not enrolled');
+    await withCustodyCheck(async () => {
+      let state;
+      try { state = await enrollment.deviceStatus(); }
+      catch (error) {
+        if (token?.recheck && !(error instanceof HostError)) unavailable('Machine enrollment could not be verified');
+        throw error;
+      }
+      if (state === 'revoked') { revoke(); fail('device_revoked', 'device revoked: re-enroll'); }
+      if (state !== 'enrolled') unavailable('HQ is not enrolled');
+    });
     if (token && token.expiresAt <= clock.now()) token = undefined;
-    if (token && token.expiresAt > clock.now() + 60_000) return token;
+    if (token && token.expiresAt > clock.now() + 60_000) return reuseAccess(token, epoch);
     if (refreshing) return refreshing;
     const generation = epoch;
     const pending = (async () => {
       const started = clock.now();
-      const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
-      const ephemeralJwk = publicKey.export({ format: 'jwk' });
-      const assertion = enrollment.assertion({ ephemeralJwk });
+      if (!custody) unavailable('Machine has no authorized DPoP session');
+      const { session, ephemeralJwk, assertion } = await withCustodyCheck(() => custody.openSession());
       let claims;
       try { claims = JSON.parse(Buffer.from(assertion.split('.')[1], 'base64url')); } catch { unavailable('HQ assertion is malformed'); }
       if (typeof claims.jti !== 'string' || claims.jti.length < 8) unavailable('HQ assertion has no request nonce');
@@ -224,7 +267,12 @@ export function createIdentityService({
       if (out.status >= 500) unavailable('access token service is temporarily unavailable', true);
       if (out.status !== 200 || result?.token_type !== 'DPoP' || typeof result.access_token !== 'string' || !result.access_token
         || !Number.isSafeInteger(result.expires_in) || result.expires_in <= 0 || result.expires_in > 900) unavailable('access token was refused or malformed');
-      const candidate = { value: result.access_token, expiresAt: started + result.expires_in * 1000, privateKey, publicJwk: ephemeralJwk, harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string') : [] };
+      const binding = await withCustodyCheck(() => custody.bindAccess({ session, body: out.text, headers: out.headers }));
+      alive(generation);
+      if (!Number.isSafeInteger(binding.expiresAt) || binding.expiresAt <= clock.now()) unavailable('administrator access session expired');
+      const deviceId = typeof claims.iss === 'string' && claims.iss.length > 0 && claims.iss.length <= 256
+        && claims.sub === claims.iss ? claims.iss : undefined;
+      const candidate = { deviceId, recheck: binding.recheck, proveWhoami: binding.proveWhoami, value: result.access_token, expiresAt: Math.min(started + result.expires_in * 1000, binding.expiresAt), session, publicJwk: ephemeralJwk, harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string') : [] };
       // expires_in is measured conservatively from the request's start.
       // A slow but authenticated response must not cache an expired token.
       freshAccess(candidate);
@@ -233,7 +281,7 @@ export function createIdentityService({
     })().catch((e) => {
       // Share the fallback with every concurrent waiter, as well as the
       // refresh itself. Revocation and owner-policy refusals never use it.
-      if (e?.[TRANSIENT] && !closed && !revoked && token?.expiresAt > clock.now()) return token;
+      if (e?.[TRANSIENT] && !closed && !revoked && token?.expiresAt > clock.now()) return reuseAccess(token, generation);
       throw e;
     });
     refreshing = pending;
@@ -250,18 +298,48 @@ export function createIdentityService({
       check();
       if (typeof method !== 'string' || !/^(GET|POST|PUT|PATCH|DELETE)$/.test(method)
         || !validDaemonPath(method, path)) fail('host.invalid_request', 'the identity link accepts a daemon API method and path only');
+      if (path === WHOAMI && (method !== 'GET' || body !== undefined)) fail('host.invalid_request', 'identity lookup requires GET without a body');
+      if (path.startsWith(ISSUANCE_LOOKUP) && body !== undefined) fail('host.invalid_request', 'an issuance lookup accepts only its operation ID');
+      const allowed = method === 'GET' && (path === WHOAMI || path === '/api/daemon/notices' || path.startsWith(ISSUANCE_LOOKUP))
+        || method === 'POST' && ['/api/daemon/notices/take', '/api/daemon/notices/ack', '/api/daemon/notices/release'].includes(path);
+      if (!allowed) unavailable('this route requires administrator-side credential use');
+      custody?.checkOperation?.(method, path);
       const current = await access();
       const generation = epoch;
       alive(generation);
       freshAccess(current);
+      if (path === WHOAMI && !current.deviceId) unavailable('identity lookup requires an assertion for one enrolled device');
       // Notices are scoped twice: the owner selects queues, and HQ refuses
       // a queue outside this enrolled device's current scope before sending.
       if (body?.harness !== undefined && !current.harnesses.includes(body.harness)) fail('host.route_not_allowed', 'the harness is outside this device enrollment');
-      const jti = nonce();
-      const header = Buffer.from(JSON.stringify({ alg: 'ES256', typ: 'dpop+jwt', jwk: current.publicJwk })).toString('base64url');
-      const payload = Buffer.from(JSON.stringify({ htm: method, htu: `${server}${path}`, iat: Math.floor(clock.now() / 1000), jti, ath: hash(current.value).toString('base64url') })).toString('base64url');
-      const unsigned = `${header}.${payload}`;
-      const proof = `${unsigned}.${sign('sha256', Buffer.from(unsigned), { key: current.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url')}`;
+      const machineWhoami = path === WHOAMI && typeof current.proveWhoami === 'function';
+      // For this purpose keyd chooses its own nonce. HQ supplies only the session selector.
+      let jti = machineWhoami ? undefined : nonce();
+      const ath = hash(current.value).toString('base64url');
+      const proof = machineWhoami ? await withCustodyCheck(() => current.proveWhoami())
+        : await custody.requestProof({ session: current.session, method, path, body, ath, jti });
+      const parts = typeof proof === 'string' && proof.split('.');
+      let header, claims;
+      try {
+        if (!parts || parts.length !== 3) throw new Error();
+        header = proofSegment(parts[0]);
+        claims = proofSegment(parts[1]);
+        const now = clock.now() / 1000;
+        if (machineWhoami) {
+          if (Object.keys(header).length !== 3 || Object.keys(header.jwk).length !== 4 || Object.keys(claims).length !== 5
+            || typeof claims.jti !== 'string' || !/^[a-zA-Z0-9_-]{22}$/.test(claims.jti)
+            || Buffer.from(claims.jti, 'base64url').toString('base64url') !== claims.jti
+            || Buffer.from(parts[2], 'base64url').toString('base64url') !== parts[2]) throw new Error();
+          jti = claims.jti;
+        }
+        if (header.alg !== 'ES256' || header.typ !== 'dpop+jwt' || !header.jwk || 'd' in header.jwk
+          || header.jwk.kty !== 'EC' || header.jwk.crv !== 'P-256' || header.jwk.x !== current.publicJwk.x || header.jwk.y !== current.publicJwk.y
+          || claims.htm !== method || claims.htu !== server + path || claims.ath !== ath || claims.jti !== jti
+          || !Number.isSafeInteger(claims.iat) || Math.abs(now - claims.iat) > (machineWhoami ? WHOAMI_PROOF_WINDOW_SECONDS : 120)
+          || !verify('sha256', Buffer.from(parts.slice(0, 2).join('.')), { key: createPublicKey({ key: current.publicJwk, format: 'jwk' }),
+            dsaEncoding: 'ieee-p1363' }, Buffer.from(parts[2], 'base64url'))) throw new Error();
+      } catch { unavailable('Machine returned an invalid DPoP request proof'); }
+      alive(generation);
       const reply = await request(path, { method, headers: { accept: 'application/json', authorization: `DPoP ${current.value}`, DPoP: proof, ...(body !== undefined ? { 'content-type': 'application/json' } : {}) }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) }, jti, current);
       alive(generation);
       if (reply.status === 401) drop(); // Never replay an external write automatically.

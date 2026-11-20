@@ -42,7 +42,7 @@ and an accepted platform decision differ, the decision wins.
 - **The repositories map onto 0.4** as the platform's
   [repository catalog](https://github.com/true-line/agent-bot-platform/blob/main/docs/03-architecture/repository-catalog.md) charters them (platform PDR-0002):
   - **agent-bot-daemon** is HQ: admission, grants, approvals, budgets, the
-    task and action ledgers, the device key and the plugin host.
+    task and action ledgers, device enrollment and the plugin host.
   - **agent-bot-identity** is the identity toolset inside each Soul: the
     `agent-bot` CLI, hooks, the fail-closed `gh` and attribution. Its HQ
     half moves to agent-bot-daemon.
@@ -142,7 +142,7 @@ section summarises it.
 
 | Current ADR-0645 module | Goes to |
 | --- | --- |
-| `identity` | HQ authority (enrollment, the identity-service link, device key and signer, grants, approvals, credential references) becomes part of HQ core in agent-bot-daemon, not a plugin (PDR-0027). The tools members run (gh shim, credential helper, git hooks) stay in agent-bot-identity on the Soul side and are cooperative-profile only; its HQ plugin registers only member surfaces (MCP tools, CLI commands, hook handlers) that resolve to broker queries. Key custody, secret stores and App management go to the identity service; the inbox is deprecated. |
+| `identity` | HQ authority (enrollment, the identity-service link, device-operation requests, grants, approvals, credential references) becomes part of HQ core in agent-bot-daemon, not a plugin (PDR-0027). The tools members run (gh shim, credential helper, git hooks) stay in agent-bot-identity on the Soul side and are cooperative-profile only; its HQ plugin registers only member surfaces (MCP tools, CLI commands, hook handlers) that resolve to broker queries. App-key custody, secret stores and App management go to the identity service; the inbox is deprecated. |
 | `soul` | The Soul runtime, in three parts: `core/` (pure, used on both sides), `hq/` (validation, render, admission, launch, transfer) and `entry-point/` (front door, members, recovery). The entry point goes to agent-bot-souls, package validation, digests and render to soul-package, and adapter manifests to soul-adapters. |
 | `comms` | agent-comms: broker mode in HQ, client mode in the Soul. |
 | `host`, `cli` | agent-bot-daemon: the host, the HQ CLI and owner commands. The member-facing surfaces (`agent-bot mcp`, `reach-mcp`, the hook runner, the commands members run) go to agent-bot-identity, which the platform's repository catalog says owns them (PDR-0027). They run in the Soul, register through `hq-plugin-contract`, and only ask HQ. |
@@ -172,7 +172,8 @@ These are heuristic scans; Appendix A has the per-file flags.
   - Host: `keyd-supervisor`.
   - Soul: `soul-credential-migration` and `soul-secrets`.
 
-  keyd's App-key role ends and its device-key role moves into HQ's signer.
+  HQ requests device operations from its paired Machine. Machine and keyd
+  retain administrative custody of the device key.
 - **comms imported from soul.** These are `cold-wake` → `comms-relay`,
   `soul-join`/`soul-fork`/`soul-remove` → `comms-membership`, `soul-comms`
   and `soul-remove` → `daemon-status`, `soul-build`/`soul-builder` →
@@ -228,7 +229,7 @@ Tarjan's algorithm over shim-resolved imports.
  │         member launch under per-member principals · identity-service link         │
  │         identity: enrollment · signer · grants · approvals · credential refs      │
  │   plugins (in process): comms (broker) · Soul runtime (hq side) · member surfaces │
- │   signer: non-exportable device key (Secure Enclave / TPM), HQ account only        │
+ │   signer client → paired Machine → administrative keyd (Secure Enclave / TPM)      │
  │        ▲ hq/v1 (owner)            ▲ broker socket + Hello/Admit/Equip/Ready/Lease  │
  │   GeniusBar · HQ CLI          ┌───┴──────────────── tier 4  Soul ───────────────┐  │
  │   (owner account)             │ entry point `agent-bot soul run` (ACP + chat)   │  │
@@ -283,15 +284,28 @@ the plugins in one of them; which repository ships each piece follows §3.1.
 | `hq/v1` control socket, owner sessions, lifecycle | HQ | R2: lifecycle and the admin channel end at local HQ. |
 | Authoritative store: grants, spent nonces, task revisions, dedup, action ledger, budgets, approvals | HQ, inaccessible to members | 0.4 §11: a member-writable ledger can't fence a hostile member. |
 | Member launch, per-member principals, profile reporting | HQ | R3, R8 |
-| Identity-service link (assertions signed by the HQ signer; DPoP tokens in memory) | HQ | No long-lived secret on the host. |
+| Identity-service link (HTTPS and in-memory tokens in HQ, proof authorization in Machine) | HQ | No long-lived secret on the host. |
 | `agent-bot mcp`, `reach-mcp`, hook runner, commands members run | Soul | Thin clients. HQ repeats every check. |
 | Network listeners | none | HQ dials out only. The optional browser PWA's `127.0.0.1` listener is the one exception (§7). |
 
 #### Identity
 
+HQ requests each privileged device operation over its authenticated Machine
+channel. Machine checks its purpose and authority. Its administrative
+executor or keyd holds and uses the private keys. This applies to dedicated
+and ordinary HQ accounts across profiles. When the secure provider or
+pairing is unavailable, the operation is unavailable.
+[Platform custody decision](https://github.com/true-line/agent-bot-platform/discussions/91)
+
+The owner approved local Secure Enclave signing only for explicitly configured
+standalone HQ in its dedicated account on a Mac without Machine installed.
+Stopping Machine or revoking pairing never enables this mode. Standalone
+signing remains unavailable while installation history is uncertain.
+[Standalone decision](https://github.com/true-line/agent-bot-platform/discussions/93)
+
 | Piece | Domain | Why |
 | --- | --- | --- |
-| Device key | HQ signer (Secure Enclave or TPM, HQ account only) | Non-exportable. Revoking the device needs no key rotation. A software key is a stage 0–1 transition only, and the identity service may refuse to mint for it per policy (§4.7). |
+| Device key | Machine/keyd in the secure administrative account | Non-exportable. Revoking the device needs no key rotation. The stage 0–1 software-key experiment is recorded in §9. |
 | Enrollment | HQ, plus the owner confirming on the identity service | One-time, owner-confirmed challenge (0.4 §3). |
 | GitHub App keys and other service identities | Identity service | 0.4 §4, §12 |
 | Minting, issuance records | Identity service | Bound to the device and the grant. Each issuance is recorded. |
@@ -300,7 +314,7 @@ the plugins in one of them; which repository ships each piece follows §3.1.
 | Approval records | HQ, signed, from the owner session | 0.4 §8: bound to the digest of the proposed action. |
 | Soul ID, member, runtime and installation records; receipts | HQ store | R1 |
 | gh shim, credential helper, git hooks | Soul, **cooperative profile only** | In the protected profile members hold no service token, and service writes go through the broker's adapter. |
-| Vouch / soul-token key (today `vouch-key.pem`) | **HQ signer only**, non-exportable | No long-lived signing key as a file on the host. Secure Enclave and most TPMs hold P-256 rather than Ed25519, so soul tokens move to a `v2` signed with ES256. The agent-comms broker verifies `v2` and accepts `v1` (Ed25519) only during the transition window. If a host has no hardware signer, the identity service signs soul tokens instead, and HQ asks for them like any other credential. |
+| Vouch / soul-token key (today `vouch-key.pem`) | Administrative Machine/keyd for host signing, non-exportable | No long-lived signing key as a file on the host. Secure Enclave and most TPMs hold P-256 rather than Ed25519, so soul tokens move to a `v2` signed with ES256. The agent-comms broker verifies `v2` and accepts `v1` (Ed25519) only during the transition window. If a host has no hardware signer, the identity service signs soul tokens instead, and HQ asks for them like any other credential. |
 
 #### Comms
 
@@ -333,9 +347,9 @@ cooperative. What HQ does with them:
 - Every receipt and the GeniusBar header name the profile actually in force.
   A protected claim under a weaker profile is refused with
   `profile_insufficient`.
-- `legacy-local-custody` is **off by default** and can be turned on only in
-  the standalone profile. `doctor` and `status` flag it, and every receipt
-  names it.
+- Earlier prototypes offered `legacy-local-custody` in the standalone profile.
+  That setting grants no protected-resource access. `doctor` and `status`
+  should flag legacy key files for an administrator-reviewed migration.
 - The first operator pilot requires a qualified Mac. Stage 2a row 29 owns
   the Mac evidence, and row 16 tracks Linux qualification independently.
   [Platform PDR-0085](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0085-macos-first-protected-pilot.md)
@@ -518,6 +532,11 @@ not a plugin (PDR-0027), so it is ready before any plugin code runs:
 that registers one is refused. If a plugin fails, it is marked `degraded`,
 its dependents don't start, and `status` reports why.
 
+For paired HQ, `device.status.device` records the enrollment state learned
+from Identity. `status.hq.signer.available` reports whether HQ could verify
+the Machine signer on its latest check. A local pairing refusal or Machine
+outage leaves the existing enrollment record in place.
+
 ### 4.5 Versioning and compatibility
 
 - **Plugin semver** and an integer **`hostApi`** (N and N-1 supported).
@@ -560,8 +579,8 @@ These rules apply to every call from HQ to the identity service.
 - **No redirects.** Every fetch uses `redirect: 'error'`.
 - **DPoP on every request.** The proof carries `htm`, `htu`, `iat`, a fresh
   `jti` and `ath`, signed by the ephemeral key bound to the token's `jkt`.
-  The jwt-bearer assertion that gets the token is signed by the **HQ
-  signer's** non-exportable device key.
+  HQ requests the jwt-bearer assertion and authorized DPoP proofs from
+  Machine. Their private keys stay with the administrative executor.
 - **Signed responses are required.** Every response must carry three
   headers:
   - `Agent-Bot-Signature`, an Ed25519 signature over
@@ -588,14 +607,14 @@ These rules apply to every call from HQ to the identity service.
   held in memory for that operation only and dropped when its action record
   reaches a terminal state. The cost is one mint per protected operation,
   bounded by a per-device rate limit at the identity service.
-- **Software device keys.** Until stage 2a a host may still enroll with a
-  software key (`key_storage=software`). The identity service can refuse to
-  mint for software-key devices **per owner policy**. Once that policy is on,
-  those mints are refused with `profile_insufficient`, and the receipt
-  names the device's key storage. The device itself is not revoked.
+- **Earlier software-key enrollment.** The stage 0–1 prototype reported
+  `key_storage=software`; the identity service could refuse mints under
+  owner policy. Current enrollment uses the administrative custody path
+  in §3.2 even on a cooperative host.
 - **`device_revoked`.** When the identity service answers that the device is
-  revoked (today `invalid_grant` on `/oauth/token`, or an explicit revoked
-  status on any call), HQ maps it to `device_revoked` and does the
+  revoked (a signed HTTP 400 from `/oauth/token` carrying `invalid_grant`
+  and `error_description: device_revoked`, or an explicit signed
+  `device_revoked` error), HQ maps it to `device_revoked` and does the
   following:
   - it **drops every cached token and resolved credential immediately**,
     without waiting for expiry;
@@ -908,10 +927,10 @@ releases.
 | --- | --- | --- |
 | MCP `take_inbox`, `POST /v0/inbox/take`, `gh-inbox-query`, `inbox-probe` | Broker-pulled notices (§4.8) and a member query `notices.peek` | Two releases after notices ship |
 | `gh-app-hook` Worker, `wrangler.toml`, `INBOX_TOKEN`, `WEBHOOK_SECRETS`, `SUBSCRIBERS` | Identity-service webhooks and notices | After a dual-run window |
-| Local App key custody: `ensure-private-key`, `identity-app-store`, `soul-credentials`, `credential-reconciler`, keyd App items, `migrate-credentials` | Identity service; HQ credential references | Off by default from PR 18, opt-in only under the standalone profile and flagged by `doctor`/`status`. **Code removed at stage 3 exit or on 2027-01-31, whichever comes first** (decided 2026-10-27, §10.1). The opt-in stops working on that date. |
-| `secret*.mjs`, Proton Pass providers, `soul secret set` | Identity-service vault (owner-unlock); HQ credential references | Same switch and the same dated removal as local App key custody |
-| `vouch-key.pem`, `/v0/keyd/grant`, keyd `credential`/`git_credential` tools | HQ signer only (soul token `v2`, ES256), or identity-service signing where no hardware signer exists; brokered service adapter | Stage 2a for the key; stage 2b for the tools |
-| `device-key.pem` (software) | HQ signer hardware key, after re-enrollment. Until then the identity service may refuse software-key devices per policy. | Stage 2a |
+| Local App key custody: `ensure-private-key`, `identity-app-store`, `soul-credentials`, `credential-reconciler`, keyd App items, `migrate-credentials` | Identity service; HQ credential references | Keep legacy App-key custody disabled in every HQ profile. `doctor` and `status` flag existing state for administrator-reviewed migration. **Code removed at stage 3 exit or on 2027-01-31, whichever comes first** (§10.1). |
+| `secret*.mjs`, Proton Pass providers, `soul secret set` | Identity-service vault (owner-unlock); HQ credential references | Keep legacy secret providers disabled in every HQ profile. The same code-removal deadline applies. |
+| `vouch-key.pem`, `/v0/keyd/grant`, keyd `credential`/`git_credential` tools | Administrative Machine/keyd (soul token `v2`, ES256), or identity-service signing where no hardware signer exists; brokered service adapter | Stage 2a for the key; stage 2b for the tools |
+| `device-key.pem` (software) | Administrative Machine/keyd hardware key, after re-enrollment. Until then the identity service may refuse software-key devices per policy. | Stage 2a |
 | Owner gate through keyd Touch ID or the admin dialog in an agent account; agent-comms principal credential checks for revisions | HQ approval records from the owner session | Stage 3 |
 | One daemon per agent account | One HQ per host in its own account (strangler; the old daemon is retired when HQ passes the same contract and recovery tests) | Stage 3 |
 | `soul.json` format 1/2 packages | `contents-1` layout (§5.4) | One major after migration ships |
@@ -956,27 +975,23 @@ repository that does the work; this repository tracks only its own rows.
 
 | # | Repo | WP | PR | Done when |
 | --- | --- | --- | --- | --- |
-| 15 | agent-bot-daemon | WP2 | **HQ signer:** device key in TPM (Linux) or Secure Enclave (macOS) under the HQ account; soul-token key in the signer (`v2`, ES256), with `vouch-key.pem` removed; re-enrollment path. Delivered in the four slices below. | `key_storage=hardware`; no signing key file on the host; the agent-comms broker verifies soul token `v2`; T02 |
-| 15a | agent-bot-daemon | WP2 | **Signer port and key backends** (`hq/signer.mjs`): one pinned P-256 key used only through `sign`; a `software` backend (key file, transition custody) and a `helper` backend for a hardware key behind the `agent-bot-hq-signer/1` protocol; ES256 signatures on approval records; `signer rekey` | Under the helper backend HQ's state directory holds no key file and `status` reports `key_storage=hardware`; a missing or changed key is safe mode; a software key is a stated reason the profile is not protected |
-| 15b | agent-bot-daemon | WP2 | **Hardware helpers, behind the `hardwareSigner` feature flag:** a TPM 2.0 helper for the Linux reference host, and the Secure Enclave helper for macOS (needs a Developer ID build with a provisioning profile, D4). Off by default; rows 15c, 15d and 16 do not wait for it | Each helper passes the 15a helper tests on its platform, with a non-exportable key, and is qualified on real hardware before the flag's default changes |
-| 15c | agent-bot-daemon, agent-bot-identity | WP2 | **Enrollment on the signer's key** (`hq/enrollment.mjs`, opt-in with `enrollment.source: hq`; `legacy` stays the default until the identity-service link can use the enrolled device; a real enrollment on a software key succeeded on 2026-11-10): device enrollment, re-enrollment (`enroll --force`, a fresh key generation) and the jwt-bearer assertion move into HQ and are signed by the signer | The identity service's device record names the signer's key, with the `key_storage` the signer reports (`software` unless `hardwareSigner` is on); device status no longer comes from the legacy bridge |
-| 15d | agent-bot-identity, agent-comms | WP2 | **Soul tokens without a key file:** HQ asks the identity service for `v2` soul tokens (the agent-bot-comms broker already verifies them) and `vouch-key.pem` is removed, with the keyd grants it signs today | No `vouch-key.pem` on the host; soul token `v1` off. With `hardwareSigner` on there is no signing key file at all; T02 |
+| 15 | agent-bot-daemon, agent-bot-machine | WP2 | **Device signing:** HQ requests each authorized operation over the paired Machine channel. Machine/keyd holds and uses the non-exportable device key in the secure administrative account (Secure Enclave on macOS, TPM on supported Linux hosts). Retire `vouch-key.pem` and support explicit re-enrollment. | `key_storage=hardware`; no signing key file on the host; the agent-comms broker verifies soul token `v2`; T02 |
+| 15a | agent-bot-daemon | WP2 | **Signer port and key backends** (`hq/signer.mjs`): the original prototype exercised the software and helper backends, approval signatures and rekey. In the deployed path HQ requests named device operations from Machine. | HQ retains public identity. Missing or changed custody refuses the operation. |
+| 15b | agent-bot-daemon, agent-bot-machine | WP2 | **Administrative hardware providers:** qualify the Secure Enclave and TPM providers behind Machine. Earlier HQ-role helper probes remain component evidence. | Verify an authorized result on the declared host and record the calling and executing accounts, key boundary and behavior after restart. |
+| 15c | agent-bot-daemon, agent-bot-identity | WP2 | **Enrollment:** HQ runs the identity-service exchange and requests the enrollment proof and access assertion from paired Machine. A real enrollment using the earlier software prototype succeeded on 2026-11-10. | The identity service device record matches the public identity returned by Machine and reports its key storage. |
+| 15d | agent-bot-identity, agent-comms | WP2 | **Soul tokens without a key file:** HQ asks the identity service for `v2` soul tokens (the agent-bot-comms broker already verifies them) and `vouch-key.pem` is removed, with the keyd grants it signs today | No `vouch-key.pem` on the host; soul token `v1` off. Administrative hardware custody leaves no signing key file on the host (T02). |
 | 16 | agent-bot-daemon | WP2 | **Linux protected profile:** per-member service identities, namespaces, broker socket and workspace views as the only exits, caller-bound grant handles. Proposed in the four slices below. | T01–T03, T21 |
 | 16a | agent-bot-daemon | WP2 | **Caller identity from the kernel:** HQ learns which OS account is on a broker connection from the host, never from a field the caller sends. Since platform PDR-0053 the account is the harness's (D7 as amended): a runtime belongs to the account of its role's adapter, fixed at admission; a binding or grant handle presented from any other account is `caller_mismatch` before the operation, and still after an HQ restart. The account check proves which harness credential is calling, not which agent: two agents in one harness account are told apart only by the second layer, where `bind` answers a challenge, the runtime proves it holds its key, and the binding is never sent. **Built in all three repositories:** HQ (`hq/harness-accounts.mjs`, first as `hq/members.mjs` in [#113](https://github.com/true-line/agent-bot-hq/pull/113) and re-keyed by harness in row 16b), the agent-comms broker plugin ([agent-bot-comms#312](https://github.com/true-line/agent-bot-comms/pull/312)) and the Soul runtime ([agent-bot-souls#3](https://github.com/true-line/agent-bot-souls/pull/3)), which never sends the binding. Still to come: agent-bot-machine creates the endpoint directories | T01 on two real accounts: the agent in account B presents the binding and handle of the agent in account A and is refused; a caller on the right endpoint without the runtime's key is refused too |
-| 16b | agent-bot-daemon | WP2 | **Harness accounts and HQ-controlled launch:** HQ starts every agent in the OS account of its harness (D7 as amended by platform PDR-0053) through a launcher HQ cannot widen; each agent works in a 0700 directory of its own in that account; HQ's state directory admits only the HQ account. **Built in HQ** (`hq/launch.mjs`): a two-step launch on the admission socket, after which the attached connection is the agent's stdin and stdout; stop signals the launch's own process group, learned from a marker the launch wrapper prints, and nothing else; a launch HQ cannot confirm stopped is held as uncontained; homes are verified at start. Still to come: the entry point in agent-bot-souls starts agents through it, agent-bot-machine installs the rule, the agent's working directory is captured into the Soul's package, a launch is stopped when its runtime's lease expires or is superseded, HQ cleans up after its own crash, and a process that leaves its group (setsid) is contained, which needs a cgroup and so root | An agent reads neither another harness account's state nor any file in HQ's state directory, and cannot run HQ's signer or credential tooling; stopping one launch leaves another launch in the same account running (T02) |
+| 16b | agent-bot-daemon | WP2 | **Harness accounts and HQ-controlled launch:** HQ starts every agent in the OS account of its harness (D7 as amended by platform PDR-0053) through a launcher HQ cannot widen; each agent works in a 0700 directory of its own in that account; HQ's state directory admits only the HQ account. **Built in HQ** (`hq/launch.mjs`): a two-step launch on the admission socket, after which the attached connection is the agent's stdin and stdout; stop signals the launch's own process group, learned from a marker the launch wrapper prints, and nothing else; a launch HQ cannot confirm stopped is held as uncontained; homes are verified at start. Still to come: the entry point in agent-bot-souls starts agents through it, agent-bot-machine installs the rule, the agent's working directory is captured into the Soul's package, a launch is stopped when its runtime's lease expires or is superseded, HQ cleans up after its own crash, and a process that leaves its group (setsid) is contained, which needs a cgroup and so root | An agent reads neither another harness account's state nor any file in HQ's state directory, and cannot use the administrative signer or HQ's credential tooling; stopping one launch leaves another launch in the same account running (T02) |
 | 16c | agent-bot-daemon | WP2 | **Exits:** a member account has no network route of its own. The member broker socket and its workspace view are the only ways out | A member's direct connection to a provider or service is blocked by the host, while the same request through the broker socket is delivered (T03) |
 | 16d | agent-bot-daemon | WP2 | **Qualification and the label:** the hostile-member suite (T01–T03, T21) as one suite that row 29 reuses on macOS; a qualification record for the host; `managed-protected` reported only when the record, member accounts, the HQ account and a hardware key all hold | The suite passes on the Linux reference host under `managed-protected`; run under `managed-cooperative`, every receipt names cooperative and each protected claim is `profile_insufficient` (T21) |
-| 29 | agent-bot-daemon | WP2 | **Qualify the pilot Mac.** Run HQ under its dedicated account and isolate harness credentials in separate OS accounts (D6 and amended D7). | On the designated Mac, T01–T03 pass under protected enforcement, including a verified Secure Enclave signature for T02. On the cooperative configuration, T21 verifies cooperative receipts and refusal of a protected claim. Record the host and report in [#56](https://github.com/true-line/agent-bot-hq/issues/56). |
+| 29 | agent-bot-daemon | WP2 | **Qualify the pilot Mac.** Run HQ under its dedicated account and isolate harness credentials in separate OS accounts (D6 and amended D7). | On the designated Mac, T01–T03 pass under protected enforcement, including a verified T02 operation requested by HQ and signed with the Secure Enclave key in administrative custody. On the cooperative configuration, T21 verifies cooperative receipts and refusal of a protected claim. Record the host and report in [#56](https://github.com/true-line/agent-bot-hq/issues/56). |
 
-**The hardware signer is a feature flag (`features.hardwareSigner`, off by
-default).** The TPM and Secure Enclave helpers cannot be tested as thoroughly
-as the rest: they need real hardware and, on macOS, a signed build. So the
-helper backend is opt-in, HQ refuses a helper config while the flag is off,
-and rows 15c, 15d and 16 are built and tested on the software key. Row 15's
-hardware conditions (`key_storage=hardware`, no signing key file on the
-host) are met only with the flag on, and `managed-protected` still requires
-a hardware key (§3.3). The flag's default changes when row 15b's helpers are
-qualified on real hardware; that is an owner decision.
+**Prototype evidence.** The original `features.hardwareSigner` flag
+selected a helper or a software key to exercise rows 15c, 15d and 16.
+Current deployments require the administrative custody path in §3.2.
+Protected qualification still requires hardware evidence on the declared
+host (§3.3).
 
 **Row 15d, first step, on a real host (2026-11-10 UTC).** The existing
 identity daemon on the owner's Mac was switched to version 2 soul tokens:
@@ -1018,9 +1033,9 @@ reports what the other three enforce.
   creates throwaway accounts itself, so each slice is built and tested on real
   account separation in CI. A real host reports `managed-protected` only
   after both of those land.
-- **The label still needs a hardware key.** With `features.hardwareSigner`
-  off, a host can pass all of row 16 and still report `managed-cooperative`,
-  with the software key as the stated reason (row 15).
+- **The label still needs a hardware key.** A host can pass the isolation
+  checks in row 16 and still report `managed-cooperative` while hardware
+  custody remains unqualified (row 15).
 - **Mac qualification runs in parallel.** Row 16 covers Linux enforcement.
   Row 29 covers the Mac implementation and evidence in this stage. HQ
   reports `managed-cooperative` on the Mac until its protected boundary
@@ -1214,7 +1229,7 @@ that needs it:
 | # | Repo | WP | PR | Done when |
 | --- | --- | --- | --- | --- |
 | 17 | agent-bot | WP2 | **Identity service:** grant-bound minting per task and operation, credential issuance records with `task_id` and `operation_id`, live tokens revoked on device revoke and `device_revoked` on every call afterwards, hardware attestation, an owner policy to refuse software-key devices, device self-revoke, owner-unlock vault | Documented in the server API docs; revocation test shows cached tokens dropped and `device_revoked` |
-| 18 | agent-bot-daemon | WP2 | **Credential references resolved by HQ;** `legacy-local-custody` off by default and opt-in only under the standalone profile; `doctor` and `status` flag it and any key file | No long-lived secret on a fresh host |
+| 18 | agent-bot-daemon | WP2 | **Credential references resolved by HQ;** `doctor` and `status` flag prior `legacy-local-custody` state and any key file for migration | No long-lived secret on a fresh host |
 | 19 | agent-bot-daemon | WP4 | **Brokered inference and service adapter** (GitHub), action ledger with reconciliation, budgets and sub-allocations. Under `managed-protected`, service writes go only through this adapter; members get no service tokens and no member-side `signed-commit` (Q4) | T06–T11, T17–T19, T23, T25, T26; negative tests for a direct member write and for a weaker profile claiming protected |
 | 20 | agent-bot-identity | WP4 | **Retire gh-app-hook** | `doctor` has no `inbox.*` checks |
 
@@ -1393,7 +1408,8 @@ These are this repository's decisions, and the platform's [decision log](https:/
     request still needs the owner's presence signature, which a delegate
     can request but not produce.
 - **`legacy-local-custody`: removed at stage 3 exit or on 2027-01-31,
-  whichever comes first.** It is off by default until then. It shipped off
+  whichever comes first.** Until removal, every HQ profile keeps it disabled
+  under the custody decision in §3.3. It originally shipped off
   by default, with the date enforced in code, in
   qwts/agent-bot-identity#1185.
 
@@ -1589,7 +1605,7 @@ Columns: **Now** is the ADR-0645 module; **Target** is the destination; **Domain
 | `identity/inbox-probe.mjs` | 94 | identity | deprecated | removed | comms, net | 0/1 | - |  |  |
 | `identity/inbox-take.mjs` | 243 | identity | deprecated | removed | exec, worktree, comms, os-secret | 3/2 | `identity/secret-providers/proton-pass` `identity/secret-store` |  | `take_inbox` → notices pulled by the broker. |
 | `identity/install-gh-shim.mjs` | 503 | identity | identity | owner client | fs, exec | 3/1 | - |  |  |
-| `identity/keyd-client.mjs` | 296 | identity | identity | HQ | fs, keyd, net, os-secret | 4/7 | - |  | Client of the HQ signer. |
+| `identity/keyd-client.mjs` | 296 | identity | identity | HQ | fs, keyd, net, os-secret | 4/7 | - |  | HQ client of administrative custody through Machine. |
 | `identity/mint-token.mjs` | 319 | identity | identity | HQ | fs, worktree, keyd, net, key-material | 5/6 | `identity/soul-credentials` `identity/server-client` | C1 | Credential-reference resolution via the identity service. |
 | `identity/owner-approval.mjs` | 110 | identity | identity | HQ | exec, worktree, keyd | 3/3 | - |  |  |
 | `identity/owner-decision-action.mjs` | 236 | identity | identity | HQ | keyd, comms | 2/4 | - |  |  |
@@ -1613,16 +1629,16 @@ Columns: **Now** is the ADR-0645 module; **Target** is the destination; **Domain
 | `identity/secret-providers/proton-pass.mjs` | 312 | identity | identity service | identity service | exec, os-secret | 1/2 | - |  |  |
 | `identity/secret-store.mjs` | 157 | identity | identity service | identity service | - | 0/5 | - |  |  |
 | `identity/secret.mjs` | 81 | identity | identity service | identity service | - | 3/2 | - |  | Vault: owner-unlock, per-owner encryption. |
-| `identity/server-client.mjs` | 448 | identity | daemon (link) + identity (enrollment) | HQ | fs, exec, net, key-material | 1/1 | - |  | Identity-service link; device key in the HQ signer. |
+| `identity/server-client.mjs` | 448 | identity | daemon (link) + identity (enrollment) | HQ | fs, exec, net, key-material | 1/1 | - |  | HQ identity-service link. Machine/keyd uses the device key. |
 | `identity/session-approvals.mjs` | 28 | identity | identity | HQ | - | 0/2 | - |  |  |
 | `identity/signed-commit.mjs` | 310 | identity | identity | Soul | exec, worktree | 4/0 | - |  | Becomes a brokered service operation. |
 | `identity/soul-credentials.mjs` | 553 | identity | identity service | identity service | fs, exec, keyd, os-secret, key-material | 9/7 | `identity/agent-identity` `identity/owner-gate` `soul-app-declarations` `identity/mint-token` | C1 | HQ gets credential references resolved to short-lived tokens instead. |
 | `identity/soul-genesis.mjs` | 33 | identity | identity | HQ | - | 2/1 | - |  |  |
 | `identity/uninstalled-identity-hook.mjs` | 900 | identity | identity | Soul | fs, exec | 2/1 | - |  |  |
-| `identity/vouch.mjs` | 318 | identity | identity | HQ | fs, comms, key-material | 1/5 | - |  | Signing key moves into the HQ signer (non-exportable; soul token `v2`, ES256). |
+| `identity/vouch.mjs` | 318 | identity | identity | HQ | fs, comms, key-material | 1/5 | - |  | Administrative Machine/keyd supplies authorized host signatures (soul token `v2`, ES256). |
 | `identity/worktree-token.mjs` | 207 | identity | identity | Soul | fs, exec, worktree | 7/0 | - |  |  |
 | `install.mjs` | 512 | cli | daemon | owner client | fs, exec, worktree | 7/3 | `spaces-cutover` `sandbox` |  |  |
-| `keyd-supervisor.mjs` | 116 | host | identity | HQ | fs, exec, keyd, os-secret | 2/0 | `daemon-supervisor` |  | Supervises the HQ signer. |
+| `keyd-supervisor.mjs` | 116 | host | identity | HQ | fs, exec, keyd, os-secret | 2/0 | `daemon-supervisor` |  | Original supervisor. Machine supervises administrative keyd. |
 | `metrics.mjs` | 393 | host | daemon | HQ | fs, exec, worktree, comms | 4/1 | `identity/identity-host` |  |  |
 | `muse-acp.mjs` | 408 | soul | soul-runtime/entry-point | Soul | fs, exec | 0/0 | - |  |  |
 | `organization-profile-schema.mjs` | 539 | shared | daemon/sdk | HQ + Soul | keyd | 0/3 | - |  |  |

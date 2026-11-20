@@ -155,25 +155,14 @@ test('a helper that misbehaves is refused: wrong protocol, a software claim, a p
   } finally { rmSync(home, { recursive: true, force: true }); rmSync(dirname(chip), { recursive: true, force: true }); }
 });
 
-test('signer config: software by default, a helper by absolute path, nothing else', () => {
-  assert.equal(backendFromConfig(undefined, { home: '/h' }).kind, 'software');
-  assert.equal(backendFromConfig({ backend: 'helper', command: ['/usr/local/bin/hq-signer'] }, { home: '/h' }).kind, 'helper');
-  const on = { features: { hardwareSigner: true } };
-  assert.doesNotThrow(() => validateConfig({ ...on, signer: { backend: 'helper', command: ['/usr/local/bin/hq-signer', '--slot', '1'] } }));
-  // The helper backend is off unless the owner turns the feature on.
-  for (const features of [undefined, {}, { hardwareSigner: false }]) {
-    assert.throws(() => validateConfig({ ...(features ? { features } : {}), signer: { backend: 'helper', command: ['/usr/local/bin/hq-signer'] } }), /behind a feature flag; set features\.hardwareSigner/);
+test('runtime configuration allows only paired Machine custody', () => {
+  assert.doesNotThrow(() => validateConfig({ signer: { backend: 'machine' } }));
+  assert.throws(() => validateConfig({ standalone: true, signer: { backend: 'secure-enclave' } }), /verified dedicated-account installation/);
+  assert.throws(() => validateConfig({ signer: { backend: 'secure-enclave' } }), /paired Machine backend/);
+  for (const signer of [{ backend: 'software' }, { backend: 'helper', command: ['/example/fixture'] },
+    { backend: 'machine', command: ['/example/fixture'] }]) {
+    assert.throws(() => validateConfig({ features: { hardwareSigner: true }, signer }), /paired Machine backend/);
   }
-  assert.doesNotThrow(() => validateConfig({ features: { hardwareSigner: true } }), 'the flag alone changes nothing: the backend stays software');
-  assert.throws(() => validateConfig({ features: { hardwareSigner: 'yes' } }), /is a boolean/);
-  assert.throws(() => validateConfig({ features: { tpm: true } }), /unknown key features\.tpm/);
-  assert.throws(() => validateConfig({ features: [] }), /features is an object/);
-  assert.doesNotThrow(() => validateConfig({ signer: { backend: 'software' } }));
-  assert.throws(() => validateConfig({ signer: { backend: 'helper' } }), /signer\.command/);
-  assert.throws(() => validateConfig({ signer: { backend: 'helper', command: ['hq-signer'] } }), /absolute path/);
-  assert.throws(() => validateConfig({ signer: { backend: 'software', command: ['/x'] } }), /only for the helper/);
-  assert.throws(() => validateConfig({ signer: { backend: 'cloud' } }), /software or helper/);
-  assert.throws(() => validateConfig({ signer: { key: 'x' } }), /unknown key signer\.key/);
 });
 
 test('HQ: status names the signer and its custody, a software key is a stated reason protected is out of reach, and approvals carry a real signature', async () => {
@@ -197,7 +186,9 @@ test('HQ: status names the signer and its custody, a software key is a stated re
 
 test('HQ on a helper: hardware custody in status, no key file in the state directory, and the software reason is gone', async () => {
   const chip = outside();
-  const t = await startHQ({ config: { features: { hardwareSigner: true }, signer: { backend: 'helper', command: helperCommand(chip) } } });
+  const home = tempHome();
+  const signer = createSigner({ home, backend: helper(chip), enrollment });
+  const t = await startHQ({ home, signer, config: { features: { hardwareSigner: true } } });
   try {
     const s = (await (await t.owner()).request('status')).result;
     assert.deepEqual([s.hq.signer.backend, s.hq.signer.key_storage, s.hq.signer.key_files], ['helper', 'hardware', 0]);
@@ -229,37 +220,12 @@ test('HQ with an unavailable signer starts in safe mode and says why', async () 
   } finally { await t.done(); }
 });
 
-test('signer rekey: moves custody to the helper, removes the key file, and is refused while HQ runs', async () => {
+test('the stopped HQ CLI cannot create or replace a device key', () => {
   const home = tempHome();
-  const chip = outside();
-  const cli = (...args) => spawnSync(process.execPath, [MAIN, ...args, '--home', home, '--json'], { encoding: 'utf8' });
   try {
-    const first = await startHQ({ home, config: {} });
-    const before = first.status.hq.signer;
-    // Asynchronous: this process is also the HQ the command talks to.
-    const live = await new Promise((resolve) => {
-      execFile(process.execPath, [MAIN, 'signer', 'rekey', '--home', home], { encoding: 'utf8', timeout: 20_000 }, (err, stdout, stderr) => resolve({ status: err ? (err.code ?? -1) : 0, stderr }));
-    });
-    assert.notEqual(live.status, 0);
-    assert.match(live.stderr, /HQ is running/);
-    await first.done({ keep: true });
-    assert.equal(existsSync(join(home, 'signer/device-key.pem')), true);
-
-    // The owner points HQ at the helper. Without a rekey the pin still names the old custody.
-    writeFileSync(join(home, 'config.json'), JSON.stringify({ features: { hardwareSigner: true }, signer: { backend: 'helper', command: helperCommand(chip) } }), { mode: 0o600 });
-    const stale = createSigner({ home, backend: backendFromConfig({ backend: 'helper', command: helperCommand(chip) }, { home }), enrollment });
-    assert.match(stale.report().reason, /changing custody is a re-enrollment/);
-
-    const out = JSON.parse(execFileSync(process.execPath, [MAIN, 'signer', 'rekey', '--home', home, '--json'], { encoding: 'utf8' }));
-    assert.deepEqual([out.key_storage, out.generation, out.software_key_removed], ['hardware', 2, true]);
-    assert.notEqual(out.thumbprint, before.thumbprint);
-    assert.equal(existsSync(join(home, 'signer/device-key.pem')), false);
-    assert.equal(cli('signer', 'nope').status, 1);
-
-    // With the feature turned off again, HQ refuses the config instead of using the helper.
-    writeFileSync(join(home, 'config.json'), JSON.stringify({ signer: { backend: 'helper', command: helperCommand(chip) } }), { mode: 0o600 });
-    const off = cli('signer', 'rekey');
-    assert.notEqual(off.status, 0);
-    assert.match(off.stderr, /behind a feature flag/);
-  } finally { rmSync(home, { recursive: true, force: true }); rmSync(dirname(chip), { recursive: true, force: true }); }
+    const result = spawnSync(process.execPath, [MAIN, 'signer', 'rekey', '--home', home], { encoding: 'utf8' });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /administrator action in Machine\/keyd/);
+    assert.equal(existsSync(join(home, 'signer')), false);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });

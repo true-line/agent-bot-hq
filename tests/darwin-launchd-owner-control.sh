@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Run from the unpacked HQ archive after the native CI job creates the role account.
 set -euo pipefail
-[[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "$(uname -s)" == Darwin ]]
+source "$(dirname "$0")/fixtures/darwin-hosted.sh"
+require_hosted_darwin || exit 1
 label=ai.true-line.agent-bot-hq
 plist="/Library/LaunchDaemons/$label.plist"
-socket=/private/var/agent-bot-hq-control.sock
+runtime='/Library/Application Support/ai.true-line.agent-bot-hq'
+socket="$runtime/owner-control.sock"
 role=_agent-bot-hq
 state=/var/agent-bot-hq/.agent-bot-hq
 owner="$(id -un)"
@@ -13,25 +15,26 @@ entry="$archive/hq/main.mjs"
 helper="$archive/helpers/darwin-owner.rb"
 system_node="${1:?node executable required}"
 
-[[ "$(id -u)" != 0 && "$(id -u)" != "$(id -u "$role")" ]]
-[[ ! -e "$plist" && ! -L "$plist" && ! -e "$socket" && ! -L "$socket" ]]
-if sudo launchctl print "system/$label" >/dev/null 2>&1; then
-  echo "a system HQ job already exists" >&2
-  exit 1
-fi
+owner_uid="$(id -u)"
+role_uid="$(id -u "$role")"
+[[ "$role_uid" =~ ^[1-9][0-9]*$ && "$owner_uid" != 0 && "$owner_uid" != "$role_uid" ]] || exit 1
+[[ ! -e "$plist" && ! -L "$plist" && ! -e "$runtime" && ! -L "$runtime" ]] || exit 1
+fixture_job_absent "$label" || { echo 'HQ launchd job exists or cannot be inspected' >&2; exit 1; }
 work="$(sudo mktemp -d /Library/hq-owner-ci.XXXXXXXX)"
-cleanup() {
-  sudo launchctl bootout "system/$label" >/dev/null 2>&1 || true
-  sudo rm -f "$plist"
-  if [[ -S "$socket" ]]; then sudo rm -f "$socket"; fi
-  sudo rm -rf "$work"
-}
-trap cleanup EXIT
+work_id="$(fixture_inode "$work")"
+runtime_id= socket_id= plist_created=false job_started=false
+trap cleanup_hq_fixture EXIT
+sudo mkdir -m 0755 "$runtime"
+runtime_id="$(fixture_inode "$runtime")"
+sudo chown root:wheel "$runtime"
 sudo chmod 0755 "$work"
 # This test runner keeps its Node next to its native runtime libraries.
 sudo install -m 0600 -o "$role" -g "$role" /dev/null "$work/launchd.stderr"
 sudo -n -H -u "$role" "$system_node" --version
-"$system_node" "$entry" check-owner-control | jq -e '.capability == "darwin-owner-control/v1"' >/dev/null
+"$system_node" --test tests/hq-owner-control.test.mjs
+capability="$(jq -er '.owner_control_capability | select(. == "darwin-owner-control/v2")' "$archive/governance/interim-release.json")"
+"$system_node" "$entry" check-owner-control | jq -e --arg expected "$capability" \
+  '.capability == $expected and .launch_diagnostics == "darwin-hq-launch-exits/v2"' >/dev/null
 
 # Generate typed launchd properties with the same service, socket and CLI
 # arguments that Machine installs. launchd owns the listener.
@@ -42,7 +45,7 @@ import sys
 label, role, socket, node, entry, helper, state, owner, stderr = sys.argv[1:]
 plistlib.dump({
     "Label": label,
-    "UserName": role, "GroupName": role,
+    "UserName": role, "GroupName": role, "Umask": 0o077,
     "ProgramArguments": ["/usr/bin/ruby", "--disable-gems", helper, "launch",
                          node, entry, "run", "--home", state, "--owner-account", owner],
     "Sockets": {"owner-control": {"SockPathName": socket, "SockPathMode": 0o666,
@@ -50,37 +53,103 @@ plistlib.dump({
     "StandardErrorPath": stderr,
 }, sys.stdout.buffer)
 PY
-sudo install -d -m 0700 -o "$role" -g "$role" "$state"
-sudo install -m 0644 -o root -g wheel "$work/launch.plist" "$plist"
+# A first install provides an empty role home. HQ creates its own private state.
+sudo -n -u "$role" test ! -e "$state"
+sudo chown root:wheel "$work/launch.plist"
+sudo chmod 0644 "$work/launch.plist"
+# Publish exclusively, retaining the original inode for cleanup.
+sudo -n /usr/bin/python3 -I -c 'import os,sys; os.link(sys.argv[1], sys.argv[2])' "$work/launch.plist" "$plist"
+plist_created=true
 plutil -lint "$plist"
 sudo launchctl bootstrap system "$plist"
+job_started=true
 
 # Only the manager runs as root. This normal CLI runs as the designated owner.
-stat -f '%N uid=%u gid=%g mode=%Lp type=%HT' /private /private/var "$socket"
 diagnose() {
   sudo cat "$work/launchd.stderr" >&2
   sudo launchctl print "system/$label" | awk '/state =|last exit code =|pid =/ { print }' >&2
   exit 1
 }
+socket_id="$(python3 - "$socket" <<'PY'
+import os
+import stat
+import sys
+import time
+
+path = sys.argv[1]
+deadline = time.monotonic() + 3
+while True:
+    try:
+        sock = os.lstat(path)
+        break
+    except FileNotFoundError:
+        if time.monotonic() >= deadline:
+            raise
+        time.sleep(0.05)
+assert stat.S_ISSOCK(sock.st_mode) and sock.st_uid == 0 and stat.S_IMODE(sock.st_mode) == 0o666
+print(f"{sock.st_dev}:{sock.st_ino}")
+PY
+)" || diagnose
 python3 - "$system_node" "$entry" "$owner" "$socket" <<'PY' || diagnose
 import json
 import os
-import stat
 import subprocess
 import sys
 
 node, entry, owner, path = sys.argv[1:]
-sock = os.lstat(path)
-assert stat.S_ISSOCK(sock.st_mode) and sock.st_uid == 0 and stat.S_IMODE(sock.st_mode) == 0o666
-result = subprocess.run([node, entry, "status", "--owner-control", "--json"],
-                        check=True, stdout=subprocess.PIPE, text=True, timeout=45)
+# Machine apply runs as root with this small environment and invokes the
+# CLI as the approved owner. Hosted CI itself starts as the ordinary owner.
+result = subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/env", "-i",
+                         "PATH=/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL=C",
+                         "/usr/bin/sudo", "-n", "-H", "-u", owner, "--",
+                         node, entry, "status", "--owner-control", "--json"],
+                        check=True, stdout=subprocess.PIPE, text=True, timeout=30)
 status = json.loads(result.stdout)
 control = status["hq"]["sockets"]["ownerControl"]
 assert control["path"] == path and control["peer_check"] == "getpeereid"
 assert control["uid"] == os.getuid() and control["account"] == owner
 assert status["hq"]["account"] == "_agent-bot-hq" and status["profile"] == "managed-cooperative"
 PY
+[[ "$(sudo stat -f '%u:%Lp' "$state")" == "$(id -u "$role"):700" ]] || exit 1
 pid="$(sudo launchctl print "system/$label" | awk '$1 == "pid" && $2 == "=" { print $3 }')"
-[[ "$pid" =~ ^[1-9][0-9]*$ ]]
-[[ "$(ps -o uid= -p "$pid" | tr -d ' ')" == "$(id -u "$role")" ]]
+[[ "$pid" =~ ^[1-9][0-9]*$ ]] || exit 1
+[[ "$(ps -o uid= -p "$pid" | tr -d ' ')" == "$(id -u "$role")" ]] || exit 1
 echo "The owner CLI reached the launchd service running as $role with getpeereid authentication."
+
+# launchd retains the listening socket while restarting HQ. Queue a normal
+# request from the designated owner while the dedicated CI service is paused.
+python3 - "$label" "$pid" "$socket" "$owner" <<'PY' || diagnose
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+label, pid, path, owner = sys.argv[1:]
+service = "system/" + label
+before = os.lstat(path)
+subprocess.run(["/usr/bin/sudo", "-n", "/bin/launchctl", "kill", "SIGSTOP", service], check=True)
+deadline = time.monotonic() + 5
+while "T" not in subprocess.check_output(["/bin/ps", "-o", "state=", "-p", pid], text=True):
+    if time.monotonic() >= deadline:
+        raise RuntimeError("CI HQ process did not pause")
+    time.sleep(0.05)
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as pending:
+    pending.settimeout(40)
+    pending.connect(path)
+    pending.sendall(b'{"id":37,"op":"status"}\n')
+    subprocess.run(["/usr/bin/sudo", "-n", "/bin/launchctl", "kill", "SIGKILL", service], check=True)
+    with pending.makefile("rb") as reply:
+        response = json.loads(reply.readline(1024 * 1024))
+assert response["id"] == 37 and response["ok"] is True
+report = response["result"]["hq"]
+assert report["account"] == "_agent-bot-hq"
+control = report["sockets"]["ownerControl"]
+assert control["uid"] == os.getuid() and control["account"] == owner and control["peer_check"] == "getpeereid"
+after = os.lstat(path)
+assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+PY
+restarted_pid="$(sudo launchctl print "system/$label" | awk '$1 == "pid" && $2 == "=" { print $3 }')"
+[[ "$restarted_pid" =~ ^[1-9][0-9]*$ && "$restarted_pid" != "$pid" ]] || exit 1
+echo "A pending owner status request reached the restarted HQ through the same launchd socket."

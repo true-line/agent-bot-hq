@@ -34,22 +34,21 @@
 // (§9 row 10); credential resolution is row 18. `assertion()` builds the
 // assertion the link sends. This enrollment record retains its transitional
 // first-use server key; the link trusts only its separate release pin.
-import { randomBytes } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { hostname } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fail } from '../sdk/errors.mjs';
 
 export const DEFAULT_IDENTITY_SERVICE = 'https://agents.true-line.ai';
 export const GRANT_DEVICE_CODE = 'urn:ietf:params:oauth:grant-type:device_code';
 export const GRANT_JWT_BEARER = 'urn:ietf:params:oauth:grant-type:jwt-bearer';
 
+const ENROLLMENT_RECEIPT = 'agent-bot-sig-v1';
 const REQUEST_TIMEOUT_MS = 20_000;
 const MAX_BODY_BYTES = 64 * 1024;
 const HARNESS = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const PLATFORMS = { darwin: 'macos', linux: 'linux', win32: 'windows' };
-
-const b64url = (buf) => Buffer.from(buf).toString('base64url');
 
 // A bare origin: https anywhere, http only on loopback (tests, local service).
 export function validateServiceUrl(raw) {
@@ -97,6 +96,10 @@ function writeJsonFile(path, value) {
   try { writeSync(fd, `${JSON.stringify(value, null, 2)}\n`); fsyncSync(fd); } finally { closeSync(fd); }
   chmodSync(tmp, 0o600);
   renameSync(tmp, path);
+  if (process.platform !== 'win32') {
+    const dir = openSync(dirname(path), 'r');
+    try { fsyncSync(dir); } finally { closeSync(dir); }
+  }
 }
 
 export function createEnrollment({
@@ -115,11 +118,11 @@ export function createEnrollment({
   if (!signer) throw new TypeError('createEnrollment needs the HQ signer');
   validateServiceUrl(server);
   const dir = join(home, 'identity');
-  const paths = { device: join(dir, 'device.json'), previous: join(dir, 'device.previous.json'), serverKey: join(dir, 'server-key.json') };
+  const paths = { device: join(dir, 'device.json'), previous: join(dir, 'device.previous.json'), serverKey: join(dir, 'server-key.json'), pending: join(dir, 'pending-receipt.json') };
   let grant;       // { state: pending | approved | failed, ... } for the current HQ process
   let polling;
+  let starting = false;
 
-  const seconds = () => Math.floor(clock.now() / 1000);
   const iso = () => new Date(clock.now()).toISOString();
   const key = () => {
     const r = signer.report();
@@ -139,12 +142,27 @@ export function createEnrollment({
     } catch (e) {
       fail('credential_unavailable', `the identity service is unreachable (${e?.name === 'TimeoutError' ? 'timed out' : e?.cause?.code ?? e?.code ?? 'network error'})`);
     }
-    const text = await res.text();
-    if (text.length > MAX_BODY_BYTES) throw new Error(`the identity service answered ${path} with more than ${MAX_BODY_BYTES} bytes`);
+    const reader = res.body?.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const next = reader && await reader.read();
+        if (!next || next.done) break;
+        size += next.value.byteLength;
+        if (size > MAX_BODY_BYTES) {
+          await reader.cancel();
+          throw new Error(`the identity service answered ${path} with more than ${MAX_BODY_BYTES} bytes`);
+        }
+        chunks.push(next.value);
+      }
+    } finally { reader?.releaseLock(); }
+    const bytes = Buffer.concat(chunks, size);
+    const text = bytes.toString('utf8');
     let body;
     try { body = JSON.parse(text); } catch { body = undefined; }
     if (!body || typeof body !== 'object' || Array.isArray(body)) body = { error: `http_${res.status}` };
-    return { ok: res.ok, status: res.status, body };
+    return { ok: res.ok, status: res.status, body, bytes, headers: res.headers };
   }
 
   const oauthMessage = (what, body) => `${what}: ${body.error ?? 'error'}${typeof body.error_description === 'string' ? ` (${body.error_description.slice(0, 200)})` : ''}`;
@@ -170,21 +188,128 @@ export function createEnrollment({
   function stateOf(rec, thumbprint) {
     if (!rec) return 'unenrolled';
     if (rec.revoked_at) return 'revoked';
-    if (rec.server !== server || rec.jkt !== thumbprint) return 'unenrolled';
+    if (rec.server !== server || rec.jkt !== thumbprint || (signer.acceptsRecord && !signer.acceptsRecord(rec))) return 'unenrolled';
     return 'enrolled';
   }
 
-  async function poll(auth, started) {
+  async function poll(auth, started, proof) {
     let interval = Number(auth.interval) > 0 ? Number(auth.interval) : 5;
     const deadline = started + (Number(auth.expires_in) > 0 ? Number(auth.expires_in) : 900) * 1000;
     for (;;) {
       await sleep(interval * 1000);
       if (clock.now() > deadline) throw new Error('the device code expired before the owner approved it');
-      const { body } = await request('/oauth/token', { grant_type: GRANT_DEVICE_CODE, device_code: auth.device_code });
-      if (typeof body.device_id === 'string' && body.device_id.length > 0 && body.device_id.length <= 256) return body;
+      const response = await request('/oauth/token', { grant_type: GRANT_DEVICE_CODE, device_code: auth.device_code });
+      const { body } = response;
+      if (response.status === 200 && typeof body.device_id === 'string' && body.device_id.length > 0 && body.device_id.length <= 256) {
+        if (!signer.bindEnrollment) return body; // An explicitly injected component-test signer.
+        const receipt = {
+          receipt_body: response.bytes.toString('base64url'),
+          receipt_jti: response.headers.get('agent-bot-request-jti'),
+          receipt_kid: response.headers.get('agent-bot-key-id'),
+          receipt_signature: response.headers.get('agent-bot-signature'),
+        };
+        if (receipt.receipt_jti !== 'enroll-v1:' + createHash('sha256').update(proof, 'ascii').digest('hex')) {
+          throw new Error('Identity returned an enrollment receipt for a different device authorization');
+        }
+        signer.verifyEnrollmentReceipt(receipt, server);
+        return { receipt };
+      }
+      // The receipt issuer can refuse a poll before it consumes the approved code.
+      if (signer.bindEnrollment && response.status === 503 &&
+          (body.error === 'credential_unavailable' || body.error === 'temporarily_unavailable')) continue;
       if (body.error === 'slow_down') interval += 5;
       else if (body.error !== 'authorization_pending') throw new Error(oauthMessage('enrollment was refused', body));
     }
+  }
+
+  function saveRecord(result, k, name, serverKeyId, receipt) {
+    const saved = {
+      server, device_id: result.device_id, jkt: k.thumbprint, key_storage: k.key_storage, key_generation: k.generation,
+      method: 'device_code', platform, device_name: name,
+      ...(receipt && { receipt_body: receipt.receipt_body, receipt_jti: receipt.receipt_jti }),
+      harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string').slice(0, 64) : [],
+      server_key_id: serverKeyId ?? null, enrolled_at: iso(),
+    };
+    writeJsonFile(paths.device, saved);
+    grant = { state: 'approved', device_id: saved.device_id, key_thumbprint: k.thumbprint, key_storage: k.key_storage, restart: true };
+    onEvent({ kind: 'device.enrolled', device_id: saved.device_id, key_storage: k.key_storage });
+  }
+
+  async function completeBinding(pending, k) {
+    if (pending.server !== server || pending.thumbprint !== k.thumbprint || pending.generation !== k.generation) throw new Error('pending receipt belongs to a different device enrollment');
+    const result = await signer.bindEnrollment(pending.receipt, server);
+    saveRecord(result, k, pending.name, pending.receipt.receipt_kid, pending.receipt);
+    rmSync(paths.pending);
+    return { ...grant };
+  }
+
+  async function beginEnrollment(payload) {
+    const harnesses = payload.harnesses;
+    if (!Array.isArray(harnesses) || harnesses.length === 0 || harnesses.length > 32 || !harnesses.every((h) => typeof h === 'string' && HARNESS.test(h))) {
+      fail('host.invalid_request', 'enroll names at least one harness (lowercase letters, digits and hyphens)');
+    }
+    if (payload.force !== undefined && typeof payload.force !== 'boolean') fail('host.invalid_request', 'force is a boolean');
+    if (payload.device_name !== undefined && (typeof payload.device_name !== 'string' || payload.device_name.length === 0 || payload.device_name.length > 128)) fail('host.invalid_request', 'device_name is a string of at most 128 characters');
+    if (grant?.state === 'pending') return { pending: true, ...grant };
+
+    ensureDir(dir, uid);
+    const rec = record();
+    let k = key();
+    if (signer.bindEnrollment) {
+      if (rec && rec.jkt !== k.thumbprint) throw new Error('existing HQ enrollment requires administrator migration to the Machine device key');
+      const pending = readJsonFile(paths.pending, uid);
+      if (pending) return completeBinding(pending, k);
+    }
+    const state = stateOf(rec, k.thumbprint);
+    if (state === 'enrolled' && payload.force !== true) {
+      if (k.backend === 'machine') fail('host.invalid_request', 'this HQ is already enrolled with its Machine-managed device key');
+      fail('host.invalid_request', 'this HQ is already enrolled; pass force to re-enroll with a fresh key');
+    }
+    // A key that has been enrolled, here or for a revoked record, is never enrolled again.
+    if (rec && rec.jkt === k.thumbprint) {
+      signer.createKey({ replace: true });
+      k = key();
+    }
+    if (rec) renameSync(paths.device, paths.previous);
+
+    const serverKey = await pinServerKey();
+    const aud = `${server}/oauth/device_authorization`;
+    const name = payload.device_name ?? deviceName;
+    const proof = await signer.enrollmentProof(aud);
+    const { ok, body: auth } = await request('/oauth/device_authorization', { ...(signer.bindEnrollment && { enrollment_receipt: ENROLLMENT_RECEIPT }), device_name: name, platform, key_storage: k.key_storage, tags: '', harnesses: harnesses.join(' '), proof });
+    if (!ok || typeof auth.user_code !== 'string' || typeof auth.device_code !== 'string') throw new Error(oauthMessage('device authorization failed', auth));
+
+    if (signer.bindEnrollment && auth.enrollment_receipt !== ENROLLMENT_RECEIPT) {
+      throw new Error('the identity service did not confirm signed enrollment receipts');
+    }
+    const started = clock.now();
+    grant = {
+      state: 'pending',
+      user_code: auth.user_code,
+      ...(typeof auth.verification_uri === 'string' ? { verification_uri: auth.verification_uri } : {}),
+      ...(typeof auth.verification_uri_complete === 'string' ? { verification_uri_complete: auth.verification_uri_complete } : {}),
+      expires_at: new Date(started + (Number(auth.expires_in) > 0 ? Number(auth.expires_in) : 900) * 1000).toISOString(),
+      key_thumbprint: k.thumbprint,
+      key_storage: k.key_storage,
+      key_generation: k.generation,
+    };
+    onEvent({ kind: 'device.enroll.started', key_storage: k.key_storage, key_generation: k.generation });
+
+    polling = poll(auth, started, proof).then(async (result) => {
+      if (result.receipt) {
+        const pending = { receipt: result.receipt, server, name, generation: k.generation, thumbprint: k.thumbprint };
+        // Only independently verified public evidence is durable. It lets a
+        // later owner retry the same binding after a lost Machine reply.
+        writeJsonFile(paths.pending, pending);
+        await completeBinding(pending, k);
+      } else {
+        saveRecord({ ...result, harnesses: result.harnesses ?? harnesses }, k, name, serverKey.kid);
+      }
+    }).catch((e) => {
+      grant = { state: 'failed', reason: e.message, key_thumbprint: k.thumbprint };
+      onEvent({ kind: 'device.enroll.failed', reason: e.message });
+    });
+    return { pending: true, ...grant };
   }
 
   const enrollment = {
@@ -224,63 +349,11 @@ export function createEnrollment({
     // Start (or report) the device-code grant. Resolves once the service has
     // issued a user code; approval is polled for in the background.
     async enroll(payload = {}) {
-      const harnesses = payload.harnesses;
-      if (!Array.isArray(harnesses) || harnesses.length === 0 || harnesses.length > 32 || !harnesses.every((h) => typeof h === 'string' && HARNESS.test(h))) {
-        fail('host.invalid_request', 'enroll names at least one harness (lowercase letters, digits and hyphens)');
-      }
-      if (payload.force !== undefined && typeof payload.force !== 'boolean') fail('host.invalid_request', 'force is a boolean');
-      if (payload.device_name !== undefined && (typeof payload.device_name !== 'string' || payload.device_name.length === 0 || payload.device_name.length > 128)) fail('host.invalid_request', 'device_name is a string of at most 128 characters');
-      if (grant?.state === 'pending') return { pending: true, ...grant };
-
-      ensureDir(dir, uid);
-      const rec = record();
-      let k = key();
-      const state = stateOf(rec, k.thumbprint);
-      if (state === 'enrolled' && payload.force !== true) fail('host.invalid_request', 'this HQ is already enrolled; pass force to re-enroll with a fresh key');
-      // A key that has been enrolled, here or for a revoked record, is never enrolled again.
-      if (rec && rec.jkt === k.thumbprint) {
-        signer.createKey({ replace: true });
-        k = key();
-      }
-      if (rec) renameSync(paths.device, paths.previous);
-
-      const serverKey = await pinServerKey();
-      const aud = `${server}/oauth/device_authorization`;
-      const name = payload.device_name ?? deviceName;
-      const proof = signer.signJws({ typ: 'ab-enroll+jwt', jwk: signer.publicJwk() }, { aud, iat: seconds(), jti: b64url(randomBytes(16)) }, { kid: false });
-      const { ok, body: auth } = await request('/oauth/device_authorization', { device_name: name, platform, key_storage: k.key_storage, tags: '', harnesses: harnesses.join(' '), proof });
-      if (!ok || typeof auth.user_code !== 'string' || typeof auth.device_code !== 'string') throw new Error(oauthMessage('device authorization failed', auth));
-
-      const started = clock.now();
-      grant = {
-        state: 'pending',
-        user_code: auth.user_code,
-        ...(typeof auth.verification_uri === 'string' ? { verification_uri: auth.verification_uri } : {}),
-        ...(typeof auth.verification_uri_complete === 'string' ? { verification_uri_complete: auth.verification_uri_complete } : {}),
-        expires_at: new Date(started + (Number(auth.expires_in) > 0 ? Number(auth.expires_in) : 900) * 1000).toISOString(),
-        key_thumbprint: k.thumbprint,
-        key_storage: k.key_storage,
-        key_generation: k.generation,
-      };
-      onEvent({ kind: 'device.enroll.started', key_storage: k.key_storage, key_generation: k.generation });
-
-      polling = poll(auth, started).then((result) => {
-        const saved = {
-          server, device_id: result.device_id, jkt: k.thumbprint, key_storage: k.key_storage, key_generation: k.generation,
-          method: 'device_code', platform, device_name: name,
-          harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string').slice(0, 64) : harnesses,
-          server_key_id: serverKey.kid ?? null, enrolled_at: iso(),
-        };
-        writeJsonFile(paths.device, saved);
-        grant = { state: 'approved', device_id: saved.device_id, key_thumbprint: k.thumbprint, key_storage: k.key_storage, restart: true };
-        onEvent({ kind: 'device.enrolled', device_id: saved.device_id, key_storage: k.key_storage });
-      }, (e) => {
-        grant = { state: 'failed', reason: e.message, key_thumbprint: k.thumbprint };
-        onEvent({ kind: 'device.enroll.failed', reason: e.message });
-      });
-      return { pending: true, ...grant };
+      if (starting) fail('host.invalid_request', 'HQ is already starting or restoring a device grant');
+      starting = true;
+      try { return await beginEnrollment(payload); }
+      finally { starting = false; }
     },
-
     // Resolves when the grant in flight (if any) has ended, either way.
     settled: async () => { await polling; },
 
@@ -300,10 +373,7 @@ export function createEnrollment({
       if (state === 'revoked') fail('device_revoked', 'device revoked: re-enroll');
       if (state !== 'enrolled') fail('host.invalid_request', 'this HQ is not enrolled');
       if (!ephemeralJwk || typeof ephemeralJwk !== 'object' || 'd' in ephemeralJwk) throw new TypeError('assertion needs the public ephemeral key');
-      const t = seconds();
-      return signer.signJws({ typ: 'JWT' }, {
-        iss: rec.device_id, sub: rec.device_id, aud: `${server}/oauth/token`, iat: t, exp: t + 120, jti: b64url(randomBytes(16)), cnf: { jwk: ephemeralJwk },
-      }, { kid: false });
+      return signer.accessAssertion({ server, deviceId: rec.device_id, ephemeralJwk });
     },
   };
   return enrollment;

@@ -35,14 +35,13 @@ import { verify } from '../scripts/soul-contracts.mjs';
 import { SCHEMA_NAMES } from './admission.mjs';
 import { NOTICE_SCHEMA_NAMES } from './notices.mjs';
 import { TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES } from './tasks.mjs';
-import { createHQ, readConfig } from './hq.mjs';
-import { backendFromConfig, createSigner, removeSoftwareKey } from './signer.mjs';
+import { createHQ } from './hq.mjs';
 import { readPins } from './plugins.mjs';
 import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { connectSocket } from './socket.mjs';
 import { machineRoleCommand } from './machine-channel.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|signer rekey|machine identity|machine status|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
@@ -80,22 +79,9 @@ async function ask(controlPath, op) {
 }
 
 function signerLine(g) {
-  if (!g.available) return `signer: unavailable (${g.reason})`;
-  const custody = g.key_storage === 'hardware' ? 'hardware key (experimental feature hardwareSigner)' : 'software key file (transition custody)';
-  return `signer: ${custody}, ${g.backend} backend, key ${g.thumbprint.slice(0, 12)}, generation ${g.generation}`;
-}
-
-// Replace the signer's key while HQ is stopped. A running HQ holds the old
-// pin in memory, so it is refused rather than left signing with a dead key.
-export async function rekeySigner(home) {
-  let live = false;
-  try { const c = await connectSocket(join(home, 'control.sock')); live = true; await c.close(); } catch { /* not running */ }
-  if (live) throw new Error('HQ is running: stop it before replacing the signer key');
-  const cfg = readConfig(home);
-  const signer = createSigner({ home, backend: backendFromConfig(cfg.signer, { home }) });
-  const made = signer.createKey({ replace: true });
-  const removed = made.key_storage === 'hardware' ? removeSoftwareKey({ home }) : undefined;
-  return { ...made, ...(removed === undefined ? {} : { software_key_removed: removed }) };
+  const backend = g.backend === 'machine' ? 'paired Machine/keyd' : g.backend;
+  if (!g.available) return `signer: ${backend} unavailable (${g.reason})`;
+  return `signer: ${g.key_storage} key, ${backend} backend, key ${g.thumbprint.slice(0, 12)}, generation ${g.generation}`;
 }
 
 function printStatus(s) {
@@ -115,34 +101,50 @@ function printStatus(s) {
 
 async function main(argv) {
   if (argv[0] === 'machine') {
-    console.log(JSON.stringify(await machineRoleCommand(argv.slice(1))));
+    const result = await machineRoleCommand(argv.slice(1));
+    console.log(typeof result === 'string' ? result : JSON.stringify(result));
     return;
   }
   const args = parse(argv);
   if (args.cmd === 'check-owner-control') {
-    console.log(JSON.stringify({ capability: checkOwnerControlSupport() }));
+    const capability = checkOwnerControlSupport();
+    const report = { capability };
+    if (process.platform === 'darwin') report.launch_diagnostics = 'darwin-hq-launch-exits/v2';
+    console.log(JSON.stringify(report));
     return;
   }
   const controlPath = args.ownerControl ? OWNER_CONTROL_PATH : join(args.home, 'control.sock');
   if (args.ownerControl) checkOwnerSocketPath(process.getuid?.());
   if (args.cmd === 'run') {
     if ([process.env.LISTEN_PID, process.env.HQ_LAUNCHD_OWNER_PID].includes(String(process.pid)) && !args.ownerAccount) throw new Error('socket activation requires --owner-account NAME');
-    const ownerControl = args.ownerAccount ? activatedOwnerControl(args.ownerAccount) : undefined;
-    const hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins: readPins(PINS), pluginsDir: args.plugins, devPlugins: args.devPlugins });
-    // Handlers first, so a signal during start still shuts down cleanly.
-    let starting = true;
-    const shutdown = (signal) => {
-      const wait = starting ? new Promise((r) => { const i = setInterval(() => { if (!starting) { clearInterval(i); r(); } }, 50); }) : Promise.resolve();
-      wait.then(() => hq.stop({ reason: signal })).then(() => process.exit(0), (e) => { console.error(e.message); process.exit(1); });
-    };
-    process.once('SIGINT', shutdown);
-    process.once('SIGTERM', shutdown);
+    let ownerControl;
     try {
-      printStatus(await hq.start());
-    } finally {
-      starting = false;
+      if (args.ownerAccount) ownerControl = await activatedOwnerControl(args.ownerAccount);
+    } catch (error) {
+      if (process.platform !== 'darwin' || process.env.HQ_LAUNCHD_OWNER_PID !== String(process.pid)) throw error;
+      // Only this inherited owner-control startup boundary has a versioned
+      // post-exec exit status. Later service failures retain normal handling.
+      console.error('HQ could not activate the inherited macOS owner-control listener');
+      process.exitCode = 87;
+      return;
     }
-    console.log(`listening: ${hq.paths.control} (owner), ${hq.paths.admission} (entry points), ${hq.paths.broker} (members)`);
+    try {
+      const hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins: readPins(PINS), pluginsDir: args.plugins, devPlugins: args.devPlugins });
+      // Handlers first, so a signal during start still shuts down cleanly.
+      let starting = true;
+      const shutdown = (signal) => {
+        const wait = starting ? new Promise((r) => { const i = setInterval(() => { if (!starting) { clearInterval(i); r(); } }, 50); }) : Promise.resolve();
+        wait.then(() => hq.stop({ reason: signal })).then(() => process.exit(0), (e) => { console.error(e.message); process.exit(1); });
+      };
+      process.once('SIGINT', shutdown);
+      process.once('SIGTERM', shutdown);
+      try {
+        printStatus(await hq.start());
+      } finally {
+        starting = false;
+      }
+      console.log(`listening: ${hq.paths.control} (owner), ${hq.paths.admission} (entry points), ${hq.paths.broker} (members)`);
+    } finally { await ownerControl?.listener?.closeUnused(); }
     return;
   }
   if (args.cmd === 'enroll') {
@@ -163,9 +165,7 @@ async function main(argv) {
   }
   if (args.cmd === 'signer') {
     if (args.sub !== 'rekey') throw new Error(USAGE);
-    const made = await rekeySigner(args.home);
-    console.log(args.json ? JSON.stringify(made, null, 2) : `signer key replaced: ${made.key_storage} key ${made.thumbprint.slice(0, 12)}, generation ${made.generation}`);
-    return;
+    throw new Error('Device key rotation requires administrator action in Machine/keyd');
   }
   if (args.cmd === 'status' || args.cmd === 'souls') {
     const res = await ask(controlPath, args.cmd === 'status' ? 'status' : 'souls.list');

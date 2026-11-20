@@ -1,0 +1,1 @@
+On macOS the paired HQ role can export a signed service repair plan for owner review, verify and submit the returned one-time proof, or cancel the challenge. The administrator applies the approved plan separately.

@@ -1,0 +1,53 @@
+name: Paired device protocol
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  protocol:
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      MACHINE_REVISION: 15c58fafdb92bf5c93fe80718121ca1d47ced82d
+    steps:
+      - name: Check out the exact HQ revision
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          git fetch -q --no-tags --depth=1 "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Fetch the pinned Machine test source
+        run: |
+          machine="$RUNNER_TEMP/machine"
+          git init -q "$machine"
+          git -C "$machine" fetch -q --no-tags --depth=1 https://github.com/true-line/agent-bot-machine.git "$MACHINE_REVISION"
+          git -C "$machine" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$machine" rev-parse HEAD)" = "$MACHINE_REVISION"
+          cd "$machine"
+          test -f internal/daemon/hq_device_interop_test.go
+          test -f tests/fixtures/build-keyd-device-interop.sh
+      - name: Install Machine's Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: ${{ runner.temp }}/machine/go.mod
+          cache: false
+      - name: Build the Machine test binary
+        working-directory: ${{ runner.temp }}/machine
+        run: |
+          go test -c -o "$RUNNER_TEMP/machine-fixture" ./internal/daemon
+      - name: Build the offline Darwin HQ package
+        run: |
+          command -v gtar >/dev/null || brew install gnu-tar
+          bash scripts/ci-build-darwin-artifact.sh "$GITHUB_SHA" "$RUNNER_TEMP/paired-hq.tar"
+          mkdir "$RUNNER_TEMP/paired-release"
+          tar -xf "$RUNNER_TEMP/paired-hq.tar" -C "$RUNNER_TEMP/paired-release"
+      - name: Exercise paired HQ and keyd with disposable keys
+        env:
+          HQ_TEST_PACKAGED_HOSTED: '1'
+        run: |
+          node --version
+          node tests/machine-device-interop.mjs "$RUNNER_TEMP/machine-fixture" "$RUNNER_TEMP/machine/tests/fixtures/build-keyd-device-interop.sh" "$RUNNER_TEMP/paired-release/hq/hq/main.mjs"

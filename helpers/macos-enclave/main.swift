@@ -1,9 +1,14 @@
 import Foundation
 import Security
 
-// Require the provisioned Developer ID application at the installed entry
-// point. The dedicated role and its file Keychain are checked by roleStore.
+func requireStandaloneInstallation() throws {
+    // The native guard collects positive evidence. Neither a clean search
+    // nor an HQ-owned setting supplies an authoritative standalone install.
+    throw MachineInstallationProbe.standard.inspect()
+}
+
 do {
+    try requireStandaloneInstallation()
     var code: SecCode?
     var requirement: SecRequirement?
     let expression = #"anchor apple generic and identifier "ai.true-line.hq.signer" and certificate leaf[subject.OU] = "Z5DM34QS5U" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"#
@@ -17,6 +22,9 @@ do {
           let groups = SecTaskCopyValueForEntitlement(task, "keychain-access-groups" as CFString, nil) as? [String],
           groups.contains(app) else { throw SignerFailure.accessControl }
     try runSigner()
+} catch let evidence as MachineInstallationEvidence {
+    FileHandle.standardError.write(Data((evidence.refusal + "\n").utf8))
+    exit(1)
 } catch {
     FileHandle.standardError.write(Data("HQ Secure Enclave signer unavailable\n".utf8))
     exit(1)

@@ -1,0 +1,1 @@
+HQ enrolls through its paired Machine and verifies the administrator-bound device record on restart. Machine outages or revoked pairings leave protected operations unavailable. Existing local signer state requires an authorized migration. Standalone Secure Enclave signing remains unavailable until the installation can prove Machine absence.
