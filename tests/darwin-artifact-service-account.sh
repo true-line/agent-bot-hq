@@ -55,6 +55,35 @@ if [[ "${2:?compiled enclave probe or --launchd-only required}" != --launchd-onl
   bash tests/darwin-enclave-restart.sh "$stage" "$name" "$home"
 fi
 cd "$stage/hq"
+# Exercise the packaged HQ entry point as the runner's login account before
+# switching to the dedicated role. Standalone custody must refuse at startup.
+"$node_bin" --input-type=module - <<'JS'
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { userInfo } from 'node:os';
+import { join } from 'node:path';
+
+assert.notEqual(userInfo().username, '_agent-bot-hq');
+assert.notEqual(process.getuid(), 0);
+const state = mkdtempSync('/private/tmp/hq-ordinary.');
+try {
+  writeFileSync(join(state, 'config.json'), JSON.stringify({ standalone: true, signer: { backend: 'secure-enclave' } }));
+  const result = spawnSync(process.execPath, ['hq/main.mjs', 'run', '--home', state], {
+    encoding: 'utf8', timeout: 10000, killSignal: 'SIGKILL',
+  });
+  if (result.error) throw result.error;
+  assert.equal(result.status, 1);
+  assert.ok(result.stdout === '', 'unexpected standalone response');
+  const expected = 'standalone Secure Enclave signing requires a verified dedicated-account installation without Agent Machine';
+  assert.ok(result.stderr.trim() === expected, 'unexpected standalone refusal');
+  for (const file of ['signer/pin.json', 'signer/device-key.pem', 'control.sock']) {
+    assert.equal(existsSync(join(state, file)), false, file);
+  }
+} finally {
+  rmSync(state, { recursive: true, force: true });
+}
+JS
 sudo -n -H -u "$name" -- /bin/bash tests/dedicated-hq-account.sh "$node_bin" --disposable-machine-role
 bash tests/darwin-launchd-owner-control.sh "$node_bin"
 python3 -I tests/packaged-darwin-harness-accounts.py "$stage/hq" "$node_bin"

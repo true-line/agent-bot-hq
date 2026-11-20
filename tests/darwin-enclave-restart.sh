@@ -10,22 +10,32 @@ uid="$(id -u "$role")"
 [[ "$uid" != 0 && "$uid" != "$(id -u)" ]] || exit 1
 node_bin="$(node -p 'process.execPath')"
 probe="$RUNNER_TEMP/hq-fixture-signer"
-installation=helpers/macos-enclave/MachineInstallation.swift
+guard_sources=(helpers/macos-enclave/MachineInstallation.swift helpers/macos-enclave/Standalone.swift)
 sources=(helpers/macos-enclave/Signer.swift helpers/macos-enclave/RoleStore.swift)
-xcrun swiftc -parse-as-library "$installation" tests/fixtures/machine-installation/main.swift -o "$RUNNER_TEMP/hq-machine-presence-test"
+xcrun swiftc -parse-as-library "${guard_sources[@]}" tests/fixtures/machine-installation/main.swift -o "$RUNNER_TEMP/hq-machine-presence-test"
 "$RUNNER_TEMP/hq-machine-presence-test"
-sudo install -o root -g wheel -m 0555 "$RUNNER_TEMP/hq-machine-presence-test" "$stage/presence-test"
-reason="$(sudo -n -H -u "$role" "$stage/presence-test" standard-reason)"
-xcrun swiftc "${sources[@]}" tests/fixtures/enclave-keychain/main.swift -o "$probe"
-xcrun swiftc "${sources[@]}" "$installation" helpers/macos-enclave/main.swift -o "$RUNNER_TEMP/hq-release-signer"
+xcrun swiftc "${sources[@]}" "${guard_sources[@]}" tests/fixtures/enclave-keychain/main.swift -o "$probe"
+bash "$stage/hq/scripts/build-macos-standalone-signer.sh" "$RUNNER_TEMP/hq-release-signer"
 sudo install -o root -g wheel -m 0555 "$RUNNER_TEMP/hq-release-signer" "$stage/release-signer"
-if sudo -n -H -u "$role" "$stage/release-signer" status <<< '{}' >"$RUNNER_TEMP/hq-release-status" 2>"$RUNNER_TEMP/hq-release-error"; then
+if sudo -n -H -u "$role" "$stage/release-signer" standalone-v1-status <<< '{}' >"$RUNNER_TEMP/hq-release-status" 2>"$RUNNER_TEMP/hq-release-error"; then
   echo 'Unprovisioned production helper accepted a signer operation' >&2; exit 1
 fi
 test ! -s "$RUNNER_TEMP/hq-release-status"
-grep -Fxq -- "$reason" "$RUNNER_TEMP/hq-release-error"
-sudo install -o root -g wheel -m 0555 "$probe" "$stage/fixture-signer"
-if "$stage/fixture-signer" status <<< '{}' >"$RUNNER_TEMP/hq-foreign-status"; then
+grep -Fxq 'HQ Secure Enclave signer unavailable' "$RUNNER_TEMP/hq-release-error"
+support="$stage/Application Support"
+product="$support/ai.true-line.agent-bot-hq"
+declaration="$product/standalone"
+fixture="$declaration/hq-signer"
+for dir in "$support" "$product" "$declaration"; do sudo install -d -m 0755 -o root -g wheel "$dir"; done
+sudo install -o root -g wheel -m 0555 "$probe" "$fixture"
+uuid="$(dscl . -read "/Users/$role" GeneratedUID | awk '{print toupper($2)}')"
+[[ "$uuid" =~ ^[A-F0-9]{8}-([A-F0-9]{4}-){3}[A-F0-9]{12}$ ]]
+printf 'agent-bot-hq/standalone-transition/v1\n' > "$RUNNER_TEMP/hq-transition"
+sudo install -o root -g "$role" -m 0640 "$RUNNER_TEMP/hq-transition" "$declaration/transition-v1"
+digest="$(shasum -a 256 "$probe" | awk '{print $1}')"
+printf 'agent-bot-hq/standalone-signing/v1\nrole=_agent-bot-hq\nuid=%s\nuuid=%s\nno-custom-machine-installation=true\nhelper-sha256=%s\n' "$uid" "$uuid" "$digest" > "$RUNNER_TEMP/hq-declaration"
+sudo install -o root -g wheel -m 0644 "$RUNNER_TEMP/hq-declaration" "$declaration/declaration-v1"
+if "$fixture" standalone-v1-status <<< '{}' >"$RUNNER_TEMP/hq-foreign-status"; then
   echo 'A foreign UID was allowed to use the HQ signer' >&2; exit 1
 fi
 test ! -s "$RUNNER_TEMP/hq-foreign-status"
@@ -37,7 +47,7 @@ sudo /usr/bin/tee "$plist" >/dev/null <<PLIST
   <key>Label</key><string>$label</string>
   <key>UserName</key><string>$role</string>
   <key>GroupName</key><string>$role</string>
-  <key>ProgramArguments</key><array><string>$node_bin</string><string>$stage/hq/tests/macos-enclave-restart.mjs</string><string>$stage/fixture-signer</string><string>$home</string><string>$uid</string></array>
+  <key>ProgramArguments</key><array><string>$node_bin</string><string>$stage/hq/tests/macos-enclave-restart.mjs</string><string>$fixture</string><string>$home</string><string>$uid</string></array>
   <key>WorkingDirectory</key><string>$home</string>
   <key>StandardOutPath</key><string>$home/restart.out</string>
   <key>StandardErrorPath</key><string>$home/restart.err</string>
@@ -65,3 +75,11 @@ for iteration in 1 2; do
   trap - EXIT
 done
 sudo grep -F 'The restarted HQ job retained its enclave key' "$home/restart.out"
+# Retire only the scratch namespace after positive signing and restart.
+sudo install -o root -g wheel -m 0644 /dev/null "$declaration/machine-retired-v1"
+for op in status sign; do
+  if sudo -n -H -u "$role" "$fixture" "standalone-v1-$op" <<< '{"message":"YQ"}' >"$RUNNER_TEMP/hq-retired-result"; then
+    echo 'The retired installation still accepted a key operation' >&2; exit 1
+  fi
+  test ! -s "$RUNNER_TEMP/hq-retired-result"
+done
