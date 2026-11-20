@@ -101,8 +101,10 @@ jobs:
         run: |
           node -e 'if (process.platform !== "darwin" || process.arch !== "arm64") process.exit(1)'
           node --test --test-concurrency=1 tests/hq-signer.test.mjs tests/hq-profile-legacy.test.mjs tests/hq-enrollment.test.mjs
-      - name: Verify Darwin harness endpoints and kernel peer UIDs
-        run: node --test tests/hq-darwin-harness-accounts.test.mjs
+      - name: Verify Darwin harness endpoints, member socket allocation and kernel peer UIDs
+        env:
+          TMPDIR: /tmp
+        run: node --test --test-concurrency=1 tests/hq-darwin-harness-accounts.test.mjs tests/hq-launch.test.mjs
       - name: Check CryptoKit signatures and available Secure Enclave support
         env:
           HQ_TEST_SECURE_ENCLAVE: '1'

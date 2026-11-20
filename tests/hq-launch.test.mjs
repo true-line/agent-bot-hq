@@ -10,6 +10,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { once } from 'node:events';
+import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { DARWIN_HARNESS_DIR } from '../hq/darwin-harness-accounts.mjs';
@@ -80,7 +82,7 @@ test('Darwin member sockets fit the existing broker directory for every supporte
   assert.throws(() => launchMemberSocket(tooLong, id, 'darwin'), { code: 'host.launch_unavailable' });
 });
 
-test('Darwin allocation retries a compact name held by another launch or already present on disk', { skip: process.platform === 'win32' }, t => {
+test('Darwin allocation avoids occupied names and delivers through a 103-byte member socket', { skip: process.platform === 'win32' }, async t => {
   const root = mkdtempSync('/tmp/hq-member-');
   t.after(() => rmSync(root, { recursive: true, force: true }));
   // A 91-byte parent leaves exactly 11 bytes after the slash.
@@ -96,9 +98,24 @@ test('Darwin allocation retries a compact name held by another launch or already
   writeFileSync(path(8n), 'occupied', { flag: 'wx' });
   const candidates = [7n, collision, 8n, 9n];
   const random = { hex(bytes) { assert.equal(bytes, 12); return hex(candidates.shift()); } };
-  assert.deepEqual(allocateLaunchAddress(endpoint, launches, random, 'darwin'), { launch_id: id(9n), member_socket: path(9n) });
+  const address = allocateLaunchAddress(endpoint, launches, random, 'darwin');
+  assert.deepEqual(address, { launch_id: id(9n), member_socket: path(9n) });
+  assert.equal(Buffer.byteLength(address.member_socket), 103);
   assert.equal(readFileSync(path(8n), 'utf8'), 'occupied');
   assert.throws(() => allocateLaunchAddress(endpoint, launches, { hex: () => hex(collision) }, 'darwin'), { code: 'host.launch_busy' });
+  const server = createServer(socket => socket.end('ready'));
+  server.listen(address.member_socket);
+  await once(server, 'listening');
+  const client = createConnection(address.member_socket);
+  try {
+    client.setEncoding('utf8');
+    let reply = '';
+    for await (const chunk of client) reply += chunk;
+    assert.equal(reply, 'ready');
+  } finally {
+    client.destroy();
+    await new Promise(resolve => server.close(resolve));
+  }
 });
 
 test('HQ asks sudo for exactly one form: the harness account, the fixed shell with soul and agent as arguments, detached, the allowed env, its endpoint, a fixed PATH', async () => {
