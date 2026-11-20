@@ -268,11 +268,20 @@ for (const purpose of ['harness-launch-install', 'harness-launch-retire']) {
     await assert.rejects(f.run(other, 'cancel', '--challenge-file', f.challengeFile, '--socket', f.socket), /misdirected/);
     assert.deepEqual(f.requests.map(r => r.verb), ['status', 'members-plans', purpose]);
     writeFileSync(f.proofFile, JSON.stringify(proof(challenge, f.owner)));
-    assert.equal((await f.approve()).state, 'approved');
-    await assert.rejects(f.approve(), /MM_DAEMON_PEER_REFUSED/);
-    writeFileSync(f.challengeFile, await f.issue());
     assert.equal((await f.cancel()).state, 'cancelled');
     assert.equal(f.requests.at(-1).owner_signature, undefined);
+    const reissued = await f.issue();
+    const fresh = JSON.parse(reissued).body;
+    assert.notEqual(fresh.nonce, challenge.nonce);
+    await assert.rejects(f.approve(), /MM_DAEMON_PEER_REFUSED/);
+
+    writeFileSync(f.challengeFile, reissued);
+    const before = f.requests.length;
+    await assert.rejects(f.approve(), /invalid owner signature/);
+    assert.equal(f.requests.length, before);
+    writeFileSync(f.proofFile, JSON.stringify(proof(fresh, f.owner)));
+    assert.equal((await f.approve()).state, 'approved');
+    await assert.rejects(f.approve(), /MM_DAEMON_PEER_REFUSED/);
   });
 }
 
