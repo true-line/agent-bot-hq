@@ -11,7 +11,9 @@ const stepFields = ['kind', 'target', 'action', 'owner', 'group', 'mode', 'conte
 const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 function validStep(s) {
-  if (!object(s) || !stepKinds.has(s.kind) || !stepActions.has(s.action) || !s.target) return false;
+  if (!object(s) || !stepKinds.has(s.kind) || !s.target) return false;
+  const upgrade = s.action === 'upgrade' && s.kind === 'service' && s.target === 'ai.true-line.agent-bot-hq';
+  if (!upgrade && !stepActions.has(s.action)) return false;
   const keys = Object.keys(s);
   return keys.length >= 3 && keys.every((key, i) =>
     typeof s[key] === 'string' && s[key].length > 0 && stepFields.includes(key) &&
@@ -31,6 +33,10 @@ function validMembers(plan) {
       service.target === 'ai.true-line.agent-bot-hq'));
 }
 
+export function canonicalMembersJSON(value) {
+  return JSON.stringify(value).replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029') + '\n';
+}
+
 export function validatedMembersPlan(id, response) {
   const body = response.body;
   if (!object(body) || response.state !== 'found') throw new Error('unexpected Machine members-plans lookup state');
@@ -48,7 +54,7 @@ export function validatedMembersPlan(id, response) {
   }
   // Go emits compact JSON without HTML escaping, but it escapes U+2028 and
   // U+2029. This checks form only; the exact received bytes are returned.
-  if (JSON.stringify(p).replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029') + '\n' !== plan_canonical) {
+  if (canonicalMembersJSON(p) !== plan_canonical) {
     throw new Error('Machine members plan is not in canonical form');
   }
   return p;

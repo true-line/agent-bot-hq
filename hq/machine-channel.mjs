@@ -2,7 +2,7 @@
 // seed belongs to the service account. It is independent of the HQ signer.
 import { isUtf8 } from 'node:buffer';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
-import { recoveryArgs, serviceRecovery } from './machine-service-recovery.mjs';
+import { isServiceHandoff, serviceHandoffArgs, serviceHandoff } from './machine-service-recovery.mjs';
 import { membersPlanResult, validPlanId } from './machine-members-plans.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash, createPrivateKey, createPublicKey, randomBytes, sign, verify } from 'node:crypto';
@@ -136,7 +136,7 @@ function responseFields(line) {
 
 function authenticatedResponse(line, nonce, pinned, verb) {
   const { value: r, body } = responseFields(line);
-  if (['hq-service-recovery', 'hq-device'].includes(verb) && Object.keys(r).some((field) =>
+  if ((isServiceHandoff(verb) || verb === 'hq-device') && Object.keys(r).some((field) =>
     !['ok', 'diagnostic', 'message', 'state', 'body', 'timestamp', 'nonce', 'request_nonce', 'signature'].includes(field))) {
     throw new Error('unexpected Machine ' + verb + ' response field');
   }
@@ -232,24 +232,24 @@ export function machineRoleDevice(option, fields) {
 export function machineRoleCommand(argv) {
   const { account, ordinary } = roleAccount(!['identity', 'status'].includes(argv[0]));
   if (argv[0] === 'hq-device') throw new Error('the device port is internal to HQ enrollment');
-  if (argv[0] === 'hq-service-recovery' && process.platform !== 'darwin') throw new Error('paired HQ service recovery requires macOS');
+  if (isServiceHandoff(argv[0]) && process.platform !== 'darwin') throw new Error('paired HQ service handoff requires macOS');
   return machineCommandInHome(argv, account.homedir, account.uid, undefined, ordinary);
 }
 
 // Also exercised with a temporary private home in the protocol tests. The CLI
 // always obtains its home and UID from the kernel-backed account lookup above.
-export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false) {
+export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false, roleUid = uid) {
   const [verb, ...args] = argv;
   const identity = verb === 'identity' && !args.length;
-  let socket, hex, recovery, option = '', planID = '';
+  let socket, hex, handoff, option = '', planID = '';
   if (verb === 'status' && args[0] === '--socket' &&
       (args.length === 2 || (args.length === 4 && args[2] === '--daemon-key' && HEX_KEY.test(args[3])))) {
     [, socket, , hex] = args;
-  } else if (verb === 'hq-device' && args.length === 3 && ['identity', 'enrollment-proof', 'bind-enrollment', 'access-assertion', 'bind-access'].includes(args[0]) && args[1] === '--socket') {
+  } else if (verb === 'hq-device' && args.length === 3 && ['identity', 'enrollment-proof', 'bind-enrollment', 'access-assertion', 'bind-access', 'whoami'].includes(args[0]) && args[1] === '--socket') {
     [option, , socket] = args;
-  } else if (verb === 'hq-service-recovery') {
-    recovery = recoveryArgs(args);
-    socket = recovery.socket;
+  } else if (isServiceHandoff(verb)) {
+    handoff = serviceHandoffArgs(verb, args);
+    socket = handoff.socket;
   } else if (verb === 'members-plans') {
     option = args[0];
     if (option === 'list' && args[1] === '--socket' &&
@@ -296,7 +296,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     const timestamp = Math.floor(Date.now() / 1000);
     const nonce = randomBytes(16).toString('base64url');
     const parts = [fields.verb, '', fields.option ?? '', '', fields.plan_id ?? '', '', '', '', timestamp, nonce];
-    for (const field of ['plan_digest', 'challenge_nonce', 'owner_signature', 'hq_epoch', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature']) {
+    for (const field of ['plan_digest', 'challenge_nonce', 'owner_signature', 'hq_epoch', 'session', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature']) {
       if (fields[field] !== undefined) parts.push(field, fields[field]);
     }
     const request = { ...fields, timestamp, nonce, public_key: pub.toString('base64'),
@@ -304,10 +304,17 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     const line = await exchange(socket, request);
     return { line, response: authenticatedResponse(line, nonce, daemon, fields.verb) };
   }
-  if (recovery) return serviceRecovery(recovery, daemon.toString('hex'), pub.toString('hex'), send,
-    (line) => authenticatedResponse(line, null, daemon, verb));
+  if (handoff) return serviceHandoff(verb, handoff, daemon.toString('hex'), pub.toString('hex'), send,
+    (line) => authenticatedResponse(line, null, daemon, verb), roleUid);
   if (verb === 'hq-device' && option !== 'identity') {
-    const keys = ['bind-enrollment', 'bind-access'].includes(option) ? ['hq_epoch', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature'] : ['hq_epoch'];
+    const keys = ['hq_epoch'];
+    if (['bind-enrollment', 'bind-access'].includes(option)) keys.push('receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature');
+    if (option === 'whoami') {
+      keys.push('session');
+      const session = deviceFields?.session;
+      if (typeof session !== 'string' || !/^[a-zA-Z0-9_-]{43}$/.test(session)
+        || Buffer.from(session, 'base64url').toString('base64url') !== session) throw new Error('invalid Machine session selector');
+    }
     if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))
       || Object.keys(deviceFields).length !== keys.length || !/^(legacy|[a-f0-9]{64})$/.test(deviceFields.hq_epoch)) throw new Error('invalid Machine device fields');
   } else if (deviceFields !== undefined) throw new Error('unexpected Machine device fields');
