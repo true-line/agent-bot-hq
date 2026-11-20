@@ -88,11 +88,18 @@ paths, as `_agent-bot-hq` on macOS or `agent-bot-hq` on Linux.
    `public_key` (Ed25519 hex) and `fingerprint` (SHA-256 hex) for the prefix
    owner. Repeating the command returns the same identity. The seed stays
    under the provisioned HQ role's private home.
-2. As the prefix owner, enroll those public values as `agent-daemon`. On macOS
-   follow [Machine's owner approval procedure](https://github.com/true-line/agent-bot-machine/blob/main/docs/plans/macos-signing.md#owner-approval-for-a-new-hq-pairing).
-   Keep the verified public `machine_key` from the approved challenge for the
-   first status check. On Linux obtain the prefix owner's published raw
-   Ed25519 `daemon.pub` as 64 hex digits directly from that administrator.
+2. As the prefix owner, enroll those public values as `agent-daemon`. New
+   dedicated-account pairings on macOS require fresh consent in the owner's
+   session. For qualification on a fresh Mac, use the signed first-enrollment
+   CLI, independently pin its public key in Machine, and verify that Machine
+   accepts a fresh proof for the intended HQ. Record that result before
+   offering the CLI to customers. An existing pilot keeps its pinned owner
+   key and can continue using its matching test provider.
+   [First-enrollment CLI](https://github.com/true-line/agent-bot-identity/pull/1469)
+   For an existing macOS pairing, use the verified public `machine_key` from
+   the approved challenge for the first status check. On Linux obtain the
+   prefix owner's published raw Ed25519 `daemon.pub` as 64 hex digits
+   directly from that administrator.
 3. As the HQ role, run `node hq/main.mjs machine status --socket PATH --daemon-key HEX`.
    Use the prefix owner's absolute `var/agent-machine/daemon.sock` path and
    the verified Machine public key. HQ persists the pin after a fresh,
