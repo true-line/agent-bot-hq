@@ -245,7 +245,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   if (verb === 'status' && args[0] === '--socket' &&
       (args.length === 2 || (args.length === 4 && args[2] === '--daemon-key' && HEX_KEY.test(args[3])))) {
     [, socket, , hex] = args;
-  } else if (verb === 'hq-device' && args.length === 3 && ['identity', 'enrollment-proof', 'bind-enrollment', 'access-assertion', 'bind-access'].includes(args[0]) && args[1] === '--socket') {
+  } else if (verb === 'hq-device' && args.length === 3 && ['identity', 'enrollment-proof', 'bind-enrollment', 'access-assertion', 'bind-access', 'whoami'].includes(args[0]) && args[1] === '--socket') {
     [option, , socket] = args;
   } else if (verb === 'hq-service-recovery') {
     recovery = recoveryArgs(args);
@@ -296,7 +296,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     const timestamp = Math.floor(Date.now() / 1000);
     const nonce = randomBytes(16).toString('base64url');
     const parts = [fields.verb, '', fields.option ?? '', '', fields.plan_id ?? '', '', '', '', timestamp, nonce];
-    for (const field of ['plan_digest', 'challenge_nonce', 'owner_signature', 'hq_epoch', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature']) {
+    for (const field of ['plan_digest', 'challenge_nonce', 'owner_signature', 'hq_epoch', 'session', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature']) {
       if (fields[field] !== undefined) parts.push(field, fields[field]);
     }
     const request = { ...fields, timestamp, nonce, public_key: pub.toString('base64'),
@@ -307,7 +307,14 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   if (recovery) return serviceRecovery(recovery, daemon.toString('hex'), pub.toString('hex'), send,
     (line) => authenticatedResponse(line, null, daemon, verb));
   if (verb === 'hq-device' && option !== 'identity') {
-    const keys = ['bind-enrollment', 'bind-access'].includes(option) ? ['hq_epoch', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature'] : ['hq_epoch'];
+    const keys = ['hq_epoch'];
+    if (['bind-enrollment', 'bind-access'].includes(option)) keys.push('receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature');
+    if (option === 'whoami') {
+      keys.push('session');
+      const session = deviceFields?.session;
+      if (typeof session !== 'string' || !/^[a-zA-Z0-9_-]{43}$/.test(session)
+        || Buffer.from(session, 'base64url').toString('base64url') !== session) throw new Error('invalid Machine session selector');
+    }
     if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))
       || Object.keys(deviceFields).length !== keys.length || !/^(legacy|[a-f0-9]{64})$/.test(deviceFields.hq_epoch)) throw new Error('invalid Machine device fields');
   } else if (deviceFields !== undefined) throw new Error('unexpected Machine device fields');

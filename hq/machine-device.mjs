@@ -199,6 +199,7 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
     accessAssertion() { unavailable('Machine credential-use and DPoP operations are unavailable'); },
     custody: {
       checkOperation(method, path) {
+        if (method === 'GET' && path === '/api/daemon/whoami') return;
         if (method !== 'GET' || !/^\/api\/daemon\/issuances\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(path)) unavailable('Machine has no authority for this credential operation');
       },
       async openSession() {
@@ -237,6 +238,15 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
           || b.expires_at <= clock.now() / 1000 || b.expires_at > clock.now() / 1000 + 900) throw new Error('invalid Machine DPoP session binding');
         return {
           expiresAt: b.expires_at * 1000,
+          async proveWhoami() {
+            const result = await requestPurpose('whoami', { hq_epoch: bound.epoch, session });
+            const reply = result.body;
+            if (result.state !== 'whoami-proved' || !only(reply, ['hq_epoch', 'session', 'proof'])
+              || reply.hq_epoch !== bound.epoch || reply.session !== session || typeof reply.proof !== 'string') {
+              unavailable('Machine returned an invalid self-lookup response');
+            }
+            return reply.proof;
+          },
           async recheck() {
             await refresh();
             if (current?.epoch !== bound.epoch || current.generation !== bound.generation || current.thumbprint !== bound.thumbprint

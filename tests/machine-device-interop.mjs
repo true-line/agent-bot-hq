@@ -219,19 +219,30 @@ try {
     return hq.start();
   }
 
-  const lookup = () => hq.core.identity.call('GET', '/api/daemon/issuances/fixture-op');
+  const lookup = () => hq.core.identity.call('GET', '/api/daemon/whoami');
   async function bindFreshSession() {
     await hq.settled();
     assert.equal(hq.core.identity.status().tokenCached, false);
     const before = server.state.requests.length;
     const operations = calls.length;
-    await assert.rejects(lookup(), { code: 'credential_unavailable', message: /no authorized DPoP action/ });
-    assert.deepEqual(calls.slice(operations).filter(op => op !== 'identity'), ['access-assertion', 'bind-access']);
+    const reply = await lookup();
+    assert.equal(reply.status, 200);
+    assert.deepEqual(calls.slice(operations).filter(op => op !== 'identity'), ['access-assertion', 'bind-access', 'whoami']);
     const sent = server.state.requests.slice(before);
-    assert.deepEqual(sent.map(r => [r.method, r.url]), [['POST', '/oauth/token']]);
+    assert.deepEqual(sent.map(r => [r.method, r.url]), [['POST', '/oauth/token'], ['GET', '/api/daemon/whoami']]);
     assert.equal(hq.core.identity.status().tokenCached, true);
     // The fixture issuer verified the assertion; retain only its public identifiers.
     const claims = JSON.parse(Buffer.from(sent[0].form.assertion.split('.')[1], 'base64url'));
+    assert.equal(reply.body.device.id, claims.iss);
+    const warm = await lookup();
+    assert.equal(warm.status, 200);
+    assert.equal(warm.body.device.id, claims.iss);
+    assert.notEqual(warm.headers['agent-bot-request-jti'], reply.headers['agent-bot-request-jti']);
+    assert.deepEqual(server.state.requests.slice(before + 2).map(r => [r.method, r.url]), [['GET', '/api/daemon/whoami']]);
+    const requests = server.state.requests.length;
+    await assert.rejects(hq.core.identity.call('GET', '/api/daemon/issuances/fixture-op'),
+      { code: 'credential_unavailable', message: /no authorized DPoP action/ });
+    assert.equal(server.state.requests.length, requests);
     return { device: claims.iss, jti: claims.jti, session: jwkThumbprint(claims.cnf.jwk) };
   }
   async function refuseWarmLookup(reason, diagnostic) {
@@ -312,8 +323,8 @@ try {
   assert.equal((await startHQ()).mode, 'safe');
   assert.equal((await cliStatus()).hq.signer.available, false);
   await assertNoLocalSigner();
-  assert.equal(server.state.requests.filter(r => r.url.startsWith('/api/daemon/')).length, 0);
-  console.log('Verified fresh access sessions on one enrolled device and warm-token refusal at Machine outage and revocation, with no local signer calls.');
+  assert.deepEqual(server.state.requests.filter(r => r.url.startsWith('/api/daemon/')).map(r => r.url), Array(4).fill('/api/daemon/whoami'));
+  console.log('Verified signed self-lookups on one enrolled device across Machine restart and warm-token refusal on outage and revocation.');
 } finally {
   try {
     await stopPackage();

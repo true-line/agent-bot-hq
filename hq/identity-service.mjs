@@ -4,12 +4,14 @@
 import { createHash, createPublicKey, randomBytes, verify } from 'node:crypto';
 import { isUtf8 } from 'node:buffer';
 import { readFileSync } from 'node:fs';
+import { parseStrict } from '../sdk/wire/strict-json.mjs';
 import { fail, HostError } from '../sdk/errors.mjs';
 import { GRANT_JWT_BEARER, validateServiceUrl } from './enrollment.mjs';
 
 const TIMEOUT_MS = 20_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_SKEW_MS = 5 * 60_000;
+const WHOAMI_PROOF_WINDOW_SECONDS = 60;
 const WHOAMI = '/api/daemon/whoami';
 const ISSUANCE_LOOKUP = '/api/daemon/issuances/';
 const B64URL = /^[A-Za-z0-9_-]+$/;
@@ -21,6 +23,11 @@ const unavailable = (reason, transient = false) => {
   if (transient) error[TRANSIENT] = true;
   throw error;
 };
+function proofSegment(segment) {
+  const bytes = Buffer.from(segment, 'base64url');
+  if (bytes.toString('base64url') !== segment || !isUtf8(bytes)) throw new Error();
+  return parseStrict(bytes.toString());
+}
 const ownObject = (v) => v && typeof v === 'object' && !Array.isArray(v);
 function dateMillis(value) {
   if (typeof value !== 'string') return NaN;
@@ -265,7 +272,7 @@ export function createIdentityService({
       if (!Number.isSafeInteger(binding.expiresAt) || binding.expiresAt <= clock.now()) unavailable('administrator access session expired');
       const deviceId = typeof claims.iss === 'string' && claims.iss.length > 0 && claims.iss.length <= 256
         && claims.sub === claims.iss ? claims.iss : undefined;
-      const candidate = { deviceId, recheck: binding.recheck, value: result.access_token, expiresAt: Math.min(started + result.expires_in * 1000, binding.expiresAt), session, publicJwk: ephemeralJwk, harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string') : [] };
+      const candidate = { deviceId, recheck: binding.recheck, proveWhoami: binding.proveWhoami, value: result.access_token, expiresAt: Math.min(started + result.expires_in * 1000, binding.expiresAt), session, publicJwk: ephemeralJwk, harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string') : [] };
       // expires_in is measured conservatively from the request's start.
       // A slow but authenticated response must not cache an expired token.
       freshAccess(candidate);
@@ -305,19 +312,30 @@ export function createIdentityService({
       // Notices are scoped twice: the owner selects queues, and HQ refuses
       // a queue outside this enrolled device's current scope before sending.
       if (body?.harness !== undefined && !current.harnesses.includes(body.harness)) fail('host.route_not_allowed', 'the harness is outside this device enrollment');
-      const jti = nonce();
+      const machineWhoami = path === WHOAMI && typeof current.proveWhoami === 'function';
+      // For this purpose keyd chooses its own nonce. HQ supplies only the session selector.
+      let jti = machineWhoami ? undefined : nonce();
       const ath = hash(current.value).toString('base64url');
-      const proof = await custody.requestProof({ session: current.session, method, path, body, ath, jti });
+      const proof = machineWhoami ? await withCustodyCheck(() => current.proveWhoami())
+        : await custody.requestProof({ session: current.session, method, path, body, ath, jti });
       const parts = typeof proof === 'string' && proof.split('.');
       let header, claims;
       try {
         if (!parts || parts.length !== 3) throw new Error();
-        header = JSON.parse(Buffer.from(parts[0], 'base64url'));
-        claims = JSON.parse(Buffer.from(parts[1], 'base64url'));
+        header = proofSegment(parts[0]);
+        claims = proofSegment(parts[1]);
+        const now = clock.now() / 1000;
+        if (machineWhoami) {
+          if (Object.keys(header).length !== 3 || Object.keys(header.jwk).length !== 4 || Object.keys(claims).length !== 5
+            || typeof claims.jti !== 'string' || !/^[a-zA-Z0-9_-]{22}$/.test(claims.jti)
+            || Buffer.from(claims.jti, 'base64url').toString('base64url') !== claims.jti
+            || Buffer.from(parts[2], 'base64url').toString('base64url') !== parts[2]) throw new Error();
+          jti = claims.jti;
+        }
         if (header.alg !== 'ES256' || header.typ !== 'dpop+jwt' || !header.jwk || 'd' in header.jwk
           || header.jwk.kty !== 'EC' || header.jwk.crv !== 'P-256' || header.jwk.x !== current.publicJwk.x || header.jwk.y !== current.publicJwk.y
           || claims.htm !== method || claims.htu !== server + path || claims.ath !== ath || claims.jti !== jti
-          || !Number.isSafeInteger(claims.iat) || Math.abs(clock.now() / 1000 - claims.iat) > 120
+          || !Number.isSafeInteger(claims.iat) || Math.abs(now - claims.iat) > (machineWhoami ? WHOAMI_PROOF_WINDOW_SECONDS : 120)
           || !verify('sha256', Buffer.from(parts.slice(0, 2).join('.')), { key: createPublicKey({ key: current.publicJwk, format: 'jwk' }),
             dsaEncoding: 'ieee-p1363' }, Buffer.from(parts[2], 'base64url'))) throw new Error();
       } catch { unavailable('Machine returned an invalid DPoP request proof'); }

@@ -1,6 +1,4 @@
-// A stand-in identity service for HQ's enrollment tests: the three routes
-// the device-code grant uses, checked the way the real service must check
-// them (the proof is a JWS by the key it carries, for this audience).
+// A loopback issuer for device enrollment, session binding and signed self-lookup.
 import { createHash, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from 'node:crypto';
 import { signatureBytes } from '../hq/identity-service.mjs';
 import { createServer } from 'node:http';
@@ -9,6 +7,8 @@ export async function fakeIdentityService({ issuer } = {}) {
   const signing = generateKeyPairSync('ed25519');
   const serverKey = signing.publicKey.export({ format: 'jwk' });
   const state = { requests: [], grants: new Map(), devices: [], mode: 'ok', interval: 1 };
+  const sessions = new Map();
+  const usedProofs = new Set();
   const json = (res, status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
   const server = createServer((req, res) => {
     let raw = '';
@@ -54,7 +54,10 @@ export async function fakeIdentityService({ issuer } = {}) {
           }
           const status = state.mode === 'assertion-expired' ? 400 : 200;
           const body = status === 400 ? { error: 'invalid_grant', error_description: 'assertion expired or not yet valid' }
-            : { device_id: claims.iss, token_type: 'DPoP', access_token: 'disposable-fixture-token', expires_in: 300, harnesses: grant.form.harnesses.split(' ') };
+            : { device_id: claims.iss, token_type: 'DPoP', access_token: randomBytes(32).toString('base64url'), expires_in: 300, harnesses: grant.form.harnesses.split(' ') };
+          if (status === 200) {
+            sessions.set(body.access_token, { jwk: claims.cnf.jwk, deviceId: claims.iss, expires: Date.now() + body.expires_in * 1000 });
+          }
           res.setHeader('agent-bot-key-id', 'srv-1');
           res.setHeader('agent-bot-request-jti', claims.jti);
           res.setHeader('agent-bot-signature', sign(null, signatureBytes(status, JSON.stringify(body), claims.jti), signing.privateKey).toString('base64url'));
@@ -75,6 +78,30 @@ export async function fakeIdentityService({ issuer } = {}) {
           res.setHeader('agent-bot-signature', sign(null, signatureBytes(200, JSON.stringify(body), jti), signing.privateKey).toString('base64url'));
         }
         return json(res, 200, body);
+      }
+      if (req.method === 'GET' && req.url === '/api/daemon/whoami') {
+        try {
+          const token = req.headers.authorization?.match(/^DPoP ([A-Za-z0-9_-]+)$/)?.[1];
+          const session = sessions.get(token);
+          const parts = req.headers.dpop.split('.');
+          const [header, claims] = parts.slice(0, 2).map(part => JSON.parse(Buffer.from(part, 'base64url')));
+          if (!session || session.expires <= Date.now() || raw || parts.length !== 3
+            || header.typ !== 'dpop+jwt' || header.alg !== 'ES256' || 'd' in header.jwk
+            || !['kty', 'crv', 'x', 'y'].every(field => header.jwk[field] === session.jwk[field])
+            || claims.htm !== req.method || claims.htu !== (issuer ?? state.url) + req.url
+            || claims.ath !== createHash('sha256').update(token).digest('base64url')
+            || !Number.isSafeInteger(claims.iat) || Math.abs(Date.now() / 1000 - claims.iat) > 120
+            || typeof claims.jti !== 'string' || !/^[A-Za-z0-9_-]{22}$/.test(claims.jti) || usedProofs.has(claims.jti)
+            || !verify('sha256', Buffer.from(parts.slice(0, 2).join('.')), {
+              key: createPublicKey({ key: session.jwk, format: 'jwk' }), dsaEncoding: 'ieee-p1363',
+            }, Buffer.from(parts[2], 'base64url'))) return json(res, 401, { error: 'invalid_dpop_proof' });
+          usedProofs.add(claims.jti);
+          const body = { device: { id: session.deviceId } };
+          res.setHeader('agent-bot-key-id', 'srv-1');
+          res.setHeader('agent-bot-request-jti', claims.jti);
+          res.setHeader('agent-bot-signature', sign(null, signatureBytes(200, JSON.stringify(body), claims.jti), signing.privateKey).toString('base64url'));
+          return json(res, 200, body);
+        } catch { return json(res, 401, { error: 'invalid_dpop_proof' }); }
       }
       return json(res, 404, { error: 'not_found' });
     });
