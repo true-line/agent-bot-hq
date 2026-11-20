@@ -2,14 +2,15 @@
 # The caller owns the disposable account and stage directory; this script
 # owns just its one-shot job in the system launchd domain.
 set -euo pipefail
-[[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "$(uname -s)" == Darwin ]]
+source "$(dirname "$0")/fixtures/darwin-hosted.sh"
+require_hosted_darwin || exit 1
 probe="${1:?compiled probe required}"
 stage="${2:?fixture stage required}"
 role="${3:?fixture account required}"
 home="${4:?fixture home required}"
-[[ "$role" == _agent-bot-hq && "$home" == /private/var/agent-bot-hq ]]
+[[ "$role" == _agent-bot-hq && "$home" == /private/var/agent-bot-hq ]] || exit 1
 uid="$(id -u "$role")"
-[[ "$uid" != "$(id -u)" && "$uid" != 0 ]]
+[[ "$uid" != "$(id -u)" && "$uid" != 0 ]] || exit 1
 challenge="$(node -e 'console.log(require("node:crypto").randomBytes(32).toString("base64"))')"
 label=ai.true-line.hq.ci-transient-enclave
 plist="$stage/enclave.plist"
@@ -29,8 +30,9 @@ sudo /usr/bin/tee "$plist" >/dev/null <<PLIST
 PLIST
 sudo chmod 0644 "$plist"
 plutil -lint "$plist"
+fixture_job_absent "$label" || exit 1
 sudo launchctl bootstrap system "$plist"
-trap 'sudo launchctl bootout "system/$label"' EXIT
+trap cleanup_probe_fixture EXIT
 for _ in {1..30}; do
   status="$(sudo launchctl print "system/$label")"
   if [[ "$status" =~ last\ exit\ code\ =\ ([0-9]+) ]]; then

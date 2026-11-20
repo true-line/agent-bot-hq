@@ -63,7 +63,7 @@ jobs:
           build="$(sw_vers -buildVersion)"
           arch="$(uname -m)"
           printf 'macOS %s (%s), %s\n' "$product" "$build" "$arch"
-          [[ "${product%%.*}" == "$EXPECTED_MACOS_MAJOR" && "$build" =~ ^[0-9]+[A-Z][0-9]+[a-z]?$ && "$arch" == arm64 ]]
+          [[ "${product%%.*}" == "$EXPECTED_MACOS_MAJOR" && "$build" =~ ^[0-9]+[A-Z][0-9]+[a-z]?$ && "$arch" == arm64 ]] || exit 1
           node --version
           archive="$RUNNER_TEMP/hq-darwin.tar"
           bash scripts/ci-build-darwin-artifact.sh "$GITHUB_SHA" "$archive"
