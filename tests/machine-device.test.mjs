@@ -193,6 +193,11 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.match(statusText, /^signer: hardware key, paired Machine\/keyd backend, key /m);
   assert.doesNotMatch(statusText, /hardwareSigner|experimental feature/);
   assert.equal(existsSync(join(home, 'signer')), false);
+  const beforeWhoami = service.state.requests.length;
+  await assert.rejects(active.hq.core.identity.call('GET', '/api/daemon/whoami'), {
+    code: 'credential_unavailable', message: /Machine has no authority for this credential operation/,
+  });
+  assert.equal(service.state.requests.length, beforeWhoami);
   const lookup = () => active.hq.core.identity.call('GET', '/api/daemon/issuances/example-op');
   const enrolled = readFileSync(join(home, 'identity/device.json'));
   const repeat = await offer();

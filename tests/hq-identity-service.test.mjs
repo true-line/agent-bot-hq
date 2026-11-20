@@ -56,14 +56,14 @@ function fixture({ server = SERVER, device = generateKeyPairSync('ec', { namedCu
       assert.equal(claims.aud, `${server}/oauth/token`);
       assert.equal('d' in claims.cnf.jwk, false);
       const accessToken = `access-secret-canary-${state.tokens}`;
-      tokenKeys.set(accessToken, claims.cnf.jwk);
+      tokenKeys.set(accessToken, { publicKey: claims.cnf.jwk, deviceId: claims.sub });
       out = signed(state.mode === 'token-revoked' || state.mode === 'software-refused' ? 400 : 200, state.mode === 'software-refused' ? { error: 'profile_insufficient', error_description: 'SECRET_CANARY' } : state.mode === 'token-revoked' ? { error: 'invalid_grant', error_description: 'device_revoked' } : { access_token: accessToken, token_type: 'DPoP', expires_in: state.expiresIn, harnesses: ['codex'] }, claims.jti);
     } else {
       state.apiCalls++;
       const token = init.headers.authorization.slice('DPoP '.length);
       const proof = init.headers.DPoP;
       const [header, claims] = decode(proof), parts = proof.split('.');
-      assert.deepEqual(header.jwk, tokenKeys.get(token));
+      assert.deepEqual(header.jwk, tokenKeys.get(token).publicKey);
       assert.equal(header.typ, 'dpop+jwt');
       assert.equal(verify('sha256', Buffer.from(parts.slice(0, 2).join('.')), { key: createPublicKey({ key: header.jwk, format: 'jwk' }), dsaEncoding: 'ieee-p1363' }, Buffer.from(parts[2], 'base64url')), true);
       assert.equal(claims.htm, init.method);
@@ -74,7 +74,10 @@ function fixture({ server = SERVER, device = generateKeyPairSync('ec', { namedCu
       usedNonces.add(claims.jti);
       if (state.hold) await state.hold;
       if (state.mode === 'advance-clock') clock.advance(301_000);
-      out = signed(state.mode === 'api-revoked' ? 401 : state.mode === 'unauthorized' ? 401 : 200, state.mode === 'api-revoked' ? { error: 'device_revoked', detail: 'SECRET_CANARY' } : state.mode === 'unauthorized' ? { error: 'invalid_token' } : (state.apiReply ?? { notices: [], harness: 'codex' }), claims.jti);
+      const normalReply = url === server + '/api/daemon/whoami'
+        ? { device: { id: tokenKeys.get(token).deviceId }, server_time: new Date(clock.now()).toISOString() }
+        : { notices: [], harness: 'codex' };
+      out = signed(state.mode === 'api-revoked' ? 401 : state.mode === 'unauthorized' ? 401 : 200, state.mode === 'api-revoked' ? { error: 'device_revoked', detail: 'SECRET_CANARY' } : state.mode === 'unauthorized' ? { error: 'invalid_token' } : (state.apiReply ?? normalReply), claims.jti);
     }
     return new Response(out.text, { status: out.status, headers: out.headers });
   };
@@ -255,6 +258,27 @@ test('a transient refresh failure rechecks custody before returning the still-va
     await assert.rejects(client.call('GET', '/api/daemon/whoami'), error => error === cutoff);
     assert.equal(client.status().tokenCached, false);
     assert.equal(f.state.apiCalls, 1);
+  } finally { client.close(); }
+});
+
+test('self lookup is an exact bodyless read of the device named by the session assertion', async () => {
+  const f = fixture(), client = f.make(), path = '/api/daemon/whoami';
+  try {
+    for (const args of [['POST', path], ['GET', path, null], ['GET', path, {}], ['GET', path + '?device=other'], ['GET', path + '#self']]) {
+      await assert.rejects(client.call(...args), code('host.invalid_request'));
+    }
+    assert.equal(f.state.requests.length, 0);
+    const reply = await client.call('GET', path);
+    assert.equal(reply.status, 200);
+    assert.equal(reply.body.device.id, 'dev_hq');
+    for (const response of [{ device: { id: 'FOREIGN_DEVICE_CANARY' } }, { device: {} }, { private_field: 'RESPONSE_CANARY' }]) {
+      f.state.apiReply = response;
+      await assert.rejects(client.call('GET', path), error => {
+        assert.equal(error.code, 'credential_unavailable');
+        assert.equal(error.message, 'identity service: identity lookup returned a different or missing device');
+        return true;
+      });
+    }
   } finally { client.close(); }
 });
 

@@ -10,6 +10,7 @@ import { GRANT_JWT_BEARER, validateServiceUrl } from './enrollment.mjs';
 const TIMEOUT_MS = 20_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_SKEW_MS = 5 * 60_000;
+const WHOAMI = '/api/daemon/whoami';
 const ISSUANCE_LOOKUP = '/api/daemon/issuances/';
 const B64URL = /^[A-Za-z0-9_-]+$/;
 const nonce = () => randomBytes(24).toString('base64url');
@@ -182,6 +183,9 @@ export function createIdentityService({
         if (!isUtf8(bytes)) unavailable('authenticated response is not UTF-8 JSON');
         let body;
         try { body = JSON.parse(bytes.toString('utf8')); } catch { unavailable('authenticated response is not JSON'); }
+        if (path === WHOAMI && response.status === 200 && body?.device?.id !== accessToken.deviceId) {
+          unavailable('identity lookup returned a different or missing device');
+        }
         link = 'ok';
         // The token endpoint also uses invalid_grant for an expired or replayed assertion.
         const grantRevoked = path === '/oauth/token' && response.status === 400
@@ -259,7 +263,9 @@ export function createIdentityService({
       const binding = await withCustodyCheck(() => custody.bindAccess({ session, body: out.text, headers: out.headers }));
       alive(generation);
       if (!Number.isSafeInteger(binding.expiresAt) || binding.expiresAt <= clock.now()) unavailable('administrator access session expired');
-      const candidate = { recheck: binding.recheck, value: result.access_token, expiresAt: Math.min(started + result.expires_in * 1000, binding.expiresAt), session, publicJwk: ephemeralJwk, harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string') : [] };
+      const deviceId = typeof claims.iss === 'string' && claims.iss.length > 0 && claims.iss.length <= 256
+        && claims.sub === claims.iss ? claims.iss : undefined;
+      const candidate = { deviceId, recheck: binding.recheck, value: result.access_token, expiresAt: Math.min(started + result.expires_in * 1000, binding.expiresAt), session, publicJwk: ephemeralJwk, harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string') : [] };
       // expires_in is measured conservatively from the request's start.
       // A slow but authenticated response must not cache an expired token.
       freshAccess(candidate);
@@ -285,8 +291,9 @@ export function createIdentityService({
       check();
       if (typeof method !== 'string' || !/^(GET|POST|PUT|PATCH|DELETE)$/.test(method)
         || !validDaemonPath(method, path)) fail('host.invalid_request', 'the identity link accepts a daemon API method and path only');
+      if (path === WHOAMI && (method !== 'GET' || body !== undefined)) fail('host.invalid_request', 'identity lookup requires GET without a body');
       if (path.startsWith(ISSUANCE_LOOKUP) && body !== undefined) fail('host.invalid_request', 'an issuance lookup accepts only its operation ID');
-      const allowed = method === 'GET' && (path === '/api/daemon/whoami' || path === '/api/daemon/notices' || path.startsWith(ISSUANCE_LOOKUP))
+      const allowed = method === 'GET' && (path === WHOAMI || path === '/api/daemon/notices' || path.startsWith(ISSUANCE_LOOKUP))
         || method === 'POST' && ['/api/daemon/notices/take', '/api/daemon/notices/ack', '/api/daemon/notices/release'].includes(path);
       if (!allowed) unavailable('this route requires administrator-side credential use');
       custody?.checkOperation?.(method, path);
@@ -294,6 +301,7 @@ export function createIdentityService({
       const generation = epoch;
       alive(generation);
       freshAccess(current);
+      if (path === WHOAMI && !current.deviceId) unavailable('identity lookup requires an assertion for one enrolled device');
       // Notices are scoped twice: the owner selects queues, and HQ refuses
       // a queue outside this enrolled device's current scope before sending.
       if (body?.harness !== undefined && !current.harnesses.includes(body.harness)) fail('host.route_not_allowed', 'the harness is outside this device enrollment');
