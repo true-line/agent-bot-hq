@@ -34,3 +34,33 @@ done
 for invalid in GITHUB_REPOSITORY=other/repo arch=x86_64 version=15.7; do
   expect_refusal --socket-parent-comparison "$invalid" 'requires the ordinary hosted macOS 27 arm64 socket comparison runner'
 done
+
+# A pending comparison keeps the outer fixture's account, stage and home.
+(
+  source "$here/fixtures/darwin-hosted.sh"
+  source "$here/fixtures/darwin-socket-parent.sh"
+  stage="$work/retained"
+  mkdir "$stage"
+  stage_id="$(fixture_inode "$stage")"
+  touch "$stage/socket-parent.plist"
+  sudo() { echo touched >> "$work/trace"; exit 79; }
+  cleanup_socket_parent_fixture
+) >"$work/out" 2>&1 && exit 1
+test ! -e "$work/trace"
+grep -Fxq 'retaining fixture account and files after unconfirmed socket comparison cleanup' "$work/out"
+# After a confirmed trial, perform the ordinary cleanup and preserve errors.
+source "$here/fixtures/darwin-hosted.sh"
+source "$here/fixtures/darwin-socket-parent.sh"
+stage="$work/cleared"
+mkdir "$stage"
+stage_id="$(fixture_inode "$stage")"
+cleanup_account_fixture() { echo called >> "$work/calls"; exit "$cleanup_result"; }
+for pair in 0:0 9:0 0:1; do
+  prior=${pair%:*}
+  cleanup_result=${pair#*:}
+  result=0
+  ( trap cleanup_socket_parent_fixture EXIT; exit "$prior" ) || result=$?
+  if (( prior != 0 )); then test "$result" -eq "$prior"; else test "$result" -eq "$cleanup_result"; fi
+done
+test "$(wc -l < "$work/calls")" -eq 3
+/usr/bin/python3 -IB "$here/darwin-socket-parent-cleanup.py"

@@ -22,6 +22,25 @@ def sudo(*args, check=True):
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
 
 
+def fixture_job(*args):
+    helper = Path(__file__).resolve().parent / "fixtures/darwin-hosted.sh"
+    subprocess.run(["/bin/bash", "-c", 'source "$1" && shift && "$@"', "fixture", str(helper), *args],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=20)
+
+
+def exists(path):
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def require_same(path, recorded):
+    if recorded is None or not os.path.samestat(recorded, path.lstat()):
+        raise RuntimeError("fixture resource changed")
+
+
 def sip_state():
     result = subprocess.run(["/usr/bin/csrutil", "status"], capture_output=True, text=True)
     for value in ("enabled", "disabled"):
@@ -46,19 +65,24 @@ def native_refusal(journal):
 
 
 def observe(endpoint, journal):
+    recorded = None
     nonce = secrets.token_bytes(32)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         refusal = native_refusal(journal)
         if refusal:
-            return refusal
+            return refusal, recorded
         try:
             entry = endpoint.lstat()
         except FileNotFoundError:
             time.sleep(.05)
             continue
         if not (stat.S_ISSOCK(entry.st_mode) and entry.st_uid == 0 and stat.S_IMODE(entry.st_mode) == 0o666):
-            return "unexpected socket metadata"
+            return "unexpected socket metadata", recorded
+        if recorded is None:
+            recorded = entry
+        else:
+            require_same(endpoint, recorded)
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(4)
             try:
@@ -66,25 +90,43 @@ def observe(endpoint, journal):
                 client.sendall(nonce)
                 with client.makefile("rb") as response:
                     if response.read(32) != nonce:
-                        return native_refusal(journal) or "owner round trip failed"
+                        return native_refusal(journal) or "owner round trip failed", recorded
             except ConnectionRefusedError:
                 time.sleep(.05)
                 continue
             except OSError:
-                return native_refusal(journal) or "owner round trip failed"
+                return native_refusal(journal) or "owner round trip failed", recorded
         events = journal.read_bytes().splitlines()
-        return "passed" if events == [b"role", b"native=0", b"descriptor"] else "descriptor evidence missing"
-    return native_refusal(journal) or "publication timed out"
+        return ("passed" if events == [b"role", b"native=0", b"descriptor"] else "descriptor evidence missing"), recorded
+    return native_refusal(journal) or "publication timed out", recorded
+
+
+def clean_trial(label, plist, anchor, endpoint, parent_id, socket_id, loaded):
+    require_same(plist, anchor.lstat())
+    if loaded:
+        fixture_job("fixture_stop_job", label, str(plist))
+    else:
+        # An unsuccessful bootstrap does not identify any job it left behind.
+        fixture_job("fixture_job_absent", label)
+    require_same(endpoint.parent, parent_id)
+    if exists(endpoint):
+        require_same(endpoint, socket_id)
+        sudo("/bin/rm", endpoint)
+    require_same(plist, anchor.lstat())
+    sudo("/bin/rm", plist)
+    sudo("/bin/rm", anchor)
 
 
 def run_trial(stage, parent):
     token = secrets.token_hex(6)
     label = "ai.true-line.agent-bot-hq-ci." + token
-    target = "system/" + label
     endpoint = parent / ("hq-ci-" + token + ".sock")
     plist = Path("/Library/LaunchDaemons") / (label + ".plist")
     journal = stage / (token + ".result")
-    if any(os.path.lexists(p) for p in (plist, endpoint, journal)) or sudo("/bin/launchctl", "print", target, check=False).returncode == 0:
+    parent_id = parent.lstat()
+    anchor = stage / "socket-parent.plist"
+    fixture_job("fixture_job_absent", label)
+    if any(exists(p) for p in (plist, endpoint, journal, anchor)):
         raise RuntimeError("disposable trial collision")
     config = {"Label": label, "UserName": ROLE, "GroupName": ROLE, "Umask": 0o077,
               "ProgramArguments": ["/usr/bin/ruby", "--disable-gems", str(stage / "darwin-socket-parent-probe.rb"),
@@ -94,25 +136,18 @@ def run_trial(stage, parent):
     with tempfile.NamedTemporaryFile() as source:
         plistlib.dump(config, source)
         source.flush()
-        sudo("/usr/bin/install", "-o", "root", "-g", "wheel", "-m", "0644", source.name, plist)
+        sudo("/usr/bin/install", "-o", "root", "-g", "wheel", "-m", "0644", source.name, anchor)
+        sudo("/bin/ln", anchor, plist)
     loaded = False
+    socket_id = None
     try:
         if sudo("/bin/launchctl", "bootstrap", "system", plist, check=False).returncode != 0:
             return "bootstrap refused"
         loaded = True
-        return observe(endpoint, journal)
+        result, socket_id = observe(endpoint, journal)
+        return result
     finally:
-        if loaded or sudo("/bin/launchctl", "print", target, check=False).returncode == 0:
-            sudo("/bin/launchctl", "bootout", target)
-        try:
-            entry = endpoint.lstat()
-        except FileNotFoundError:
-            entry = None
-        if entry is not None:
-            if not stat.S_ISSOCK(entry.st_mode) or entry.st_uid != 0:
-                raise RuntimeError("unexpected disposable endpoint during cleanup")
-            sudo("/bin/rm", "-f", endpoint)
-        sudo("/bin/rm", plist)
+        clean_trial(label, plist, anchor, endpoint, parent_id, socket_id, loaded)
 
 
 def main():
@@ -121,10 +156,11 @@ def main():
         raise RuntimeError("requires the disposable hosted macOS runner")
     stage = Path(sys.argv[1])
     if (not root_directory(stage) or not all(root_directory(p) for p in CANDIDATE.parents)
-            or os.path.lexists(CANDIDATE)):
+            or exists(CANDIDATE)):
         raise RuntimeError("unexpected initial fixture directories")
     print("System Integrity Protection:", sip_state(), flush=True)
     sudo("/bin/mkdir", "-m", "0755", CANDIDATE)
+    candidate_id = CANDIDATE.lstat()
     try:
         sudo("/usr/sbin/chown", "root:wheel", CANDIDATE)
         metadata = CANDIDATE.lstat()
@@ -136,6 +172,9 @@ def main():
             if name == "candidate" and result != "passed":
                 return 1
     finally:
+        if exists(stage / "socket-parent.plist"):
+            raise RuntimeError("unconfirmed trial cleanup")
+        require_same(CANDIDATE, candidate_id)
         sudo("/bin/rmdir", CANDIDATE)
     return 0
 
