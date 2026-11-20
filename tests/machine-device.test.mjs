@@ -75,6 +75,8 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   const clientKey = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(client.public_key, 'hex')]), type: 'spki', format: 'der' });
   let binding, lostReply = true, receiptJti, accessJti, session, revoked = false;
   const options = [];
+  const accessBindings = [];
+  let accessResponse;
   // Simulate an administrator changing the pair between the identity read
   // and the next normal operation on this running HQ.
   let refuseAssertion, holdIdentity;
@@ -127,9 +129,16 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
       }
       assert.equal(r.public_key, Buffer.from(client.public_key, 'hex').toString('base64'));
       assert.ok(verify(null, Buffer.from(parts.join('\n')), clientKey, Buffer.from(r.signature, 'base64')));
+      if (r.option === 'bind-access') {
+        const { hq_epoch, receipt_body, receipt_jti, receipt_kid, receipt_signature } = r;
+        accessBindings.push({ nonce: r.nonce, receipt: { hq_epoch, receipt_body, receipt_jti, receipt_kid, receipt_signature } });
+        if (accessBindings.length === 1 || accessResponse === 'closed') { stream.destroy(); return; }
+        if (accessResponse === 'partial') { stream.end('{'); return; }
+      }
       if (r.option === 'bind-enrollment' && lostReply) { lostReply = false; stream.destroy(); return; }
       if (refuseAssertion === 'offline' && r.option === 'access-assertion') { stream.destroy(); return; }
-      const diagnostic = revoked ? 'MM_DAEMON_UNKNOWN_KEY' : (r.option === 'access-assertion' ? refuseAssertion : undefined);
+      const diagnostic = revoked ? 'MM_DAEMON_UNKNOWN_KEY' : r.option === 'bind-access' && accessResponse === 'refused'
+        ? 'MM_DAEMON_CALLER_REFUSED' : (r.option === 'access-assertion' ? refuseAssertion : undefined);
       const response = { ok: !diagnostic, ...(diagnostic && { diagnostic }), state, body, timestamp: r.timestamp, nonce: randomBytes(16).toString('base64url'), request_nonce: r.nonce };
       response.signature = sign(null, Buffer.from([response.ok, response.diagnostic ?? '', '', state, JSON.stringify(body), r.timestamp, response.nonce, r.nonce].join('\n')), machine.privateKey).toString('base64');
       const send = () => stream.end(JSON.stringify(response) + '\n');
@@ -195,7 +204,18 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   service.state.mode = 'ok';
   await assert.rejects(lookup(), /no authorized DPoP action/);
   assert.notEqual(accessJti, expiredJti, 'retry opens a fresh admin session');
-  assert.ok(options.includes('access-assertion') && options.includes('bind-access'));
+  assert.equal(options.filter(o => o === 'access-assertion').length, 2);
+  assert.equal(accessBindings.length, 2);
+  assert.deepEqual(accessBindings[0].receipt, accessBindings[1].receipt);
+  assert.notEqual(accessBindings[0].nonce, accessBindings[1].nonce);
+  assert.equal(service.state.requests.filter(r => r.form.grant_type === 'urn:ietf:params:oauth:grant-type:jwt-bearer').length, 2);
+  for (const [response, attempts] of [['closed', 2], ['partial', 1], ['refused', 1]]) {
+    accessResponse = response;
+    const before = accessBindings.length;
+    await assert.rejects(request('bind-access', accessBindings[0].receipt));
+    assert.equal(accessBindings.length - before, attempts, response);
+  }
+  accessResponse = undefined;
   assert.equal(service.state.requests.filter((r) => r.url.includes('/api/daemon/')).length, 0);
   await assert.rejects(active.hq.core.identity.call('POST', '/api/daemon/credentials', {}), /administrator-side credential use/);
   const deviceRecord = readFileSync(join(home, 'identity/device.json'));

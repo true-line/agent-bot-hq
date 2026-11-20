@@ -168,19 +168,28 @@ function authenticatedResponse(line, nonce, pinned, verb) {
   return r;
 }
 
+class MissingMachineReply extends Error {}
+
 function exchange(socketPath, request) {
   return new Promise((resolve, reject) => {
     const stream = connect({ path: socketPath });
     const chunks = [];
     let size = 0;
+    let connected = false;
     const timer = setTimeout(() => stream.destroy(new Error('Machine request timed out')), 10000);
-    stream.once('connect', () => stream.write(JSON.stringify(request) + '\n'));
+    stream.once('connect', () => {
+      connected = true;
+      stream.write(JSON.stringify(request) + '\n');
+    });
     stream.on('error', error => {
       if (request.verb === 'hq-device' && error.syscall === 'connect' && (error.code === 'ENOENT' || error.code === 'ECONNREFUSED')) {
         reject(new HostError('credential_unavailable', 'HQ could not connect to the paired Machine. Ask the prefix owner to check that Machine is running, then retry.'));
       } else reject(error);
     });
-    stream.on('close', () => { clearTimeout(timer); reject(new Error('Machine closed without a response')); });
+    stream.on('close', () => {
+      clearTimeout(timer);
+      reject(connected && size === 0 ? new MissingMachineReply('Machine closed without a response') : new Error('Machine closed without a complete response'));
+    });
     stream.on('data', (chunk) => {
       size += chunk.length;
       if (size > MAX_MESSAGE + 1) return stream.destroy(new Error('Machine response exceeds its size limit'));
@@ -302,7 +311,13 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))
       || Object.keys(deviceFields).length !== keys.length || !/^(legacy|[a-f0-9]{64})$/.test(deviceFields.hq_epoch)) throw new Error('invalid Machine device fields');
   } else if (deviceFields !== undefined) throw new Error('unexpected Machine device fields');
-  const { response: r } = await send({ verb, ...deviceFields, ...(option && { option }), ...(planID && { plan_id: planID }) });
+  const fields = { verb, ...deviceFields, ...(option && { option }), ...(planID && { plan_id: planID }) };
+  const { response: r } = await send(fields).catch(error => {
+    // keyd binds this exact signed receipt idempotently. Reconnect once with
+    // a fresh channel nonce if Machine closed without returning any bytes.
+    if (verb === 'hq-device' && option === 'bind-access' && error instanceof MissingMachineReply) return send(fields);
+    throw error;
+  });
   const result = { client: 'agent-daemon', channel: 'signed', state: r.state, daemon_fingerprint: fingerprint(daemon) };
   if (verb === 'hq-device') return r;
   if (verb === 'members-plans') return { ...result, ...membersPlanResult(option, planID, r) };
