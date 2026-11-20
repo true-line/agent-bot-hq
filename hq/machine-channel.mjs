@@ -213,7 +213,7 @@ export function machineRoleCommand(argv) {
 
 // Also exercised with a temporary private home in the protocol tests. The CLI
 // always obtains its home and UID from the kernel-backed account lookup above.
-export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false) {
+export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false, roleUid = uid) {
   const [verb, ...args] = argv;
   const identity = verb === 'identity' && !args.length;
   let socket, hex, handoff, option = '', planID = '';
@@ -269,7 +269,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     return { line, response: authenticatedResponse(line, nonce, daemon, fields.verb) };
   }
   if (handoff) return serviceHandoff(verb, handoff, daemon.toString('hex'), pub.toString('hex'), send,
-    (line) => authenticatedResponse(line, null, daemon, verb));
+    (line) => authenticatedResponse(line, null, daemon, verb), roleUid);
   if (verb === 'hq-device' && option !== 'identity') {
     const keys = ['bind-enrollment', 'bind-access'].includes(option) ? ['hq_epoch', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature'] : ['hq_epoch'];
     if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))

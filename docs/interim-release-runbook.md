@@ -183,3 +183,27 @@ the paired role.
 ```sh
 node hq/main.mjs machine hq-service-upgrade cancel --challenge-file "$challenge_file" --socket "$socket"
 ```
+
+### Review a dedicated macOS harness launch policy
+
+Use the paired dedicated HQ account and the Machine pin saved during verified
+status. For a saved installation plan, export its signed challenge with:
+
+```sh
+node hq/main.mjs machine harness-launch-install export "$plan_id" --socket "$socket" > "$challenge_file"
+```
+
+Transfer the original signed line to the daily owner's matching reviewer.
+Review the target accounts and UIDs, adapter executable digests and exact
+arguments, launcher and sandbox digests, and resulting sudoers rule. Return
+the owner's proof to the paired role. Submit it with:
+
+```sh
+node hq/main.mjs machine harness-launch-install approve --challenge-file "$challenge_file" --proof-file "$proof_file" --socket "$socket"
+```
+
+For retirement use `harness-launch-retire` for both commands and check the
+installed plan ID and digest. Each operation requires a fresh challenge and
+its own proof. Either operation supports `cancel --challenge-file FILE
+--socket PATH`. After an approved response, the administrator applies the
+exact saved plan through the usual members apply command.

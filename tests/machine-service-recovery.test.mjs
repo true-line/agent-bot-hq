@@ -30,7 +30,9 @@ function savedPlan() {
 async function fixture(t, purpose = action) {
   const home = mkdtempSync(join(tmpdir(), 'hqr-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  const run = (...args) => machineCommandInHome(args, home, process.getuid());
+  // The test process owns the scratch key files. The protocol fixture models
+  // a distinct enrolled macOS system role at UID 300.
+  const run = (...args) => machineCommandInHome(args, home, process.getuid(), undefined, false, 300);
   const identity = await run('identity');
   const key = generateKeyPairSync('ed25519');
   const owner = generateKeyPairSync('ec', { namedCurve: 'P-256' });
@@ -244,4 +246,102 @@ test('paired service upgrade refuses a different job, owner, node, socket or pur
   f.state.saved = upgradePlan();
   f.state.tweak = (c) => { c.action = action; };
   await assert.rejects(f.issue(), /misdirected/);
+});
+
+for (const purpose of ['harness-launch-install', 'harness-launch-retire']) {
+  test(`paired ${purpose} submits only an owner proof for that exact operation`, arm, async (t) => {
+    const f = await fixture(t, purpose);
+    f.state.saved = harnessPlan(purpose);
+    await assert.rejects(f.issue(), /pin saved by verified Machine status/);
+    await f.pin();
+    await assert.rejects(machineCommandInHome([purpose, 'export', id, '--socket', f.socket],
+      f.home, process.getuid(), undefined, true), /dedicated HQ/);
+    const line = await f.issue();
+    assert.equal(line, f.state.raw);
+    writeFileSync(f.challengeFile, line + '\n');
+    const challenge = JSON.parse(line).body;
+    const policy = JSON.parse(JSON.parse(challenge.plan_canonical).steps[0].content);
+    assert.deepEqual(policy.adapters[0].args, ['--member', 'a & b', 'quoted "value"', '', '☃\u2028λ']);
+    const other = purpose === 'harness-launch-install' ? 'harness-launch-retire' : 'harness-launch-install';
+    writeFileSync(f.proofFile, JSON.stringify(proof({ ...challenge, action: other }, f.owner)));
+    await assert.rejects(f.approve(), /invalid owner signature/);
+    await assert.rejects(f.run(other, 'cancel', '--challenge-file', f.challengeFile, '--socket', f.socket), /misdirected/);
+    assert.deepEqual(f.requests.map(r => r.verb), ['status', 'members-plans', purpose]);
+    writeFileSync(f.proofFile, JSON.stringify(proof(challenge, f.owner)));
+    assert.equal((await f.approve()).state, 'approved');
+    await assert.rejects(f.approve(), /MM_DAEMON_PEER_REFUSED/);
+    writeFileSync(f.challengeFile, await f.issue());
+    assert.equal((await f.cancel()).state, 'cancelled');
+    assert.equal(f.requests.at(-1).owner_signature, undefined);
+  });
+}
+
+function harnessJSON(value) {
+  return JSON.stringify(value).replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029') + '\n';
+}
+
+function harnessPlan(purpose, change = () => {}) {
+  const root = '/Library/Application Support/ai.true-line.agent-bot-hq';
+  const install = purpose === 'harness-launch-install';
+  const members = ['_alpha', '_beta'];
+  const p = {
+    schema: 'agent-bot-harness-launch/v1', action: install ? 'install' : 'retire', hq_uid: 300,
+    launcher: { path: root + '/harness-launch', sha256: 'a'.repeat(64) },
+    sandbox: { path: root + '/harness-egress.sb', sha256: 'b'.repeat(64) },
+    adapters: [
+      { adapter_id: 'first', account: members[0], uid: 301, executable: '/Library/Tools/First Helper', sha256: 'c'.repeat(64), args: ['--member', 'a & b', 'quoted "value"', '', '☃\u2028λ'] },
+      { adapter_id: 'second', account: members[1], uid: 302, executable: '/Library/Tools/Second', sha256: 'd'.repeat(64), args: [] },
+      { adapter_id: 'third', account: members[0], uid: 301, executable: '/Library/Tools/Third', sha256: 'e'.repeat(64), args: [] },
+    ],
+    installed_plan_id: install ? '' : 'plan-20261118T040000Z-cdef', installed_plan_digest: install ? '' : 'f'.repeat(64),
+  };
+  const file = (target, mode, content) => ({ kind: 'file', target, action: install ? 'create' : 'remove', owner: 'root', group: 'wheel', mode, content });
+  const step = file(root + '/harness-launch-policy.json', '0644', '');
+  const command = '/Library/Application\\ Support/ai.true-line.agent-bot-hq/harness-launch harness-run';
+  const rule = '# Managed by managed-machine harness launch v1.\n' + members.map(account =>
+    `_agent-bot-hq ALL = (${account}) NOPASSWD: NOSETENV: sha256:${'a'.repeat(64)} ${command}\n`).join('');
+  const permit = file('/private/etc/sudoers.d/agent-bot-hq-harness-launch', '0440', rule);
+  const plan = { version: 3, hq_account: role, dir: root + '/ipc', members, steps: [step, permit] };
+  change(p, plan);
+  step.content ||= harnessJSON(p);
+  const plan_canonical = harnessJSON(plan);
+  return { plan_id: id, plan_canonical, plan_digest: createHash('sha256').update(plan_canonical).digest('hex') };
+}
+
+test('paired harness review refuses changes outside the saved launch-rule purpose before issuing', arm, async (t) => {
+  const purpose = 'harness-launch-install';
+  const f = await fixture(t, purpose);
+  await f.pin();
+  const changes = [
+    (p, plan) => { plan.hq_account = 'operator'; },
+    (p, plan) => { plan.hq_account += '\n'; },
+    (p, plan) => { plan.members[0] += '\n'; p.adapters[0].account = plan.members[0]; },
+    p => { p.adapters[0].adapter_id += '\n'; },
+    p => { p.adapters[0].args.push('\ud800'); },
+    (p, plan) => { plan.dir += '/other'; },
+    (p, plan) => { plan.members = ['_alpha']; },
+    (p, plan) => { plan.steps.push(plan.steps[0]); },
+    (p, plan) => { plan.steps[0].detail = 'additional action'; },
+    (p, plan) => { plan.steps[0].target += '.other'; },
+    (p, plan) => { plan.steps[0].content = JSON.stringify(p, null, 2) + '\n'; },
+    (p, plan) => { plan.steps[1].mode = '0644'; },
+    (p, plan) => { plan.steps[1].content += '# changed\n'; },
+    p => { p.hq_uid = 0; }, p => { p.hq_uid = 399; }, p => { p.adapters[0].uid = p.hq_uid; },
+    p => { p.adapters[1].uid = p.adapters[0].uid; }, p => { p.adapters[2].uid++; },
+    p => { p.adapters[0].args = Array(32).fill('x'.repeat(1024)); },
+    p => { p.adapters[0].args.push('line\nfeed'); }, p => { p.adapters[0].executable += '/..'; },
+    p => { p.adapters[0].adapter_id = p.adapters[1].adapter_id; },
+    p => { p.adapters[0].env = {}; }, p => { p.sandbox.path += '.other'; },
+    p => { p.installed_plan_id = id; },
+  ];
+  for (const change of changes) {
+    f.state.saved = harnessPlan(purpose, change);
+    const before = f.requests.length;
+    await assert.rejects(f.issue());
+    assert.deepEqual(f.requests.slice(before).map(r => r.verb), ['members-plans']);
+  }
+  f.state.saved = harnessPlan('harness-launch-retire');
+  await assert.rejects(f.issue());
+  f.state.saved = savedPlan();
+  await assert.rejects(f.issue());
 });
