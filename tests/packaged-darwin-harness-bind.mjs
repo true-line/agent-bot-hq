@@ -1,5 +1,5 @@
-// Hosted positive qualification, invoked by packaged-darwin-harness-accounts.py.
-// Only the runner may switch users. Each ticket goes to its assigned harness via stdin.
+// Hosted cooperative broker qualification, invoked by packaged-darwin-harness-accounts.py.
+// Only the runner switches users and retains reusable test bindings.
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -22,8 +22,8 @@ const json = path => JSON.parse(readFileSync(path, 'utf8'));
 const out = data => process.stdout.write(JSON.stringify(data) + '\n');
 const uidOf = account => Number(execFileSync('/usr/bin/id', ['-u', account], { encoding: 'utf8' }).trim());
 const readLines = input => createInterface({ input })[Symbol.asyncIterator]();
-const stdinJSON = async () => {
-  const { value, done } = await readLines(process.stdin).next();
+const stdinJSON = async (lines = readLines(process.stdin)) => {
+  const { value, done } = await lines.next();
   assert.ok(!done, 'fixture controller closed');
   return JSON.parse(value);
 };
@@ -121,21 +121,56 @@ async function hostPass(state, accounts, pass) {
         assert.equal(r.profile, 'managed-cooperative');
       }
     }
+    const refused = hq.core.receipts.filter(r => r.kind === 'hq.bind.refused');
+    assert.equal(refused.length, pass);
+    for (const receipt of refused) {
+      assert.equal(receipt.runtime_id, ids[0]);
+      assert.equal(receipt.caller_account, accounts[1]);
+      assert.equal(receipt.code, 'caller_mismatch');
+      assert.equal(receipt.profile, 'managed-cooperative');
+    }
   } finally { await hq.stop(); }
 }
 
 async function bindMember(account) {
   assert.equal(userInfo().username, account);
-  const { runtime_id, channel_binding } = await stdinJSON();
+  const input = readLines(process.stdin);
+  const { runtime_id, expectMismatch } = await stdinJSON(input);
   const conn = await connectSocket(join(DARWIN_HARNESS_DIR, account, 'broker.sock'));
   try {
     const challenge = await conn.request('bind.challenge', { runtime_id });
     assert.equal(challenge.ok, true);
-    const proof = bindProof(channel_binding, challenge.result.nonce, runtime_id);
+    out({ nonce: challenge.result.nonce });
+    const { proof } = await stdinJSON(input);
     const reply = await conn.request('bind', { runtime_id, proof });
-    assert.equal(reply.ok, true);
-    out({ uid: process.getuid(), binding: reply.result });
+    const read = await conn.request('task.directives', {});
+    if (expectMismatch) {
+      for (const response of [reply, read]) {
+        assert.equal(response.ok, false);
+        assert.equal(response.refusal?.error, 'caller_mismatch');
+      }
+      out({ uid: process.getuid(), refused: true });
+    } else {
+      assert.equal(reply.ok, true);
+      assert.equal(read.ok, true);
+      out({ uid: process.getuid(), binding: reply.result });
+    }
   } finally { await conn.close(); }
+}
+
+async function checkMember(account, uid, ticket, expectMismatch) {
+  const member = runAs(account, ['--member', account]);
+  try {
+    const { channel_binding, ...binding } = ticket;
+    const runtime_id = binding.runtime_id;
+    member.child.stdin.write(JSON.stringify({ runtime_id, expectMismatch }) + '\n');
+    const { nonce } = await stdinJSON(member.lines);
+    assert.ok(typeof nonce === 'string' && nonce.length > 0);
+    const proof = bindProof(channel_binding, nonce, runtime_id);
+    member.child.stdin.end(JSON.stringify({ proof }) + '\n');
+    assert.deepEqual(await stdinJSON(member.lines), expectMismatch ? { uid, refused: true } : { uid, binding });
+    assert.deepEqual(await member.exit, [0, null]);
+  } finally { member.child.kill(); }
 }
 
 async function run(archive, state, accounts) {
@@ -155,19 +190,15 @@ async function run(archive, state, accounts) {
         console.log('Packaged HQ CLI loaded the production broker, opened both verified endpoints and refused admission in safe mode.');
       } else assert.equal(offered.length, 0);
       for (const [i, account] of accounts.entries()) {
-        const member = runAs(account, ['--member', account]);
-        try {
-          const { channel_binding, ...binding } = tickets[i];
-          member.child.stdin.end(JSON.stringify({ runtime_id: binding.runtime_id, channel_binding }) + '\n');
-          assert.deepEqual(JSON.parse((await member.lines.next()).value), { uid: uids[i], binding });
-          assert.deepEqual(await member.exit, [0, null]);
-        } finally { member.child.kill(); }
+        await checkMember(account, uids[i], tickets[i], false);
       }
+      // Same valid runtime and proof protocol, but a fresh connection from the other native UID.
+      await checkMember(accounts[1], uids[1], tickets[0], true);
       host.child.stdin.end(JSON.stringify(tickets.map(t => t.runtime_id)) + '\n');
       assert.deepEqual(await host.exit, [0, null]);
     } finally { host.child.stdin.end(); await host.exit; }
   }
-  console.log('With fixture enrollment status, both native harness UIDs bound before and after HQ restarted. Four persisted cooperative receipts recorded the assigned accounts.');
+  console.log('With fixture enrollment status, both native harness UIDs bound before and after HQ restarted. Both accounts read directives. The other UID was refused for the lead runtime and its read on each pass. All six binding receipts persisted.');
 }
 
 assert.ok(process.platform === 'darwin' && process.getuid() !== 0 && process.env.GITHUB_ACTIONS === 'true' &&
