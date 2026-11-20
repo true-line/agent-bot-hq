@@ -88,11 +88,18 @@ paths, as `_agent-bot-hq` on macOS or `agent-bot-hq` on Linux.
    `public_key` (Ed25519 hex) and `fingerprint` (SHA-256 hex) for the prefix
    owner. Repeating the command returns the same identity. The seed stays
    under the provisioned HQ role's private home.
-2. As the prefix owner, enroll those public values as `agent-daemon`. On macOS
-   follow [Machine's owner approval procedure](https://github.com/true-line/agent-bot-machine/blob/main/docs/plans/macos-signing.md#owner-approval-for-a-new-hq-pairing).
-   Keep the verified public `machine_key` from the approved challenge for the
-   first status check. On Linux obtain the prefix owner's published raw
-   Ed25519 `daemon.pub` as 64 hex digits directly from that administrator.
+2. As the prefix owner, enroll those public values as `agent-daemon`. New
+   dedicated-account pairings on macOS require fresh consent in the owner's
+   session. For qualification on a fresh Mac, use the signed first-enrollment
+   CLI, independently pin its public key in Machine, and verify that Machine
+   accepts a fresh proof for the intended HQ. Record that result before
+   offering the CLI to customers. An existing pilot keeps its pinned owner
+   key and can continue using its matching test provider.
+   [First-enrollment CLI](https://github.com/true-line/agent-bot-identity/pull/1469)
+   For an existing macOS pairing, use the verified public `machine_key` from
+   the approved challenge for the first status check. On Linux obtain the
+   prefix owner's published raw Ed25519 `daemon.pub` as 64 hex digits
+   directly from that administrator.
 3. As the HQ role, run `node hq/main.mjs machine status --socket PATH --daemon-key HEX`.
    Use the prefix owner's absolute `var/agent-machine/daemon.sock` path and
    the verified Machine public key. HQ persists the pin after a fresh,
@@ -155,3 +162,55 @@ command as the paired HQ role.
 ```sh
 node hq/main.mjs machine hq-service-recovery cancel --challenge-file "$challenge_file" --socket "$socket"
 ```
+
+### Upgrade a paired macOS service
+
+Run the upgrade-capable HQ CLI as the existing dedicated role. Use the saved
+Machine plan for replacing the installed v2 service. Its unchanged account
+and service owner, current plan ID and digest, previous and next release
+records, and both LaunchDaemon plists are covered by the challenge.
+
+```sh
+node hq/main.mjs machine hq-service-upgrade export "$plan_id" --socket "$socket" > "$challenge_file"
+```
+
+Transfer the original signed line to the daily owner's upgrade reviewer.
+Confirm the independently trusted Machine fingerprint and both release records.
+Return the operation-specific proof to the paired role within the challenge
+lifetime. An approved reply records the normal short-lived members approval
+for the exact replacement plan. Machine applies the saved plan separately.
+
+```sh
+node hq/main.mjs machine hq-service-upgrade approve --challenge-file "$challenge_file" --proof-file "$proof_file" --socket "$socket"
+```
+
+To discard a pending upgrade, return its original challenge to Machine as
+the paired role.
+
+```sh
+node hq/main.mjs machine hq-service-upgrade cancel --challenge-file "$challenge_file" --socket "$socket"
+```
+
+### Review a dedicated macOS harness launch policy
+
+Use the paired dedicated HQ account and the Machine pin saved during verified
+status. For a saved installation plan, export its signed challenge with:
+
+```sh
+node hq/main.mjs machine harness-launch-install export "$plan_id" --socket "$socket" > "$challenge_file"
+```
+
+Transfer the original signed line to the daily owner's matching reviewer.
+Review the target accounts and UIDs, adapter executable digests and exact
+arguments, launcher and sandbox digests, and resulting sudoers rule. Return
+the owner's proof to the paired role. Submit it with:
+
+```sh
+node hq/main.mjs machine harness-launch-install approve --challenge-file "$challenge_file" --proof-file "$proof_file" --socket "$socket"
+```
+
+For retirement use `harness-launch-retire` for both commands and check the
+installed plan ID and digest. Each operation requires a fresh challenge and
+its own proof. Either operation supports `cancel --challenge-file FILE
+--socket PATH`. After an approved response, the administrator applies the
+exact saved plan through the usual members apply command.

@@ -34,7 +34,7 @@ node hq/main.mjs souls    # admitted Souls and their runtimes
 
 ## Identity-service link (row 10)
 
-HQ owns HTTPS. Machine/keyd holds the administrator's device and DPoP signing keys. HQ verifies the issuer's response signature, key ID and exact request nonce before parsing each response. The token exchange binds the sender-constrained token to an administrator-owned session. The API client refuses operations without a matching purpose-specific proof. The first candidate reconciliation operation is an issuance lookup for a specific authorized task and operation. A verified token alone grants no lookup, notice access or credential issue. SDK approval records can be checked against the current public device key. A new approval decision stays pending when the administrator has no independently verified owner decision. A verified 401 invalidates the cached session token without replaying the request.
+HQ owns HTTPS. Machine/keyd holds the administrator's device and DPoP signing keys. HQ verifies the issuer's response signature, key ID and exact request nonce before parsing each response. The token exchange binds the sender-constrained token to an administrator-owned session. The API client refuses operations without a matching purpose-specific proof. The paired provider supports a bodyless `GET /api/daemon/whoami` for its own enrolled device. HQ passes Machine the bound session selector, verifies the returned proof against its token and checks the device ID in Identity's signed reply. Issuance reconciliation still requires a proof for a specific authorized task and operation. A verified token alone grants no lookup, notice access or credential issue. SDK approval records can be checked against the current public device key. A new approval decision stays pending when the administrator has no independently verified owner decision. A verified 401 invalidates the cached session token without replaying the request.
 
 [`governance/server-keys.json`](../governance/server-keys.json) is a release
 pin, separate from enrollment's transitional `identity/server-key.json`.
@@ -43,6 +43,21 @@ The transport never learns trust from the network. Each public key has one
 or `retired`). A pre-published next key is usable only inside its interval;
 retired, unknown and out-of-window keys refuse. Deploying rotation requires
 the reviewed release pin first.
+
+## macOS harness launch readiness
+
+For each configured account, HQ checks the Machine installation plan digest,
+the recorded launcher and sandbox, the admitted adapter and UID, and sudo's
+noninteractive permission for the exact supervisor command. Status lists the
+installed adapters separately from those available for launch. Launch also
+requires independently verified Darwin package qualification for that exact
+adapter. The production verifier has no qualified adapters yet.
+
+A qualified launch hands the supervisor a private stdin header followed by
+ACP. Closing stdin requests shutdown of that launch's process group. HQ holds
+the slot as uncontained unless the supervisor confirms group closure or an
+explicit refusal before spawn. Per-launch member authentication and retirement
+remain under Souls and Machine respectively.
 
 ## Linux owner control under the dedicated account
 
@@ -84,6 +99,10 @@ others can write it, and refuses unknown keys:
 ```
 
 `node hq/main.mjs enroll --harness NAME` starts the grant and displays the code to approve. The enrollment server must match the administrator-configured origin. The service must support the signed enrollment receipt. Legacy local enrollment records cannot authorize the Machine-held identity.
+
+A routine Machine restart preserves enrollment. Use `node hq/main.mjs status --json` to check which signer HQ can reach before retrying an operation.
+
+If an HQ is compromised, the Homebrew administrator can run `managed-machine daemon revoke-hq` to stop new local signing for that pairing. The deny record persists across restart. To withdraw the enrolled device's service access as well, the owner can revoke that device on the Identity service's [Devices page](https://agents.true-line.ai/devices). The service rejects subsequent device requests and retries upstream revocation for tracked GitHub installation tokens. Legacy installation tokens expire within one hour. Issuer details are in the [Identity API guide](https://github.com/true-line/agent-bot/blob/e001bf270d2cd45cd0c1919e5f4caae40e22fe66/docs/api.md).
 
 `notices` opts the agent-comms broker plugin into explicit identity-service
 queues, for example `{ "harnesses": ["example-codex-agent"] }`. HQ validates

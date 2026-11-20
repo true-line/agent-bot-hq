@@ -122,12 +122,15 @@
 // and serves row 16a; launch for that account is host.launch_unavailable,
 // and status and the profile reasons say why.
 //
-// Linux only: elsewhere every launch is refused (macOS waits for row 29).
+// Darwin checks the installed rule and requires independently verified adapter qualification.
 // Launches are in memory only, so after a restart nothing runs under HQ and an
 // old launch ID or token is refused. HQ does not clean up after a crash: an
 // agent left running by an HQ that stopped abnormally keeps running.
 import { spawn as nodeSpawn } from 'node:child_process';
+import { approvedDarwinAdapter, readDarwinGrant, supervisorArgv, supervisorListArgv } from './darwin-launch-grant.mjs';
+import { supervisorReceipts } from './darwin-launch-receipts.mjs';
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fail, HostError } from '../sdk/errors.mjs';
 import { pushReceipt, redact } from '../sdk/services.mjs';
@@ -188,12 +191,41 @@ export function launchWorkdir(home, soulId, memberId) {
   return join(home, '.agent-bot-hq', 'souls', soulId, memberId);
 }
 
-export function launchMemberSocket(endpoint, launchId) {
+export function launchMemberSocket(endpoint, launchId, platform = process.platform) {
   if (typeof endpoint !== 'string' || !endpoint.startsWith('/')) throw new TypeError('launch member socket needs an absolute harness endpoint');
   if (!LAUNCH_ID.test(launchId)) throw new TypeError('launch member socket needs a launch ID');
-  const path = join(dirname(endpoint), `member-${launchId.slice(3)}.sock`);
+  const dir = dirname(endpoint);
+  const id = launchId.slice(3);
+  const path = join(dir, `member-${id}.sock`);
+  if (platform === 'darwin' && Buffer.byteLength(path) > 103) {
+    const room = 103 - Buffer.byteLength(dir) - 1;
+    // The longest supported harness account still leaves 11 bytes. Base 36
+    // keeps the name case-insensitive and retains the full ID when it fits.
+    if (room < 11) fail('host.launch_unavailable', 'the harness directory leaves too little room for a Darwin member socket');
+    const name = BigInt(`0x${id}`).toString(36).padStart(19, '0');
+    return join(dir, name.slice(-room));
+  }
   if (Buffer.byteLength(path) > 107) fail('host.launch_unavailable', `the harness endpoint path leaves no room for the member socket (${Buffer.byteLength(path)} bytes; Linux allows 107)`);
   return path;
+}
+
+export function allocateLaunchAddress(endpoint, launches, random, platform) {
+  for (let tries = 0; tries < 8; tries += 1) {
+    const launch_id = `ln_${random.hex(12)}`;
+    if (launches.has(launch_id)) continue;
+    const member_socket = launchMemberSocket(endpoint, launch_id, platform);
+    if (platform === 'darwin') {
+      if ([...launches.values()].some(l => l.member_socket === member_socket)) continue;
+      // A previous entry process may still own this name after HQ restarts.
+      try {
+        if (lstatSync(member_socket, { throwIfNoEntry: false })) continue;
+      } catch {
+        fail('host.launch_unavailable', 'could not inspect the Darwin member socket directory');
+      }
+    }
+    return { launch_id, member_socket };
+  }
+  fail('host.launch_busy', 'could not allocate a unique launch address');
 }
 
 export function agentArgv(account, soulId, memberId, command) {
@@ -256,6 +288,11 @@ export function createLauncher({
   configured = false,
   platform = process.platform,
   spawn = nodeSpawn,
+  installedDarwinGrant = readDarwinGrant,
+  // A reviewed Machine installation and sudo permission do not qualify an adapter
+  // release. No Darwin package verifier is available yet. Tests supply evidence
+  // for their own exact fixture only; CLI and config expose no override.
+  qualifiedDarwinAdapter = () => false,
   timers = { setTimeout, clearTimeout },
   graceMs = DEFAULT_GRACE_MS,
   mode = () => 'running',
@@ -329,6 +366,28 @@ export function createLauncher({
 
   // At HQ start. Every account in parallel, each bounded by PROBE_TIMEOUT_MS.
   async function probe() {
+    if (platform === 'darwin') {
+      if (!configured) return;
+      let grant;
+      try { grant = installedDarwinGrant(); } catch { /* a missing grant leaves the broker available */ }
+      await Promise.all(harnesses.endpoints.map(async e => {
+        const unavailable = { available: false, reason: 'reviewed Darwin launcher or its dedicated permission is unavailable' };
+        if (!grant) { readiness.set(e.account, unavailable); return; }
+        const supported = e.adapters.filter(id => {
+          try { approvedDarwinAdapter(grant, e, id); return true; } catch { return false; }
+        });
+        const r = supported.length && await runOnce(supervisorListArgv(e.account), PROBE_TIMEOUT_MS, ['ignore', 'ignore', 'pipe']);
+        if (!r || r.code !== 0 || r.timedOut || r.error) { readiness.set(e.account, unavailable); return; }
+        const qualified = supported.filter(id => {
+          try { return qualifiedDarwinAdapter(approvedDarwinAdapter(grant, e, id)) === true; } catch { return false; }
+        });
+        readiness.set(e.account, {
+          available: qualified.length === e.adapters.length, adapters: qualified, installed_adapters: supported,
+          ...(qualified.length < e.adapters.length ? { reason: 'a configured adapter lacks a reviewed mapping or verified Darwin package qualification' } : {}),
+        });
+      }));
+      return;
+    }
     if (platform !== 'linux') return;
     await Promise.all(harnesses.endpoints.map(async (e) => {
       const r = await probeAccount(e.account);
@@ -339,7 +398,7 @@ export function createLauncher({
 
   const accounts = () => harnesses.endpoints.map((e) => ({
     account: e.account,
-    ...(readiness.get(e.account) ?? { available: false, reason: platform === 'linux' ? 'not checked' : `launch needs Linux; this host is ${platform}` }),
+    ...(readiness.get(e.account) ?? { available: false, reason: ['linux', 'darwin'].includes(platform) ? 'not checked' : `launch is unavailable on ${platform}` }),
   }));
 
   // One signal command as the harness account. True only when sudo ran it
@@ -428,7 +487,7 @@ export function createLauncher({
       partial = parts.pop();
       for (const p of parts) {
         if (skipping) { skipping = false; continue; } // the rest of a line already clipped
-        if (takeMarker(l, p)) continue;
+        if (platform !== 'darwin' && takeMarker(l, p)) continue;
         emit(p);
       }
       if (partial.length > STDERR_LINE) {
@@ -443,6 +502,28 @@ export function createLauncher({
   async function lifecycle(l) {
     await Promise.race([l.exited.promise, l.halted.promise]);
     const failures = [];
+    if (platform === 'darwin') {
+      const pipesClosed = l.exit !== undefined && await within(l.closed.promise, CLOSE_WAIT_MS);
+      const outcome = l.protocol.finish(l.exit, pipesClosed);
+      l.proc.stderr.off('data', l.readSupervisorFrame);
+      l.protocol = undefined;
+      l.readSupervisorFrame = undefined;
+      const contained = Boolean(l.spawnError || outcome.contained);
+      l.secrets = undefined;
+      if (contained) {
+        l.state = 'exited';
+        release(l);
+      } else {
+        l.state = 'uncontained';
+        l.uncontained = 'Darwin supervisor did not confirm process-group closure';
+        for (const stream of [l.proc.stdin, l.proc.stdout, l.proc.stderr]) stream?.destroy();
+      }
+      if (l.socket) endSocket(l.socket);
+      await receipt({ kind: 'hq.launch.exited', launch_id: l.launch_id, soul_id: l.soul_id, member_id: l.member_id,
+        account: l.account, exit_code: outcome.code ?? null, signal: l.exit?.signal ?? null,
+        reason: l.spawnError || outcome.refused ? 'spawn-failed' : l.reason, contained });
+      return;
+    }
     if (l.spawnError) {
       // sudo never ran: nothing started, so nothing is signalled. `contained`
       // means "nothing of this launch is left running", which holds when
@@ -493,10 +574,20 @@ export function createLauncher({
   function start(l) {
     if (launches.get(l.launch_id) !== l || l.state !== 'attaching') fail('caller_mismatch', 'no launch waits for this attach');
     if (closing) { release(l); fail('host.not_running', 'HQ is stopping'); }
+    const darwin = platform === 'darwin';
+    if (darwin) {
+      try {
+        const grant = installedDarwinGrant();
+        if (grant.plan_digest !== l.plan_digest) throw new Error();
+        const adapter = approvedDarwinAdapter(grant, harnesses.accountOf(l.adapter_id), l.adapter_id, l.command);
+        if (qualifiedDarwinAdapter(adapter) !== true) throw new Error();
+      } catch { release(l); fail('host.launch_unavailable', 'the reviewed Darwin launch mapping changed before attach'); }
+    }
     let proc;
     try {
       // detached: sudo leads a new session, so HQ's signals and terminal never reach the launch.
-      proc = spawn(SUDO, agentArgv(l.account, l.soul_id, l.member_id, l.command), { stdio: ['pipe', 'pipe', 'pipe'], env: { ...l.env, [MEMBER_ID_ENV]: l.member_id, [ROLE_ENV]: l.role, [BROKER_ENV]: l.endpoint, [MEMBER_SOCKET_ENV]: l.member_socket, PATH: AGENT_PATH }, cwd: '/', detached: true });
+      if (darwin) proc = spawn(SUDO, supervisorArgv(l.account), { stdio: ['pipe', 'pipe', 'pipe'], env: {}, cwd: '/', detached: true });
+      else proc = spawn(SUDO, agentArgv(l.account, l.soul_id, l.member_id, l.command), { stdio: ['pipe', 'pipe', 'pipe'], env: { ...l.env, [MEMBER_ID_ENV]: l.member_id, [ROLE_ENV]: l.role, [BROKER_ENV]: l.endpoint, [MEMBER_SOCKET_ENV]: l.member_socket, PATH: AGENT_PATH }, cwd: '/', detached: true });
     } catch (e) {
       release(l);
       fail('host.launch_unavailable', `sudo could not be started: ${e.message}`);
@@ -505,10 +596,10 @@ export function createLauncher({
     // The secret values are kept, in memory only, until the launch ends; the
     // rest of the environment is dropped now.
     const secrets = SECRET_ENV.map((k) => l.env?.[k]).filter((v) => typeof v === 'string' && v.length > 0);
-    Object.assign(l, { proc, sudoPid, pgid: undefined, groupFixed: false, group: undefined, secrets, state: 'running', started_at: core.clock.now(), env: undefined, exited: deferred(), closed: deferred(), halted: deferred(), grouped: deferred() });
+    Object.assign(l, { proc, sudoPid, pgid: undefined, groupFixed: false, group: undefined, secrets, state: darwin ? 'starting' : 'running', started_at: darwin ? undefined : core.clock.now(), env: undefined, exited: deferred(), closed: deferred(), halted: deferred(), grouped: deferred() });
     const ended = (code, signal) => {
       l.exit ??= { code, signal };
-      if (l.state === 'running') { l.state = 'exiting'; l.reason = 'exited'; }
+      if (l.state === 'starting' || l.state === 'running') { l.state = 'exiting'; l.reason = 'exited'; }
       l.exited.resolve();
     };
     proc.once('exit', ended);
@@ -533,9 +624,22 @@ export function createLauncher({
       });
     }
     proc.stderr.setEncoding('utf8');
-    proc.stderr.on('data', stderrSink(l));
+    const logStarted = () => receipt({ kind: 'hq.launch', launch_id: l.launch_id, soul_id: l.soul_id, member_id: l.member_id, adapter_id: l.adapter_id, runtime_id: l.runtime_id, account: l.account, argv_sha256: argvDigest(l.command), argv0: l.command[0] });
+    const stderr = stderrSink(l);
+    if (darwin) {
+      l.protocol = supervisorReceipts(() => {
+        l.started_at = core.clock.now();
+        if (l.state === 'starting') l.state = 'running';
+        logStarted();
+      }, stderr);
+      l.readSupervisorFrame = chunk => l.protocol.push(chunk);
+      proc.stderr.on('data', l.readSupervisorFrame);
+      proc.stdin.write(JSON.stringify({ plan_digest: l.plan_digest, adapter_id: l.adapter_id, launch_id: l.launch_id,
+        soul_id: l.soul_id, member_id: l.member_id, role: l.role, member_token: secrets[0] }) + '\n');
+    } else {
+      proc.stderr.on('data', stderr); logStarted();
+    }
     l.done = lifecycle(l);
-    receipt({ kind: 'hq.launch', launch_id: l.launch_id, soul_id: l.soul_id, member_id: l.member_id, adapter_id: l.adapter_id, runtime_id: l.runtime_id, account: l.account, argv_sha256: argvDigest(l.command), argv0: l.command[0] });
     return (socket) => {
       socket.on('error', () => {});
       // Ended before the connection was handed over (a failed spawn): close it.
@@ -552,7 +656,7 @@ export function createLauncher({
   // stopped. Resolves when its lifecycle has ended. Idempotent.
   function terminate(l, reason) {
     if (l.state === 'reserved' || l.state === 'attaching') { release(l); return Promise.resolve(); }
-    if (l.state !== 'running') return l.done ?? Promise.resolve();
+    if (l.state !== 'running' && l.state !== 'starting') return l.done ?? Promise.resolve();
     l.state = 'stopping';
     l.reason = reason;
     // Resolves with what failed, if anything.
@@ -560,6 +664,10 @@ export function createLauncher({
       const failures = [];
       if (l.socket) l.socket.unpipe(l.proc.stdin);
       l.proc.stdin.end();
+      if (platform === 'darwin') {
+        await within(l.exited.promise, graceMs + KILL_WAIT_MS + 1000);
+        return failures;
+      }
       try { l.proc.kill('SIGTERM'); } catch { /* EPERM: sudo runs as root */ }
       await fixGroup(l);
       if (!(await signalGroup(l, 'TERM'))) failures.push(`the TERM to ${describeGroup(l)} failed`);
@@ -581,12 +689,12 @@ export function createLauncher({
     }
     // Inside admission's queue: the runtime cannot change while HQ decides.
     return withLiveRuntime(payload.runtime_id, caller, (rt) => {
-      if (platform !== 'linux' || !configured) fail('host.launch_unavailable', `launch needs harness accounts on Linux (§9 row 16b); this host is ${platform}${configured ? '' : ' with no harnesses in HQ\'s config'}`);
+      if (!['linux', 'darwin'].includes(platform) || !configured) fail('host.launch_unavailable', `launch needs configured harness accounts on Linux or macOS (§9 row 16b); this host is ${platform}${configured ? '' : ' with no harnesses in HQ\'s config'}`);
       const endpoint = harnesses.accountOf(rt.adapter_id);
       if (!endpoint) fail('host.launch_unavailable', `the harness of agent ${rt.member_id} of ${rt.soul_id} (adapter ${rt.adapter_id ?? 'unknown'}) has no account in HQ's config`);
       if (rt.harness_uid !== endpoint.uid) fail('host.launch_unavailable', `runtime ${payload.runtime_id} was not admitted for account ${endpoint.account}; send Hello again`);
       const ready = readiness.get(endpoint.account);
-      if (!ready?.available) fail('host.launch_unavailable', `launch is not available for account ${endpoint.account}: ${ready?.reason ?? 'not checked'}`);
+      if (!ready?.available && !(platform === 'darwin' && ready?.adapters?.includes(rt.adapter_id))) fail('host.launch_unavailable', `launch is not available for account ${endpoint.account}: ${ready?.reason ?? 'not checked'}`);
       expire();
       const slot = `${rt.soul_id}\n${rt.member_id}`;
       const holder = slots.has(slot) ? launches.get(slots.get(slot)) : undefined;
@@ -598,17 +706,22 @@ export function createLauncher({
       if (!SOUL_ID.test(rt.soul_id) || !MEMBER_ID.test(rt.member_id)) fail('host.invalid_request', 'the runtime\'s soul_id or member_id is not valid');
       const command = validCommand(payload.command);
       const env = validEnv(payload.env);
-      const now = core.clock.now();
-      let launchId;
-      for (let tries = 0; tries < 8 && !launchId; tries += 1) {
-        const candidate = `ln_${core.random.hex(12)}`;
-        if (!launches.has(candidate)) launchId = candidate;
+      let plan_digest;
+      if (platform === 'darwin') {
+        if (!/^[0-9a-f]{48}$/.test(env.AGENT_BOT_SOULS_MEMBER_TOKEN ?? '') || !/^[a-z][a-z0-9-]{0,31}$/.test(rt.role)) fail('host.invalid_request', 'Darwin launch requires the Souls role and per-launch member token');
+        try {
+          const grant = installedDarwinGrant();
+          const adapter = approvedDarwinAdapter(grant, endpoint, rt.adapter_id, command);
+          if (qualifiedDarwinAdapter(adapter) !== true) throw new Error();
+          plan_digest = grant.plan_digest;
+        } catch { fail('host.launch_unavailable', 'the requested command or account has no matching reviewed Darwin launch mapping'); }
       }
-      if (!launchId) fail('host.launch_busy', 'could not allocate a unique launch ID');
+      const now = core.clock.now();
+      const address = allocateLaunchAddress(endpoint.path, launches, core.random, platform);
       const l = {
-        launch_id: launchId, attach: core.random.hex(32), state: 'reserved', expires: now + RESERVE_MS, caller,
+        ...address, plan_digest, attach: core.random.hex(32), state: 'reserved', expires: now + RESERVE_MS, caller,
         soul_id: rt.soul_id, member_id: rt.member_id, role: rt.role, adapter_id: rt.adapter_id, runtime_id: payload.runtime_id, account: endpoint.account, endpoint: endpoint.path,
-        cwd: launchWorkdir(endpoint.home, rt.soul_id, rt.member_id), member_socket: launchMemberSocket(endpoint.path, launchId), command, env,
+        cwd: launchWorkdir(endpoint.home, rt.soul_id, rt.member_id), command, env,
       };
       launches.set(l.launch_id, l);
       slots.set(slot, l.launch_id);

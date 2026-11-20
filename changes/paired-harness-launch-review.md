@@ -1,0 +1,1 @@
+The dedicated macOS HQ role can submit a saved harness launch policy for owner review or retirement. Each operation checks the target account UIDs, fixed adapter commands, installed launcher and sandbox digests, and exact sudoers rule before returning the owner's proof to Machine.
