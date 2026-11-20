@@ -6,8 +6,9 @@ import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
 import { validatedMembersPlan, validPlanId } from './machine-members-plans.mjs';
 import { checkUpgradeRecords } from './machine-service-upgrade.mjs';
+import { checkHarnessLaunchPlan, isHarnessLaunchHandoff } from './machine-harness-launch.mjs';
 
-export const isServiceHandoff = (verb) => verb === 'hq-service-recovery' || verb === 'hq-service-upgrade';
+export const isServiceHandoff = (verb) => verb === 'hq-service-recovery' || verb === 'hq-service-upgrade' || isHarnessLaunchHandoff(verb);
 const role = '_agent-bot-hq';
 const maxFrame = 64 * 1024;
 const fieldsAre = (o, names) => o && typeof o === 'object' && !Array.isArray(o) &&
@@ -52,7 +53,8 @@ function ownerPublicKey(encoded) {
     x: point.subarray(1, 33).toString('base64url'), y: point.subarray(33).toString('base64url') } });
 }
 
-function checkServiceScope(plan, action, id) {
+function checkPlanScope(plan, action, id, roleUid) {
+  if (isHarnessLaunchHandoff(action)) return checkHarnessLaunchPlan(plan, action, id, roleUid);
   const [account, service] = plan.steps;
   if (plan.hq_account !== role || plan.dir !== 'none' || !Array.isArray(plan.members) || plan.members.length ||
       plan.steps.length !== 2 || !fieldsAre(account, ['kind', 'target', 'action', 'group', 'mode', 'detail']) ||
@@ -65,7 +67,7 @@ function checkServiceScope(plan, action, id) {
   if (action === 'hq-service-upgrade') checkUpgradeRecords(service, id);
 }
 
-function validatedChallenge(r, machine, hq, action) {
+function validatedChallenge(r, machine, hq, action, roleUid) {
   const c = r.body;
   const now = Math.floor(Date.now() / 1000);
   if (r.state !== 'challenged' || !fieldsAre(c, ['action', 'machine_key', 'hq_key', 'owner_key', 'plan_id', 'plan_digest', 'nonce', 'expires_at', 'plan_canonical']) ||
@@ -76,7 +78,7 @@ function validatedChallenge(r, machine, hq, action) {
     throw new Error('invalid, expired or misdirected Machine service challenge');
   }
   const body = { plan_id: c.plan_id, plan_digest: c.plan_digest, plan_canonical: c.plan_canonical };
-  checkServiceScope(validatedMembersPlan(c.plan_id, { state: 'found', body }), action, c.plan_id);
+  checkPlanScope(validatedMembersPlan(c.plan_id, { state: 'found', body }), action, c.plan_id, roleUid);
   ownerPublicKey(c.owner_key);
   return c;
 }
@@ -102,13 +104,13 @@ function utcSecond(value) {
   return Number.isFinite(t) && new Date(t).toISOString().replace('.000Z', 'Z') === value ? t : NaN;
 }
 
-export async function serviceHandoff(action, args, machine, hq, send, authenticateStored) {
+export async function serviceHandoff(action, args, machine, hq, send, authenticateStored, roleUid) {
   if (args.operation === 'export') {
     const { response } = await send({ verb: 'members-plans', option: 'get', plan_id: args.id });
-    checkServiceScope(validatedMembersPlan(args.id, response), action, args.id);
+    checkPlanScope(validatedMembersPlan(args.id, response), action, args.id, roleUid);
     const saved = response.body;
     const issued = await send({ verb: action, option: 'challenge', plan_id: saved.plan_id, plan_digest: saved.plan_digest });
-    const c = validatedChallenge(issued.response, machine, hq, action);
+    const c = validatedChallenge(issued.response, machine, hq, action, roleUid);
     if (c.plan_id !== saved.plan_id || c.plan_digest !== saved.plan_digest || c.plan_canonical !== saved.plan_canonical) {
       throw new Error('Machine service challenge differs from the retrieved plan');
     }
@@ -116,7 +118,7 @@ export async function serviceHandoff(action, args, machine, hq, send, authentica
   }
   const line = readTransfer(args.challengeFile, maxFrame + 1).replace(/\n$/, '');
   if (!line.length || /[\r\n]/.test(line) || Buffer.byteLength(line) > maxFrame) throw new Error('expected one signed Machine response line');
-  const c = validatedChallenge(authenticateStored(line), machine, hq, action);
+  const c = validatedChallenge(authenticateStored(line), machine, hq, action, roleUid);
   const request = { verb: action, option: args.operation, plan_id: c.plan_id, plan_digest: c.plan_digest, challenge_nonce: c.nonce };
   const approving = args.operation === 'approve';
   if (approving) request.owner_signature = ownerSignature(c, args.proofFile);
