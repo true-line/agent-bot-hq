@@ -10,7 +10,10 @@ import { fixtureBroker } from './fixtures/interim-broker.mjs';
 import { manifestDigest } from '../scripts/soul-contracts.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const run = (cmd, args, options = {}) => execFileSync(cmd, args, { encoding: 'utf8', ...options });
+// The builder fixture pins its own broker in its disposable .cache.
+const fixtureEnv = { ...process.env };
+delete fixtureEnv.HQ_COMMS_REPO;
+const run = (cmd, args, options = {}) => execFileSync(cmd, args, { encoding: 'utf8', env: fixtureEnv, ...options });
 
 test('interim artifact is reproducible, runs offline and refuses changed contracts', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'hq-builder-test-'));

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Create a temporary role account only on a fresh hosted macOS test VM.
 set -euo pipefail
-[[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "$(uname -s)" == Darwin ]]
+if [[ "${GITHUB_ACTIONS:-}" != true || "${RUNNER_ENVIRONMENT:-}" != github-hosted || "$(uname -s)" != Darwin || "$EUID" == 0 ]]; then
+  echo "requires an ordinary user on a disposable GitHub-hosted macOS runner" >&2
+  exit 1
+fi
 archive="${1:?macOS target tar required}"
 name=_agent-bot-hq
 account="/Users/$name"
 group="/Groups/$name"
 home=/private/var/agent-bot-hq
-if dscl . -read "$account" >/dev/null 2>&1 || dscl . -read "$group" >/dev/null 2>&1 || [[ -e "$home" ]]; then
+if dscl . -read "$account" >/dev/null 2>&1 || dscl . -read "$group" >/dev/null 2>&1 || [[ -e "$home" || -L "$home" ]]; then
   echo 'an existing HQ installation occupies this runner'; exit 1
 fi
 users="$(dscl . -list /Users UniqueID)"
@@ -47,3 +50,4 @@ fi
 cd "$stage/hq"
 sudo -n -H -u "$name" -- /bin/bash tests/dedicated-hq-account.sh "$node_bin" --disposable-machine-role
 bash tests/darwin-launchd-owner-control.sh "$node_bin"
+python3 -I tests/packaged-darwin-harness-accounts.py "$stage/hq" "$node_bin"
