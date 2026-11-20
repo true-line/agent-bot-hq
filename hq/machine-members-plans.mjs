@@ -33,6 +33,10 @@ function validMembers(plan) {
       service.target === 'ai.true-line.agent-bot-hq'));
 }
 
+export function canonicalMembersJSON(value) {
+  return JSON.stringify(value).replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029') + '\n';
+}
+
 export function validatedMembersPlan(id, response) {
   const body = response.body;
   if (!object(body) || response.state !== 'found') throw new Error('unexpected Machine members-plans lookup state');
@@ -50,7 +54,7 @@ export function validatedMembersPlan(id, response) {
   }
   // Go emits compact JSON without HTML escaping, but it escapes U+2028 and
   // U+2029. This checks form only; the exact received bytes are returned.
-  if (JSON.stringify(p).replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029') + '\n' !== plan_canonical) {
+  if (canonicalMembersJSON(p) !== plan_canonical) {
     throw new Error('Machine members plan is not in canonical form');
   }
   return p;

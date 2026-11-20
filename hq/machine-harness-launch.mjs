@@ -1,8 +1,9 @@
 // Validate the two Machine-reviewed files before the dedicated HQ exports a
 // challenge, and again before it returns the physical owner's proof.
+import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
-import { validPlanId } from './machine-members-plans.mjs';
+import { canonicalMembersJSON, validPlanId } from './machine-members-plans.mjs';
 
 const role = '_agent-bot-hq';
 const root = '/Library/Application Support/ai.true-line.agent-bot-hq';
@@ -61,7 +62,7 @@ export function checkHarnessLaunchPlan(plan, purpose, planId, roleUid) {
   const install = purpose === 'harness-launch-install';
   const action = install ? 'create' : 'remove';
   const [policy, rule] = plan.steps;
-  if (Buffer.byteLength(JSON.stringify(plan) + '\n') > 32 * 1024 ||
+  if (Buffer.byteLength(canonicalMembersJSON(plan)) > 32 * 1024 ||
       !isHarnessLaunchHandoff(purpose) || plan.hq_account !== role || plan.dir !== root + '/ipc' ||
       !Array.isArray(plan.members) || plan.members.length === 0 || plan.steps.length !== 2 ||
       !file(policy, root + '/harness-launch-policy.json', '0644', action) ||
@@ -75,8 +76,16 @@ export function checkHarnessLaunchPlan(plan, purpose, planId, roleUid) {
         !validPlanId(p.installed_plan_id) || p.installed_plan_id === planId || !hex(p.installed_plan_digest))) {
     throw new Error('invalid paired harness launch policy');
   }
-  if (JSON.stringify(p).replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029') + '\n' !== policy.content) {
+  if (canonicalMembersJSON(p) !== policy.content) {
     throw new Error('harness launch policy is not canonical');
   }
   if (rule.content !== expectedRule(p, plan.members)) throw new Error('unexpected harness launch sudoers rule');
+  if (!install) {
+    const priorPolicy = { ...p, action: 'install', installed_plan_id: '', installed_plan_digest: '' };
+    const priorSteps = [{ ...policy, action: 'create', content: canonicalMembersJSON(priorPolicy) }, { ...rule, action: 'create' }];
+    const priorBytes = canonicalMembersJSON({ ...plan, steps: priorSteps });
+    if (createHash('sha256').update(priorBytes).digest('hex') !== p.installed_plan_digest) {
+      throw new Error('retirement mapping differs from the referenced installation digest');
+    }
+  }
 }

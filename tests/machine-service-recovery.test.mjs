@@ -27,12 +27,12 @@ function savedPlan() {
   const plan_canonical = JSON.stringify(plan) + '\n';
   return { plan_id: id, plan_digest: createHash('sha256').update(plan_canonical).digest('hex'), plan_canonical };
 }
-async function fixture(t, purpose = action) {
+async function fixture(t, purpose = action, roleUid = 300) {
   const home = mkdtempSync(join(tmpdir(), 'hqr-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   // The test process owns the scratch key files. The protocol fixture models
   // a distinct enrolled macOS system role at UID 300.
-  const run = (...args) => machineCommandInHome(args, home, process.getuid(), undefined, false, 300);
+  const run = (...args) => machineCommandInHome(args, home, process.getuid(), undefined, false, roleUid);
   const identity = await run('identity');
   const key = generateKeyPairSync('ed25519');
   const owner = generateKeyPairSync('ec', { namedCurve: 'P-256' });
@@ -293,7 +293,7 @@ function harnessPlan(purpose, change = () => {}) {
       { adapter_id: 'second', account: members[1], uid: 302, executable: '/Library/Tools/Second', sha256: 'd'.repeat(64), args: [] },
       { adapter_id: 'third', account: members[0], uid: 301, executable: '/Library/Tools/Third', sha256: 'e'.repeat(64), args: [] },
     ],
-    installed_plan_id: install ? '' : 'plan-20261118T040000Z-cdef', installed_plan_digest: install ? '' : 'f'.repeat(64),
+    installed_plan_id: install ? '' : 'plan-20261118T040000Z-cdef', installed_plan_digest: install ? '' : harnessPlan('harness-launch-install').plan_digest,
   };
   const file = (target, mode, content) => ({ kind: 'file', target, action: install ? 'create' : 'remove', owner: 'root', group: 'wheel', mode, content });
   const step = file(root + '/harness-launch-policy.json', '0644', '');
@@ -344,4 +344,53 @@ test('paired harness review refuses changes outside the saved launch-rule purpos
   await assert.rejects(f.issue());
   f.state.saved = savedPlan();
   await assert.rejects(f.issue());
+});
+
+test('signed handoff accepts the Go canonical vectors and rejects a mismatched install before issuing retirement', arm, async (t) => {
+  for (const action of ['install', 'retire']) {
+    const purpose = 'harness-launch-' + action;
+    const f = await fixture(t, purpose, 311);
+    const plan_canonical = readFileSync(new URL('./fixtures/machine-harness-launch/' + action + '.json', import.meta.url), 'utf8');
+    f.state.saved = { plan_id: id, plan_digest: createHash('sha256').update(plan_canonical).digest('hex'), plan_canonical };
+    await f.pin();
+    const challenge = JSON.parse(await f.issue()).body;
+    assert.equal(challenge.plan_canonical, plan_canonical);
+    if (action === 'install') continue;
+    for (const change of [p => { p.installed_plan_digest = 'f'.repeat(64); },
+      p => { p.adapters[0].args.push('another argument'); }]) {
+      const plan = JSON.parse(plan_canonical);
+      const policy = JSON.parse(plan.steps[0].content);
+      change(policy);
+      plan.steps[0].content = harnessJSON(policy);
+      const bytes = harnessJSON(plan);
+      f.state.saved = { plan_id: id, plan_digest: createHash('sha256').update(bytes).digest('hex'), plan_canonical: bytes };
+      const before = f.requests.length;
+      await assert.rejects(f.issue(), /referenced installation digest/);
+      assert.deepEqual(f.requests.slice(before).map(r => r.verb), ['members-plans']);
+    }
+  }
+});
+
+test('paired harness review measures the canonical plan at the 32768-byte boundary', arm, async (t) => {
+  const purpose = 'harness-launch-install';
+  const f = await fixture(t, purpose);
+  await f.pin();
+  const args = Array(32).fill('');
+  const make = () => harnessPlan(purpose, p => { p.adapters[1].args = args; });
+  let remaining = 32768 - Buffer.byteLength(make().plan_canonical);
+  for (let i = 0; i < args.length; i++) {
+    const length = Math.min(remaining, 1024);
+    args[i] = 'x'.repeat(length);
+    remaining -= length;
+  }
+  assert.equal(remaining, 0);
+  f.state.saved = make();
+  assert.equal(Buffer.byteLength(f.state.saved.plan_canonical), 32768);
+  await f.issue();
+  args[args.length - 1] += 'x';
+  f.state.saved = make();
+  assert.equal(Buffer.byteLength(f.state.saved.plan_canonical), 32769);
+  const before = f.requests.length;
+  await assert.rejects(f.issue(), /outside the paired harness launch plan scope/);
+  assert.deepEqual(f.requests.slice(before).map(r => r.verb), ['members-plans']);
 });
