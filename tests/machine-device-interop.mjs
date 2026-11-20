@@ -11,6 +11,7 @@ import { setTimeout } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { treeDigest } from '../hq/plugins.mjs';
+import { connectSocket } from '../hq/socket.mjs';
 import { createEnrollment } from '../hq/enrollment.mjs';
 import { createHQ } from '../hq/hq.mjs';
 import { createIdentityService } from '../hq/identity-service.mjs';
@@ -326,6 +327,28 @@ try {
     assert.match((await approveEnrollment(entry)).stdout, /Enrolled as device/);
     await stopPackage();
     checkBroker(await startPackage(entry, home), true);
+    const offer = { operation_id: 'op_cooperative_owner', objective: 'Collect a scoped receipt.',
+      done_criteria: 'The owner receives the receipt.', write_scope: ['workspace:fixture'],
+      accountable_soul: 'agent_00000000-0000-4000-8000-000000000123' };
+    async function ownerOffer() {
+      const client = await connectSocket(join(home, 'control.sock'));
+      try {
+        const reply = await client.request('tasks.offer', offer);
+        assert.equal(reply.ok, true);
+        assert.equal(reply.result.by, 'owner');
+        assert.equal(reply.result.status, 'offered');
+        const { receipts } = JSON.parse(readFileSync(join(home, 'store.json'), 'utf8'));
+        const rows = receipts.filter(r => r.kind === 'task.offer' && r.operation_id === offer.operation_id);
+        assert.deepEqual(rows.map(r => [r.receipt_id, r.profile]), [[reply.result.receipt_id, 'managed-cooperative']]);
+        return reply.result;
+      } finally { await client.close(); }
+    }
+    const originalOffer = await ownerOffer();
+    assert.equal(originalOffer.profile, 'managed-cooperative', 'returned owner receipt must report the measured profile');
+    await stopPackage();
+    checkBroker(await startPackage(entry, home), true);
+    assert.deepEqual(await ownerOffer(), originalOffer, 'replay after process restart must preserve the complete receipt');
+    console.log('Enrolled packaged CLI returned a cooperative owner task receipt, retained it over process restart, and stored one matching audit record.');
     await stopPackage();
     copyFileSync(join(original, issuerPin), join(copy, issuerPin));
     assert.equal(treeDigest(copy), originalDigest);
