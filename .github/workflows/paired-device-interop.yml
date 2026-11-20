@@ -39,7 +39,15 @@ jobs:
         working-directory: ${{ runner.temp }}/machine
         run: |
           go test -c -o "$RUNNER_TEMP/machine-fixture" ./internal/daemon
+      - name: Build the offline Darwin HQ package
+        run: |
+          command -v gtar >/dev/null || brew install gnu-tar
+          bash scripts/ci-build-darwin-artifact.sh "$GITHUB_SHA" "$RUNNER_TEMP/paired-hq.tar"
+          mkdir "$RUNNER_TEMP/paired-release"
+          tar -xf "$RUNNER_TEMP/paired-hq.tar" -C "$RUNNER_TEMP/paired-release"
       - name: Exercise paired HQ and keyd with disposable keys
+        env:
+          HQ_TEST_PACKAGED_HOSTED: '1'
         run: |
           node --version
-          node tests/machine-device-interop.mjs "$RUNNER_TEMP/machine-fixture" "$RUNNER_TEMP/machine/tests/fixtures/build-keyd-device-interop.sh"
+          node tests/machine-device-interop.mjs "$RUNNER_TEMP/machine-fixture" "$RUNNER_TEMP/machine/tests/fixtures/build-keyd-device-interop.sh" "$RUNNER_TEMP/paired-release/hq/hq/main.mjs"
