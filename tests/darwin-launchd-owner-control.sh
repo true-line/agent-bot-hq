@@ -57,19 +57,13 @@ sudo install -m 0644 -o root -g wheel "$work/launch.plist" "$plist"
 plutil -lint "$plist"
 sudo launchctl bootstrap system "$plist"
 
-# Only the manager runs as root. This normal CLI runs as the designated owner.
-diagnose() {
-  sudo cat "$work/launchd.stderr" >&2
-  sudo launchctl print "system/$label" | awk '/state =|last exit code =|pid =/ { print }' >&2
-  exit 1
-}
 job_pid() {
   sudo launchctl print "system/$label" | awk '$1 == "pid" && $2 == "=" { print $3 }'
 }
 check_console_profile() {
   local profile
-  profile="$("$system_node" "$entry" status --owner-control | awk '/^profile:/ { print }')"
-  [[ "$profile" == 'profile: managed-cooperative' ]]
+  profile="$("$system_node" "$entry" status --owner-control | awk '/^profile:/ { print }')" || return 1
+  test "$profile" = 'profile: managed-cooperative'
 }
 # Read only the fixture role's private store. A length and digest carry the
 # verified receipt prefix across the restart without exposing receipt contents.
@@ -110,6 +104,12 @@ for (;;) {
 }
 JS
 }
+# Only the manager runs as root. This normal CLI runs as the designated owner.
+diagnose() {
+  sudo cat "$work/launchd.stderr" >&2
+  sudo launchctl print "system/$label" | awk '/state =|last exit code =|pid =/ { print }' >&2
+  exit 1
+}
 python3 - "$system_node" "$entry" "$owner" "$socket" <<'PY' || diagnose
 import json
 import os
@@ -143,13 +143,13 @@ assert control["uid"] == os.getuid() and control["account"] == owner
 assert status["hq"]["account"] == "_agent-bot-hq" and status["profile"] == "managed-cooperative"
 PY
 [[ "$(sudo stat -f '%u:%Lp' "$state")" == "$(id -u "$role"):700" ]]
-pid="$(job_pid)"
+pid="$(sudo launchctl print "system/$label" | awk '$1 == "pid" && $2 == "=" { print $3 }')"
 [[ "$pid" =~ ^[1-9][0-9]*$ ]]
 [[ "$(ps -o uid= -p "$pid" | tr -d ' ')" == "$(id -u "$role")" ]]
-check_console_profile
-first_receipts="$(receipt_checkpoint)"
-[[ "$(job_pid)" == "$pid" ]]
 echo "The owner CLI reached the launchd service running as $role with getpeereid authentication."
+check_console_profile || exit 1
+first_receipts="$(receipt_checkpoint)" || exit 1
+[[ "$(job_pid)" == "$pid" ]] || exit 1
 
 # launchd retains the listening socket while restarting HQ. Queue a normal
 # request from the designated owner while the dedicated CI service is paused.
@@ -186,11 +186,11 @@ assert control["uid"] == os.getuid() and control["account"] == owner and control
 after = os.lstat(path)
 assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
 PY
-restarted_pid="$(job_pid)"
+restarted_pid="$(sudo launchctl print "system/$label" | awk '$1 == "pid" && $2 == "=" { print $3 }')"
 [[ "$restarted_pid" =~ ^[1-9][0-9]*$ && "$restarted_pid" != "$pid" ]]
-[[ "$(ps -o uid= -p "$restarted_pid" | tr -d ' ')" == "$(id -u "$role")" ]]
-check_console_profile
-receipt_checkpoint "$first_receipts" >/dev/null
-[[ "$(job_pid)" == "$restarted_pid" ]]
-echo "Both dedicated HQ processes reported managed-cooperative in the owner console and persisted receipts."
 echo "A pending owner status request reached the restarted HQ through the same launchd socket."
+[[ "$(ps -o uid= -p "$restarted_pid" | tr -d ' ')" == "$(id -u "$role")" ]] || exit 1
+check_console_profile || exit 1
+receipt_checkpoint "$first_receipts" >/dev/null || exit 1
+[[ "$(job_pid)" == "$restarted_pid" ]] || exit 1
+echo "Both dedicated HQ processes reported managed-cooperative in the owner console and persisted receipts."
