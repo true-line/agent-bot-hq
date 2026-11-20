@@ -612,8 +612,9 @@ These rules apply to every call from HQ to the identity service.
   owner policy. Current enrollment uses the administrative custody path
   in §3.2 even on a cooperative host.
 - **`device_revoked`.** When the identity service answers that the device is
-  revoked (today `invalid_grant` on `/oauth/token`, or an explicit revoked
-  status on any call), HQ maps it to `device_revoked` and does the
+  revoked (a signed HTTP 400 from `/oauth/token` carrying `invalid_grant`
+  and `error_description: device_revoked`, or an explicit signed
+  `device_revoked` error), HQ maps it to `device_revoked` and does the
   following:
   - it **drops every cached token and resolved credential immediately**,
     without waiting for expiry;

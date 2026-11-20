@@ -57,7 +57,7 @@ function fixture({ server = SERVER, device = generateKeyPairSync('ec', { namedCu
       assert.equal('d' in claims.cnf.jwk, false);
       const accessToken = `access-secret-canary-${state.tokens}`;
       tokenKeys.set(accessToken, claims.cnf.jwk);
-      out = signed(state.mode === 'token-revoked' || state.mode === 'software-refused' ? 400 : 200, state.mode === 'software-refused' ? { error: 'profile_insufficient', error_description: 'SECRET_CANARY' } : state.mode === 'token-revoked' ? { error: 'invalid_grant', error_description: 'SECRET_CANARY' } : { access_token: accessToken, token_type: 'DPoP', expires_in: state.expiresIn, harnesses: ['codex'] }, claims.jti);
+      out = signed(state.mode === 'token-revoked' || state.mode === 'software-refused' ? 400 : 200, state.mode === 'software-refused' ? { error: 'profile_insufficient', error_description: 'SECRET_CANARY' } : state.mode === 'token-revoked' ? { error: 'invalid_grant', error_description: 'device_revoked' } : { access_token: accessToken, token_type: 'DPoP', expires_in: state.expiresIn, harnesses: ['codex'] }, claims.jti);
     } else {
       state.apiCalls++;
       const token = init.headers.authorization.slice('DPoP '.length);

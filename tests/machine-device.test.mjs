@@ -184,7 +184,17 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.match(statusText, /^signer: hardware key, paired Machine\/keyd backend, key /m);
   assert.doesNotMatch(statusText, /hardwareSigner|experimental feature/);
   assert.equal(existsSync(join(home, 'signer')), false);
-  await assert.rejects(active.hq.core.identity.call('GET', '/api/daemon/issuances/example-op'), /no authorized DPoP action/);
+  const lookup = () => active.hq.core.identity.call('GET', '/api/daemon/issuances/example-op');
+  const enrolled = readFileSync(join(home, 'identity/device.json'));
+  service.state.mode = 'assertion-expired';
+  await assert.rejects(lookup(), { code: 'credential_unavailable' });
+  const expiredJti = accessJti;
+  assert.equal(options.includes('bind-access'), false);
+  assert.equal((await active.owner.request('device.status')).result.device, 'enrolled');
+  assert.deepEqual(readFileSync(join(home, 'identity/device.json')), enrolled);
+  service.state.mode = 'ok';
+  await assert.rejects(lookup(), /no authorized DPoP action/);
+  assert.notEqual(accessJti, expiredJti, 'retry opens a fresh admin session');
   assert.ok(options.includes('access-assertion') && options.includes('bind-access'));
   assert.equal(service.state.requests.filter((r) => r.url.includes('/api/daemon/')).length, 0);
   await assert.rejects(active.hq.core.identity.call('POST', '/api/daemon/credentials', {}), /administrator-side credential use/);

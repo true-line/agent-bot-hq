@@ -183,7 +183,10 @@ export function createIdentityService({
         let body;
         try { body = JSON.parse(bytes.toString('utf8')); } catch { unavailable('authenticated response is not JSON'); }
         link = 'ok';
-        if (body?.error === 'device_revoked' || (path === '/oauth/token' && body?.error === 'invalid_grant')) { revoke(); fail('device_revoked', 'device revoked: re-enroll'); }
+        // The token endpoint also uses invalid_grant for an expired or replayed assertion.
+        const grantRevoked = path === '/oauth/token' && response.status === 400
+          && body?.error === 'invalid_grant' && body.error_description === 'device_revoked';
+        if (grantRevoked || body?.error === 'device_revoked') { revoke(); fail('device_revoked', 'device revoked: re-enroll'); }
         if (body?.error === 'profile_insufficient') fail('profile_insufficient', 'the identity service refused this device key storage under owner policy');
         if (response.status === 200 && path.startsWith(ISSUANCE_LOOKUP) && body?.operation_id !== path.slice(ISSUANCE_LOOKUP.length)) {
           unavailable('issuance reply does not match the requested operation');

@@ -52,11 +52,13 @@ export async function fakeIdentityService({ issuer } = {}) {
             || !verify('sha256', Buffer.from(h + '.' + p), { key: createPublicKey({ key, format: 'jwk' }), dsaEncoding: 'ieee-p1363' }, Buffer.from(s, 'base64url'))) {
             return json(res, 400, { error: 'invalid_grant' });
           }
-          const body = { device_id: claims.iss, token_type: 'DPoP', access_token: 'disposable-fixture-token', expires_in: 300, harnesses: grant.form.harnesses.split(' ') };
+          const status = state.mode === 'assertion-expired' ? 400 : 200;
+          const body = status === 400 ? { error: 'invalid_grant', error_description: 'assertion expired or not yet valid' }
+            : { device_id: claims.iss, token_type: 'DPoP', access_token: 'disposable-fixture-token', expires_in: 300, harnesses: grant.form.harnesses.split(' ') };
           res.setHeader('agent-bot-key-id', 'srv-1');
           res.setHeader('agent-bot-request-jti', claims.jti);
-          res.setHeader('agent-bot-signature', sign(null, signatureBytes(200, JSON.stringify(body), claims.jti), signing.privateKey).toString('base64url'));
-          return json(res, 200, body);
+          res.setHeader('agent-bot-signature', sign(null, signatureBytes(status, JSON.stringify(body), claims.jti), signing.privateKey).toString('base64url'));
+          return json(res, status, body);
         }
         const g = state.grants.get(form.device_code);
         if (form.grant_type !== 'urn:ietf:params:oauth:grant-type:device_code' || !g) return json(res, 400, { error: 'invalid_grant' });
