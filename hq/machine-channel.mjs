@@ -153,9 +153,14 @@ function authenticatedResponse(line, nonce, pinned, verb) {
     throw new Error(`Machine ${verb} signature does not match the daemon pin`);
   }
   if (!r.ok) {
-    const error = verb === 'hq-device' && r.diagnostic === 'MM_DAEMON_UNKNOWN_KEY'
-      ? new HostError('credential_unavailable', "Machine could not verify this account's pairing for device signing (MM_DAEMON_UNKNOWN_KEY). Check its pairing with the prefix owner.")
-      : new Error(`Machine refused signed ${verb}: ${r.diagnostic || 'unspecified'}`);
+    let error = new Error(`Machine refused signed ${verb}: ${r.diagnostic || 'unspecified'}`);
+    if (verb === 'hq-device') {
+      if (r.diagnostic === 'MM_DAEMON_UNKNOWN_KEY') {
+        error = new HostError('credential_unavailable', "Machine could not verify this account's pairing for device signing (MM_DAEMON_UNKNOWN_KEY). Check its pairing with the prefix owner.");
+      } else if (r.diagnostic === 'MM_DAEMON_PEER_REFUSED' || r.diagnostic === 'MM_DAEMON_CALLER_REFUSED') {
+        error = new HostError('credential_unavailable', `Machine refused this HQ account's device request (${r.diagnostic}). Ask the prefix owner to check its pairing.`);
+      }
+    }
     error.machineDiagnostic = r.diagnostic || 'unspecified';
     throw error;
   }
@@ -170,7 +175,11 @@ function exchange(socketPath, request) {
     let size = 0;
     const timer = setTimeout(() => stream.destroy(new Error('Machine request timed out')), 10000);
     stream.once('connect', () => stream.write(JSON.stringify(request) + '\n'));
-    stream.on('error', reject);
+    stream.on('error', error => {
+      if (request.verb === 'hq-device' && error.syscall === 'connect' && (error.code === 'ENOENT' || error.code === 'ECONNREFUSED')) {
+        reject(new HostError('credential_unavailable', 'HQ could not connect to the paired Machine. Ask the prefix owner to check that Machine is running, then retry.'));
+      } else reject(error);
+    });
     stream.on('close', () => { clearTimeout(timer); reject(new Error('Machine closed without a response')); });
     stream.on('data', (chunk) => {
       size += chunk.length;

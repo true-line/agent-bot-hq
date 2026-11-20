@@ -34,7 +34,9 @@ const hosted = process.env.HQ_TEST_PACKAGED_HOSTED === '1';
 const sharedDir = '/opt/homebrew/var/agent-machine';
 if (hosted) {
   assert.ok(packagedCLI && process.env.GITHUB_ACTIONS === 'true' && process.env.RUNNER_ENVIRONMENT === 'github-hosted');
-  assert.ok(process.platform === 'darwin' && process.arch === 'arm64' && userInfo().username === 'runner');
+  assert.ok(process.platform === 'darwin' && process.arch === 'arm64');
+  assert.equal(userInfo().uid, process.getuid());
+  assert.equal(process.geteuid(), process.getuid());
 }
 const role = hosted ? userInfo().homedir : join(dir, 'role');
 const roleConfig = join(role, '.config');
@@ -90,7 +92,11 @@ async function refusedPackageGrant(reason) {
   const requests = server.state.requests.length;
   await assert.rejects(packageCommand('enroll', '--harness', 'codex'), e => {
     const refusal = JSON.parse(e.stderr);
-    return e.code === 1 && (refusal.code === 'host.internal' || refusal.error === 'credential_unavailable');
+    assert.equal(e.code, 1);
+    assert.equal(refusal.error, 'credential_unavailable');
+    assert.match(refusal.explanation, reason);
+    assert.ok(!refusal.explanation.includes(dir));
+    return true;
   });
   const status = JSON.parse((await packageCommand('status', '--json')).stdout);
   assert.equal(status.hq.signer.backend, 'machine');
@@ -184,7 +190,7 @@ try {
     assert.equal(before.available, true);
     const first = await signedPackageGrant();
     await stopMachine();
-    await refusedPackageGrant(/ENOENT|ECONNREFUSED/);
+    await refusedPackageGrant(/could not connect to the paired Machine.*check that Machine is running/);
     await startMachine();
     const second = await signedPackageGrant();
     assert.equal(second.jkt, first.jkt);
@@ -248,10 +254,10 @@ try {
   writeFileSync(join(dir, 'revoke'), '');
   await until(() => existsSync(join(dir, 'revoked')), 'Machine did not acknowledge revocation');
   if (packagedCLI) {
-    await refusedPackageGrant(/MM_DAEMON_PEER_REFUSED/);
+    await refusedPackageGrant(/Machine refused this HQ account.*MM_DAEMON_PEER_REFUSED.*check its pairing/);
     await stopPackage();
     assert.equal((await startPackage()).available, false);
-    await refusedPackageGrant(/MM_DAEMON_PEER_REFUSED/);
+    await refusedPackageGrant(/Machine refused this HQ account.*MM_DAEMON_PEER_REFUSED.*check its pairing/);
     console.log('Packaged HQ accepted fresh Machine signatures across restart and refused enrollment during outage and after revocation, including after HQ restart.');
   }
   await assert.rejects(hq.core.signer.custody.openSession());

@@ -190,13 +190,20 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   await assert.rejects(active.hq.core.identity.call('POST', '/api/daemon/credentials', {}), /administrator-side credential use/);
   const deviceRecord = readFileSync(join(home, 'identity/device.json'));
   const enrollmentState = async () => (await active.owner.request('device.status')).result.device;
-  for (const refusal of ['MM_DAEMON_UNKNOWN_KEY', 'offline']) {
+  for (const refusal of ['MM_DAEMON_UNKNOWN_KEY', 'MM_DAEMON_PEER_REFUSED', 'MM_DAEMON_CALLER_REFUSED', 'offline']) {
     // An identity reply signed before the refusal can arrive afterwards.
     const queued = new Promise(resolve => { holdIdentity = resolve; });
     const pending = active.hq.core.signer.deviceStatus();
     const deliver = await queued;
     refuseAssertion = refusal;
-    await assert.rejects(active.hq.core.signer.custody.openSession());
+    await assert.rejects(active.hq.core.signer.custody.openSession(), error => {
+      if (refusal !== 'offline') {
+        assert.equal(error.code, 'credential_unavailable');
+        assert.equal(error.machineDiagnostic, refusal);
+        assert.ok(error.message.includes(refusal));
+      }
+      return true;
+    });
     deliver();
     await assert.rejects(pending, /custody changed/);
     const status = (await active.owner.request('status')).result;
