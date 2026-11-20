@@ -56,7 +56,7 @@ const refused = (res, code = 'caller_mismatch') => {
   assert.equal(res.refusal?.error ?? res.host_refusal?.code, code, JSON.stringify(res));
 };
 
-test('harnesses config: adapter IDs to accounts, shared accounts allowed, the old members key refused, nothing off Linux', () => {
+test('harnesses config: adapter IDs to accounts, shared accounts allowed, the old members key refused, Darwin requires its managed layout', () => {
   const ok = { accounts: { 'adapter-a': A, 'adapter-b': B, 'adapter-c': A } };
   assert.equal(validateHarnessesConfig(ok), ok);
   assert.doesNotThrow(() => validateConfig({ harnesses: { dir: '/run/x', ...ok } }));
@@ -75,7 +75,7 @@ test('harnesses config: adapter IDs to accounts, shared accounts allowed, the ol
   assert.throws(() => validateConfig({ members: { accounts: { [SOUL]: { m_lead: A } } } }), /unknown key members; .*harnesses: \{ dir\?, accounts: \{ <adapter_id>: <account> \} \}/);
   const l = layout();
   try {
-    assert.throws(() => planHarnessEndpoints(harnessesConfig(l.dir), { hqUid, platform: 'darwin', resolve: l.resolve, lstat: l.lstat }), /needs the Linux protected profile/);
+    assert.throws(() => planHarnessEndpoints(harnessesConfig(l.dir), { hqUid, platform: 'darwin', resolve: l.resolve, lstat: l.lstat }), /dedicated HQ account and explicit directory/);
   } finally { l.remove(); }
 });
 
@@ -326,6 +326,6 @@ test('HQ refuses to start on a layout that is not the provisioner\'s', async () 
     chmodSync(l.homes[B], 0o755);
     await assert.rejects(start(), /must be 0700/);
     chmodSync(l.homes[B], 0o700);
-    await assert.rejects(start({ platform: 'darwin' }), /needs the Linux protected profile/);
+    await assert.rejects(start({ platform: 'darwin' }), /dedicated HQ account and explicit directory/);
   } finally { l.remove(); }
 });
