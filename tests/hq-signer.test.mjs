@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createPublicKey, verify as cryptoVerify } from 'node:crypto';
 import { execFile, execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -230,6 +230,41 @@ test('the stopped HQ CLI cannot create or replace a device key', () => {
     assert.match(result.stderr, /administrator action in Machine\/keyd/);
     assert.equal(existsSync(join(home, 'signer')), false);
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test('standalone first use preserves existing enrollment or a helper key without a matching HQ pin', async (t) => {
+  for (const prior of ['identity/device.json', 'identity/device.previous.json', 'identity/pending-receipt.json', 'signer/device-key.pem', 'helper key']) {
+    await t.test(prior, () => {
+      const home = tempHome();
+      const chip = outside();
+      try {
+        if (prior === 'helper key') {
+          helper(chip).create({ replace: false });
+        } else {
+          mkdirSync(dirname(join(home, prior)), { recursive: true, mode: 0o700 });
+          writeFileSync(join(home, prior), 'preserved fixture state', { mode: 0o600 });
+        }
+        const run = helperRunner();
+        const backend = standaloneKeyBackend(() => {}, ([, op], input) => {
+          assert.equal(op, 'standalone-v1-status', 'prior custody permits inspection only');
+          return run([...helperCommand(chip), 'status'], input);
+        });
+        const signer = createSigner({ home, backend, enrollment });
+        const status = signer.report();
+        assert.equal(status.available, false);
+        assert.match(status.reason, /existing custody or enrollment requires administrator review/);
+        assert.throws(() => signer.enrollmentProof('https://example.invalid'), /requires administrator review/);
+        assert.equal(existsSync(join(home, 'signer/pin.json')), false);
+        if (prior !== 'helper key') {
+          assert.equal(readFileSync(join(home, prior), 'utf8'), 'preserved fixture state');
+          assert.equal(existsSync(chip), false);
+        }
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+        rmSync(dirname(chip), { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 test('configured standalone custody rechecks each signing operation and cannot reuse a cached enrollment key after retirement', async () => {
