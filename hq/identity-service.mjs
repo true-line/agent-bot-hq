@@ -208,19 +208,42 @@ export function createIdentityService({
     }
   }
 
+  async function reuseAccess(current, generation) {
+    await withCustodyCheck(() => current.recheck?.());
+    alive(generation);
+    freshAccess(current);
+    return current;
+  }
+
+  async function withCustodyCheck(operation) {
+    const previous = token;
+    try { return await operation(); }
+    catch (error) {
+      if (previous?.recheck && token === previous) token = undefined;
+      throw error;
+    }
+  }
+
   async function access() {
     check();
-    const state = await enrollment.deviceStatus();
-    if (state === 'revoked') { revoke(); fail('device_revoked', 'device revoked: re-enroll'); }
-    if (state !== 'enrolled') unavailable('HQ is not enrolled');
+    await withCustodyCheck(async () => {
+      let state;
+      try { state = await enrollment.deviceStatus(); }
+      catch (error) {
+        if (token?.recheck && !(error instanceof HostError)) unavailable('Machine enrollment could not be verified');
+        throw error;
+      }
+      if (state === 'revoked') { revoke(); fail('device_revoked', 'device revoked: re-enroll'); }
+      if (state !== 'enrolled') unavailable('HQ is not enrolled');
+    });
     if (token && token.expiresAt <= clock.now()) token = undefined;
-    if (token && token.expiresAt > clock.now() + 60_000) return token;
+    if (token && token.expiresAt > clock.now() + 60_000) return reuseAccess(token, epoch);
     if (refreshing) return refreshing;
     const generation = epoch;
     const pending = (async () => {
       const started = clock.now();
       if (!custody) unavailable('Machine has no authorized DPoP session');
-      const { session, ephemeralJwk, assertion } = await custody.openSession();
+      const { session, ephemeralJwk, assertion } = await withCustodyCheck(() => custody.openSession());
       let claims;
       try { claims = JSON.parse(Buffer.from(assertion.split('.')[1], 'base64url')); } catch { unavailable('HQ assertion is malformed'); }
       if (typeof claims.jti !== 'string' || claims.jti.length < 8) unavailable('HQ assertion has no request nonce');
@@ -233,10 +256,10 @@ export function createIdentityService({
       if (out.status >= 500) unavailable('access token service is temporarily unavailable', true);
       if (out.status !== 200 || result?.token_type !== 'DPoP' || typeof result.access_token !== 'string' || !result.access_token
         || !Number.isSafeInteger(result.expires_in) || result.expires_in <= 0 || result.expires_in > 900) unavailable('access token was refused or malformed');
-      const binding = await custody.bindAccess({ session, body: out.text, headers: out.headers });
+      const binding = await withCustodyCheck(() => custody.bindAccess({ session, body: out.text, headers: out.headers }));
       alive(generation);
       if (!Number.isSafeInteger(binding.expiresAt) || binding.expiresAt <= clock.now()) unavailable('administrator access session expired');
-      const candidate = { value: result.access_token, expiresAt: Math.min(started + result.expires_in * 1000, binding.expiresAt), session, publicJwk: ephemeralJwk, harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string') : [] };
+      const candidate = { recheck: binding.recheck, value: result.access_token, expiresAt: Math.min(started + result.expires_in * 1000, binding.expiresAt), session, publicJwk: ephemeralJwk, harnesses: Array.isArray(result.harnesses) ? result.harnesses.filter((h) => typeof h === 'string') : [] };
       // expires_in is measured conservatively from the request's start.
       // A slow but authenticated response must not cache an expired token.
       freshAccess(candidate);
@@ -245,7 +268,7 @@ export function createIdentityService({
     })().catch((e) => {
       // Share the fallback with every concurrent waiter, as well as the
       // refresh itself. Revocation and owner-policy refusals never use it.
-      if (e?.[TRANSIENT] && !closed && !revoked && token?.expiresAt > clock.now()) return token;
+      if (e?.[TRANSIENT] && !closed && !revoked && token?.expiresAt > clock.now()) return reuseAccess(token, generation);
       throw e;
     });
     refreshing = pending;

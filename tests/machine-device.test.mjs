@@ -195,6 +195,16 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.equal(existsSync(join(home, 'signer')), false);
   const lookup = () => active.hq.core.identity.call('GET', '/api/daemon/issuances/example-op');
   const enrolled = readFileSync(join(home, 'identity/device.json'));
+  const repeat = await offer();
+  assert.equal(repeat.host_refusal.code, 'host.invalid_request');
+  assert.equal(repeat.host_refusal.explanation, 'this HQ is already enrolled with its Machine-managed device key');
+  const forced = await active.owner.request('device.enroll', { harnesses: ['codex'], force: true });
+  assert.equal(forced.refusal.error, 'credential_unavailable');
+  assert.match(forced.refusal.explanation, /rotation requires administrator action in Machine/);
+  assert.equal(options.filter(name => name === 'enrollment-proof').length, 1);
+  assert.equal(service.state.grants.size, 1);
+  assert.deepEqual(readFileSync(join(home, 'identity/device.json')), enrolled);
+
   service.state.mode = 'assertion-expired';
   await assert.rejects(lookup(), { code: 'credential_unavailable' });
   const expiredJti = accessJti;
@@ -218,6 +228,18 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   accessResponse = undefined;
   assert.equal(service.state.requests.filter((r) => r.url.includes('/api/daemon/')).length, 0);
   await assert.rejects(active.hq.core.identity.call('POST', '/api/daemon/credentials', {}), /administrator-side credential use/);
+  // The device and its signed enrollment are unchanged, but this pair has a new epoch.
+  const requestsBeforeEpochChange = service.state.requests.length;
+  const operationsBeforeEpochChange = options.length;
+  const originalEpoch = identity.hq_epoch;
+  identity.hq_epoch = 'cd'.repeat(32);
+  await assert.rejects(lookup(), { code: 'credential_unavailable', message: /no longer matches the current pairing/ });
+  assert.deepEqual(options.slice(operationsBeforeEpochChange), ['identity']);
+  assert.equal(service.state.requests.length, requestsBeforeEpochChange);
+  assert.equal(active.hq.core.identity.status().tokenCached, false);
+  identity.hq_epoch = originalEpoch;
+  await assert.rejects(lookup(), /no authorized DPoP action/);
+  assert.equal(active.hq.core.identity.status().tokenCached, true);
   const deviceRecord = readFileSync(join(home, 'identity/device.json'));
   const enrollmentState = async () => (await active.owner.request('device.status')).result.device;
   for (const refusal of ['MM_DAEMON_UNKNOWN_KEY', 'MM_DAEMON_PEER_REFUSED', 'MM_DAEMON_CALLER_REFUSED', 'offline']) {
@@ -238,6 +260,12 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
     await assert.rejects(pending, /custody changed/);
     const status = (await active.owner.request('status')).result;
     assert.equal(status.hq.signer.available, false, refusal);
+    if (refusal === 'MM_DAEMON_UNKNOWN_KEY') {
+      const beforeLookup = service.state.requests.length;
+      await assert.rejects(lookup(), { code: 'credential_unavailable' });
+      assert.equal(active.hq.core.identity.status().tokenCached, false);
+      assert.equal(service.state.requests.length, beforeLookup);
+    }
     assert.equal(await enrollmentState(), 'enrolled');
     assert.deepEqual(readFileSync(join(home, 'identity/device.json')), deviceRecord);
     refuseAssertion = undefined;

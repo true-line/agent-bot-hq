@@ -17,7 +17,7 @@ const decode = (jwt) => jwt.split('.').slice(0, 2).map((x) => JSON.parse(Buffer.
 const digest = (s) => createHash('sha256').update(s).digest('base64url');
 const code = (want) => (e) => e.code === want;
 
-function fixture({ server = SERVER, device = generateKeyPairSync('ec', { namedCurve: 'P-256' }) } = {}) {
+function fixture({ server = SERVER, device = generateKeyPairSync('ec', { namedCurve: 'P-256' }), recheck } = {}) {
   const clock = testClock(Date.UTC(2026, 10, 13));
   const responseKey = generateKeyPairSync('ed25519');
   const keySet = [{ kid: 'release-key-1', x: responseKey.publicKey.export({ format: 'jwk' }).x, notBefore: before, notAfter: after, status: 'active' }];
@@ -82,13 +82,17 @@ function fixture({ server = SERVER, device = generateKeyPairSync('ec', { namedCu
     const sessions = new Map();
     const custody = {
       openSession() {
+        if (state.custodyError) throw state.custodyError;
         const id = String(sessions.size + 1);
         const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
         const ephemeralJwk = publicKey.export({ format: 'jwk' });
         sessions.set(id, { privateKey, ephemeralJwk });
         return { session: id, ephemeralJwk, assertion: (over.enrollment ?? enrollment).assertion({ ephemeralJwk }) };
       },
-      bindAccess({ session }) { assert.ok(sessions.has(session)); return { expiresAt: clock.now() + 900_000 }; },
+      bindAccess({ session }) {
+        assert.ok(sessions.has(session));
+        return { expiresAt: clock.now() + 900_000, recheck };
+      },
       requestProof({ session, method, path, ath, jti }) {
         const { privateKey, ephemeralJwk } = sessions.get(session);
         const header = { alg: 'ES256', typ: 'dpop+jwt', jwk: ephemeralJwk };
@@ -223,6 +227,35 @@ test('a valid token survives an early refresh outage, but never its expiry or an
   assert.equal(g.state.revocations, 0);
   assert.equal(g.state.apiCalls, 1);
   refused.close();
+});
+
+test('a custody refusal while refreshing evicts the old paired token before issuer exchange', async () => {
+  const f = fixture({ recheck() { assert.fail('a refused renewal must not fall back to cached access'); } });
+  const client = f.make();
+  try {
+    await client.call('GET', '/api/daemon/whoami');
+    f.clock.advance(841_000);
+    f.state.custodyError = Object.assign(new Error('Machine refused this session'), { code: 'credential_unavailable' });
+    await assert.rejects(client.call('GET', '/api/daemon/whoami'), error => error === f.state.custodyError);
+    assert.equal(client.status().tokenCached, false);
+    assert.equal(f.state.tokens, 1);
+    assert.equal(f.state.apiCalls, 1);
+  } finally { client.close(); }
+});
+
+test('a transient refresh failure rechecks custody before returning the still-valid token', async () => {
+  const cutoff = Object.assign(new Error('Machine refused this session'), { code: 'credential_unavailable' });
+  const f = fixture({ recheck() { throw cutoff; } });
+  const client = f.make();
+  try {
+    await client.call('GET', '/api/daemon/whoami');
+    assert.equal(client.status().tokenCached, true);
+    f.clock.advance(841_000);
+    f.state.mode = 'token-outage';
+    await assert.rejects(client.call('GET', '/api/daemon/whoami'), error => error === cutoff);
+    assert.equal(client.status().tokenCached, false);
+    assert.equal(f.state.apiCalls, 1);
+  } finally { client.close(); }
 });
 
 test('a caller cannot redirect a proof or choose a harness outside enrollment', async () => {

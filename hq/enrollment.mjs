@@ -261,7 +261,10 @@ export function createEnrollment({
       if (pending) return completeBinding(pending, k);
     }
     const state = stateOf(rec, k.thumbprint);
-    if (state === 'enrolled' && payload.force !== true) fail('host.invalid_request', 'this HQ is already enrolled; pass force to re-enroll with a fresh key');
+    if (state === 'enrolled' && payload.force !== true) {
+      if (k.backend === 'machine') fail('host.invalid_request', 'this HQ is already enrolled with its Machine-managed device key');
+      fail('host.invalid_request', 'this HQ is already enrolled; pass force to re-enroll with a fresh key');
+    }
     // A key that has been enrolled, here or for a revoked record, is never enrolled again.
     if (rec && rec.jkt === k.thumbprint) {
       signer.createKey({ replace: true });

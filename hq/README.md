@@ -85,6 +85,10 @@ others can write it, and refuses unknown keys:
 
 `node hq/main.mjs enroll --harness NAME` starts the grant and displays the code to approve. The enrollment server must match the administrator-configured origin. The service must support the signed enrollment receipt. Legacy local enrollment records cannot authorize the Machine-held identity.
 
+A routine Machine restart preserves enrollment. Use `node hq/main.mjs status --json` to check which signer HQ can reach before retrying an operation.
+
+If an HQ is compromised, the Homebrew administrator can run `managed-machine daemon revoke-hq` to stop new local signing for that pairing. The deny record persists across restart. To withdraw the enrolled device's service access as well, the owner can revoke that device on the Identity service's [Devices page](https://agents.true-line.ai/devices). The service rejects subsequent device requests and retries upstream revocation for tracked GitHub installation tokens. Legacy installation tokens expire within one hour. Issuer details are in the [Identity API guide](https://github.com/true-line/agent-bot/blob/e001bf270d2cd45cd0c1919e5f4caae40e22fe66/docs/api.md).
+
 `notices` opts the agent-comms broker plugin into explicit identity-service
 queues, for example `{ "harnesses": ["example-codex-agent"] }`. HQ validates
 the queue list, count, poll/lease intervals, storage caps, retention and wake

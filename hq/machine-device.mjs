@@ -229,13 +229,22 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
         if (!current?.device_id) unavailable('Machine access session is unavailable');
         const receipt = { receipt_body: Buffer.from(body).toString('base64url'), receipt_jti: headers['agent-bot-request-jti'],
           receipt_kid: headers['agent-bot-key-id'], receipt_signature: headers['agent-bot-signature'] };
-        const epoch = current.epoch;
-        const response = await requestPurpose('bind-access', { hq_epoch: epoch, ...receipt });
+        const bound = current;
+        const response = await requestPurpose('bind-access', { hq_epoch: bound.epoch, ...receipt });
         const b = response.body;
         if (response.state !== 'access-bound' || !only(b, ['session', 'expires_at', 'hq_epoch'])
-          || b.session !== session || b.hq_epoch !== epoch || !Number.isSafeInteger(b.expires_at)
+          || b.session !== session || b.hq_epoch !== bound.epoch || !Number.isSafeInteger(b.expires_at)
           || b.expires_at <= clock.now() / 1000 || b.expires_at > clock.now() / 1000 + 900) throw new Error('invalid Machine DPoP session binding');
-        return { expiresAt: b.expires_at * 1000 };
+        return {
+          expiresAt: b.expires_at * 1000,
+          async recheck() {
+            await refresh();
+            if (current?.epoch !== bound.epoch || current.generation !== bound.generation || current.thumbprint !== bound.thumbprint
+              || current.device_id !== bound.device_id || current.receipt_jti !== bound.receipt_jti || current.receipt_sha256 !== bound.receipt_sha256) {
+              unavailable('Machine access session no longer matches the current pairing or enrollment');
+            }
+          },
+        };
       },
       requestProof() { unavailable('Machine has no authorized DPoP action for this operation'); },
     },
