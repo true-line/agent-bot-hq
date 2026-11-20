@@ -210,6 +210,27 @@ the paired role.
 node hq/main.mjs machine hq-service-upgrade cancel --challenge-file "$challenge_file" --socket "$socket"
 ```
 
+### Review dedicated macOS harness accounts
+
+From the paired dedicated HQ account, export the administrator’s saved account
+plan for the existing owner reviewer.
+
+```sh
+node hq/main.mjs machine harness-account-provision export "$plan_id" --socket "$socket" > "$challenge_file"
+```
+
+Use the independently pinned Machine fingerprint to review the unchanged HQ
+account, each named harness account and its numeric UID and GID, and any broker
+directories. After the owner signs, return the proof from the same paired HQ
+account. Machine applies the approved plan separately.
+
+```sh
+node hq/main.mjs machine harness-account-provision approve --challenge-file "$challenge_file" --proof-file "$proof_file" --socket "$socket"
+```
+
+To discard the request, use `cancel --challenge-file "$challenge_file" --socket "$socket"`
+in place of `approve` and its arguments. A replacement challenge requires a fresh proof.
+
 ### Review a dedicated macOS harness launch policy
 
 Use the paired dedicated HQ account and the Machine pin saved during verified
