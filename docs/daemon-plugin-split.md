@@ -1308,9 +1308,14 @@ These are this repository's decisions, and the platform's [decision log](https:/
   - **Host custody and owner consent.** Homebrew installs Machine's
     signed, notarized CLI and keyd. Keyd runs under the prefix administrator,
     signs device operations and runs independently of GeniusBar.
-    The owner's session requests fresh consent for the exact
-    Machine challenge. The owner rejected a separate macOS owner-presence
-    app. An approved unbundled provider for that proof is still missing.
+    The owner's session requests fresh consent for the exact Machine
+    challenge. An internal test or private pilot can use an owner-presence
+    app. A customer release can include the app only if all apps ship
+    together as one Product. Identity's signed command-line helper covers
+    first enrollment on a fresh Mac. Customer qualification requires a
+    proof from the package customers receive, verified by Machine against
+    the independently pinned owner key.
+    [Owner packaging decision](https://github.com/true-line/agent-bot-platform/discussions/89#discussioncomment-19774904)
     The admin device key signs without an owner prompt, and keyd's
     general `owner/presence` assertion uses a different key and signed
     message.
