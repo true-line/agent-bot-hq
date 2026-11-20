@@ -23,7 +23,7 @@
 // files are refused, so the tree that was digested is the tree that runs.
 import { createHash } from 'node:crypto';
 import { lstatSync, readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { canonicalDigest, canonicalize } from '../sdk/wire/canonical-json.mjs';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
@@ -61,6 +61,25 @@ export function readPins(path) {
   }
   if (new Set(pins.plugins.map((p) => p.name)).size !== pins.plugins.length) throw new Error(`${path}: a plugin is pinned twice`);
   return pins;
+}
+
+// The Darwin archive builder renames its CLI implementation to interim-core.mjs.
+// Resolve everything against that installed module, never the caller's home or cwd.
+export function productionPluginsDir({ plugins, devPlugins }, entry, pins, platform = process.platform) {
+  if (plugins || devPlugins) return plugins;
+  if (platform !== 'darwin' || basename(entry) !== 'interim-core.mjs') return undefined;
+  const root = dirname(dirname(entry));
+  const release = parseStrict(readFileSync(join(root, 'governance/interim-release.json'), 'utf8'));
+  if (release.schema_version !== 1 || release.target_platform !== 'darwin') throw new Error('expected Darwin HQ release metadata');
+  const pin = pins.plugins.find((item) => item.name === 'agent-comms');
+  if (!pin && !Object.hasOwn(release, 'broker')) return undefined; // earlier interim archives
+  const broker = release.broker;
+  if (!pin || broker?.name !== pin.name || broker.version !== pin.version || broker.sha256 !== pin.sha256) {
+    throw new Error('bundled broker metadata must match the release plugin pin');
+  }
+  const dir = join(root, 'vendor/plugins');
+  if (!lstatSync(join(dir, pin.name)).isDirectory()) throw new Error('bundled agent-comms directory is missing or invalid');
+  return dir;
 }
 
 const sameJson = (a, b) => canonicalize(a) === canonicalize(b);

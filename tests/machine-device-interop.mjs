@@ -3,13 +3,14 @@
 // into a fresh test provider, just as a release embeds its trusted issuer.
 import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { createECDH, randomBytes } from 'node:crypto';
-import { existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createECDH, createHash, randomBytes } from 'node:crypto';
+import { copyFileSync, cpSync, existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { userInfo } from 'node:os';
 import { setTimeout } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { treeDigest } from '../hq/plugins.mjs';
 import { createEnrollment } from '../hq/enrollment.mjs';
 import { createHQ } from '../hq/hq.mjs';
 import { createIdentityService } from '../hq/identity-service.mjs';
@@ -52,12 +53,15 @@ const keydBinary = join(dir, 'keyd-fixture');
 const env = { PATH: '/usr/bin:/bin', HOME: join(dir, 'home'), KEYD_FIXTURE_STATE: dir };
 let machine, exit, hq, server, daemon, daemonExit;
 const packageHome = join(dir, 'packaged-hq');
-function packageCommand(...args) {
-  return exec(process.execPath, [packagedCLI, ...args, '--home', packageHome], { env, timeout: 15_000, encoding: 'utf8' });
+function runCLI(entry, state, args) {
+  return exec(process.execPath, [entry, ...args, '--home', state], { env, timeout: 15_000, encoding: 'utf8' });
 }
-async function startPackage() {
+function packageCommand(...args) {
+  return runCLI(packagedCLI, packageHome, args);
+}
+async function startPackage(entry = packagedCLI, state = packageHome) {
   const preload = fileURLToPath(new URL('./fixtures/paired-process-ports.mjs', import.meta.url));
-  daemon = spawn(process.execPath, [...(hosted ? [] : ['--experimental-test-module-mocks']), '--import', preload, packagedCLI, 'run', '--home', packageHome], {
+  daemon = spawn(process.execPath, [...(hosted ? [] : ['--experimental-test-module-mocks']), '--import', preload, entry, 'run', '--home', state], {
     env: { ...env, HQ_TEST_ISSUER: server.url, ...(hosted && { HQ_TEST_REGISTERED_LAYOUT: '1' }) }, stdio: ['ignore', 'ignore', 'pipe'],
   });
   let diagnostics = '';
@@ -66,11 +70,11 @@ async function startPackage() {
     daemon.once('error', reject);
     daemon.once('close', resolve);
   });
-  await Promise.race([until(() => existsSync(join(packageHome, 'control.sock')), 'packaged HQ did not serve'),
+  await Promise.race([until(() => existsSync(join(state, 'control.sock')), 'packaged HQ did not serve'),
     daemonExit.then(() => { throw new Error('packaged HQ exited before serving: ' + diagnostics); })]);
-  const status = JSON.parse((await packageCommand('status', '--json')).stdout);
+  const status = JSON.parse((await runCLI(entry, state, ['status', '--json'])).stdout);
   assert.equal(status.hq.signer.backend, 'machine');
-  return status.hq.signer;
+  return status;
 }
 async function stopPackage() {
   if (!daemon) return;
@@ -148,7 +152,7 @@ async function stopMachine() {
 }
 
 function cli(...args) {
-  return exec(process.execPath, [cliPath, ...args, '--home', home], { env, timeout: 15_000, encoding: 'utf8' });
+  return runCLI(cliPath, home, args);
 }
 async function cliStatus() {
   return JSON.parse((await cli('status', '--json')).stdout);
@@ -191,7 +195,7 @@ try {
   if (packagedCLI) {
     mkdirSync(packageHome, { mode: 0o700 });
     const before = await startPackage();
-    assert.equal(before.available, true);
+    assert.equal(before.hq.signer.available, true);
     const first = await signedPackageGrant();
     await stopMachine();
     await refusedPackageGrant(/could not connect to the paired Machine.*check that Machine is running/);
@@ -202,18 +206,24 @@ try {
   }
 
   const calls = [];
-  async function startHQ() {
+  async function startHQ({ fetchHQ = fetchImpl, loseBindReply = false } = {}) {
     const signer = createMachineSigner({
       home, keysFor: () => [server.key],
-      request: (operation, fields) => {
+      request: async (operation, fields) => {
         calls.push(operation);
-        return request(['hq-device', operation, '--socket', socket], fields);
+        const reply = await request(['hq-device', operation, '--socket', socket], fields);
+        if (loseBindReply && operation === 'bind-enrollment') {
+          assert.equal(reply.state, 'bound');
+          loseBindReply = false;
+          throw new Error('fixture lost the committed bind reply');
+        }
+        return reply;
       },
       enrollment: (device) => createEnrollment({
-        home, signer: device, server: origin, fetchImpl, sleep: () => setTimeout(10),
+        home, signer: device, server: origin, fetchImpl: fetchHQ, sleep: () => setTimeout(10),
       }),
     });
-    const identity = createIdentityService({ server: origin, keySet: [server.key], fetchImpl,
+    const identity = createIdentityService({ server: origin, keySet: [server.key], fetchImpl: fetchHQ,
       enrollment: signer.enrollment, custody: signer.custody });
     hq = createHQ({ home, schemas, signer, identity, legacy: legacyDaemon({ run: fakeLegacy().run }) });
     return hq.start();
@@ -278,14 +288,87 @@ try {
     assert.equal(existsSync(join(home, 'signer/device-key.pem')), false);
   }
 
-  assert.equal((await startHQ()).mode, 'safe');
-  assert.equal((await cliStatus()).mode, 'safe');
-  const grants = server.state.grants.size;
-  const enrolled = cli('enroll', '--harness', 'codex');
-  await until(() => server.state.grants.size === grants + 1, 'enrollment did not reach the test issuer');
-  server.decide('approved');
-  assert.match((await enrolled).stdout, /Enrolled as device/);
-  await hq.stop();
+  async function approveEnrollment(entry) {
+    const grants = server.state.grants.size;
+    const enrolled = runCLI(entry, home, ['enroll', '--harness', 'codex']);
+    await Promise.race([until(() => server.state.grants.size === grants + 1, 'enrollment did not reach the test issuer'), enrolled]);
+    server.decide('approved');
+    return enrolled;
+  }
+
+  if (packagedCLI) {
+    await stopPackage();
+    const original = dirname(dirname(packagedCLI));
+    const copy = join(dir, 'qa-package');
+    cpSync(original, copy, { recursive: true });
+    const issuerPin = 'governance/server-keys.json';
+    const originalDigest = treeDigest(original);
+    assert.equal(treeDigest(copy), originalDigest);
+    copyFileSync(manifest, join(copy, issuerPin));
+    const entry = join(copy, 'hq/main.mjs');
+    const pin = JSON.parse(readFileSync(new URL('../governance/darwin-broker.json', import.meta.url)));
+    function checkBroker(status, enrolled) {
+      assert.equal(status.mode, enrolled ? 'running' : 'safe');
+      assert.equal(status.identity.device, enrolled ? 'enrolled' : 'unenrolled');
+      assert.equal(status.profile, 'managed-cooperative');
+      assert.equal(status.hq.signer.available, true);
+      assert.ok(!status.hq.devPlugins);
+      const loaded = status.hq.pluginLoad.filter(p => p.name === pin.name);
+      assert.equal(loaded.length, 1);
+      assert.equal(loaded[0].state, 'loaded');
+      assert.equal(loaded[0].digest, pin.sha256);
+      assert.ok(!loaded[0].dev);
+      const plugin = status.plugins.find(p => p.name === pin.name);
+      assert.equal(plugin.version, pin.version);
+      assert.equal(plugin.state, enrolled ? 'running' : 'waiting');
+    }
+    checkBroker(await startPackage(entry, home), false);
+    assert.match((await approveEnrollment(entry)).stdout, /Enrolled as device/);
+    await stopPackage();
+    checkBroker(await startPackage(entry, home), true);
+    await stopPackage();
+    copyFileSync(join(original, issuerPin), join(copy, issuerPin));
+    assert.equal(treeDigest(copy), originalDigest);
+    assert.equal(treeDigest(original), originalDigest);
+    console.log('Packaged HQ enrolled through Machine and loaded the pinned production broker on restart.');
+    await startPackage();
+  } else {
+    assert.equal((await startHQ({ loseBindReply: true })).mode, 'safe');
+    assert.equal((await cliStatus()).mode, 'safe');
+    await assert.rejects(approveEnrollment(cliPath), e => e.code === 1 && /Enrollment failed/.test(e.stderr));
+
+    // Keyd has already committed the original receipt. HQ has only its pending copy.
+    const pending = join(home, 'identity', 'pending-receipt.json');
+    const device = join(home, 'identity', 'device.json');
+    const { receipt } = JSON.parse(readFileSync(pending));
+    const { body: bound } = await request(['hq-device', 'identity', '--socket', socket]);
+    assert.equal(bound.receipt_jti, receipt.receipt_jti);
+    assert.equal(bound.receipt_sha256, createHash('sha256').update(Buffer.from(receipt.receipt_body, 'base64url')).digest('hex'));
+    assert.ok(bound.device_id);
+    assert.equal(existsSync(device), false);
+    await hq.stop();
+    await stopMachine();
+    await startMachine();
+
+    // A new HQ must finish on the same pairing, with no discovery, new grant or poll.
+    const issuerRequests = server.state.requests.length;
+    let offlineRequests = 0;
+    await startHQ({ fetchHQ() { offlineRequests++; throw new Error('fixture issuer offline'); } });
+    const sinceRestart = calls.length;
+    const resumed = JSON.parse((await cli('enroll', '--harness', 'codex')).stdout);
+    assert.equal(resumed.state, 'approved');
+    assert.equal(resumed.device_id, bound.device_id);
+    assert.deepEqual(calls.slice(sinceRestart).filter(op => op !== 'identity'), ['bind-enrollment']);
+    const local = JSON.parse(readFileSync(device));
+    assert.ok(local.receipt_body === receipt.receipt_body, 'retry persisted a different receipt');
+    assert.equal(local.receipt_jti, bound.receipt_jti);
+    assert.equal(local.device_id, bound.device_id);
+    assert.equal(existsSync(pending), false);
+    assert.equal(offlineRequests, 0);
+    assert.equal(server.state.requests.length, issuerRequests);
+    await hq.stop();
+    console.log('HQ recovered the committed enrollment receipt after both restarts without contacting the issuer.');
+  }
   assert.equal((await startHQ()).mode, 'running');
   assert.equal((await cliStatus()).mode, 'running');
   const firstSession = await bindFreshSession();
@@ -314,7 +397,7 @@ try {
   if (packagedCLI) {
     await refusedPackageGrant(/Machine refused this HQ account.*MM_DAEMON_PEER_REFUSED.*check its pairing/);
     await stopPackage();
-    assert.equal((await startPackage()).available, false);
+    assert.equal((await startPackage()).hq.signer.available, false);
     await refusedPackageGrant(/Machine refused this HQ account.*MM_DAEMON_PEER_REFUSED.*check its pairing/);
     console.log('Packaged HQ accepted fresh Machine signatures across restart and refused enrollment during outage and after revocation, including after HQ restart.');
   }

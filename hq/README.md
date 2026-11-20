@@ -20,7 +20,7 @@ node hq/main.mjs souls    # admitted Souls and their runtimes
 | Durable store: the SDK's tables, blobs and receipts, written atomically to `store.json` (0600) in a 0700 directory. It refuses a wider directory and never overwrites a store it cannot read. | `store.mjs` | §3.2, §4.3 |
 | Control socket (owner), admission socket (entry points) and member broker socket. The auth class is the socket, never a client field. Strict NDJSON. Registry refusals are common/v1 error responses; host refusals go in a separate `host_refusal` field. | `socket.mjs` | §7.1, §7.2 |
 | Member broker socket ([§9 row 13b](../docs/daemon-plugin-split.md#49-the-member-broker-socket-stage-1)): `broker.sock`, whose frames go to the one plugin serving the broker (`ctx.broker.serve`). It binds a connection with `bind { runtime_id, channel_binding }` through hq-admission's `verifyBinding` and delivers later frames with `ctx.broker.deliver`; consumers authorize by the bound runtime. agent-comms ships the broker plugin; HQ alone refuses every frame with `host.no_broker`. | `hq.mjs`, `socket.mjs` | §4.9 |
-| Harness accounts ([§9 row 16a](../docs/daemon-plugin-split.md#stage-2a-member-isolation-wp2), Linux; D7 as amended by platform PDR-0053): with `harnesses` in the config, each harness account gets its own broker endpoint, `<dir>/<account>/broker.sock`, mode 0660 in a 2750 directory of that account's private group, so the file system tells HQ which account is calling. Accounts are keyed by adapter ID and shared by the agents of every Soul on that harness; several adapters may name one account, which then has one endpoint. A runtime is bound at admission to the account of its role's adapter, and that is kept in the store. It then binds only from that account's endpoint and only with a keyed proof: `bind.challenge { runtime_id }` returns a nonce, and `bind { runtime_id, proof }` answers with HMAC-SHA-256 over it, keyed with the channel binding, which is never sent. Anything else is `caller_mismatch`. The endpoint proves the account, the harness credential; two agents in one account are told apart only by the proof, and are one trust domain to the host. A role whose adapter has no account stays on the shared socket. HQ verifies the directory layout and refuses to start on any other; the provisioner makes it. | `harness-accounts.mjs`, `admission.mjs`, `hq.mjs` | §9 row 16a |
+| Harness accounts ([§9 row 16a](../docs/daemon-plugin-split.md#stage-2a-member-isolation-wp2), Linux and macOS; D7 as amended by platform PDR-0053): with `harnesses` in the config, each harness account gets its own broker endpoint, `<dir>/<account>/broker.sock`, mode 0660 in a 2750 directory of that account's private group, so the file system tells HQ which account is calling. Accounts are keyed by adapter ID and shared by the agents of every Soul on that harness; several adapters may name one account, which then has one endpoint. A runtime is bound at admission to the account of its role's adapter, and that is kept in the store. It then binds only from that account's endpoint and only with a keyed proof: `bind.challenge { runtime_id }` returns a nonce, and `bind { runtime_id, proof }` answers with HMAC-SHA-256 over it, keyed with the channel binding, which is never sent. Anything else is `caller_mismatch`. The endpoint proves the account, the harness credential; two agents in one account are told apart only by the proof, and are one trust domain to the host. A role whose adapter has no account stays on the shared socket. HQ verifies the directory layout and refuses to start on any other; the provisioner makes it. | `harness-accounts.mjs`, `admission.mjs`, `hq.mjs` | §9 row 16a |
 | Agent launch ([§9 row 16b](../docs/daemon-plugin-split.md#stage-2a-member-isolation-wp2), Linux): HQ starts an agent in its harness account, as its parent, through the sudoers rule agent-bot-machine installs, in one fixed form: `sudo -n -H -u <account> -- /bin/sh -c '<shell>' sh <soul_id> <member_id> <command>`, where the fixed shell creates `$HOME/.agent-bot-hq/souls/<soul_id>/<member_id>/` at 0700 as that account and starts the command there; the IDs and the command are arguments, never part of the script. The child gets only the four `AGENT_BOT_SOULS_*` variables a request may set, `AGENT_BOT_SOULS_BROKER` set by HQ to the account's own endpoint, and a fixed `PATH`. On the admission socket, the connection that owns the runtime sends `launch { runtime_id, command, env }` and gets a launch ID and a one-time token (30 seconds); `launch.attach { launch_id, attach }`, the first and only request on a new connection, starts the agent and makes that connection its stdin and stdout. One launch runs per Soul and agent. sudo runs detached. Before the agent starts, the fixed shell reads its own process group from `/proc/self/stat` and prints `agent-bot-hq-launch pgid <n>` on stderr; HQ takes the first such line as the launch's group and does not log it (no marker within five seconds of a stop: sudo's pid). `launch.stop { launch_id }`, a closed connection and HQ's own stop close the agent's stdin and send `kill -TERM -<pgid>`, then `kill -KILL -<pgid>` after a grace period, as the account; an agent that exits on its own gets the KILL to its group. Nothing else is signalled: a process that leaves its group (setsid, or a group of its own) is not stopped by HQ and keeps running in the harness account, whose agents are one trust domain; containing it needs a cgroup and so root. A failed signal, or sudo still running after the KILL, leaves the launch `uncontained`: its slot is held until HQ restarts and its receipt says `contained: false`. Account homes are verified at start (a directory owned by the account, mode exactly 0700); a bad one refuses the start. HQ asks sudo once per account whether the rule covers it; without it HQ serves row 16a and refuses launch for that account. `status` lists launches and each account's readiness, never commands or environments; receipts `hq.launch`, `hq.launch.refused` and `hq.launch.exited` carry a digest of the command, never the environment or the token. Agent stderr goes to HQ's log, clipped and rate limited, with the agent's token replaced by `[redacted]` first. If sudo cannot be run at all (missing or not executable), nothing starts: the exit receipt says `reason: 'spawn-failed'` with the error code in `spawn_error`, the slot is freed, and launch in that account is unavailable until HQ restarts. Any other spawn error (the process limit, for example) gives the same receipt and fails that launch only. | `launch.mjs`, `harness-accounts.mjs`, `socket.mjs`, `hq.mjs` | §9 row 16b |
 | Owner sessions: one per control connection, recorded in the store and closed on disconnect or at the next start. | `hq.mjs` | §7.2 |
 | Profile reporting: the profile in force, with the reasons a stronger one is not. Never `managed-protected` before §9 PR 16. | `profile.mjs` | §3.3, R8 |
@@ -43,6 +43,21 @@ The transport never learns trust from the network. Each public key has one
 or `retired`). A pre-published next key is usable only inside its interval;
 retired, unknown and out-of-window keys refuse. Deploying rotation requires
 the reviewed release pin first.
+
+## macOS harness launch readiness
+
+For each configured account, HQ checks the Machine installation plan digest,
+the recorded launcher and sandbox, the admitted adapter and UID, and sudo's
+noninteractive permission for the exact supervisor command. Status lists the
+installed adapters separately from those available for launch. Launch also
+requires independently verified Darwin package qualification for that exact
+adapter. The production verifier has no qualified adapters yet.
+
+A qualified launch hands the supervisor a private stdin header followed by
+ACP. Closing stdin requests shutdown of that launch's process group. HQ holds
+the slot as uncontained unless the supervisor confirms group closure or an
+explicit refusal before spawn. Per-launch member authentication and retirement
+remain under Souls and Machine respectively.
 
 ## Linux owner control under the dedicated account
 
@@ -111,7 +126,16 @@ The HQ state directory includes `control.sock`, `admission.sock` and `broker.soc
 
 If the upgrade pauses, preserve the existing pairing, owner pin, signer and enrollment records. Check the device’s enrollment history with the identity-service administrator before authorizing a custody change. A signed status from the paired Machine verifies its channel. Replacing an established device identity requires a separately approved transition.
 
-`harnesses` (Linux only) gives each harness its OS account, one per harness
+The paired integration test also drops Machine’s successful binding reply and restarts both HQ and Machine. The owner CLI must finish enrollment from the original pending receipt without contacting the issuer. To run this case offline on macOS, use the command above from the extracted Darwin archive with `HQ_INTERIM_OFFLINE=1` and cached Machine Cargo dependencies.
+
+On macOS the dedicated HQ account requires an explicit `harnesses.dir` of
+`/Library/Application Support/ai.true-line.agent-bot-hq/ipc`. Machine provisions
+this directory and one private group directory per configured harness. HQ
+checks the connected peer UID with `getpeereid` before opening its broker
+session. The keyed bind still authenticates the admitted runtime. macOS
+harness process launch and protected-profile qualification remain pending.
+
+On Linux, `harnesses` gives each harness its OS account, one per harness
 credential ([platform PDR-0053](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0053-soul-life-and-agent-replace-member.md)):
 `{ "dir": "/run/agent-bot-hq/members", "accounts": { "<adapter ID>": "<account>" } }`.
 The default directory's name predates PDR-0053. The 16a key `members` is
@@ -120,6 +144,17 @@ account's home, outside this directory, and an agent HQ starts there can
 read nothing in this directory, connect to none of its sockets, and run none
 of HQ's tooling against it (T02, run in CI on two throwaway accounts).
 Launches are in memory only: after a restart nothing runs under HQ.
+
+The Darwin interim archive includes the production agent-comms broker under
+`vendor/plugins/agent-comms`. Its source commit and plugin digest are pinned
+in `governance/darwin-broker.json` and recorded in the built archive’s
+`governance/interim-release.json`. After the first source fetch, the builder
+can use its local Comms Git cache offline. To run the CI archive wrapper
+without network, also set `HQ_CONTRACTS_DIR` to an already verified contracts
+tree. To build from an existing Comms checkout or
+bare repository, set `HQ_COMMS_REPO` to its absolute path. The builder checks
+out the pinned commit into a fresh directory and verifies the packaged bytes
+before adding the broker to the archive’s `governance/plugins.json`.
 
 ## Interim account: D4's stated risk
 

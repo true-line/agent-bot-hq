@@ -48,7 +48,7 @@ import { createMachineSigner } from './machine-device.mjs';
 import { createEnrollment, DEFAULT_IDENTITY_SERVICE, validateEnrollmentConfig } from './enrollment.mjs';
 import { createLauncher, LAUNCH_OPERATIONS } from './launch.mjs';
 import { loadPlugins } from './plugins.mjs';
-import { OWNER_CONTROL_PATH, OWNER_PEER_CHECK } from './owner-control.mjs';
+import { authenticatePeerUid, checkOwnerControlSupport, OWNER_CONTROL_PATH, OWNER_PEER_CHECK } from './owner-control.mjs';
 import { checkSocketPath, listenSocket } from './socket.mjs';
 import { checkHarnessSocket, planHarnessEndpoints, validateHarnessesConfig } from './harness-accounts.mjs';
 import { coreTable, CORE_PLUGIN, ensurePrivateDir, openStore } from './store.mjs';
@@ -239,8 +239,9 @@ export function createHQ({
     legacyRunner ??= legacyDaemon({ supervise: cfg.legacy?.supervise === true, clock });
 
     harnessPlan = cfg.harnesses
-      ? planHarnessEndpoints(cfg.harnesses, { hqUid: uid, platform, ...(accounts ? { resolve: accounts } : {}), ...(harnessLstat ? { lstat: harnessLstat } : {}) })
+      ? planHarnessEndpoints(cfg.harnesses, { hqUid: uid, hqAccount: account, platform, ...(accounts ? { resolve: accounts } : {}), ...(harnessLstat ? { lstat: harnessLstat } : {}) })
       : { endpoints: [], accountOf: () => undefined };
+    if (platform === 'darwin' && harnessPlan.endpoints.length) checkOwnerControlSupport();
     if (platform !== 'win32') for (const p of [paths.control, paths.admission, paths.broker, ...harnessPlan.endpoints.map((e) => e.path)]) checkSocketPath(p, platform);
     store = openStore(home, { uid });
     core = createCore({
@@ -384,6 +385,7 @@ export function createHQ({
       for (const endpoint of harnessPlan.endpoints) {
         sockets.push(await listenSocket({
           path: endpoint.path, auth: 'member', core, mode: 0o660,
+          authenticatePeer: platform === 'darwin' ? (socket) => authenticatePeerUid(socket, endpoint.uid) : undefined,
           dispatch: (kind, { payload, session }) => host.brokerAccept(kind, payload, { connection: session }),
           newSession: () => {
             const connection = `bc_${random.hex(12)}`;
@@ -392,7 +394,7 @@ export function createHQ({
           },
           endSession: (connection) => { brokerCallers.delete(connection); host.brokerClosed(connection); },
         }));
-        checkHarnessSocket(endpoint);
+        checkHarnessSocket(endpoint, { darwinHqUid: platform === 'darwin' ? uid : undefined });
       }
     } catch (e) {
       for (const s of sockets) await s.close();

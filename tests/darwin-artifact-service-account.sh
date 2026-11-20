@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 # Create a temporary role account only on a fresh hosted macOS test VM.
+if (( EUID == 0 )); then
+  echo "requires an ordinary user on a disposable GitHub-hosted macOS runner" >&2
+  exit 1
+fi
 set -euo pipefail
 source "$(dirname "$0")/fixtures/darwin-hosted.sh"
 require_hosted_darwin || exit 1
@@ -53,3 +57,4 @@ fi
 cd "$stage/hq"
 sudo -n -H -u "$name" -- /bin/bash tests/dedicated-hq-account.sh "$node_bin" --disposable-machine-role
 bash tests/darwin-launchd-owner-control.sh "$node_bin"
+python3 -I tests/packaged-darwin-harness-accounts.py "$stage/hq" "$node_bin"

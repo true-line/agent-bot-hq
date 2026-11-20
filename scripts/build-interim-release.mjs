@@ -32,6 +32,7 @@ for (const row of git(['ls-tree', '-rz', '--full-tree', commit]).toString('utf8'
   if (type !== 'blob' || !['100644', '100755'].includes(mode) || !path || path.startsWith('/')
     || path.split('/').some((part) => !part || part === '.' || part === '..') || /[\x00-\x1f\x7f]/.test(path)
     || path === 'hq/interim-core.mjs' || path === 'governance/interim-release.json'
+    || path === 'vendor' || path === 'governance' || path === 'vendor/plugins' || path.startsWith('vendor/plugins/')
     || path === 'vendor/soul-contracts' || path.startsWith('vendor/soul-contracts/')) {
     throw new Error(`unsupported source tree entry: ${path}`);
   }
@@ -52,7 +53,8 @@ try {
   mkdirSync(vendor, { recursive: true });
   for (const path of pin.paths) cpSync(join(resolve(contracts), path), join(vendor, path), { recursive: true, dereference: false, preserveTimestamps: false });
   verifyVendored(vendor, pin);
-  writeFileSync(join(tree, 'governance/interim-release.json'), `${JSON.stringify({ schema_version: 1, hq_commit: commit, contracts_commit: pin.commit, contracts_digest: pin.digest, ...(darwinTarget ? { target_platform: target, owner_control_capability: 'darwin-owner-control/v2' } : {}) }, null, 2)}\n`);
+  const broker = darwinTarget ? (await import('./darwin-broker.mjs')).stageDarwinBroker(tree, work) : undefined;
+  writeFileSync(join(tree, 'governance/interim-release.json'), `${JSON.stringify({ schema_version: 1, hq_commit: commit, contracts_commit: pin.commit, contracts_digest: pin.digest, ...(darwinTarget ? { target_platform: target, owner_control_capability: 'darwin-owner-control/v2', broker } : {}) }, null, 2)}\n`);
   renameSync(join(tree, 'hq/main.mjs'), join(tree, 'hq/interim-core.mjs'));
   writeFileSync(join(tree, 'hq/main.mjs'), `// Interim artifact entrypoint: verify vendored contracts without network fallback.\nif (process.platform !== '${target}') throw new Error('interim artifact runs on ${darwinTarget ? 'macOS' : 'Linux'} only');\nprocess.env.HQ_INTERIM_OFFLINE = '1';\nawait import('./interim-core.mjs');\n`);
   const temporaryTar = join(outputWork, 'artifact.tar');

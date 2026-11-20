@@ -75,7 +75,7 @@ export async function activatedOwnerControl(account) {
   const phase = darwin ? 'descriptor' : 'listener';
   if (!check([phase, OWNER_CONTROL_PATH], ...(darwin ? [fd, 4] : [fd]))) throw new Error('owner-control fd is not the expected listening Unix stream socket');
   const listener = darwin ? await prepareOwnerListener(4, () => socketCheck(['listener', OWNER_CONTROL_PATH], fd)) : undefined;
-  return { fd, account, uid, listener, authenticate: (socket) => authenticateOwner(socket, uid) };
+  return { fd, account, uid, listener, authenticate: (socket) => authenticatePeerUid(socket, uid) };
 }
 
 // launchd can retain pending requests across a restart. Accept paused streams
@@ -118,9 +118,11 @@ export async function prepareOwnerListener(fd, verifyPublic) {
 
 // Node passes the connected stream to fd 3 in the helper using the public
 // child_process stdio API. The helper only reads credentials from the kernel.
-export function authenticateOwner(socket, uid) {
+export function authenticatePeerUid(socket, uid) {
   return socketCheck(['peer', String(uid)], socket);
 }
+
+export { authenticatePeerUid as authenticateOwner };
 
 function socketCheck(args, socket) {
   return new Promise((resolve) => {

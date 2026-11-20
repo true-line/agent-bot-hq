@@ -9,11 +9,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { once } from 'node:events';
+import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
+import { DARWIN_HARNESS_DIR } from '../hq/darwin-harness-accounts.mjs';
 import { createCore, testClock } from '../sdk/services.mjs';
-import { agentArgv, AGENT_PATH, createLauncher, groupArgv, KILL_WAIT_MS, LAUNCH_SHELL, launchMemberSocket, launchWorkdir, MAX_PENDING, MEMBER_SOCKET_ENV, PGID_MARKER, STDERR_LINE, STDERR_LINES } from '../hq/launch.mjs';
+import { agentArgv, AGENT_PATH, allocateLaunchAddress, createLauncher, groupArgv, KILL_WAIT_MS, LAUNCH_SHELL, launchMemberSocket, launchWorkdir, MAX_PENDING, MEMBER_SOCKET_ENV, PGID_MARKER, STDERR_LINE, STDERR_LINES } from '../hq/launch.mjs';
 import { attachTo, DIGEST, fakeSudo, fakeTimers, harnessLayout, helloOn, SOUL, startHQ } from './hq-harness.mjs';
 
 const A = 'hqm_a';
@@ -63,6 +66,58 @@ const refused = (res, code) => {
   return res.refusal?.explanation ?? res.host_refusal?.explanation;
 };
 
+test('Darwin member sockets fit the existing broker directory for every supported account length', () => {
+  const id = 'ln_abcdef0123456789abcdef01';
+  for (let size = 1; size <= 32; size++) {
+    const dir = join(DARWIN_HARNESS_DIR, 'a'.repeat(size));
+    const path = launchMemberSocket(join(dir, 'broker.sock'), id, 'darwin');
+    assert.equal(dirname(path), dir);
+    assert.ok(Buffer.byteLength(path) <= 103);
+    assert.notEqual(basename(path), 'broker.sock');
+    if (size <= 7) assert.equal(basename(path), `member-${id.slice(3)}.sock`);
+  }
+  const endpoint = join(DARWIN_HARNESS_DIR, 'a'.repeat(9), 'broker.sock');
+  assert.equal(Buffer.byteLength(launchMemberSocket(endpoint, id, 'linux')), 105);
+  const tooLong = join(DARWIN_HARNESS_DIR, 'é'.repeat(17), 'broker.sock');
+  assert.throws(() => launchMemberSocket(tooLong, id, 'darwin'), { code: 'host.launch_unavailable' });
+});
+
+test('Darwin allocation avoids occupied names and delivers through a 103-byte member socket', { skip: process.platform === 'win32' }, async t => {
+  const root = mkdtempSync('/tmp/hq-member-');
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  // A 91-byte parent leaves exactly 11 bytes after the slash.
+  const dir = join(root, 'a'.repeat(90 - Buffer.byteLength(root)));
+  mkdirSync(dir);
+  const endpoint = join(dir, 'broker.sock');
+  const hex = n => n.toString(16).padStart(24, '0');
+  const id = n => 'ln_' + hex(n);
+  const path = n => launchMemberSocket(endpoint, id(n), 'darwin');
+  const collision = 7n + 36n ** 11n;
+  const launches = new Map([[id(7n), { member_socket: path(7n) }]]);
+  assert.equal(path(7n), path(collision));
+  writeFileSync(path(8n), 'occupied', { flag: 'wx' });
+  const candidates = [7n, collision, 8n, 9n];
+  const random = { hex(bytes) { assert.equal(bytes, 12); return hex(candidates.shift()); } };
+  const address = allocateLaunchAddress(endpoint, launches, random, 'darwin');
+  assert.deepEqual(address, { launch_id: id(9n), member_socket: path(9n) });
+  assert.equal(Buffer.byteLength(address.member_socket), 103);
+  assert.equal(readFileSync(path(8n), 'utf8'), 'occupied');
+  assert.throws(() => allocateLaunchAddress(endpoint, launches, { hex: () => hex(collision) }, 'darwin'), { code: 'host.launch_busy' });
+  const server = createServer(socket => socket.end('ready'));
+  server.listen(address.member_socket);
+  await once(server, 'listening');
+  const client = createConnection(address.member_socket);
+  try {
+    client.setEncoding('utf8');
+    let reply = '';
+    for await (const chunk of client) reply += chunk;
+    assert.equal(reply, 'ready');
+  } finally {
+    client.destroy();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('HQ asks sudo for exactly one form: the harness account, the fixed shell with soul and agent as arguments, detached, the allowed env, its endpoint, a fixed PATH', async () => {
   process.env.HQ_LAUNCH_CANARY = 'canary-from-hqs-environment';
   const t = await setup();
@@ -72,7 +127,7 @@ test('HQ asks sudo for exactly one form: the harness account, the fixed shell wi
     const { child, launch_id: launchId, member_socket: memberSocket } = await t.started();
     assert.match(launchId, /^ln_[0-9a-f]{24}$/);
     assert.equal(launchWorkdir(t.l.homes[A], SOUL, 'm_lead'), join(t.l.homes[A], '.agent-bot-hq', 'souls', SOUL, 'm_lead'));
-    assert.equal(memberSocket, launchMemberSocket(t.endpoint(A), launchId));
+    assert.equal(memberSocket, launchMemberSocket(t.endpoint(A), launchId, 'linux'));
     assert.equal(child.file, '/usr/bin/sudo');
     assert.deepEqual(child.args, ['-n', '-H', '-u', A, '--', '/bin/sh', '-c', LAUNCH_SHELL, 'sh', SOUL, 'm_lead', NODE, 'adapter.mjs', '--acp']);
     assert.equal(LAUNCH_SHELL, 'read -r _ _ _ _ g _ 2>/dev/null </proc/self/stat && printf \'agent-bot-hq-launch pgid %s\\n\' "$g" >&2; umask 077 && d="$HOME/.agent-bot-hq/souls/$1/$2" && mkdir -p "$d" && chmod 0700 "$d" && cd "$d" && shift 2 && exec "$@"');
@@ -87,7 +142,7 @@ test('HQ asks sudo for exactly one form: the harness account, the fixed shell wi
     const specialist = await t.started(t.spec);
     assert.deepEqual(t.sudo.agents.at(-1).args.slice(0, 11), ['-n', '-H', '-u', B, '--', '/bin/sh', '-c', LAUNCH_SHELL, 'sh', SOUL, 'm_spec']);
     assert.equal(t.sudo.agents.at(-1).opts.env.AGENT_BOT_SOULS_BROKER, t.endpoint(B));
-    assert.equal(t.sudo.agents.at(-1).opts.env[MEMBER_SOCKET_ENV], launchMemberSocket(t.endpoint(B), specialist.launch_id));
+    assert.equal(t.sudo.agents.at(-1).opts.env[MEMBER_SOCKET_ENV], launchMemberSocket(t.endpoint(B), specialist.launch_id, 'linux'));
     assert.deepEqual(t.receipts('hq.launch').map((r) => [r.member_id, r.adapter_id, r.account]), [['m_lead', 'adapter-a', A], ['m_spec', 'adapter-b', B]]);
   } finally { delete process.env.HQ_LAUNCH_CANARY; await t.cleanup(); }
 });

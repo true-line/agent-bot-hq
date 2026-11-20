@@ -1,0 +1,1 @@
+The dedicated macOS HQ account reports which adapters have an installed Machine launch rule and which have verified Darwin package qualification. Launch stays unavailable until the adapter qualifies. The supervisor protocol carries ACP over private pipes and records whether the launch's process group stopped.

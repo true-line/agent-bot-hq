@@ -6,10 +6,14 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync,
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { fixtureBroker } from './fixtures/interim-broker.mjs';
 import { manifestDigest } from '../scripts/soul-contracts.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const run = (cmd, args, options = {}) => execFileSync(cmd, args, { encoding: 'utf8', ...options });
+// The builder fixture pins its own broker in its disposable .cache.
+const fixtureEnv = { ...process.env };
+delete fixtureEnv.HQ_COMMS_REPO;
+const run = (cmd, args, options = {}) => execFileSync(cmd, args, { encoding: 'utf8', env: fixtureEnv, ...options });
 
 test('interim artifact is reproducible, runs offline and refuses changed contracts', () => {
   const tmp = mkdtempSync(join(realpathSync(tmpdir()), 'hq-builder-test-'));
@@ -19,6 +23,7 @@ test('interim artifact is reproducible, runs offline and refuses changed contrac
   try {
     const repo = join(tmp, 'repo'), contracts = join(tmp, 'contracts');
     for (const d of ['scripts', 'hq', 'governance']) mkdirSync(join(repo, d), { recursive: true });
+    fixtureBroker(repo, tmp, root);
     const entries = [];
     for (const d of ['errors', 'fixtures', 'schemas']) {
       mkdirSync(join(contracts, d), { recursive: true });

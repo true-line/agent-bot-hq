@@ -152,6 +152,14 @@ result = subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/env", "-i",
                          node, entry, "status", "--owner-control", "--json"],
                         check=True, stdout=subprocess.PIPE, text=True, timeout=30)
 status = json.loads(result.stdout)
+# The normal launchd command supplies no --plugins override. Match the actual
+# host's load report to the independently reviewed source policy in its archive.
+with open(os.path.join(os.path.dirname(os.path.dirname(entry)), "governance", "darwin-broker.json")) as manifest:
+    broker = json.load(manifest)
+loaded = [p for p in status["hq"]["pluginLoad"] if p["name"] == broker["name"]]
+assert len(loaded) == 1 and loaded[0]["state"] == "loaded" and not loaded[0].get("dev")
+assert (loaded[0]["version"], loaded[0]["digest"]) == (broker["version"], broker["sha256"])
+
 control = status["hq"]["sockets"]["ownerControl"]
 assert control["path"] == path and control["peer_check"] == "getpeereid"
 assert control["uid"] == os.getuid() and control["account"] == owner

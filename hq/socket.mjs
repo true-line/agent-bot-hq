@@ -7,13 +7,9 @@
 //
 // Access control. The three sockets in HQ's state directory are Unix domain
 // sockets created 0600 in a 0700 directory, so only HQ's own OS account can
-// connect. A harness account's own broker endpoint lives outside it, where the
-// file system admits that account alone (hq/harness-accounts.mjs, §9 row 16a). Node has no
-// peer-credential API (getpeereid / SO_PEERCRED), so the skeleton relies on
-// the file mode. That is exact while HQ runs in the owner's account, which is
-// the interim layout (D4's stated risk; plan §10.3 HQ-RISK-07). When HQ moves
-// to its own account (D6) the owner's client connects from another account,
-// and a peer-credential check must replace the file mode before that move (#88).
+// connect. A harness broker lives in that account's private group directory.
+// Darwin harness brokers and the system-activated owner listener also
+// validate the connected peer's kernel UID before handling input.
 // Windows named pipes are not built yet (#89); HQ refuses to start there.
 //
 // Framing: one JSON object per line (NDJSON), strictly parsed.
@@ -84,8 +80,10 @@ export function checkSocketPath(path, platform = process.platform) {
 // `mode` is the socket file's mode: 0600 for HQ's own sockets, 0660 for a
 // harness endpoint whose directory gives it the account's group (hq/harness-accounts.mjs).
 // `takeover` enables the hook above for this listener.
-export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false, activated }) {
+export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false, activated, authenticatePeer }) {
   if (process.platform === 'win32') throw new Error('HQ on Windows needs a named pipe with an owner DACL, which is not built yet (#89)');
+  const authenticate = activated ? activated.authenticate : authenticatePeer;
+  if (activated && typeof authenticate !== 'function') throw new Error('an activated listener requires peer authentication');
   checkSocketPath(path);
   if (!activated && existsSync(path)) {
     if (!lstatSync(path).isSocket()) throw new Error(`${path} exists and is not a socket; refusing to replace it`);
@@ -140,7 +138,7 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     }
   }
 
-  // An inherited owner listener gates each connection before opening an HQ
+  // An inherited owner listener and each Darwin harness broker gate the peer before opening an HQ
   // session, handling bytes, or dispatching a request. Other listeners keep
   // their existing framing, including admission's first-request takeover.
   let pendingChecks = 0;
@@ -148,11 +146,11 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     conns.add(socket);
     socket.once('close', () => conns.delete(socket));
     socket.on('error', () => {});
-    if (activated) {
+    if (authenticate) {
       if (pendingChecks >= 16) { socket.destroy(); return; }
       pendingChecks++;
       let accepted = false;
-      try { accepted = await activated.authenticate(socket); } catch { /* refuse */ }
+      try { accepted = await authenticate(socket); } catch { /* refuse */ }
       finally { pendingChecks--; }
       if (!accepted || socket.destroyed) { socket.destroy(); return; }
     }
@@ -229,13 +227,13 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
       pump();
     }
     socket.on('data', onData);
-    if (activated) socket.resume();
+    if (authenticate) socket.resume();
     // The session ends after its queued requests finish, so a request still
     // in flight (a broker bind, say) cannot recreate state after the end.
     socket.on('close', () => { queue = queue.then(() => endSession(session)).catch(() => {}); });
   }
 
-  const server = createServer({ pauseOnConnect: Boolean(activated) }, onConnection);
+  const server = createServer({ pauseOnConnect: Boolean(authenticate) }, onConnection);
   await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(activated ? { fd: activated.fd } : path, () => { server.off('error', reject); resolve(); });

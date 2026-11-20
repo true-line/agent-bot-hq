@@ -8,10 +8,10 @@
 //
 // HQ must know which OS account is on a broker connection, and it must learn
 // that from the host, never from a field the caller sends. Node has no
-// peer-credential call, so the file system does the work: each harness
+// built-in peer-credential call. Each harness
 // account gets its own broker endpoint, in a directory only HQ and that
-// account can enter. A connection that arrives on an endpoint is that
-// account's, by the kernel's permission check on connect. That identifies the
+// account can enter. Linux uses the kernel's permission check on connect;
+// Darwin also checks getpeereid on the accepted socket. That identifies the
 // account, that is the harness credential, and nothing finer: two agents in
 // one harness account are told apart only by the keyed proof at bind
 // (hq/admission.mjs), and to the host they are one trust domain.
@@ -36,10 +36,13 @@
 // directory, owned by the account's uid, with no group or other permission
 // bits (0700). HQ is not root, so it cannot repair one.
 //
-// Linux only (row 16). macOS keeps the shared socket until row 29.
+// macOS additionally requires the managed system layout and the kernel peer
+// uid on every account endpoint. Harness process launch is separate.
 import { execFileSync } from 'node:child_process';
 import { lstatSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { checkDarwinACL, DARWIN_HARNESS_DIR, resolveDarwinHarness } from './darwin-harness-accounts.mjs';
+import { HQ_ACCOUNTS } from './profile.mjs';
 
 // The directory name predates platform PDR-0053, when these were member accounts;
 // agent-bot-machine creates this path, so it stays.
@@ -101,8 +104,12 @@ function checkHome(account, info, lstat) {
 // Resolve and check every configured account once, its endpoint directory and
 // its home. Returns { dir, endpoints: [{ account, uid, gid, path, home,
 // adapters }], accountOf(adapterId) }, one endpoint per account.
-export function planHarnessEndpoints(harnesses, { hqUid, platform = process.platform, resolve = resolveAccount, lstat = lstatSync } = {}) {
-  if (platform !== 'linux') throw new Error(`HQ config: harnesses needs the Linux protected profile (§9 row 16); this host is ${platform}`);
+export function planHarnessEndpoints(harnesses, { hqUid, hqAccount, platform = process.platform, resolve = platform === 'darwin' ? resolveDarwinHarness : resolveAccount, lstat = lstatSync, checkACL = checkDarwinACL } = {}) {
+  const darwin = platform === 'darwin';
+  if (platform !== 'linux' && !darwin) throw new Error(`HQ config: harness endpoints are unsupported on ${platform}`);
+  if (darwin && (hqAccount !== HQ_ACCOUNTS.darwin || hqUid <= 0 || harnesses.dir !== DARWIN_HARNESS_DIR)) {
+    throw new Error(`Darwin harness endpoints require the dedicated HQ account and explicit directory ${DARWIN_HARNESS_DIR}`);
+  }
   if (!Number.isSafeInteger(hqUid)) throw new Error('harness endpoints need HQ\'s own uid');
   const dir = harnesses.dir ?? DEFAULT_HARNESS_DIR;
   const stat = (path, what) => {
@@ -111,6 +118,14 @@ export function planHarnessEndpoints(harnesses, { hqUid, platform = process.plat
     if (!st.isDirectory()) throw new Error(`${what} ${path} is not a directory`);
     return st;
   };
+  if (darwin) {
+    for (const path of ['/', '/Library', '/Library/Application Support', dirname(dir), dir]) {
+      const st = stat(path, 'managed harness directory');
+      if (st.uid !== 0 || (st.mode & 0o022) || !(st.mode & 0o001)) throw new Error(`untrusted Darwin harness directory ${path}`);
+      if ([dirname(dir), dir].includes(path) && (st.gid !== 0 || (st.mode & 0o7777) !== 0o755)) throw new Error(`expected root:wheel 0755 on ${path}`);
+      checkACL(path);
+    }
+  }
   const base = stat(dir, 'harness endpoint directory');
   if (base.uid !== hqUid && base.uid !== 0) throw new Error(`${dir} is owned by uid ${base.uid}, not HQ (${hqUid}) or root`);
   if (base.mode & 0o022) throw new Error(`${dir} is writable by group or others`);
@@ -137,6 +152,10 @@ export function planHarnessEndpoints(harnesses, { hqUid, platform = process.plat
     if (st.gid !== info.gid) throw new Error(`${endpointDir} has group ${st.gid}, not ${account}'s group ${info.gid}`);
     if ((st.mode & 0o7777) !== 0o2750) throw new Error(`${endpointDir} has mode ${(st.mode & 0o7777).toString(8)}; it must be 2750`);
     const home = checkHome(account, info, lstat);
+    if (darwin) {
+      checkACL(endpointDir);
+      checkACL(home);
+    }
     byAccount.set(account, Object.freeze({ account, uid: info.uid, gid: info.gid, path: join(endpointDir, HARNESS_SOCKET), home, adapters: Object.freeze([...adapters]) }));
   }
   return {
@@ -148,9 +167,13 @@ export function planHarnessEndpoints(harnesses, { hqUid, platform = process.plat
 
 // After HQ made the socket: the setgid directory must have given it the
 // account's group, or the harness cannot connect and nobody else may.
-export function checkHarnessSocket(endpoint, { lstat = lstatSync } = {}) {
+export function checkHarnessSocket(endpoint, { lstat = lstatSync, darwinHqUid, checkACL = checkDarwinACL } = {}) {
   const st = lstat(endpoint.path);
   if (!st.isSocket()) throw new Error(`${endpoint.path} is not a socket`);
+  if (darwinHqUid !== undefined) {
+    if (st.uid !== darwinHqUid) throw new Error(`${endpoint.path} must belong to HQ`);
+    checkACL(endpoint.path);
+  }
   if (st.gid !== endpoint.gid) throw new Error(`${endpoint.path} has group ${st.gid}, not ${endpoint.account}'s group ${endpoint.gid}; is its directory setgid?`);
   if ((st.mode & 0o777) !== 0o660) throw new Error(`${endpoint.path} has mode ${(st.mode & 0o777).toString(8)}; it must be 0660`);
 }
