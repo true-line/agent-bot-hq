@@ -12,7 +12,7 @@
 // the digest is the SHA-256 of the manifest's RFC 8785 (JCS) bytes.
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -76,14 +76,21 @@ export function readPin(path = PIN_PATH) {
 
 const git = (args, opts = {}) => execFileSync('git', args, { maxBuffer: 1 << 28, ...opts });
 
-// Fetch <tag> from <repository> into the cache; return the commit it points at.
-function fetchTag(repository, tag) {
-  const repo = join(CACHE, 'repo.git');
-  if (!existsSync(repo)) git(['init', '-q', '--bare', repo]);
-  // A credential-free fetch: the contracts repository is public, and no token is ever used here.
-  git(['-C', repo, '-c', 'credential.helper=', 'fetch', '-q', '--depth', '1', '--no-tags', repository, `+refs/tags/${tag}:refs/tags/${tag}`],
-    { env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
-  return { repo, commit: git(['-C', repo, 'rev-parse', `refs/tags/${tag}^{commit}`]).toString().trim() };
+// A private shallow fetch has no shared refs, index or FETCH_HEAD. Keep its
+// scratch on the cache filesystem so a complete verified tree can be renamed.
+function withFetchedTag(repository, tag, use) {
+  mkdirSync(CACHE, { recursive: true });
+  const work = mkdtempSync(join(CACHE, '.verify-'));
+  try {
+    const repo = join(work, 'repo.git');
+    git(['init', '-q', '--bare', repo]);
+    git(['-C', repo, '-c', 'credential.helper=', 'fetch', '-q', '--depth', '1', '--no-tags', repository, `refs/tags/${tag}`],
+      { env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+    const commit = git(['-C', repo, 'rev-parse', 'FETCH_HEAD^{commit}']).toString().trim();
+    return use(repo, commit, work);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
 }
 
 // Read the pinned paths of <commit> straight from git objects (modes as git records them).
@@ -97,13 +104,60 @@ function treeEntries(repo, commit, paths) {
   });
 }
 
-function materialize(dir, entries) {
-  rmSync(dir, { recursive: true, force: true });
-  for (const { path, bytes } of entries) {
-    mkdirSync(dirname(join(dir, path)), { recursive: true });
-    writeFileSync(join(dir, path), bytes);
+// Publish a complete new subtree in one rename. Existing cache directories
+// may already be in use by callers of verify(). Repair their entries in
+// place: rename complete files over old files and remove only unpinned names.
+function publishTree(source, target, work) {
+  const staged = lstatSync(source);
+  const directory = staged.isDirectory();
+  let current = lstatSync(target, { throwIfNoEntry: false });
+  if (!current) {
+    try { renameSync(source, target); return; } catch (error) {
+      current = lstatSync(target, { throwIfNoEntry: false });
+      if (!current) throw error;
+    }
   }
-  writeFileSync(join(dir, '.verified'), '');
+  if (directory && current.isDirectory()) {
+    const names = new Set(readdirSync(source));
+    for (const name of names) publishTree(join(source, name), join(target, name), work);
+    for (const name of readdirSync(target)) {
+      if (!names.has(name)) rmSync(join(target, name), { recursive: true, force: true });
+    }
+    return;
+  }
+  if (directory) {
+    // unlink cannot remove the directory if another verifier repaired it.
+    try { unlinkSync(target); } catch (error) {
+      if (error.code !== 'ENOENT' && !lstatSync(target, { throwIfNoEntry: false })?.isDirectory()) throw error;
+    }
+    publishTree(source, target, work);
+    return;
+  }
+  if (current.isFile() && current.size === staged.size && (current.mode & 0o7777) === (staged.mode & 0o7777)) {
+    try { if (readFileSync(target).equals(readFileSync(source))) return; } catch (error) {
+      if (error.code !== 'EACCES' && error.code !== 'EPERM') throw error;
+    }
+  }
+  if (current.isDirectory()) {
+    // Moving onto a directory can only displace the unwanted directory;
+    // a concurrent writer's already published regular file cannot be moved.
+    const discard = mkdtempSync(join(work, 'discard-'));
+    try { renameSync(target, discard); } catch (error) {
+      if (error.code !== 'ENOENT' && lstatSync(target, { throwIfNoEntry: false })?.isDirectory()) throw error;
+    }
+  }
+  renameSync(source, target);
+}
+
+function materialize(dir, entries, work) {
+  const stage = join(work, 'tree');
+  for (const { path, mode, bytes } of entries) {
+    const file = join(stage, path);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, bytes, { mode: mode === '100755' ? 0o755 : 0o644 });
+  }
+  writeFileSync(join(stage, '.verified'), '');
+  publishTree(stage, dir, work);
 }
 
 // Interim release entrypoint requires a public contracts tree. Verify every
@@ -147,23 +201,25 @@ export function verifyVendored(dir, pin = readPin()) {
 // Fetch and verify the pinned release; return the directory tests load from.
 export function verify(pin = readPin()) {
   if (process.env.HQ_INTERIM_OFFLINE === '1') return verifyVendored(join(ROOT, 'vendor/soul-contracts'), pin);
-  const { repo, commit } = fetchTag(pin.repository, pin.tag);
-  if (commit !== pin.commit) throw new Error(`tag ${pin.tag} now points at ${commit}, not the pinned ${pin.commit}; refusing a moved tag`);
-  const entries = treeEntries(repo, commit, pin.paths);
-  const got = manifestDigest(entries);
-  if (got.digest !== pin.digest || got.files !== pin.files) {
-    throw new Error(`soul-contracts ${pin.tag} digest ${got.digest} (${got.files} files) does not match the pin ${pin.digest} (${pin.files} files)`);
-  }
-  const dir = join(CACHE, commit);
-  materialize(dir, entries);
-  return { dir, ...got };
+  return withFetchedTag(pin.repository, pin.tag, (repo, commit, work) => {
+    if (commit !== pin.commit) throw new Error(`tag ${pin.tag} now points at ${commit}, not the pinned ${pin.commit}; refusing a moved tag`);
+    const entries = treeEntries(repo, commit, pin.paths);
+    const got = manifestDigest(entries);
+    if (got.digest !== pin.digest || got.files !== pin.files) {
+      throw new Error(`soul-contracts ${pin.tag} digest ${got.digest} (${got.files} files) does not match the pin ${pin.digest} (${pin.files} files)`);
+    }
+    const dir = join(CACHE, commit);
+    materialize(dir, entries, work);
+    return { dir, ...got };
+  });
 }
 
 export function repin(tag, pin = readPin()) {
   if (compareSemver(tag, pin.tag) < 0) throw new Error(`pins never move backwards: ${tag} is older than ${pin.tag}`);
-  const { repo, commit } = fetchTag(pin.repository, tag);
-  const got = manifestDigest(treeEntries(repo, commit, pin.paths));
-  return { ...pin, tag, commit, digest: got.digest, files: got.files };
+  return withFetchedTag(pin.repository, tag, (repo, commit) => {
+    const got = manifestDigest(treeEntries(repo, commit, pin.paths));
+    return { ...pin, tag, commit, digest: got.digest, files: got.files };
+  });
 }
 
 function isCommandEntry() {
