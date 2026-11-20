@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # Create a temporary role account only on a fresh hosted macOS test VM.
+if (( EUID == 0 )); then
+  echo "requires an ordinary user on a disposable GitHub-hosted macOS runner" >&2
+  exit 1
+fi
 set -euo pipefail
-[[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "$(uname -s)" == Darwin ]]
+source "$(dirname "$0")/fixtures/darwin-hosted.sh"
+require_hosted_darwin || exit 1
 archive="${1:?macOS target tar required}"
 if [[ "$archive" == --socket-parent-comparison ]]; then
-  [[ "${GITHUB_REPOSITORY:-}" == true-line/agent-bot-hq && "$(uname -m)" == arm64 && "$(sw_vers -productVersion)" == 27.* ]]
+  if [[ "${GITHUB_REPOSITORY:-}" != true-line/agent-bot-hq || "$(uname -m)" != arm64 || "$(sw_vers -productVersion)" != 27.* ]]; then
+    echo 'requires the ordinary hosted macOS 27 arm64 socket comparison runner' >&2
+    exit 1
+  fi
 fi
 name=_agent-bot-hq
 account="/Users/$name"
