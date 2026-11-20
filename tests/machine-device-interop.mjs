@@ -103,6 +103,7 @@ async function refusedPackageGrant(reason) {
   assert.equal(status.hq.signer.backend, 'machine');
   assert.equal(status.hq.signer.available, false);
   assert.match(status.hq.signer.reason, reason);
+  assert.ok(status.hq.profileReasons.includes('HQ could not verify hardware custody of the device key'));
   assert.equal(server.state.requests.length, requests);
   for (const name of ['device-key.pem', 'pin.json']) assert.equal(existsSync(join(packageHome, 'signer', name)), false);
 }

@@ -250,6 +250,7 @@ test('a plugin can look up credential issuance using the full operation ID', asy
       await assert.rejects(call('GET', route + id), code('host.invalid_request'));
     }
     await assert.rejects(call('POST', route + operation), code('host.invalid_request'));
+    await assert.rejects(call('GET', route + operation, { task_id: 'fixture-task' }), code('host.invalid_request'));
     assert.equal(f.state.requests.length, 0);
     f.state.apiReply = { operation_id: operation, state: 'unknown' };
     const result = await call('GET', route + operation);
@@ -258,6 +259,10 @@ test('a plugin can look up credential issuance using the full operation ID', asy
     // The fixture verifies the request's DPoP signature, method, and htu.
     assert.equal(f.state.requests.at(-1).init.method, 'GET');
     assert.equal(f.state.requests.at(-1).url, SERVER + route + operation);
+    // A valid response signature authenticates the issuer, even if its lookup
+    // returned a different record. The requested operation still has to match.
+    f.state.apiReply = { operation_id: 'other-operation', state: 'none' };
+    await assert.rejects(call('GET', route + operation), code('credential_unavailable'));
   } finally { await hq.done(); }
 });
 

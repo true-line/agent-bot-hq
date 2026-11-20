@@ -10,6 +10,7 @@ import { GRANT_JWT_BEARER, validateServiceUrl } from './enrollment.mjs';
 const TIMEOUT_MS = 20_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_SKEW_MS = 5 * 60_000;
+const ISSUANCE_LOOKUP = '/api/daemon/issuances/';
 const B64URL = /^[A-Za-z0-9_-]+$/;
 const nonce = () => randomBytes(24).toString('base64url');
 const hash = (bytes) => createHash('sha256').update(bytes).digest();
@@ -33,7 +34,7 @@ function dateMillis(value) {
 // path segment using the credential service's operation-ID alphabet.
 function validDaemonPath(method, path) {
   if (typeof path !== 'string') return false;
-  if (path.startsWith('/api/daemon/issuances/')) {
+  if (path.startsWith(ISSUANCE_LOOKUP)) {
     return method === 'GET' && /^\/api\/daemon\/issuances\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(path);
   }
   return /^\/api\/daemon\/[A-Za-z0-9/_-]+$/.test(path);
@@ -184,6 +185,9 @@ export function createIdentityService({
         link = 'ok';
         if (body?.error === 'device_revoked' || (path === '/oauth/token' && body?.error === 'invalid_grant')) { revoke(); fail('device_revoked', 'device revoked: re-enroll'); }
         if (body?.error === 'profile_insufficient') fail('profile_insufficient', 'the identity service refused this device key storage under owner policy');
+        if (response.status === 200 && path.startsWith(ISSUANCE_LOOKUP) && body?.operation_id !== path.slice(ISSUANCE_LOOKUP.length)) {
+          unavailable('issuance reply does not match the requested operation');
+        }
         return { status: response.status, headers: Object.fromEntries(response.headers.entries()), text: bytes.toString('utf8'), body };
       })();
       return await Promise.race([work, deadline]);
@@ -255,7 +259,8 @@ export function createIdentityService({
       check();
       if (typeof method !== 'string' || !/^(GET|POST|PUT|PATCH|DELETE)$/.test(method)
         || !validDaemonPath(method, path)) fail('host.invalid_request', 'the identity link accepts a daemon API method and path only');
-      const allowed = method === 'GET' && (path === '/api/daemon/whoami' || path === '/api/daemon/notices' || path.startsWith('/api/daemon/issuances/'))
+      if (path.startsWith(ISSUANCE_LOOKUP) && body !== undefined) fail('host.invalid_request', 'an issuance lookup accepts only its operation ID');
+      const allowed = method === 'GET' && (path === '/api/daemon/whoami' || path === '/api/daemon/notices' || path.startsWith(ISSUANCE_LOOKUP))
         || method === 'POST' && ['/api/daemon/notices/take', '/api/daemon/notices/ack', '/api/daemon/notices/release'].includes(path);
       if (!allowed) unavailable('this route requires administrator-side credential use');
       custody?.checkOperation?.(method, path);
