@@ -57,6 +57,7 @@ test('a task runs offered, accepted, running, completed; every record is a valid
   for (const to of ['accepted', 'running', 'completed']) {
     const r = await t.commit(t.lead, task, to, to === 'completed' ? { result_ref: 'artifact_1', evidence_refs: ['check_1'] } : {});
     assert.equal(r.outcome, 'committed');
+    assert.equal(r.profile, 'managed-cooperative');
     assert.equal(r.status, to);
     task = await t.record(task.task_id);
     valid(task);
@@ -83,6 +84,7 @@ test('T20: a specialist\'s final answer is recorded as a proposal; only the lead
 
   const proposed = await t.commit(t.spec, task, 'completed', { result_ref: 'artifact_spec' });
   assert.equal(proposed.outcome, 'proposal');
+  assert.equal(proposed.profile, 'managed-cooperative');
   assert.match(proposed.proposal_id, /^prop_/);
   const after = await t.record(task.task_id);
   assert.deepEqual(after, task, 'the task did not move');
@@ -385,6 +387,30 @@ test('HQ runs the task service as a built-in plugin, and tasks persist in its st
     assert.deepEqual((await t.hq.sweepTasks()).map((x) => x.task_id), [due.task_id]);
     assert.equal((await t.hq.host.provided('hq-tasks').get(due.task_id)).task.status, 'expired');
   } finally { await t.done(); }
+});
+
+test('T21: task replies and audit entries record the profile at commitment, including after restart', async () => {
+  const input = { operation_id: 'owner_profile', objective: 'Check the receipt', done_criteria: 'Owner can read the profile', accountable_soul: SOUL };
+  for (const account of ['_agent-bot-hq', 'ordinary-fixture']) {
+    let t = await startHQ({ account });
+    try {
+      const owner = await t.owner();
+      assert.equal((await owner.request('status')).result.profile, 'managed-cooperative');
+      const first = (await owner.request('tasks.offer', input)).result;
+      assert.equal(first.profile, 'managed-cooperative');
+      const audit = t.hq.core.receipts.filter((r) => r.kind === 'task.offer' && r.receipt_id === first.receipt_id);
+      assert.deepEqual(audit.map((r) => r.profile), [first.profile]);
+
+      const home = t.home;
+      await t.done({ keep: true });
+      t = await startHQ({ account, home, config: { standalone: true } });
+      const restarted = await t.owner();
+      assert.equal((await restarted.request('status')).result.profile, 'standalone-unenforced');
+      assert.deepEqual((await restarted.request('tasks.offer', input)).result, first);
+      const next = await restarted.request('tasks.offer', { ...input, operation_id: 'after_restart' });
+      assert.equal(next.result.profile, 'standalone-unenforced');
+    } finally { await t.done(); }
+  }
 });
 
 test('the owner\'s config names concurrent writers as a list of workspaces', () => {

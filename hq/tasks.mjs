@@ -122,9 +122,9 @@ export function tasksPlugin({ schemas }) {
     version: '0.1.0',
     hostApi: 1,
     requires: { 'hq-admission': '^0.1.0' },
-    services: ['store', 'receipts', 'clock', 'random', 'config', 'log'],
+    services: ['store', 'receipts', 'clock', 'random', 'config', 'log', 'profile'],
     async init(ctx) {
-      const { store, receipts, clock, random, config } = ctx.services;
+      const { store, receipts, clock, random, config, profile } = ctx.services;
       const admission = ctx.deps['hq-admission'];
       for (const f of ['withLiveRuntime', 'withLeases', 'withBoundRuntime']) if (typeof admission?.[f] !== 'function') throw new Error(`hq-admission does not provide ${f}`);
       const concurrent = () => config.get('concurrentWriters') ?? [];
@@ -148,7 +148,7 @@ export function tasksPlugin({ schemas }) {
         const next = { ...task, ...patch, status: to, revision: task.revision + 1 };
         if (to !== 'waiting') delete next.waiting_reason;
         check('task-record', next, false);
-        const receipt = { contract: 'task/v1', receipt_id: id('trc'), operation_id: operationId, task_id: task.task_id, outcome: 'committed', from: task.status, status: to, revision: next.revision, by, at: iso(clock.now()) };
+        const receipt = { contract: 'task/v1', receipt_id: id('trc'), profile: profile.current(), operation_id: operationId, task_id: task.task_id, outcome: 'committed', from: task.status, status: to, revision: next.revision, by, at: iso(clock.now()) };
         tx.put('tasks', task.task_id, next);
         tx.put('operations', operationId, { caller, digest, receipt });
         return receipt;
@@ -199,7 +199,7 @@ export function tasksPlugin({ schemas }) {
           if (prior) return { receipt: prior, fresh: false };
           const task = { task_id: id('task'), ...fields, ...(reference ? { parent_or_peer_reference: reference } : {}), requester, revision: 0, status: 'offered' };
           check('task-record', task, true);
-          const receipt = { contract: 'task/v1', receipt_id: id('trc'), operation_id: operationId, task_id: task.task_id, outcome: 'committed', status: 'offered', revision: 0, by: requester, at: iso(clock.now()) };
+          const receipt = { contract: 'task/v1', receipt_id: id('trc'), profile: profile.current(), operation_id: operationId, task_id: task.task_id, outcome: 'committed', status: 'offered', revision: 0, by: requester, at: iso(clock.now()) };
           tx.put('tasks', task.task_id, task);
           tx.put('operations', operationId, { caller: requester, digest, receipt });
           return { receipt, fresh: true };
@@ -234,7 +234,7 @@ export function tasksPlugin({ schemas }) {
           if (rt.role !== LEAD_ROLE) {
             // A specialist proposes (T20). The task does not move.
             const proposal = { proposal_id: id('prop'), task_id: task.task_id, operation_id: request.operation_id, member_id: rt.member_id, role: rt.role, runtime_id: request.runtime_id, transition: request.transition, evidence, task_revision: task.revision, task_status: task.status, at: iso(clock.now()) };
-            const receipt = { contract: 'task/v1', receipt_id: id('trc'), operation_id: request.operation_id, task_id: task.task_id, outcome: 'proposal', proposal_id: proposal.proposal_id, status: task.status, revision: task.revision, by: rt.member_id, at: proposal.at };
+            const receipt = { contract: 'task/v1', receipt_id: id('trc'), profile: profile.current(), operation_id: request.operation_id, task_id: task.task_id, outcome: 'proposal', proposal_id: proposal.proposal_id, status: task.status, revision: task.revision, by: rt.member_id, at: proposal.at };
             tx.put('proposals', proposal.proposal_id, proposal);
             tx.put('operations', request.operation_id, { caller, digest, receipt });
             return { receipt, fresh: true };
