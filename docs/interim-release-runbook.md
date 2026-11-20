@@ -158,6 +158,19 @@ node hq/main.mjs machine hq-service-recovery cancel --challenge-file "$challenge
 
 ### Upgrade a paired macOS service
 
+This service-only upgrade preserves an existing Machine-backed hardware device
+identity. The running service's authenticated owner status must report
+`hq.signer.available` as `true`, `hq.signer.backend` as `machine` and
+`hq.signer.key_storage` as `hardware`. Machine checks that status during
+planning, before stopping the service.
+
+If the current service uses a legacy software signer or its signer cannot be
+verified, leave the service running with its pairing, signer files, enrollment
+records and prior release intact. An absent local enrollment record cannot
+establish that the device was never enrolled. Verify its enrollment history
+with the issuer before seeking an explicitly authorized custody transition.
+Track that work in [the existing custody transition issue](https://github.com/true-line/agent-bot-hq/issues/188).
+
 Run the upgrade-capable HQ CLI as the existing dedicated role. Use the saved
 Machine plan for replacing the installed v2 service. Its unchanged account
 and service owner, current plan ID and digest, previous and next release
@@ -167,8 +180,14 @@ records, and both LaunchDaemon plists are covered by the challenge.
 node hq/main.mjs machine hq-service-upgrade export "$plan_id" --socket "$socket" > "$challenge_file"
 ```
 
-Transfer the original signed line to the daily owner's upgrade reviewer.
-Confirm the independently trusted Machine fingerprint and both release records.
+Before scheduling a physical upgrade, verify that the installed owner
+reviewer supports the exact `hq-service-upgrade` purpose with the existing
+pinned owner key. The [first-enrollment macOS CLI](https://github.com/true-line/agent-bot-identity/pull/1469)
+supports pairing and first-HQ approval only. A physical cutover must wait
+until the owner has a supported upgrade reviewer for that pin.
+
+Transfer the original signed line to that reviewer. Confirm the independently
+trusted Machine fingerprint and both release records.
 Return the operation-specific proof to the paired role within the challenge
 lifetime. An approved reply records the normal short-lived members approval
 for the exact replacement plan. Machine applies the saved plan separately.
