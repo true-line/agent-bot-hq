@@ -28,8 +28,9 @@ const exec = promisify(execFile);
 const origin = 'https://agents.true-line.ai';
 const dir = mkdtempSync(join(realpathSync('/tmp'), 'hq-custody-'));
 const home = join(dir, 'hq');
-// Only the disposable hosted runner may use the installed layout. A local
-// replay uses the same authenticated transport with paths under its fixture.
+// Only the disposable hosted runner may use the installed layout. This
+// single-account test models Machine's peer UID in its Go fixture. The
+// dedicated-account qualification exercises the kernel peer-credential check.
 const hosted = process.env.HQ_TEST_PACKAGED_HOSTED === '1';
 const sharedDir = '/opt/homebrew/var/agent-machine';
 if (hosted) {

@@ -926,8 +926,8 @@ releases.
 | --- | --- | --- |
 | MCP `take_inbox`, `POST /v0/inbox/take`, `gh-inbox-query`, `inbox-probe` | Broker-pulled notices (§4.8) and a member query `notices.peek` | Two releases after notices ship |
 | `gh-app-hook` Worker, `wrangler.toml`, `INBOX_TOKEN`, `WEBHOOK_SECRETS`, `SUBSCRIBERS` | Identity-service webhooks and notices | After a dual-run window |
-| Local App key custody: `ensure-private-key`, `identity-app-store`, `soul-credentials`, `credential-reconciler`, keyd App items, `migrate-credentials` | Identity service; HQ credential references | Off by default from PR 18, opt-in only under the standalone profile and flagged by `doctor`/`status`. **Code removed at stage 3 exit or on 2027-01-31, whichever comes first** (decided 2026-10-27, §10.1). The opt-in stops working on that date. |
-| `secret*.mjs`, Proton Pass providers, `soul secret set` | Identity-service vault (owner-unlock); HQ credential references | Same switch and the same dated removal as local App key custody |
+| Local App key custody: `ensure-private-key`, `identity-app-store`, `soul-credentials`, `credential-reconciler`, keyd App items, `migrate-credentials` | Identity service; HQ credential references | Keep legacy App-key custody disabled in every HQ profile. `doctor` and `status` flag existing state for administrator-reviewed migration. **Code removed at stage 3 exit or on 2027-01-31, whichever comes first** (§10.1). |
+| `secret*.mjs`, Proton Pass providers, `soul secret set` | Identity-service vault (owner-unlock); HQ credential references | Keep legacy secret providers disabled in every HQ profile. The same code-removal deadline applies. |
 | `vouch-key.pem`, `/v0/keyd/grant`, keyd `credential`/`git_credential` tools | Administrative Machine/keyd (soul token `v2`, ES256), or identity-service signing where no hardware signer exists; brokered service adapter | Stage 2a for the key; stage 2b for the tools |
 | `device-key.pem` (software) | Administrative Machine/keyd hardware key, after re-enrollment. Until then the identity service may refuse software-key devices per policy. | Stage 2a |
 | Owner gate through keyd Touch ID or the admin dialog in an agent account; agent-comms principal credential checks for revisions | HQ approval records from the owner session | Stage 3 |
@@ -1407,7 +1407,8 @@ These are this repository's decisions, and the platform's [decision log](https:/
     request still needs the owner's presence signature, which a delegate
     can request but not produce.
 - **`legacy-local-custody`: removed at stage 3 exit or on 2027-01-31,
-  whichever comes first.** It is off by default until then. It shipped off
+  whichever comes first.** Until removal, every HQ profile keeps it disabled
+  under the custody decision in §3.3. It originally shipped off
   by default, with the date enforced in code, in
   qwts/agent-bot-identity#1185.
 
