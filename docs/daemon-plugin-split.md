@@ -1333,11 +1333,11 @@ These are this repository's decisions, and the platform's [decision log](https:/
     agent-comms, agent-bot-machine). Work lands in the current `qwts`
     repositories, and the owner transfers them when no install breaks.
   - **Pin continuity.** Machine keeps the independently verified owner
-    public key it accepted at pairing. If a signing-team change requires
-    a new key, the old key signs a statement naming the new public key.
-    The owner approves the re-pin at Machine and updates the agent-bot
-    signer pin (`presence.signer`) through the owner gate. Until that
-    statement is accepted, Machine refuses proofs from the new key.
+    public key it accepted at pairing. A signing-team change that needs
+    a new owner key requires an explicitly approved continuity procedure
+    and recorded justification from the product owner. Until then,
+    Machine continues to require a proof from the existing owner key.
+    [First-enrollment decision](https://github.com/true-line/agent-bot-platform/blob/1291090c6e84d6ad13a9a26e499cf0d3167bc2a5/docs/04-decisions/PDR-0089-owner-approval-for-the-first-hq-account-on-macos.md#owner-key-for-first-enrollment)
 - **D5. The WP1 contracts live in `true-line/soul-contracts`, not in
   this repository. Accepted 2026-11-07.**
   §3.1 and §9 row 1 had put the WP1 schemas and fixtures here, while the
