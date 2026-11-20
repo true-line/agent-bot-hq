@@ -36,7 +36,7 @@ import { SCHEMA_NAMES } from './admission.mjs';
 import { NOTICE_SCHEMA_NAMES } from './notices.mjs';
 import { TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES } from './tasks.mjs';
 import { createHQ } from './hq.mjs';
-import { readPins } from './plugins.mjs';
+import { productionPluginsDir, readPins } from './plugins.mjs';
 import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { connectSocket } from './socket.mjs';
 import { machineRoleCommand } from './machine-channel.mjs';
@@ -59,8 +59,12 @@ function parse(argv) {
     else if (argv[i] === '--harness') (args.harnesses ??= []).push(argv[++i]);
     else if (argv[i] === '--force') args.force = true;
     else if (argv[i] === '--name') args.name = argv[++i];
-    else if (argv[i] === '--plugins') args.plugins = argv[++i];
-    else if (argv[i] === '--dev-plugins') args.devPlugins = argv[++i];
+    else if (argv[i] === '--plugins' || argv[i] === '--dev-plugins') {
+      const flag = argv[i];
+      const dir = argv[++i];
+      if (!dir || dir.startsWith('--')) throw new Error(`${flag} needs a directory`);
+      args[flag === '--plugins' ? 'plugins' : 'devPlugins'] = dir;
+    }
     else throw new Error(`unknown argument ${argv[i]}\n${USAGE}`);
   }
   if (!args.home) throw new Error(`--home needs a directory\n${USAGE}`);
@@ -129,7 +133,9 @@ async function main(argv) {
       return;
     }
     try {
-      const hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins: readPins(PINS), pluginsDir: args.plugins, devPlugins: args.devPlugins });
+      const pins = readPins(PINS);
+      const pluginsDir = productionPluginsDir(args, fileURLToPath(import.meta.url), pins);
+      const hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins, pluginsDir, devPlugins: args.devPlugins });
       // Handlers first, so a signal during start still shuts down cleanly.
       let starting = true;
       const shutdown = (signal) => {

@@ -6,6 +6,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symli
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { fixtureBroker } from './fixtures/interim-broker.mjs';
 import { manifestDigest } from '../scripts/soul-contracts.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -16,6 +17,7 @@ test('interim artifact is reproducible, runs offline and refuses changed contrac
   try {
     const repo = join(tmp, 'repo'), contracts = join(tmp, 'contracts');
     for (const d of ['scripts', 'hq', 'governance']) mkdirSync(join(repo, d), { recursive: true });
+    fixtureBroker(repo, tmp, root);
     const entries = [];
     for (const d of ['errors', 'fixtures', 'schemas']) {
       mkdirSync(join(contracts, d), { recursive: true });

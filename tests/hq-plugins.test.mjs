@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { manifestDigest } from '../scripts/soul-contracts.mjs';
-import { loadPlugins, readPins, treeDigest, PINS_FORMAT } from '../hq/plugins.mjs';
+import { productionPluginsDir, loadPlugins, readPins, treeDigest, PINS_FORMAT } from '../hq/plugins.mjs';
 import { startHQ } from './hq-harness.mjs';
 
 const SDK = pathToFileURL(join(import.meta.dirname, '../sdk/plugin.mjs')).href;
@@ -151,6 +151,37 @@ test('the pins file is strict', () => {
 
 test('the repository pins file is valid', () => {
   readPins(join(import.meta.dirname, '../governance/plugins.json'));
+});
+
+test('only the Darwin archive discovers its release-pinned broker directory', async (t) => {
+  const root = tempDir();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'vendor/plugins');
+  writePlugin(dir, { name: 'agent-comms' });
+  const broker = pin(dir, 'agent-comms');
+  const pins = pinsOf(broker);
+  mkdirSync(join(root, 'governance'));
+  const metadata = (details) => writeFileSync(join(root, 'governance/interim-release.json'), JSON.stringify({
+    schema_version: 1, target_platform: 'darwin', ...details,
+  }));
+  const entry = join(root, 'hq/interim-core.mjs');
+  metadata({});
+  assert.equal(productionPluginsDir({}, entry, pinsOf(), 'darwin'), undefined);
+  assert.throws(() => productionPluginsDir({}, entry, pins, 'darwin'), /release plugin pin/);
+  // Existing operator-selected directories take precedence regardless of bundle metadata.
+  assert.equal(productionPluginsDir({ plugins: '/installed' }, entry, pins, 'darwin'), '/installed');
+  assert.equal(productionPluginsDir({ devPlugins: '/development' }, entry, pins, 'darwin'), undefined);
+  assert.equal(productionPluginsDir({ plugins: '/installed', devPlugins: '/development' }, entry, pins, 'darwin'), '/installed');
+  metadata({ broker: { ...broker, version: '0.0.0' } });
+  assert.throws(() => productionPluginsDir({}, entry, pins, 'darwin'), /release plugin pin/);
+  metadata({ broker });
+  assert.equal(productionPluginsDir({}, join(root, 'hq/main.mjs'), pins, 'darwin'), undefined);
+  assert.equal(productionPluginsDir({}, entry, pins, 'linux'), undefined);
+  assert.throws(() => productionPluginsDir({}, entry, pinsOf(), 'darwin'), /release plugin pin/);
+  assert.equal(productionPluginsDir({}, entry, pins, 'darwin'), dir);
+  const loaded = await loadPlugins({ dir, pins });
+  assert.equal(loaded.loaded[0].plugin.name, 'agent-comms');
+  assert.equal(loaded.report[0].dev, undefined);
 });
 
 test('HQ runs pinned plugins, receipts refusals, keeps core names, and reports dev plugins', async () => {
