@@ -107,6 +107,8 @@ The HQ state directory includes `control.sock`, `admission.sock` and `broker.soc
 
 If the upgrade pauses, preserve the existing pairing, owner pin, signer and enrollment records. Check the device’s enrollment history with the identity-service administrator before authorizing a custody change. A signed status from the paired Machine verifies its channel. Replacing an established device identity requires a separately approved transition.
 
+The paired integration test also drops Machine’s successful binding reply and restarts both HQ and Machine. The owner CLI must finish enrollment from the original pending receipt without contacting the issuer. To run this case offline on macOS, use the command above from the extracted Darwin archive with `HQ_INTERIM_OFFLINE=1` and cached Machine Cargo dependencies.
+
 On macOS the dedicated HQ account requires an explicit `harnesses.dir` of
 `/Library/Application Support/ai.true-line.agent-bot-hq/ipc`. Machine provisions
 this directory and one private group directory per configured harness. HQ

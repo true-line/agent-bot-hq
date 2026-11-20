@@ -3,7 +3,7 @@
 // into a fresh test provider, just as a release embeds its trusted issuer.
 import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { createECDH, randomBytes } from 'node:crypto';
+import { createECDH, createHash, randomBytes } from 'node:crypto';
 import { copyFileSync, cpSync, existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { userInfo } from 'node:os';
@@ -205,18 +205,24 @@ try {
   }
 
   const calls = [];
-  async function startHQ() {
+  async function startHQ({ fetchHQ = fetchImpl, loseBindReply = false } = {}) {
     const signer = createMachineSigner({
       home, keysFor: () => [server.key],
-      request: (operation, fields) => {
+      request: async (operation, fields) => {
         calls.push(operation);
-        return request(['hq-device', operation, '--socket', socket], fields);
+        const reply = await request(['hq-device', operation, '--socket', socket], fields);
+        if (loseBindReply && operation === 'bind-enrollment') {
+          assert.equal(reply.state, 'bound');
+          loseBindReply = false;
+          throw new Error('fixture lost the committed bind reply');
+        }
+        return reply;
       },
       enrollment: (device) => createEnrollment({
-        home, signer: device, server: origin, fetchImpl, sleep: () => setTimeout(10),
+        home, signer: device, server: origin, fetchImpl: fetchHQ, sleep: () => setTimeout(10),
       }),
     });
-    const identity = createIdentityService({ server: origin, keySet: [server.key], fetchImpl,
+    const identity = createIdentityService({ server: origin, keySet: [server.key], fetchImpl: fetchHQ,
       enrollment: signer.enrollment, custody: signer.custody });
     hq = createHQ({ home, schemas, signer, identity, legacy: legacyDaemon({ run: fakeLegacy().run }) });
     return hq.start();
@@ -240,7 +246,7 @@ try {
     const enrolled = runCLI(entry, home, ['enroll', '--harness', 'codex']);
     await Promise.race([until(() => server.state.grants.size === grants + 1, 'enrollment did not reach the test issuer'), enrolled]);
     server.decide('approved');
-    assert.match((await enrolled).stdout, /Enrolled as device/);
+    return enrolled;
   }
 
   if (packagedCLI) {
@@ -270,7 +276,7 @@ try {
       assert.equal(plugin.state, enrolled ? 'running' : 'waiting');
     }
     checkBroker(await startPackage(entry, home), false);
-    await approveEnrollment(entry);
+    assert.match((await approveEnrollment(entry)).stdout, /Enrolled as device/);
     await stopPackage();
     checkBroker(await startPackage(entry, home), true);
     await stopPackage();
@@ -280,10 +286,41 @@ try {
     console.log('Packaged HQ enrolled through Machine and loaded the pinned production broker on restart.');
     await startPackage();
   } else {
-    assert.equal((await startHQ()).mode, 'safe');
+    assert.equal((await startHQ({ loseBindReply: true })).mode, 'safe');
     assert.equal((await cliStatus()).mode, 'safe');
-    await approveEnrollment(cliPath);
+    await assert.rejects(approveEnrollment(cliPath), e => e.code === 1 && /Enrollment failed/.test(e.stderr));
+
+    // Keyd has already committed the original receipt. HQ has only its pending copy.
+    const pending = join(home, 'identity', 'pending-receipt.json');
+    const device = join(home, 'identity', 'device.json');
+    const { receipt } = JSON.parse(readFileSync(pending));
+    const { body: bound } = await request(['hq-device', 'identity', '--socket', socket]);
+    assert.equal(bound.receipt_jti, receipt.receipt_jti);
+    assert.equal(bound.receipt_sha256, createHash('sha256').update(Buffer.from(receipt.receipt_body, 'base64url')).digest('hex'));
+    assert.ok(bound.device_id);
+    assert.equal(existsSync(device), false);
     await hq.stop();
+    await stopMachine();
+    await startMachine();
+
+    // A new HQ must finish on the same pairing, with no discovery, new grant or poll.
+    const issuerRequests = server.state.requests.length;
+    let offlineRequests = 0;
+    await startHQ({ fetchHQ() { offlineRequests++; throw new Error('fixture issuer offline'); } });
+    const sinceRestart = calls.length;
+    const resumed = JSON.parse((await cli('enroll', '--harness', 'codex')).stdout);
+    assert.equal(resumed.state, 'approved');
+    assert.equal(resumed.device_id, bound.device_id);
+    assert.deepEqual(calls.slice(sinceRestart).filter(op => op !== 'identity'), ['bind-enrollment']);
+    const local = JSON.parse(readFileSync(device));
+    assert.ok(local.receipt_body === receipt.receipt_body, 'retry persisted a different receipt');
+    assert.equal(local.receipt_jti, bound.receipt_jti);
+    assert.equal(local.device_id, bound.device_id);
+    assert.equal(existsSync(pending), false);
+    assert.equal(offlineRequests, 0);
+    assert.equal(server.state.requests.length, issuerRequests);
+    await hq.stop();
+    console.log('HQ recovered the committed enrollment receipt after both restarts without contacting the issuer.');
   }
   assert.equal((await startHQ()).mode, 'running');
   assert.equal((await cliStatus()).mode, 'running');
