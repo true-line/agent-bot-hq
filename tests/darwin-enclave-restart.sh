@@ -2,11 +2,12 @@
 # Called within the already provisioned disposable HQ fixture. The staged Node
 # driver and native binary are root-owned; the role owns only the fixture data.
 set -euo pipefail
-[[ "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted && "$(uname -s)" == Darwin ]]
+source "$(dirname "$0")/fixtures/darwin-hosted.sh"
+require_hosted_darwin || exit 1
 stage="${1:?fixture stage}" role="${2:?fixture role}" home="${3:?fixture home}"
-[[ "$role" == _agent-bot-hq && "$home" == /private/var/agent-bot-hq ]]
+[[ "$role" == _agent-bot-hq && "$home" == /private/var/agent-bot-hq ]] || exit 1
 uid="$(id -u "$role")"
-[[ "$uid" != 0 && "$uid" != "$(id -u)" ]]
+[[ "$uid" != 0 && "$uid" != "$(id -u)" ]] || exit 1
 node_bin="$(node -p 'process.execPath')"
 probe="$RUNNER_TEMP/hq-fixture-signer"
 installation=helpers/macos-enclave/MachineInstallation.swift
@@ -48,8 +49,9 @@ plutil -lint "$plist"
 # Boot out between runs to clear launchd's last exit code and terminate the
 # service context. Only the scoped test Keychain, pin, and public evidence survive.
 for iteration in 1 2; do
+  fixture_job_absent "$label" || exit 1
   sudo launchctl bootstrap system "$plist"
-  trap 'sudo launchctl bootout "system/$label"' EXIT
+  trap cleanup_probe_fixture EXIT
   for _ in {1..45}; do
     status="$(sudo launchctl print "system/$label")"
     if [[ "$status" =~ last\ exit\ code\ =\ ([0-9]+) ]]; then break; fi
@@ -59,7 +61,7 @@ for iteration in 1 2; do
     sudo cat "$home/restart.err" >&2
     echo "Secure Enclave restart fixture failed on run $iteration" >&2; exit 1
   fi
-  sudo launchctl bootout "system/$label"
+  fixture_stop_job "$label" "$plist"
   trap - EXIT
 done
 sudo grep -F 'The restarted HQ job retained its enclave key' "$home/restart.out"
