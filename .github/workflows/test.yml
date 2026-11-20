@@ -109,7 +109,7 @@ jobs:
           # macOS children inherit the parent group. The harness fixture must
           # own that group to create its required setgid directories.
           chgrp "$(id -gn)" "$TMPDIR"
-          node --test --test-concurrency=1 tests/hq-darwin-harness-accounts.test.mjs tests/hq-launch.test.mjs
+          node --test --test-concurrency=1 tests/hq-darwin-harness-accounts.test.mjs tests/hq-darwin-launch.test.mjs tests/hq-launch.test.mjs
       - name: Check CryptoKit signatures and available Secure Enclave support
         env:
           HQ_TEST_SECURE_ENCLAVE: '1'

@@ -44,6 +44,21 @@ or `retired`). A pre-published next key is usable only inside its interval;
 retired, unknown and out-of-window keys refuse. Deploying rotation requires
 the reviewed release pin first.
 
+## macOS harness launch readiness
+
+For each configured account, HQ checks the Machine installation plan digest,
+the recorded launcher and sandbox, the admitted adapter and UID, and sudo's
+noninteractive permission for the exact supervisor command. Status lists the
+installed adapters separately from those available for launch. Launch also
+requires independently verified Darwin package qualification for that exact
+adapter. The production verifier has no qualified adapters yet.
+
+A qualified launch hands the supervisor a private stdin header followed by
+ACP. Closing stdin requests shutdown of that launch's process group. HQ holds
+the slot as uncontained unless the supervisor confirms group closure or an
+explicit refusal before spawn. Per-launch member authentication and retirement
+remain under Souls and Machine respectively.
+
 ## Linux owner control under the dedicated account
 
 The service manager can pass a Unix stream listener to `hq/main.mjs run
