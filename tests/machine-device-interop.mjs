@@ -23,7 +23,8 @@ const [machineBinary, keydBuilder, packagedCLI] = process.argv.slice(2).map((fil
 assert.ok(machineBinary && keydBuilder && [4, 5].includes(process.argv.length),
   'usage: node tests/machine-device-interop.mjs MACHINE_TEST_BINARY KEYD_FIXTURE_BUILD_SCRIPT [UNPACKED_HQ_CLI]');
 assert.ok(process.getuid?.() > 0, 'run as an ordinary Unix account');
-const cliPath = fileURLToPath(new URL('../hq/main.mjs', import.meta.url));
+// The shipped CLI loads its verified offline contracts during startup.
+const cliPath = packagedCLI ?? fileURLToPath(new URL('../hq/main.mjs', import.meta.url));
 const exec = promisify(execFile);
 const origin = 'https://agents.true-line.ai';
 const dir = mkdtempSync(join(realpathSync('/tmp'), 'hq-custody-'));
