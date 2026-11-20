@@ -58,3 +58,7 @@ test('Darwin reports only versioned launch failures and keeps ordinary CLI exits
   assert.equal(launched.status, 87);
   assert.equal(launched.stderr.trim(), 'HQ could not activate the inherited macOS owner-control listener');
 });
+
+test('stock macOS Bash guards the hosted fixtures and cleans up only their recorded resources', { skip: process.platform !== 'darwin' }, () => {
+  execFileSync('/bin/bash', [fileURLToPath(new URL('fixtures/darwin-hosted-check.sh', import.meta.url))], { stdio: 'pipe', timeout: 20000 });
+});

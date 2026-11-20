@@ -17,6 +17,7 @@ import { createIdentityService } from '../hq/identity-service.mjs';
 import { legacyDaemon } from '../hq/legacy.mjs';
 import { machineCommandInHome } from '../hq/machine-channel.mjs';
 import { createMachineSigner } from '../hq/machine-device.mjs';
+import { jwkThumbprint } from '../hq/signer.mjs';
 import { fakeLegacy, schemas } from './hq-harness.mjs';
 import { fakeIdentityService } from './identity-service-fixture.mjs';
 
@@ -228,6 +229,52 @@ try {
     return hq.start();
   }
 
+  const lookup = () => hq.core.identity.call('GET', '/api/daemon/whoami');
+  async function bindFreshSession() {
+    await hq.settled();
+    assert.equal(hq.core.identity.status().tokenCached, false);
+    const before = server.state.requests.length;
+    const operations = calls.length;
+    const reply = await lookup();
+    assert.equal(reply.status, 200);
+    assert.deepEqual(calls.slice(operations).filter(op => op !== 'identity'), ['access-assertion', 'bind-access', 'whoami']);
+    const sent = server.state.requests.slice(before);
+    assert.deepEqual(sent.map(r => [r.method, r.url]), [['POST', '/oauth/token'], ['GET', '/api/daemon/whoami']]);
+    assert.equal(hq.core.identity.status().tokenCached, true);
+    // The fixture issuer verified the assertion; retain only its public identifiers.
+    const claims = JSON.parse(Buffer.from(sent[0].form.assertion.split('.')[1], 'base64url'));
+    assert.equal(reply.body.device.id, claims.iss);
+    const warm = await lookup();
+    assert.equal(warm.status, 200);
+    assert.equal(warm.body.device.id, claims.iss);
+    assert.notEqual(warm.headers['agent-bot-request-jti'], reply.headers['agent-bot-request-jti']);
+    assert.deepEqual(server.state.requests.slice(before + 2).map(r => [r.method, r.url]), [['GET', '/api/daemon/whoami']]);
+    const requests = server.state.requests.length;
+    await assert.rejects(hq.core.identity.call('GET', '/api/daemon/issuances/fixture-op'),
+      { code: 'credential_unavailable', message: /no authorized DPoP action/ });
+    assert.equal(server.state.requests.length, requests);
+    return { device: claims.iss, jti: claims.jti, session: jwkThumbprint(claims.cnf.jwk) };
+  }
+  async function refuseWarmLookup(reason, diagnostic) {
+    // Both accessors are snapshots. Keep the last good identity for the first lookup after cutoff.
+    assert.equal(hq.core.signer.report().available, true);
+    assert.equal(hq.core.identity.status().tokenCached, true);
+    const requests = server.state.requests.length;
+    const operations = calls.length;
+    await assert.rejects(lookup(), error => {
+      assert.equal(error.code, 'credential_unavailable');
+      assert.equal(error.machineDiagnostic, diagnostic);
+      assert.match(error.message, reason);
+      return true;
+    });
+    assert.deepEqual(calls.slice(operations), ['identity']);
+    const signer = hq.core.signer.report();
+    assert.equal(signer.available, false);
+    assert.match(signer.reason, reason);
+    assert.equal(hq.core.identity.status().tokenCached, false);
+    assert.equal(server.state.requests.length, requests, 'warm lookup must not refresh a token or transmit a daemon request');
+  }
+
   const trapHome = join(dir, 'trap');
   const marker = join(trapHome, 'invoked');
   mkdirSync(trapHome, { mode: 0o700 });
@@ -324,12 +371,12 @@ try {
   }
   assert.equal((await startHQ()).mode, 'running');
   assert.equal((await cliStatus()).mode, 'running');
-  await assert.rejects(hq.core.identity.call('GET', '/api/daemon/issuances/fixture-op'), /no authorized DPoP action/);
-  assert.ok(calls.includes('bind-access'));
-  assert.equal(server.state.requests.filter((item) => item.url.startsWith('/api/daemon/')).length, 0);
+  const firstSession = await bindFreshSession();
+  assert.equal(firstSession.device, server.state.devices[0].device_id);
   await assertNoLocalSigner();
 
   await stopMachine();
+  await refuseWarmLookup(/could not connect to the paired Machine/);
   await assert.rejects(hq.core.signer.custody.openSession());
   assert.equal((await cliStatus()).hq.signer.available, false);
   await assertNoLocalSigner();
@@ -337,8 +384,16 @@ try {
   assert.equal(await hq.core.signer.deviceStatus(), 'enrolled');
   assert.equal((await cliStatus()).hq.signer.available, true);
   await assertNoLocalSigner();
+  // A new HQ instance discards the in-memory token. Reuse its existing enrollment and pairing.
+  await hq.stop();
+  assert.equal((await startHQ()).mode, 'running');
+  const recovered = await bindFreshSession();
+  assert.equal(recovered.device, firstSession.device);
+  assert.ok(recovered.jti !== firstSession.jti, 'recovery requires a fresh signed access assertion');
+  assert.ok(recovered.session !== firstSession.session, 'recovery requires a new admin session');
   writeFileSync(join(dir, 'revoke'), '');
   await until(() => existsSync(join(dir, 'revoked')), 'Machine did not acknowledge revocation');
+  await refuseWarmLookup(/MM_DAEMON_PEER_REFUSED/, 'MM_DAEMON_PEER_REFUSED');
   if (packagedCLI) {
     await refusedPackageGrant(/Machine refused this HQ account.*MM_DAEMON_PEER_REFUSED.*check its pairing/);
     await stopPackage();
@@ -351,7 +406,8 @@ try {
   assert.equal((await startHQ()).mode, 'safe');
   assert.equal((await cliStatus()).hq.signer.available, false);
   await assertNoLocalSigner();
-  console.log('Verified paired enrollment, access-token binding, restart, outage and revocation with no local signer calls.');
+  assert.deepEqual(server.state.requests.filter(r => r.url.startsWith('/api/daemon/')).map(r => r.url), Array(4).fill('/api/daemon/whoami'));
+  console.log('Verified signed self-lookups on one enrolled device across Machine restart and warm-token refusal on outage and revocation.');
 } finally {
   try {
     await stopPackage();

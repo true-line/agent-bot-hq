@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, chmodSync, truncateSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync, rmSync, chmodSync, truncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { manifestDigest, verifyVendored } from '../scripts/soul-contracts.mjs';
 
 test('vendored contracts verify exact content and refuse tampering and symlinks', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'hq-contracts-'));
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'hq-contracts-'));
   try {
     mkdirSync(join(dir, 'schemas'));
     const file = join(dir, 'schemas', 'one.json');
@@ -36,11 +36,30 @@ test('vendored contracts verify exact content and refuse tampering and symlinks'
   } finally { rmSync(dir, { recursive:true, force:true }); }
 });
 
+test('importing the verifier from stdin, eval or print leaves CLI execution to the caller', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const entry = fileURLToPath(new URL('../scripts/soul-contracts.mjs', import.meta.url));
+  const expression = "import(process.argv.at(-1)).then(() => console.log('imported verifier'))";
+  for (const args of [
+    ['--input-type=module', '-', entry],
+    ['-e', expression, entry], ['--eval', expression, entry], [`--eval=${expression}`, entry],
+    ['-p', expression, entry], ['--print', expression, entry], ['--print=true', expression, entry], ['-pe', expression, entry],
+  ]) {
+    const result = spawnSync(process.execPath, args, {
+      encoding: 'utf8', input: expression, env: { ...process.env, PATH: '/nonexistent', HQ_INTERIM_OFFLINE: '1' },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /^imported verifier$/m);
+    assert.doesNotMatch(result.stdout, /ok soul-contracts/);
+  }
+});
+
 test('interim mode verifies offline and missing payload never falls back to git', async () => {
   const { copyFileSync } = await import('node:fs');
   const { spawnSync } = await import('node:child_process');
   const { fileURLToPath } = await import('node:url');
-  const dir = mkdtempSync(join(tmpdir(), 'hq-interim-'));
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'hq-interim-'));
   try {
     for (const path of ['scripts', 'governance', 'vendor/soul-contracts/schemas']) mkdirSync(join(dir, path), {recursive:true});
     copyFileSync(fileURLToPath(new URL('../scripts/soul-contracts.mjs', import.meta.url)), join(dir,'scripts/soul-contracts.mjs'));
@@ -50,12 +69,21 @@ test('interim mode verifies offline and missing payload never falls back to git'
     writeFileSync(join(dir,'governance/soul-contracts.json'), JSON.stringify(pin));
     const file = join(dir,'vendor/soul-contracts/schemas/one.json');
     writeFileSync(file, bytes);
-    const run = () => spawnSync(process.execPath, [join(dir,'scripts/soul-contracts.mjs'),'verify'], {encoding:'utf8', env:{...process.env, PATH:'/nonexistent', HQ_INTERIM_OFFLINE:'1'}});
-    assert.equal(run().status, 0);
+    const entry = join(dir, 'scripts/soul-contracts.mjs');
+    const alias = join(dir, 'verify-contracts.mjs');
+    symlinkSync(entry, alias);
+    const run = (script) => spawnSync(process.execPath, [script, 'verify'], {encoding:'utf8', env:{...process.env, PATH:'/nonexistent', HQ_INTERIM_OFFLINE:'1'}});
+    for (const script of [entry, alias]) {
+      const result = run(script);
+      assert.equal(result.status, 0);
+      assert.match(result.stdout, /ok soul-contracts/);
+    }
     rmSync(file);
-    const refused = run();
-    assert.equal(refused.status, 1);
-    assert.match(refused.stderr, /does not match/);
-    assert.doesNotMatch(refused.stderr, /spawnSync git/);
+    for (const script of [entry, alias]) {
+      const refused = run(script);
+      assert.equal(refused.status, 1);
+      assert.match(refused.stderr, /does not match/);
+      assert.doesNotMatch(refused.stderr, /spawnSync git/);
+    }
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });

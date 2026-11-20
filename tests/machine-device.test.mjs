@@ -15,6 +15,7 @@ import { signatureBytes } from '../hq/identity-service.mjs';
 import { machineCommandInHome } from '../hq/machine-channel.mjs';
 import { createMachineSigner } from '../hq/machine-device.mjs';
 import { decideApproval } from '../sdk/services.mjs';
+import { definePlugin } from '../sdk/plugin.mjs';
 import { fakeIdentityService } from './identity-service-fixture.mjs';
 import { schemas, fakeLegacy, tempHome } from './hq-harness.mjs';
 
@@ -76,7 +77,7 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   let binding, lostReply = true, receiptJti, accessJti, session, revoked = false;
   const options = [];
   const accessBindings = [];
-  let accessResponse;
+  let accessResponse, sessionKey, accessHash, whoamiChange;
   // Simulate an administrator changing the pair between the identity read
   // and the next normal operation on this running HQ.
   let refuseAssertion, holdIdentity;
@@ -101,13 +102,26 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
           const proof = bytes + '.' + sign('sha256', Buffer.from(bytes), { key: device.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url');
           state = 'proved'; body = { ...identity, proof }; receiptJti = 'enroll-v1:' + hash(proof);
         } else if (r.option === 'access-assertion') {
-          const ephemeralJwk = generateKeyPairSync('ec', { namedCurve: 'P-256' }).publicKey.export({ format: 'jwk' });
+          sessionKey = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+          const ephemeralJwk = sessionKey.publicKey.export({ format: 'jwk' });
           session = jwkThumbprint(ephemeralJwk);
           accessJti = randomBytes(16).toString('base64url');
           const iat = Math.floor(Date.now() / 1000);
           const input = b64({ typ: 'JWT', alg: 'ES256' }) + '.' + b64({ iss: binding.device_id, sub: binding.device_id,
             aud: service.url + '/oauth/token', iat, exp: iat + 120, jti: accessJti, cnf: { jwk: ephemeralJwk } });
           state = 'asserted'; body = { ...identity, assertion: input + '.' + sign('sha256', Buffer.from(input), { key: device.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url') };
+        } else if (r.option === 'whoami') {
+          assert.deepEqual(Object.keys(r).sort(), ['hq_epoch', 'nonce', 'option', 'public_key', 'session', 'signature', 'timestamp', 'verb']);
+          assert.equal(r.session, session);
+          parts.push('session', r.session);
+          const header = { alg: 'ES256', typ: 'dpop+jwt', jwk: sessionKey.publicKey.export({ format: 'jwk' }) };
+          const claims = { htm: 'GET', htu: service.url + '/api/daemon/whoami', ath: accessHash,
+            iat: Math.floor(Date.now() / 1000), jti: randomBytes(16).toString('base64url') };
+          body = { session, hq_epoch: identity.hq_epoch };
+          const key = whoamiChange?.({ claims, header, body }) ?? sessionKey.privateKey;
+          const input = b64(header) + '.' + b64(claims);
+          body.proof = input + '.' + sign('sha256', Buffer.from(input), { key, dsaEncoding: 'ieee-p1363' }).toString('base64url');
+          state = 'whoami-proved';
         } else {
           assert.ok(['bind-enrollment', 'bind-access'].includes(r.option));
           for (const field of ['receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature']) parts.push(field, r[field]);
@@ -119,7 +133,9 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
             key: { kty: 'OKP', crv: 'Ed25519', x: service.key.x }, format: 'jwk',
           }), Buffer.from(r.receipt_signature, 'base64url')));
           if (r.option === 'bind-access') {
-            assert.equal(JSON.parse(bytes).access_token, 'disposable-fixture-token');
+            const token = JSON.parse(bytes).access_token;
+            assert.ok(typeof token === 'string' && token.length > 0);
+            accessHash = createHash('sha256').update(token).digest('base64url');
             state = 'access-bound'; body = { session, expires_at: Math.floor(Date.now() / 1000) + 300, hq_epoch: identity.hq_epoch };
           } else {
             binding = { device_id: JSON.parse(bytes).device_id, receipt_jti: receiptJti, receipt_sha256: hash(bytes) };
@@ -152,8 +168,15 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   await assert.rejects(request('identity'), /requires the daemon pin/);
   const machineKey = machine.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
   await run(['status', '--socket', socket, '--daemon-key', machineKey.toString('hex')]);
+  const selfLookup = definePlugin({
+    name: 'self-lookup', version: '1.0.0', hostApi: 1,
+    services: ['identityService'], identityServiceRoutes: ['/api/daemon/whoami'],
+    async init(ctx) {
+      return { provides: { read: () => ctx.services.identityService.call('GET', '/api/daemon/whoami') } };
+    },
+  });
   const open = async (config = {}) => {
-    const hq = createHQ({ home, schemas, config: { enrollment: { source: 'hq', server: service.url }, ...config },
+    const hq = createHQ({ home, schemas, plugins: [selfLookup], config: { enrollment: { source: 'hq', server: service.url }, ...config },
       serverKeys: [service.key], createDeviceSigner: (opts) => createMachineSigner({ ...opts, request, keysFor: () => [service.key] }),
       legacy: legacyDaemon({ run: fakeLegacy().run }),
     });
@@ -193,8 +216,23 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.match(statusText, /^signer: hardware key, paired Machine\/keyd backend, key /m);
   assert.doesNotMatch(statusText, /hardwareSigner|experimental feature/);
   assert.equal(existsSync(join(home, 'signer')), false);
+  const beforeNotices = service.state.requests.length;
+  await assert.rejects(active.hq.core.identity.call('GET', '/api/daemon/notices'), {
+    code: 'credential_unavailable', message: /Machine has no authority for this credential operation/,
+  });
+  assert.equal(service.state.requests.length, beforeNotices);
   const lookup = () => active.hq.core.identity.call('GET', '/api/daemon/issuances/example-op');
   const enrolled = readFileSync(join(home, 'identity/device.json'));
+  const repeat = await offer();
+  assert.equal(repeat.host_refusal.code, 'host.invalid_request');
+  assert.equal(repeat.host_refusal.explanation, 'this HQ is already enrolled with its Machine-managed device key');
+  const forced = await active.owner.request('device.enroll', { harnesses: ['codex'], force: true });
+  assert.equal(forced.refusal.error, 'credential_unavailable');
+  assert.match(forced.refusal.explanation, /rotation requires administrator action in Machine/);
+  assert.equal(options.filter(name => name === 'enrollment-proof').length, 1);
+  assert.equal(service.state.grants.size, 1);
+  assert.deepEqual(readFileSync(join(home, 'identity/device.json')), enrolled);
+
   service.state.mode = 'assertion-expired';
   await assert.rejects(lookup(), { code: 'credential_unavailable' });
   const expiredJti = accessJti;
@@ -218,6 +256,42 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   accessResponse = undefined;
   assert.equal(service.state.requests.filter((r) => r.url.includes('/api/daemon/')).length, 0);
   await assert.rejects(active.hq.core.identity.call('POST', '/api/daemon/credentials', {}), /administrator-side credential use/);
+  // The device and its signed enrollment are unchanged, but this pair has a new epoch.
+  const requestsBeforeEpochChange = service.state.requests.length;
+  const operationsBeforeEpochChange = options.length;
+  const originalEpoch = identity.hq_epoch;
+  identity.hq_epoch = 'cd'.repeat(32);
+  await assert.rejects(lookup(), { code: 'credential_unavailable', message: /no longer matches the current pairing/ });
+  assert.deepEqual(options.slice(operationsBeforeEpochChange), ['identity']);
+  assert.equal(service.state.requests.length, requestsBeforeEpochChange);
+  assert.equal(active.hq.core.identity.status().tokenCached, false);
+  identity.hq_epoch = originalEpoch;
+  await assert.rejects(lookup(), /no authorized DPoP action/);
+  assert.equal(active.hq.core.identity.status().tokenCached, true);
+  const whoami = () => active.hq.host.provided('self-lookup').read();
+  const received = () => service.state.requests.filter(r => r.url === '/api/daemon/whoami').length;
+  const positive = await whoami();
+  assert.equal(positive.body.device.id, binding.device_id);
+  assert.equal(positive.status, 200);
+  assert.equal(received(), 1);
+  for (const change of [
+    ({ claims }) => { claims.ath = 'wrong-token'; },
+    ({ claims }) => { claims.jti = 'invalid'; },
+    ({ claims }) => { claims.htu += '?query'; },
+    ({ claims }) => { claims.htm = 'POST'; },
+    ({ claims }) => { claims.extra = 'extra'; },
+    ({ claims }) => { claims.iat -= 61; },
+    ({ claims }) => { claims.iat += 62; },
+    ({ body }) => { body.session = 'another-session'; },
+    ({ body }) => { body.hq_epoch = 'legacy'; },
+    ({ header }) => { header.jwk = jwk; return device.privateKey; },
+    () => device.privateKey,
+  ]) {
+    whoamiChange = change;
+    await assert.rejects(whoami(), { code: 'credential_unavailable' });
+    assert.equal(received(), 1, 'an invalid Machine proof never reaches Identity');
+  }
+  whoamiChange = undefined;
   const deviceRecord = readFileSync(join(home, 'identity/device.json'));
   const enrollmentState = async () => (await active.owner.request('device.status')).result.device;
   for (const refusal of ['MM_DAEMON_UNKNOWN_KEY', 'MM_DAEMON_PEER_REFUSED', 'MM_DAEMON_CALLER_REFUSED', 'offline']) {
@@ -238,6 +312,12 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
     await assert.rejects(pending, /custody changed/);
     const status = (await active.owner.request('status')).result;
     assert.equal(status.hq.signer.available, false, refusal);
+    if (refusal === 'MM_DAEMON_UNKNOWN_KEY') {
+      const beforeLookup = service.state.requests.length;
+      await assert.rejects(lookup(), { code: 'credential_unavailable' });
+      assert.equal(active.hq.core.identity.status().tokenCached, false);
+      assert.equal(service.state.requests.length, beforeLookup);
+    }
     assert.equal(await enrollmentState(), 'enrolled');
     assert.deepEqual(readFileSync(join(home, 'identity/device.json')), deviceRecord);
     refuseAssertion = undefined;

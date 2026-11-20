@@ -24,9 +24,16 @@ export function commsCheckout() {
       git(work, 'init', '-q', '--template=');
       git(work, 'fetch', '-q', '--depth', '1', '--no-tags', REPOSITORY, COMMIT);
       git(work, 'checkout', '-q', '--detach', 'FETCH_HEAD');
-      renameSync(work, cache);
-    } catch (error) { rmSync(work, { recursive: true, force: true }); throw error; }
+      try {
+        renameSync(work, cache);
+      } catch (error) {
+        // Another test process may have published its checkout first.
+        if (error.code !== 'EEXIST' && error.code !== 'ENOTEMPTY') throw error;
+      }
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
   }
-  if (git(cache, 'rev-parse', 'HEAD').trim() !== COMMIT || git(cache, 'status', '--porcelain', '--untracked-files=all').trim()) throw new Error('test comms checkout must match the clean reviewed commit');
+  if (git(cache, 'rev-parse', 'HEAD').trim() !== COMMIT || git(cache, '--no-optional-locks', 'status', '--porcelain', '--untracked-files=all').trim()) throw new Error('test comms checkout must match the clean reviewed commit');
   return cache;
 }

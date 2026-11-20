@@ -95,14 +95,25 @@ jobs:
           git init -q .
           git fetch -q --no-tags --depth 1 "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
           git checkout -q --detach FETCH_HEAD
+      - name: Verify the paired macOS plan handoff
+        env:
+          TMPDIR: /private/tmp
+        run: node --test tests/machine-service-recovery.test.mjs
       - name: Exercise the signer, custody reporting and enrollment fixture
         env:
           TMPDIR: /tmp
         run: |
           node -e 'if (process.platform !== "darwin" || process.arch !== "arm64") process.exit(1)'
           node --test --test-concurrency=1 tests/hq-signer.test.mjs tests/hq-profile-legacy.test.mjs tests/hq-enrollment.test.mjs
-      - name: Verify Darwin harness endpoints and kernel peer UIDs
-        run: node --test tests/hq-darwin-harness-accounts.test.mjs
+      - name: Verify Darwin harness endpoints, member socket allocation and kernel peer UIDs
+        run: |
+          TMPDIR="$(mktemp -d /tmp/hq.XXXXXX)"
+          export TMPDIR
+          trap 'rm -rf "$TMPDIR"' EXIT
+          # macOS children inherit the parent group. The harness fixture must
+          # own that group to create its required setgid directories.
+          chgrp "$(id -gn)" "$TMPDIR"
+          node --test --test-concurrency=1 tests/hq-darwin-harness-accounts.test.mjs tests/hq-darwin-launch.test.mjs tests/hq-launch.test.mjs
       - name: Check CryptoKit signatures and available Secure Enclave support
         env:
           HQ_TEST_SECURE_ENCLAVE: '1'
