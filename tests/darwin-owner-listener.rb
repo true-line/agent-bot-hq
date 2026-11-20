@@ -21,16 +21,17 @@ Dir.mktmpdir('hq-listener-', '/private/tmp') do |dir|
       end
       expected = listener.local_address.unix_path
       raise 'renamed listener lost its original bound address' unless expected == name
-      raise 'published path did not reach the listener' unless published_peer?(path, expected)
-      raise 'a different socket matched' if published_peer?(other, expected)
-      raise 'unreachable public path matched' if published_peer?(name, expected)
-      raise 'ordinary bound address accepted as a launchd address' if launchd_address?(listener, expected)
-      # Each probe closes without data. The next waiting client stays queued.
-      listener.accept.first.close
-      unrelated.accept.first.close
+      # Keep a real client first in the queue while the probes connect and close.
+      # A closed probe need not remain available for a later blocking accept.
       Addrinfo.unix(path).connect do |client|
         client.write('ready')
-        connection, = listener.accept
+        raise 'published path did not reach the listener' unless published_peer?(path, expected)
+        raise 'a different socket matched' if published_peer?(other, expected)
+        raise 'unreachable public path matched' if published_peer?(name, expected)
+        raise 'ordinary bound address accepted as a launchd address' if launchd_address?(listener, expected)
+        accepted = listener.accept_nonblock(exception: false)
+        raise 'the waiting client was consumed' if accepted == :wait_readable
+        connection, = accepted
         begin
           raise 'the waiting client was consumed' unless connection.read(5) == 'ready'
           raise 'connected fd accepted as listener' if listener?(connection)

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Managed by managed-machine members. -->
+<!-- archive aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa node bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb owner UID 501 -->
+<plist version="1.0"><dict>
+<key>Label</key><string>ai.true-line.agent-bot-hq</string>
+<key>UserName</key><string>_agent-bot-hq</string>
+<key>GroupName</key><string>_agent-bot-hq</string>
+<key>Umask</key><integer>63</integer>
+<key>ProgramArguments</key><array>
+<string>/usr/bin/ruby</string><string>--disable-gems</string><string>/test/releases/previous/hq/helpers/darwin-owner.rb</string><string>launch</string>
+<string>/test/tools/node</string><string>/test/releases/previous/hq/hq/main.mjs</string><string>run</string><string>--home</string><string>/var/agent-bot-hq/.agent-bot-hq</string>
+<string>--owner-account</string><string>operator</string></array>
+<key>Sockets</key><dict><key>owner-control</key><dict>
+<key>SockPathName</key><string>/Library/Application Support/ai.true-line.agent-bot-hq/owner-control.sock</string><key>SockPathMode</key><integer>438</integer>
+<key>SockType</key><string>stream</string></dict></dict>
+</dict></plist>
