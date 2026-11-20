@@ -128,6 +128,7 @@
 // agent left running by an HQ that stopped abnormally keeps running.
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fail, HostError } from '../sdk/errors.mjs';
 import { pushReceipt, redact } from '../sdk/services.mjs';
@@ -188,12 +189,41 @@ export function launchWorkdir(home, soulId, memberId) {
   return join(home, '.agent-bot-hq', 'souls', soulId, memberId);
 }
 
-export function launchMemberSocket(endpoint, launchId) {
+export function launchMemberSocket(endpoint, launchId, platform = process.platform) {
   if (typeof endpoint !== 'string' || !endpoint.startsWith('/')) throw new TypeError('launch member socket needs an absolute harness endpoint');
   if (!LAUNCH_ID.test(launchId)) throw new TypeError('launch member socket needs a launch ID');
-  const path = join(dirname(endpoint), `member-${launchId.slice(3)}.sock`);
+  const dir = dirname(endpoint);
+  const id = launchId.slice(3);
+  const path = join(dir, `member-${id}.sock`);
+  if (platform === 'darwin' && Buffer.byteLength(path) > 103) {
+    const room = 103 - Buffer.byteLength(dir) - 1;
+    // The longest supported harness account still leaves 11 bytes. Base 36
+    // keeps the name case-insensitive and retains the full ID when it fits.
+    if (room < 11) fail('host.launch_unavailable', 'the harness directory leaves too little room for a Darwin member socket');
+    const name = BigInt(`0x${id}`).toString(36).padStart(19, '0');
+    return join(dir, name.slice(-room));
+  }
   if (Buffer.byteLength(path) > 107) fail('host.launch_unavailable', `the harness endpoint path leaves no room for the member socket (${Buffer.byteLength(path)} bytes; Linux allows 107)`);
   return path;
+}
+
+export function allocateLaunchAddress(endpoint, launches, random, platform) {
+  for (let tries = 0; tries < 8; tries += 1) {
+    const launch_id = `ln_${random.hex(12)}`;
+    if (launches.has(launch_id)) continue;
+    const member_socket = launchMemberSocket(endpoint, launch_id, platform);
+    if (platform === 'darwin') {
+      if ([...launches.values()].some(l => l.member_socket === member_socket)) continue;
+      // A previous entry process may still own this name after HQ restarts.
+      try {
+        if (lstatSync(member_socket, { throwIfNoEntry: false })) continue;
+      } catch {
+        fail('host.launch_unavailable', 'could not inspect the Darwin member socket directory');
+      }
+    }
+    return { launch_id, member_socket };
+  }
+  fail('host.launch_busy', 'could not allocate a unique launch address');
 }
 
 export function agentArgv(account, soulId, memberId, command) {
@@ -599,16 +629,11 @@ export function createLauncher({
       const command = validCommand(payload.command);
       const env = validEnv(payload.env);
       const now = core.clock.now();
-      let launchId;
-      for (let tries = 0; tries < 8 && !launchId; tries += 1) {
-        const candidate = `ln_${core.random.hex(12)}`;
-        if (!launches.has(candidate)) launchId = candidate;
-      }
-      if (!launchId) fail('host.launch_busy', 'could not allocate a unique launch ID');
+      const address = allocateLaunchAddress(endpoint.path, launches, core.random, platform);
       const l = {
-        launch_id: launchId, attach: core.random.hex(32), state: 'reserved', expires: now + RESERVE_MS, caller,
+        ...address, attach: core.random.hex(32), state: 'reserved', expires: now + RESERVE_MS, caller,
         soul_id: rt.soul_id, member_id: rt.member_id, role: rt.role, adapter_id: rt.adapter_id, runtime_id: payload.runtime_id, account: endpoint.account, endpoint: endpoint.path,
-        cwd: launchWorkdir(endpoint.home, rt.soul_id, rt.member_id), member_socket: launchMemberSocket(endpoint.path, launchId), command, env,
+        cwd: launchWorkdir(endpoint.home, rt.soul_id, rt.member_id), command, env,
       };
       launches.set(l.launch_id, l);
       slots.set(slot, l.launch_id);
