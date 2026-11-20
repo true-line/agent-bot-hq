@@ -25,6 +25,37 @@ function readRecord(path, attributes, run) {
 
 const only = (values, expected) => values.length === 1 && values[0] === expected;
 
+function effectiveGroups(account, run) {
+  const values = run('/usr/bin/id', ['-G', account]).trim().split(/\s+/);
+  if (!values.every((id) => /^(0|[1-9][0-9]{0,9})$/.test(id) && Number(id) <= 0xffffffff)) {
+    throw new Error('unreadable effective group list');
+  }
+  return new Set(values);
+}
+
+// Machine accepts the harness's private group plus resolved groups also held by
+// nobody. It does not exempt groups by a name prefix for a harness account.
+function verifyEffectiveGroups(name, primary, localGroups, run) {
+  const actual = effectiveGroups(name, run);
+  if (!actual.delete(primary)) throw new Error('missing private primary group');
+  if (!actual.size) return;
+  const common = effectiveGroups('nobody', run);
+  for (const gid of actual) {
+    if (!common.has(gid)) throw new Error('unexpected supplemental group');
+    // id(1) prints unsigned gid_t; Directory Services also emits signed
+    // decimal (for example, the built-in nobody group has GID -2).
+    const signedGid = String(Number(gid) | 0);
+    if (localGroups.has(gid) || localGroups.has(signedGid)) continue;
+    // Directory Services can supply a group outside the local node. Match
+    // Machine's refusal of an unresolved supplemental GID, even if shared.
+    const group = run('/usr/bin/dscacheutil', ['-q', 'group', '-a', 'gid', gid]);
+    const groups = group.split('\n');
+    if (!groups.some((line) => /^name: \S/.test(line)) || !groups.some((line) => line === 'gid: ' + gid || line === 'gid: ' + signedGid)) {
+      throw new Error('unresolved supplemental group');
+    }
+  }
+}
+
 // Check the public attributes that distinguish the local harness user and its
 // dedicated group. This is the role and home emitted by Machine, not a request
 // to look up arbitrary caller-supplied user metadata.
@@ -43,11 +74,9 @@ export function resolveDarwinHarness(name, { run = command } = {}) {
     }
     for (const [path, field] of [['/Users', 'UniqueID'], ['/Users', 'PrimaryGroupID'], ['/Groups', 'PrimaryGroupID']]) {
       const rows = run('/usr/bin/dscl', ['.', '-list', path, field]).trim().split('\n');
-      const owners = rows.flatMap((row) => {
-        const match = /^(.*?)\s+(-?\d+)$/.exec(row.trim());
-        return match?.[2] === id ? [match[1]] : [];
-      });
-      if (!only(owners, name)) throw new Error();
+      const records = rows.map((row) => /^(.*?)\s+(-?\d+)$/.exec(row.trim())).filter(Boolean);
+      if (!only(records.filter((entry) => entry[2] === id).map((entry) => entry[1]), name)) throw new Error();
+      if (path === '/Groups') verifyEffectiveGroups(name, id, new Set(records.map((entry) => entry[2])), run);
     }
     return { uid: Number(id), gid: Number(id), groupMembers: [], home };
   } catch {

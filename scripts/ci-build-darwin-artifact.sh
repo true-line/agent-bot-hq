@@ -12,7 +12,8 @@ import { join } from 'node:path';
 import { readPin, verify, verifyVendored } from './scripts/soul-contracts.mjs';
 
 const pin = readPin();
-const source = verify().dir;
+const source = process.env.HQ_CONTRACTS_DIR
+  ? verifyVendored(process.env.HQ_CONTRACTS_DIR, pin).dir : verify().dir;
 const target = process.argv[2];
 for (const path of pin.paths) cpSync(join(source, path), join(target, path), { recursive: true });
 verifyVendored(target, pin);

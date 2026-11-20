@@ -18,9 +18,18 @@ function directoryService({ additionalPrimary = '', nested = [], hiddenAttribute
     IsHidden: ['1'], UserShell: ['/usr/bin/false'], NFSHomeDirectory: [home] };
   const group = { RecordName: [account], PrimaryGroupID: ['350'], NestedGroups: nested };
   return (file, args, input) => {
-    if (file === '/usr/bin/id') { assert.deepEqual(args, ['-u', account]); return '350\n'; }
+    if (file === '/usr/bin/id') {
+      if (args[0] === '-G') {
+        if (args[1] === 'nobody') return '4294967294 12 61\n';
+        assert.equal(args[1], account);
+        return '350 12 61\n';
+      }
+      assert.deepEqual(args, ['-u', account]);
+      return '350\n';
+    }
     if (file === '/usr/bin/plutil') return input;
     assert.equal(file, '/usr/bin/dscl');
+    if (args[1] === '-list' && args[2] === '/Groups') return `${account} 350\neveryone 12\nlocalaccounts 61\nnobody -2\n`;
     if (args[1] === '-list') return `${account} 350\n${args[2] === '/Users' && args[3] === 'PrimaryGroupID' ? additionalPrimary : ''}`;
     assert.deepEqual(args.slice(0, 3), ['-plist', '.', '-read']);
     const record = args[3] === `/Users/${account}` ? user : group;
@@ -42,6 +51,38 @@ test('Darwin resolves the local Machine role and verifies its private primary gr
   for (const change of [{ standardHidden: '0' }, { additionalPrimary: 'second account 350\n' }, { nested: ['other-group'] }]) {
     assert.throws(() => resolveDarwinHarness(account, { run: directoryService(change) }), /own uid, private group and home/);
   }
+});
+
+test('Darwin rechecks the effective groups, including groups from Directory Services', () => {
+  const local = directoryService();
+  let harness = '12 350 61 901 4294967294';
+  let baseline = '4294967294 61 901 12';
+  let external = 'name: Common Directory Group\ngid: 901\n';
+  const run = (file, args, input) => {
+    if (file === '/usr/bin/id' && args[0] === '-G') {
+      const result = args[1] === 'nobody' ? baseline : harness;
+      if (result === null) throw new Error('directory lookup failed');
+      return result;
+    }
+    if (file === '/usr/bin/dscacheutil') {
+      assert.deepEqual(args, ['-q', 'group', '-a', 'gid', '901']);
+      return external;
+    }
+    return local(file, args, input);
+  };
+  const lookup = () => resolveDarwinHarness(account, { run });
+  assert.equal(lookup().uid, 350);
+  harness += ' 80';
+  assert.throws(lookup, /private group/);
+  harness = '350 901';
+  external = '';
+  assert.throws(lookup, /private group/);
+  external = 'name: Common Directory Group\ngid: 902\n';
+  assert.throws(lookup, /private group/);
+  for (baseline of [null, '', '12 partial']) assert.throws(lookup, /private group/);
+  for (harness of [null, '', '12 61', '350 partial', '350 4294967296']) assert.throws(lookup, /private group/);
+  harness = '350';
+  assert.equal(lookup().uid, 350);
 });
 
 test('Darwin plans exactly one broker for adapters on the same managed account', () => {

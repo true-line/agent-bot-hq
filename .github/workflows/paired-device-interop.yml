@@ -45,6 +45,10 @@ jobs:
           bash scripts/ci-build-darwin-artifact.sh "$GITHUB_SHA" "$RUNNER_TEMP/paired-hq.tar"
           mkdir "$RUNNER_TEMP/paired-release"
           tar -xf "$RUNNER_TEMP/paired-hq.tar" -C "$RUNNER_TEMP/paired-release"
+      - name: Recover a committed enrollment after a lost reply and restart
+        env:
+          HQ_INTERIM_OFFLINE: '1'
+        run: node "$RUNNER_TEMP/paired-release/hq/tests/machine-device-interop.mjs" "$RUNNER_TEMP/machine-fixture" "$RUNNER_TEMP/machine/tests/fixtures/build-keyd-device-interop.sh"
       - name: Exercise paired HQ and keyd with disposable keys
         env:
           HQ_TEST_PACKAGED_HOSTED: '1'

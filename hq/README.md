@@ -122,6 +122,8 @@ The HQ state directory includes `control.sock`, `admission.sock` and `broker.soc
 
 If the upgrade pauses, preserve the existing pairing, owner pin, signer and enrollment records. Check the device’s enrollment history with the identity-service administrator before authorizing a custody change. A signed status from the paired Machine verifies its channel. Replacing an established device identity requires a separately approved transition.
 
+The paired integration test also drops Machine’s successful binding reply and restarts both HQ and Machine. The owner CLI must finish enrollment from the original pending receipt without contacting the issuer. To run this case offline on macOS, use the command above from the extracted Darwin archive with `HQ_INTERIM_OFFLINE=1` and cached Machine Cargo dependencies.
+
 On macOS the dedicated HQ account requires an explicit `harnesses.dir` of
 `/Library/Application Support/ai.true-line.agent-bot-hq/ipc`. Machine provisions
 this directory and one private group directory per configured harness. HQ
@@ -138,6 +140,17 @@ account's home, outside this directory, and an agent HQ starts there can
 read nothing in this directory, connect to none of its sockets, and run none
 of HQ's tooling against it (T02, run in CI on two throwaway accounts).
 Launches are in memory only: after a restart nothing runs under HQ.
+
+The Darwin interim archive includes the production agent-comms broker under
+`vendor/plugins/agent-comms`. Its source commit and plugin digest are pinned
+in `governance/darwin-broker.json` and recorded in the built archive’s
+`governance/interim-release.json`. After the first source fetch, the builder
+can use its local Comms Git cache offline. To run the CI archive wrapper
+without network, also set `HQ_CONTRACTS_DIR` to an already verified contracts
+tree. To build from an existing Comms checkout or
+bare repository, set `HQ_COMMS_REPO` to its absolute path. The builder checks
+out the pinned commit into a fresh directory and verifies the packaged bytes
+before adding the broker to the archive’s `governance/plugins.json`.
 
 ## Interim account: D4's stated risk
 
