@@ -1,0 +1,1 @@
+Dedicated macOS HQ can now send a saved harness-account provisioning plan to the owner for review and return the signed proof to Machine. The review binds the requested accounts, numeric identities, home permissions and optional broker directories to that one operation.

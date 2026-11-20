@@ -248,10 +248,22 @@ test('paired service upgrade refuses a different job, owner, node, socket or pur
   await assert.rejects(f.issue(), /misdirected/);
 });
 
-for (const purpose of ['harness-launch-install', 'harness-launch-retire']) {
+const accountsPurpose = 'harness-account-provision';
+function provisionPlan(change, broker = true) {
+  const file = broker ? 'accounts-and-broker' : 'accounts';
+  const original = readFileSync(new URL(`./fixtures/machine-harness-accounts/${file}.json`, import.meta.url), 'utf8');
+  const plan = JSON.parse(original);
+  if (change) change(plan);
+  const plan_canonical = change ? harnessJSON(plan) : original;
+  return { plan_id: id, plan_digest: createHash('sha256').update(plan_canonical).digest('hex'), plan_canonical };
+}
+
+for (const purpose of ['harness-launch-install', 'harness-launch-retire', accountsPurpose]) {
   test(`paired ${purpose} submits only an owner proof for that exact operation`, arm, async (t) => {
-    const f = await fixture(t, purpose);
-    f.state.saved = harnessPlan(purpose);
+    const saved = purpose === accountsPurpose ? provisionPlan() : harnessPlan(purpose);
+    const roleUid = purpose === accountsPurpose ? JSON.parse(saved.plan_canonical).steps[0].uid : 300;
+    const f = await fixture(t, purpose, roleUid);
+    f.state.saved = saved;
     await assert.rejects(f.issue(), /pin saved by verified Machine status/);
     await f.pin();
     await assert.rejects(machineCommandInHome([purpose, 'export', id, '--socket', f.socket],
@@ -260,8 +272,11 @@ for (const purpose of ['harness-launch-install', 'harness-launch-retire']) {
     assert.equal(line, f.state.raw);
     writeFileSync(f.challengeFile, line + '\n');
     const challenge = JSON.parse(line).body;
-    const policy = JSON.parse(JSON.parse(challenge.plan_canonical).steps[0].content);
-    assert.deepEqual(policy.adapters[0].args, ['--member', 'a & b', 'quoted "value"', '', '☃\u2028λ']);
+    assert.equal(challenge.plan_canonical, saved.plan_canonical);
+    if (purpose !== accountsPurpose) {
+      const policy = JSON.parse(JSON.parse(challenge.plan_canonical).steps[0].content);
+      assert.deepEqual(policy.adapters[0].args, ['--member', 'a & b', 'quoted "value"', '', '☃\u2028λ']);
+    }
     const other = purpose === 'harness-launch-install' ? 'harness-launch-retire' : 'harness-launch-install';
     writeFileSync(f.proofFile, JSON.stringify(proof({ ...challenge, action: other }, f.owner)));
     await assert.rejects(f.approve(), /invalid owner signature/);
@@ -401,5 +416,66 @@ test('paired harness review measures the canonical plan at the 32768-byte bounda
   assert.equal(Buffer.byteLength(f.state.saved.plan_canonical), 32769);
   const before = f.requests.length;
   await assert.rejects(f.issue(), /outside the paired harness launch plan scope/);
+  assert.deepEqual(f.requests.slice(before).map(r => r.verb), ['members-plans']);
+});
+
+test('paired account provisioning checks Machine’s exact account and optional broker steps before challenging', arm, async (t) => {
+  const f = await fixture(t, accountsPurpose, 320);
+  await f.pin();
+  f.state.saved = provisionPlan(undefined, false);
+  assert.equal(JSON.parse(await f.issue()).body.plan_canonical, f.state.saved.plan_canonical);
+  f.state.saved = provisionPlan(p => {
+    const member = p.steps[2];
+    member.action = 'repair';
+    member.detail = 'exists; home /var/agent-bot-harness-_spec has mode 0755 and is set to 0700; its password is checked at apply';
+  });
+  await f.issue();
+  f.state.saved = provisionPlan(p => {
+    p.steps[2].action = 'none';
+    p.steps[2].detail = 'exists; home /var/agent-bot-harness-_spec; its password is checked at apply';
+    for (const dir of p.steps.slice(3)) dir.action = 'none';
+  });
+  await f.issue();
+  for (const change of [
+    p => { delete p.purpose; }, p => { p.purpose = 'harness-launch-install'; },
+    p => { p.steps[0].uid = p.steps[0].gid = 321; },
+    p => { p.steps[0].action = 'repair'; }, p => { p.steps[0].group = 'wheel'; },
+    p => { p.steps[1].uid = p.steps[1].gid = p.steps[0].uid; },
+    p => { p.steps[2].uid = p.steps[2].gid = p.steps[1].uid; },
+    p => { p.steps[2].uid = p.steps[2].gid = 502; }, p => { p.steps[2].gid++; },
+    p => { p.steps[2].mode = '0755'; }, p => { p.steps[2].detail += '\nsubstitute'; },
+    p => { p.steps[2].content = 'additional action'; }, p => { p.steps[2].action = 'remove'; },
+    p => { p.steps[2].action = 'repair'; }, p => { p.members.reverse(); }, p => { p.steps.pop(); },
+    p => { p.dir = '/tmp'; }, p => { p.steps[3].owner = '_lead'; },
+    p => { p.steps[4].target = p.steps[5].target; }, p => { p.steps[4].mode = '0777'; },
+    p => { p.steps[5].group = '_lead'; }, p => { p.steps.push(JSON.parse(savedPlan().plan_canonical).steps[1]); },
+  ]) {
+    f.state.saved = provisionPlan(change);
+    const before = f.requests.length;
+    await assert.rejects(f.issue());
+    assert.deepEqual(f.requests.slice(before).map(r => r.verb), ['members-plans']);
+  }
+  f.state.saved = provisionPlan();
+  f.state.tweak = c => { c.expires_at -= 121; };
+  await assert.rejects(f.issue(), /expired/);
+});
+
+test('paired account scope bounds the canonical bytes even for an otherwise valid batch', arm, async (t) => {
+  const f = await fixture(t, accountsPurpose, 320);
+  await f.pin();
+  const build = count => provisionPlan(p => {
+    const [hq, , account, parent, , dir] = p.steps;
+    p.members = Array.from({ length: count }, (_, n) => '_harness' + String(n).padStart(2, '0') + 'x'.repeat(22));
+    p.steps = [hq, ...p.members.map((name, i) => ({ ...account, target: name, group: name,
+      detail: account.detail.replace('_spec', name), uid: i < 20 ? 300 + i : 301 + i, gid: i < 20 ? 300 + i : 301 + i })),
+    parent, ...p.members.map(name => ({ ...dir, target: p.dir + '/' + name, group: name }))];
+  });
+  f.state.saved = build(55);
+  assert.ok(Buffer.byteLength(f.state.saved.plan_canonical) < 32768);
+  await f.issue();
+  f.state.saved = build(65);
+  assert.ok(Buffer.byteLength(f.state.saved.plan_canonical) > 32768);
+  const before = f.requests.length;
+  await assert.rejects(f.issue(), /unsupported structure/);
   assert.deepEqual(f.requests.slice(before).map(r => r.verb), ['members-plans']);
 });

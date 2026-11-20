@@ -1,5 +1,6 @@
 // Read-only responses for Machine's members-plans verb. The digest covers the
 // original Go Plan.Canonical() bytes, including its final LF.
+import { accountsPurpose, validHarnessAccounts } from './machine-harness-accounts.mjs';
 import { createHash } from 'node:crypto';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
 
@@ -47,9 +48,12 @@ export function validatedMembersPlan(id, response) {
     throw new Error('Machine members plan does not match the requested ID and canonical digest');
   }
   const p = parseStrict(plan_canonical, { maxDepth: 6 });
-  if (!object(p) || Object.keys(p).join(',') !== 'version,hq_account,dir,members,steps' ||
+  const accounts = p?.purpose === accountsPurpose;
+  const fields = accounts ? 'version,hq_account,dir,members,steps,purpose' : 'version,hq_account,dir,members,steps';
+  if (!object(p) || Object.keys(p).join(',') !== fields ||
       p.version !== 3 || !isAccount(p.hq_account) || typeof p.dir !== 'string' || !p.dir ||
-      !Array.isArray(p.steps) || !p.steps.length || !p.steps.every(validStep) || !validMembers(p)) {
+      !Array.isArray(p.steps) || !p.steps.length || !validMembers(p) ||
+      (accounts ? Buffer.byteLength(plan_canonical) > 32768 || !validHarnessAccounts(p) : !p.steps.every(validStep))) {
     throw new Error('Machine members plan has an unsupported structure');
   }
   // Go emits compact JSON without HTML escaping, but it escapes U+2028 and
