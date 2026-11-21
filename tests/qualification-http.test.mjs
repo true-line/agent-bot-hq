@@ -89,7 +89,8 @@ test('a consumed qualification plan stays consumed after HQ restart', async (t) 
   const home = tempHome();
   const plan = { plan_id: 'plan-qualification-b', plan_digest: 'b'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT),
     response_text: 'one-use result', expires_at_ms: Date.now() + 60_000 };
-  const plugins = () => [referenceBroker(), qualificationProvider({ plan, authorize: async () => true })];
+  let authorizations = 0;
+  const plugins = () => [referenceBroker(), qualificationProvider({ plan, authorize: async () => { authorizations++; return true; } })];
   const first = await startHQ({ home, plugins: plugins() });
   const entry = await first.entry();
   const admitted = await entry.request('Hello', hello({ request_id: 'qualification_restart' }));
@@ -106,12 +107,14 @@ test('a consumed qualification plan stays consumed after HQ restart', async (t) 
     return member;
   };
   const initial = await bind(first);
-  const accepted = await initial.request('qualification.messages', payload);
-  assert.equal(accepted.ok, true);
+  const concurrent = await Promise.all([initial.request('qualification.messages', payload), initial.request('qualification.messages', payload)]);
+  assert.equal(concurrent.filter((reply) => reply.ok).length, 1);
+  assert.equal(authorizations, 1);
   await first.done({ keep: true });
   const second = await startHQ({ home, plugins: plugins() });
   t.after(async () => { await second.done({ keep: true }); rmSync(home, { recursive: true, force: true }); });
   const replay = await (await bind(second)).request('qualification.messages', payload);
   assert.equal(replay.ok, false);
   assert.equal(replay.refusal?.error ?? replay.host_refusal?.code, 'host.invalid_request', JSON.stringify(replay));
+  assert.equal(authorizations, 1);
 });
