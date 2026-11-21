@@ -322,6 +322,9 @@ function credentialsService(core, plugin) {
           if (core.deviceRevoked) fail('device_revoked', 'device revoked: re-enroll');
           fail('host.context_revoked', 'credentials were dropped while this one was minted');
         }
+        if (!Number.isFinite(minted?.expiresAt) || minted.expiresAt <= core.clock.now()) {
+          fail('credential_unavailable', 'the identity service returned a credential without a valid remaining lifetime');
+        }
         core.tokens.set(key, minted);
         return minted.token;
       }).finally(() => { if (core.minting.get(key) === pending) core.minting.delete(key); });
