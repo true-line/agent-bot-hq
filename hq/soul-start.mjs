@@ -3,7 +3,7 @@
 // its private account. The owner connection becomes the runner's ACP stream.
 // This local event is not a protected qualification or signed provenance.
 import { lstatSync, realpathSync } from 'node:fs';
-import { dirname, isAbsolute, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { fail } from '../sdk/errors.mjs';
 import { pushReceipt } from '../sdk/services.mjs';
 import { takeover } from './socket.mjs';
@@ -30,6 +30,7 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
   const byUid = new Map();
   const installationBinding = new Map();
   const uidOwner = new Map();
+  let shuttingDown = false;
   const report = () => [...starts.values()].map(({ id, path, pid, uid, gid, soulId, installationId, packageDigest, startedAt, state }) => ({
     start_id: id, package_path: path, pid, runner_uid: uid, runner_gid: gid,
     soul_id: soulId, installation_id: installationId, package_digest: packageDigest,
@@ -37,15 +38,16 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
   }));
 
   function stop(item) {
-    if (item.stopping) return item.stopPromise;
-    item.stopping = true;
+    item.stopRequested = true;
     item.state = 'stopping';
+    if (!item.launch) return item.startSettled.then(() => item.launch ? stop(item) : undefined);
+    if (item.stopPromise) return item.stopPromise;
     // Machine owns group termination and must confirm containment. HQ keeps
     // the live slot until its completion report; no local signal is enough.
     item.stopPromise = Promise.resolve().then(() => item.launch.stop()).then(
       () => item.done,
       () => { item.state = 'containment_unconfirmed'; },
-    );
+    ).finally(() => { if (starts.has(item.id)) item.stopPromise = null; });
     return item.stopPromise;
   }
 
@@ -57,7 +59,7 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
     if (op !== START_OP) fail('host.invalid_request', `unknown Soul start operation ${op}`);
     if (auth !== 'owner') fail('host.auth_mismatch', 'Soul start is owner-only');
     if (!canTakeOver) fail('host.invalid_request', 'soul.start must be the first request on a new owner connection');
-    if (mode() !== 'running') fail('host.launch_unavailable', 'HQ is not running admissions');
+    if (shuttingDown || mode() !== 'running') fail('host.launch_unavailable', 'HQ is not running admissions');
     if (!machineLaunch || typeof machineLaunch.reserve !== 'function'
       || typeof verifyMachineReservation !== 'function' || typeof verifyMachineCompletion !== 'function'
       || typeof machineLaunch.start !== 'function') {
@@ -74,7 +76,24 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       if (!lstatSync(path).isDirectory()) throw new Error('not a directory');
     } catch { fail('host.invalid_request', 'soul.start package_path is not an existing directory'); }
     const hqRoot = realpathSync(home);
-    const inHqHome = (candidate) => candidate === hqRoot || candidate.startsWith(`${hqRoot}${sep}`);
+    const canonicalCandidate = (candidate) => {
+      let existing = candidate;
+      const missing = [];
+      while (true) {
+        try { return join(realpathSync(existing), ...missing); }
+        catch (error) {
+          if (error?.code !== 'ENOENT') throw error;
+          const parent = dirname(existing);
+          if (parent === existing) throw error;
+          missing.unshift(basename(existing));
+          existing = parent;
+        }
+      }
+    };
+    const inHqHome = (candidate) => {
+      const canonical = canonicalCandidate(candidate);
+      return canonical === hqRoot || canonical.startsWith(`${hqRoot}${sep}`);
+    };
     if (byPath.has(path)) fail('host.launch_busy', 'HQ has already started this Soul package');
     const id = `st_${core.random.hex(12)}`;
     if (!ID.test(id)) throw new Error('invalid HQ start ID');
@@ -107,6 +126,10 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       if (!valid || await verifyMachineReservation(reservation, request) !== true) {
         fail('host.launch_unavailable', 'Machine reservation lacks an authenticated per-installation runner binding');
       }
+      if (shuttingDown) {
+        try { await reservation.cancel?.(); } catch { /* Machine reservation may already have expired */ }
+        fail('host.launch_unavailable', 'HQ stopped before Machine reservation completed');
+      }
     } catch (error) {
       byPath.delete(path);
       fail('host.launch_unavailable', `Machine refused Soul runner reservation: ${error?.code ?? error?.message ?? 'unavailable'}`);
@@ -132,10 +155,13 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       runnerPackagePath: reservation.runnerPackagePath,
     });
     uidOwner.set(reservation.uid, reservation.installationId);
+    let settleStart;
+    const startSettled = new Promise((resolve) => { settleStart = resolve; });
     const item = { id, path, pid: null, uid: reservation.uid, gid: reservation.gid,
       soulId: reservation.soulId, installationId: reservation.installationId,
       definitionDigest: reservation.definitionDigest, packageDigest: reservation.packageDigest,
-      launch: null, startedAt: new Date(core.clock.now()).toISOString(), state: 'starting', stopping: false };
+      launch: null, startedAt: new Date(core.clock.now()).toISOString(), state: 'starting',
+      stopRequested: false, stopPromise: null, startSettled, terminal: false };
     starts.set(id, item);
     byInstallation.set(item.installationId, id);
     byUid.set(item.uid, id);
@@ -145,17 +171,19 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       // A transport error after Machine accepted start may hide a live process.
       // Keep all reservations until a future authenticated reconciliation.
       item.state = 'containment_unconfirmed';
+      settleStart();
       fail('host.launch_unavailable', `Machine Soul runner start is unconfirmed: ${error?.code ?? error?.message ?? 'unavailable'}`);
     }
     item.launch = launch;
     item.pid = launch?.pid ?? null;
     item.done = Promise.resolve(launch?.done).then((result) => result,
-      () => ({ contained: false, exit_code: null, signal: null })).then(async (result = {}) => {
-      const { exit_code = null, signal = null, contained = false } = result;
+      () => ({ contained: false, exit_code: null, signal: null })).then(async (result) => {
+      const safeResult = result && typeof result === 'object' ? result : {};
+      const { exit_code = null, signal = null, contained = false } = safeResult;
       let confirmed = false;
       if (contained === true) {
         try {
-          confirmed = await verifyMachineCompletion(result, {
+          confirmed = await verifyMachineCompletion(safeResult, {
             startId: id, hqEpoch, packagePath: path, uid: item.uid, gid: item.gid,
             soulId: item.soulId, installationId: item.installationId,
             definitionDigest: item.definitionDigest, packageDigest: item.packageDigest,
@@ -163,6 +191,7 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
           }) === true;
         } catch { /* an unverifiable completion keeps the slot occupied */ }
       }
+      item.terminal = true;
       if (confirmed === true) {
         starts.delete(id);
         byPath.delete(path);
@@ -174,7 +203,8 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       await pushReceipt(core, { plugin: 'hq', kind: 'hq.soul.exited', start_id: id,
         installation_id: item.installationId, hq_epoch: hqEpoch, exit_code, signal,
         contained: confirmed === true }).catch(() => {});
-    });
+    }).catch(() => { item.terminal = true; item.state = 'containment_unconfirmed'; });
+    settleStart();
     const validLaunch = launch?.startId === id && launch.packagePath === path
       && launch.hqEpoch === hqEpoch && launch.uid === item.uid && launch.gid === item.gid
       && launch.soulId === item.soulId && launch.installationId === item.installationId
@@ -195,6 +225,13 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       else item.state = 'containment_unconfirmed';
       fail('host.launch_unavailable', 'Machine launch response did not match its authenticated reservation');
     }
+    // Let an already-settled completion run before reporting a live ACP
+    // takeover. A later completion is also checked in open() below.
+    await new Promise((resolve) => setImmediate(resolve));
+    if (shuttingDown || item.stopRequested || item.terminal) {
+      if (!item.terminal) await stop(item);
+      fail('host.launch_unavailable', 'Soul runner stopped before ACP takeover');
+    }
     item.state = 'running';
     launch.stdin.on?.('error', () => {});
     launch.stdout.on?.('error', () => {});
@@ -207,13 +244,14 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       await stop(item);
       throw error;
     }
-    if (!starts.has(id)) fail('host.launch_unavailable', 'Soul runner exited before its ACP stream was attached');
+    if (item.terminal || !starts.has(id) || shuttingDown) fail('host.launch_unavailable', 'Soul runner exited before its ACP stream was attached');
     const result = { start_id: id, package_path: path, pid: item.pid, runner_uid: item.uid, runner_gid: item.gid,
       soul_id: item.soulId, installation_id: item.installationId, definition_digest: item.definitionDigest,
       package_digest: item.packageDigest, hq_epoch: hqEpoch,
       profile: 'managed-cooperative', protected: false };
     return takeover(result, {
       open: () => (socket) => {
+        if (item.terminal || !starts.has(id) || shuttingDown) { socket.destroy(); return; }
         socket.pipe(launch.stdin);
         launch.stdout.pipe(socket);
         socket.once('close', () => { stop(item); });
@@ -223,5 +261,8 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
     });
   }
 
-  return { dispatch, report, stopAll: async () => { await Promise.all([...starts.values()].map(stop)); } };
+  return { dispatch, report, stopAll: async () => {
+    shuttingDown = true;
+    await Promise.all([...starts.values()].map(stop));
+  } };
 }

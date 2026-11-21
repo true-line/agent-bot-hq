@@ -1,12 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { realpathSync, rmSync } from 'node:fs';
+import { realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { DIGEST, HARNESS_UIDS, SOUL, fakeSudo, harnessLayout, startHQ, tempHome } from './hq-harness.mjs';
 import { validateConfig } from '../hq/hq.mjs';
+import { createSoulStarter } from '../hq/soul-start.mjs';
 
 const waitFor = async (check) => {
   for (let i = 0; i < 100; i++) {
@@ -66,6 +67,13 @@ function fakeMachineLaunch(calls, overrides = {}, completion = { exit_code: 0, s
 }
 const machineOptions = (machine) => ({ soulLaunch: machine, soulVerifier: machine.verifyReservation,
   soulCompletionVerifier: machine.verifyCompletion });
+const starter = (home, machine) => createSoulStarter({
+  core: { random: { hex: (n) => 'ab'.repeat(n) }, clock: { now: () => Date.now() },
+    receipts: [], profile: 'managed-cooperative' },
+  home, machineLaunch: machine, verifyMachineReservation: machine.verifyReservation,
+  verifyMachineCompletion: machine.verifyCompletion, mode: () => 'running',
+});
+const startRequest = (path) => ({ auth: 'owner', payload: { package_path: path }, takeover: true });
 
 async function rawStart(t, path) {
   const stream = connect(t.hq.paths.control);
@@ -356,6 +364,125 @@ test('an unconfigured HQ refuses Soul start and never reports a live start', asy
     assert.equal(refused.host_refusal.code, 'host.launch_unavailable');
     assert.deepEqual(t.hq.status().hq.soulStarts, []);
   } finally { await t.done(); }
+});
+
+test('shutdown fences a Machine reservation that completes after stopAll', async () => {
+  const home = tempHome();
+  const launches = [];
+  const machine = fakeMachineLaunch(launches);
+  const reserve = machine.reserve.bind(machine);
+  let entered;
+  let release;
+  const reserving = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  machine.reserve = async (request) => { entered(); await held; return reserve(request); };
+  const control = starter(home, machine);
+  try {
+    const pending = control.dispatch('soul.start', startRequest(home));
+    await reserving;
+    await control.stopAll();
+    release();
+    await assert.rejects(pending, (error) => error.code === 'host.launch_unavailable');
+    assert.equal(launches.length, 0);
+    assert.deepEqual(control.report(), []);
+  } finally { release(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('shutdown during pending Machine start stops its late runner before takeover', async () => {
+  const home = tempHome();
+  const launches = [];
+  const machine = fakeMachineLaunch(launches);
+  const start = machine.start.bind(machine);
+  let entered;
+  let release;
+  let stops = 0;
+  const starting = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  machine.start = async (reservation) => {
+    entered();
+    await held;
+    const launch = await start(reservation);
+    const stop = launch.stop;
+    launch.stop = async () => { stops += 1; return stop(); };
+    return launch;
+  };
+  const control = starter(home, machine);
+  try {
+    const pending = control.dispatch('soul.start', startRequest(home));
+    await starting;
+    const stopped = control.stopAll();
+    release();
+    await assert.rejects(pending, (error) => error.code === 'host.launch_unavailable');
+    await stopped;
+    assert.equal(launches.length, 1);
+    assert.equal(stops, 1);
+    assert.deepEqual(control.report(), []);
+  } finally { release(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('failed stop of a late Machine runner remains occupied and can be retried', async () => {
+  const home = tempHome();
+  const machine = fakeMachineLaunch([]);
+  const start = machine.start.bind(machine);
+  let entered;
+  let release;
+  let stops = 0;
+  const starting = new Promise((resolve) => { entered = resolve; });
+  const held = new Promise((resolve) => { release = resolve; });
+  machine.start = async (reservation) => {
+    entered();
+    await held;
+    return { ...await start(reservation), async stop() { stops += 1; throw new Error('stop unavailable'); } };
+  };
+  const control = starter(home, machine);
+  try {
+    const pending = control.dispatch('soul.start', startRequest(home));
+    await starting;
+    const stopped = control.stopAll();
+    release();
+    await assert.rejects(pending, (error) => error.code === 'host.launch_unavailable');
+    await stopped;
+    assert.equal(control.report()[0]?.state, 'containment_unconfirmed');
+    assert.ok(stops >= 1);
+    const beforeRetry = stops;
+    await control.stopAll();
+    assert.ok(stops > beforeRetry, 'an unconfirmed stop is retried rather than treated as contained');
+  } finally { release(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('a null Machine completion cannot produce an ACP takeover or release occupancy', async () => {
+  const home = tempHome();
+  const machine = fakeMachineLaunch([]);
+  const start = machine.start.bind(machine);
+  machine.start = async (reservation) => ({ ...await start(reservation), done: Promise.resolve(null) });
+  const control = starter(home, machine);
+  try {
+    await assert.rejects(control.dispatch('soul.start', startRequest(home)),
+      (error) => error.code === 'host.launch_unavailable');
+    assert.equal(control.report()[0]?.state, 'containment_unconfirmed');
+  } finally { await control.stopAll(); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('a symlink alias into HQ home cannot stage a runner copy or endpoint', async () => {
+  const home = tempHome();
+  const aliases = tempHome();
+  const alias = join(aliases, 'private');
+  symlinkSync(home, alias);
+  try {
+    for (const field of ['runnerPackagePath', 'endpoint']) {
+      const launches = [];
+      const machine = fakeMachineLaunch(launches, () => field === 'runnerPackagePath'
+        ? { runnerPackagePath: join(alias, 'runner-copy') }
+        : { endpoint: { directory: join(alias, 'runner-endpoint'),
+          socketPath: join(alias, 'runner-endpoint', 'admission.sock'), ownerUid: process.getuid(),
+          groupGid: 61001, dirMode: 0o2750, socketMode: 0o660, peerUid: 61001 } });
+      const control = starter(home, machine);
+      await assert.rejects(control.dispatch('soul.start', startRequest(home)),
+        (error) => error.code === 'host.launch_unavailable');
+      assert.equal(launches.length, 0);
+      assert.deepEqual(control.report(), []);
+    }
+  } finally { rmSync(aliases, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
 });
 
 test('the owner CLI speaks the start handshake and relays ACP', { timeout: 10000 }, async () => {
