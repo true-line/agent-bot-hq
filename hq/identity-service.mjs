@@ -237,16 +237,21 @@ export function createIdentityService({
 
   async function access() {
     check();
+    // Never reuse a token after the Machine signer has observed custody loss.
+    if (token?.recheck && custody?.available?.() === false) token = undefined;
     await withCustodyCheck(async () => {
       let state;
-      try { state = await enrollment.deviceStatus(); }
+      const refreshCustody = typeof custody?.deviceStatus === 'function';
+      try { state = await (refreshCustody ? custody.deviceStatus() : enrollment.deviceStatus()); }
       catch (error) {
-        if (token?.recheck && !(error instanceof HostError)) unavailable('Machine enrollment could not be verified');
+        if ((refreshCustody || token?.recheck) && !(error instanceof HostError)) unavailable('Machine enrollment could not be verified');
         throw error;
       }
+      check(); // A late status cannot mutate revocation state after closure.
       if (state === 'revoked') { revoke(); fail('device_revoked', 'device revoked: re-enroll'); }
       if (state !== 'enrolled') unavailable('HQ is not enrolled');
     });
+    check(); // Closing or revoking during the asynchronous custody check cancels this call.
     if (token && token.expiresAt <= clock.now()) token = undefined;
     if (token && token.expiresAt > clock.now() + 60_000) return reuseAccess(token, epoch);
     if (refreshing) return refreshing;
@@ -255,6 +260,7 @@ export function createIdentityService({
       const started = clock.now();
       if (!custody) unavailable('Machine has no authorized DPoP session');
       const { session, ephemeralJwk, assertion } = await withCustodyCheck(() => custody.openSession());
+      alive(generation);
       let claims;
       try { claims = JSON.parse(Buffer.from(assertion.split('.')[1], 'base64url')); } catch { unavailable('HQ assertion is malformed'); }
       if (typeof claims.jti !== 'string' || claims.jti.length < 8) unavailable('HQ assertion has no request nonce');
