@@ -222,6 +222,26 @@ test('concurrent paths sharing a runner UID reserve before either process starts
   } finally { first?.stream.destroy(); second?.stream.destroy(); await t.done(); rmSync(other, { recursive: true, force: true }); }
 });
 
+test('a contained start does not let another installation reuse its runner UID', { timeout: 10000 }, async () => {
+  const home = tempHome();
+  const other = tempHome();
+  const launches = [];
+  const machine = fakeMachineLaunch(launches,
+    (request) => ({ installationId: request.packagePath === realpathSync(home) ? 'inst_one' : 'inst_two' }));
+  const t = await startHQ({ home, ...machineOptions(machine) });
+  let first;
+  try {
+    first = await rawStart(t, home);
+    assert.equal(first.response.ok, true);
+    first.stream.destroy();
+    await waitFor(() => t.hq.status().hq.soulStarts.length === 0);
+    const second = await rawStart(t, other);
+    assert.equal(second.response.host_refusal.code, 'host.launch_unavailable');
+    second.stream.destroy();
+    assert.equal(launches.length, 1);
+  } finally { first?.stream.destroy(); await t.done(); rmSync(other, { recursive: true, force: true }); }
+});
+
 test('a failed Machine stop keeps the runner UID and package occupied', { timeout: 10000 }, async () => {
   const home = tempHome();
   const other = tempHome();

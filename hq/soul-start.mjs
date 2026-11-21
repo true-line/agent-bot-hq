@@ -27,6 +27,8 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
   const byPath = new Map();
   const byInstallation = new Map();
   const byUid = new Map();
+  const installationBinding = new Map();
+  const uidOwner = new Map();
   const report = () => [...starts.values()].map(({ id, path, pid, uid, gid, soulId, installationId, packageDigest, startedAt, state }) => ({
     start_id: id, package_path: path, pid, runner_uid: uid, runner_gid: gid,
     soul_id: soulId, installation_id: installationId, package_digest: packageDigest,
@@ -114,6 +116,20 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       try { await reservation.cancel?.(); } catch { /* reservation can expire in Machine */ }
       fail('host.launch_busy', 'Soul installation or runner account already has a live start');
     }
+    const prior = installationBinding.get(reservation.installationId);
+    if ((uidOwner.has(reservation.uid) && uidOwner.get(reservation.uid) !== reservation.installationId)
+      || (prior && (prior.uid !== reservation.uid || prior.path !== path
+        || prior.packageDigest !== reservation.packageDigest
+        || prior.runnerPackagePath !== reservation.runnerPackagePath))) {
+      byPath.delete(path);
+      try { await reservation.cancel?.(); } catch { /* no process started */ }
+      fail('host.launch_unavailable', 'Machine remapped a Soul installation or reused its runner UID');
+    }
+    installationBinding.set(reservation.installationId, {
+      uid: reservation.uid, path, packageDigest: reservation.packageDigest,
+      runnerPackagePath: reservation.runnerPackagePath,
+    });
+    uidOwner.set(reservation.uid, reservation.installationId);
     const item = { id, path, pid: null, uid: reservation.uid, gid: reservation.gid,
       soulId: reservation.soulId, installationId: reservation.installationId,
       definitionDigest: reservation.definitionDigest, packageDigest: reservation.packageDigest,
