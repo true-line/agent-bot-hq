@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { bindProof } from '../sdk/member-session.mjs';
 import { referenceBroker } from './broker-fixture.mjs';
-import { hello, startHQ } from './hq-harness.mjs';
+import { hello, startHQ, tempHome } from './hq-harness.mjs';
 import { qualificationProvider, qualificationPromptDigest } from '../hq/qualification-provider.mjs';
 import { startClaudeQualificationHttp } from '../hq/claude-qualification-http.mjs';
 
@@ -27,7 +27,7 @@ async function http(socketPath, method, path, body) {
 test('stock Messages HTTP reaches only a bound, one-use HQ qualification consumer', async (t) => {
   let expectedRuntime;
   const decisions = [];
-  const plan = { model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT), response_text: 'Stage 2a brokered fixture turn.', expires_at_ms: Date.now() + 60_000 };
+  const plan = { plan_digest: 'a'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT), response_text: 'Stage 2a brokered fixture turn.', expires_at_ms: Date.now() + 60_000 };
   const provider = qualificationProvider({ plan, async authorize(input) {
     decisions.push(input);
     return input.runtime_id === expectedRuntime && input.model === MODEL && input.prompt_sha256 === plan.prompt_sha256;
@@ -72,6 +72,7 @@ test('stock Messages HTTP reaches only a bound, one-use HQ qualification consume
   assert.match(turn.body, /Stage 2a brokered fixture turn/);
   assert.match(turn.body, /event: message_stop/);
   assert.equal(decisions.length, 1);
+  assert.equal(decisions[0].plan_digest, plan.plan_digest);
   assert.equal(decisions[0].runtime_id, expectedRuntime);
   const replay = await http(bridge.socketPath, 'POST', '/v1/messages', message);
   assert.equal(replay.status, 403);
@@ -80,5 +81,36 @@ test('stock Messages HTTP reaches only a bound, one-use HQ qualification consume
 
 test('unconfigured or malformed qualification plans fail closed', () => {
   assert.throws(() => qualificationProvider({}), /requires an exact plan/);
-  assert.throws(() => qualificationProvider({ plan: { model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT), response_text: 'x', expires_at_ms: Date.now() + 1000 } }), /Machine authorization callback/);
+  assert.throws(() => qualificationProvider({ plan: { plan_digest: 'a'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT), response_text: 'x', expires_at_ms: Date.now() + 1000 } }), /Machine authorization callback/);
+});
+
+test('a consumed qualification plan stays consumed after HQ restart', async (t) => {
+  const home = tempHome();
+  const plan = { plan_digest: 'b'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT),
+    response_text: 'one-use result', expires_at_ms: Date.now() + 60_000 };
+  const plugins = () => [referenceBroker(), qualificationProvider({ plan, authorize: async () => true })];
+  const first = await startHQ({ home, plugins: plugins() });
+  const entry = await first.entry();
+  const admitted = await entry.request('Hello', hello({ request_id: 'qualification_restart' }));
+  assert.equal(admitted.ok, true);
+  const runtime = admitted.result.admitted_runtimes[0];
+  const payload = { model: MODEL, prompt_sha256: plan.prompt_sha256 };
+  const bind = async (world) => {
+    const member = await world.member();
+    const challenge = await member.request('bind.challenge', { runtime_id: runtime.runtime_id });
+    assert.equal(challenge.ok, true);
+    const confirmed = await member.request('bind', { runtime_id: runtime.runtime_id,
+      proof: bindProof(runtime.channel_binding, challenge.result.nonce, runtime.runtime_id) });
+    assert.equal(confirmed.ok, true);
+    return member;
+  };
+  const initial = await bind(first);
+  const accepted = await initial.request('qualification.messages', payload);
+  assert.equal(accepted.ok, true);
+  await first.done({ keep: true });
+  const second = await startHQ({ home, plugins: plugins() });
+  t.after(async () => { await second.done({ keep: true }); rmSync(home, { recursive: true, force: true }); });
+  const replay = await (await bind(second)).request('qualification.messages', payload);
+  assert.equal(replay.ok, false);
+  assert.equal(replay.refusal?.error ?? replay.host_refusal?.code, 'host.invalid_request', JSON.stringify(replay));
 });
