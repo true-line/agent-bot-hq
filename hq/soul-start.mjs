@@ -20,9 +20,10 @@ const PACKAGE_SHA256 = /^[0-9a-f]{64}$/;
 // must authenticate Machine's one-use binding independently of that client.
 // Production passes no client until Machine #629/#630 implement that proof.
 export function createSoulStarter({ core, home, machineLaunch, verifyMachineReservation, verifyMachineCompletion,
-  mode, hqUid = process.getuid?.() } = {}) {
+  mode, hqUid = process.getuid?.(), harnessUids = [] } = {}) {
   // Machine's fixed SoulRunRequest header uses exactly 64 lowercase hex.
   const hqEpoch = core.random.hex(32);
+  const excludedUids = new Set(harnessUids);
   const starts = new Map();
   const byPath = new Map();
   const byInstallation = new Map();
@@ -89,7 +90,8 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       Object.freeze(reservation);
       const valid = reservation?.startId === id && reservation.packagePath === path
         && reservation.hqEpoch === hqEpoch
-        && Number.isSafeInteger(reservation.uid) && reservation.uid > 0 && reservation.uid !== hqUid
+        && Number.isSafeInteger(reservation.uid) && reservation.uid > 0
+        && reservation.uid !== hqUid && !excludedUids.has(reservation.uid)
         && Number.isSafeInteger(reservation.gid) && reservation.gid > 0
         && SOUL_ID.test(reservation.soulId ?? '') && INSTALLATION_ID.test(reservation.installationId ?? '')
         && DIGEST.test(reservation.definitionDigest ?? '') && PACKAGE_SHA256.test(reservation.packageDigest ?? '')

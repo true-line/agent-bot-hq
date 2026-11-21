@@ -5,7 +5,7 @@ import { realpathSync, rmSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
-import { DIGEST, SOUL, startHQ, tempHome } from './hq-harness.mjs';
+import { DIGEST, HARNESS_UIDS, SOUL, fakeSudo, harnessLayout, startHQ, tempHome } from './hq-harness.mjs';
 import { validateConfig } from '../hq/hq.mjs';
 
 const waitFor = async (check) => {
@@ -139,6 +139,24 @@ test('HQ rejects a runner in its own UID and does not record a managed start', a
     assert.deepEqual(t.hq.status().hq.soulStarts, []);
     assert.equal(t.hq.core.receipts.some((r) => r.kind === 'hq.soul.started'), false);
   } finally { await t.done(); }
+});
+
+test('HQ rejects a Soul runner in a harness credential UID', async () => {
+  const layout = harnessLayout(['hqm_a']);
+  const launches = [];
+  const machine = fakeMachineLaunch(launches, { uid: HARNESS_UIDS.hqm_a });
+  const t = await startHQ({ platform: 'linux', accounts: layout.resolve, harnessLstat: layout.lstat,
+    launch: { spawn: fakeSudo().spawn },
+    config: { acceptedDefinitions: { [SOUL]: [DIGEST] },
+      harnesses: { dir: layout.dir, accounts: { 'adapter-a': 'hqm_a' } } },
+    ...machineOptions(machine) });
+  try {
+    const owner = await t.owner();
+    const refused = await owner.request('soul.start', { package_path: t.home });
+    assert.equal(refused.host_refusal.code, 'host.launch_unavailable');
+    assert.equal(launches.length, 0);
+    assert.deepEqual(t.hq.status().hq.soulStarts, []);
+  } finally { await t.done(); layout.remove(); }
 });
 
 test('HQ rejects a self-asserted Machine reservation before starting a process', async () => {

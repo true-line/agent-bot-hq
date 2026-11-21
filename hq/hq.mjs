@@ -289,7 +289,8 @@ export function createHQ({
     });
     soulStarter = createSoulStarter({ core, home, machineLaunch: soulLaunch,
       verifyMachineReservation: soulVerifier, verifyMachineCompletion: soulCompletionVerifier,
-      mode: () => host?.mode ?? 'starting', hqUid: uid });
+      mode: () => host?.mode ?? 'starting', hqUid: uid,
+      harnessUids: harnessPlan.endpoints.map((endpoint) => endpoint.uid) });
     // Whether the provisioner's rule lets HQ start each harness account;
     // bounded, and a missing rule leaves HQ serving row 16a.
     await launcher.probe();
