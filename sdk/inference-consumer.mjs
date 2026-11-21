@@ -28,8 +28,10 @@ export async function* runInference({ accounting, authorize, responses, request,
         if (!output.terminal(result) || !Number.isFinite(actualCost) || actualCost < 0) {
           fail('host.internal', 'inference completed without a valid stop, measured usage and cost');
         }
-        await accounting.settle(claim, result.usage, actualCost);
-        return result;
+        // Use one HQ-owned snapshot for durable accounting and the reply.
+        const measured = { ...usage };
+        await accounting.settle(claim, measured, actualCost);
+        return { ...result, usage: measured };
       }
       signal.throwIfAborted();
       if (!output.chunk(event.value)) fail('host.internal', 'invalid inference chunk');

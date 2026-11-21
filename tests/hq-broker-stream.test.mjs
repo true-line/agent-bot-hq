@@ -123,12 +123,14 @@ async function setup(produce, home, beforeAuthorize) {
         return persist(updates);
       };
     },
-    holdNextReservationWrite() {
+    holdNextInferenceWrite(outcome) {
       const written = deferred();
       const release = deferred();
       const core = t.hq.core;
       const persist = core.persistTables;
       core.persistTables = async (updates) => {
+        const rows = updates?.get(budgetTable);
+        if (![...(rows?.values() ?? [])].some((record) => record.outcome === outcome)) return persist(updates);
         core.persistTables = persist;
         await persist(updates);
         written.resolve();
@@ -391,6 +393,29 @@ test('incoherent tool output fails with the existing unknown billing hold', { ti
   } finally { await t.close(); }
 });
 
+test('the terminal reply and durable accounting use the same measured usage snapshot', { timeout: 5000 }, async () => {
+  const usage = { ...terminal.usage };
+  const t = await setup(async function* () {
+    yield delta('reply');
+    return { ...terminal, usage };
+  });
+  const settlement = t.holdNextInferenceWrite('completed');
+  try {
+    await t.bind();
+    t.approve(2);
+    const reply = t.client.requestResponses(t.request, () => {});
+    await settlement.written;
+    // A provider can reuse its own usage counters while HQ waits for a commit.
+    usage.output_tokens += 1;
+    settlement.release();
+    assert.deepEqual(await reply, { usage: terminal.usage });
+    assert.deepEqual(t.records()[0].usage, terminal.usage);
+  } finally {
+    settlement.release();
+    await t.close();
+  }
+});
+
 test('oversized data leaves its operation unknown and retains the reservation', { timeout: 5000 }, async () => {
   const t = await setup(async function* () { yield delta('x'.repeat(MAX_LINE_BYTES)); return terminal; });
   try {
@@ -550,7 +575,7 @@ test('cancelling a committed reservation before dispatch releases its hold', { t
   const t = await setup(async function* () { assert.fail('producer should not open'); }, undefined, (signal) => { providerSignal = signal; });
   await t.bind();
   t.approve(1);
-  const hold = t.holdNextReservationWrite();
+  const hold = t.holdNextInferenceWrite('outcome_unknown');
   try {
     const response = t.client.requestResponses(t.request, () => {});
     await Promise.race([hold.written, response]);
