@@ -567,6 +567,31 @@ test('credentials: concurrent resolves share one mint; a mint in flight at revoc
   assert.equal(host.tokensHeld(), 0);
 });
 
+test('credentials: a mint that expires in flight is refused and the operation can retry', async (t) => {
+  const p = probe('agent-comms', ['credentials']);
+  const host = createTestHost({ plugins: [p.plugin], tokenTtlMs: 1_000 });
+  await host.start();
+  t.after(() => host.stop());
+  const { credentials } = p.ctx.services;
+  const reference = credentials.issue('fixture-provider');
+  const scope = { task: 't1', operation: 'op1' };
+
+  const requests = [credentials.resolve(reference, scope), credentials.resolve(reference, scope)];
+  assert.equal(host.identity.mints.length, 1, 'the synthetic issuer has issued one shared result');
+  host.clock.advance(1_000); // Its asynchronous reply arrives exactly at expiry.
+  await Promise.all(requests.map((request) => assert.rejects(request, code('credential_unavailable'))));
+  assert.equal(host.tokensHeld(), 0);
+  assert.equal(credentials.release({ reference, ...scope }), false, 'no pending or cached credential survives');
+
+  const retry = credentials.resolve(reference, scope);
+  host.clock.advance(999);
+  const usable = await retry;
+  assert.equal(await credentials.resolve(reference, scope), usable);
+  assert.equal(host.identity.mints.length, 2);
+  assert.equal(credentials.release({ reference, ...scope }), true);
+  assert.equal(host.tokensHeld(), 0);
+});
+
 test('credentials: completing an operation drops its pending resolution and preserves other operations', async (t) => {
   const p = probe('agent-comms', ['credentials']);
   const host = createTestHost({ plugins: [p.plugin] });
