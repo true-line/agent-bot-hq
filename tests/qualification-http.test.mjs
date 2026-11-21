@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
 import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,6 +13,8 @@ import { startClaudeQualificationHttp } from '../hq/claude-qualification-http.mj
 
 const MODEL = 'claude-haiku-4-5-20251001';
 const PROMPT = 'Return the Stage 2a fixture response.';
+const providerBytes = (response_text) => Buffer.from(JSON.stringify({ model: MODEL, prompt: PROMPT, response_text }));
+const providerPin = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
 async function http(socketPath, method, path, body) {
   const encoded = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
@@ -27,10 +30,13 @@ async function http(socketPath, method, path, body) {
 test('stock Messages HTTP reaches only a bound, one-use HQ qualification consumer', async (t) => {
   let expectedRuntime;
   const decisions = [];
-  const plan = { plan_id: 'plan-qualification-a', plan_digest: 'a'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT), response_text: 'Stage 2a brokered fixture turn.', expires_at_ms: Date.now() + 60_000 };
-  const provider = qualificationProvider({ plan, async authorize(input) {
+  const config = providerBytes('Stage 2a brokered fixture turn.');
+  const plan = { plan_id: 'plan-qualification-a', plan_digest: 'a'.repeat(64), provider_config_sha256: providerPin(config), expires_at_ms: Date.now() + 60_000 };
+  const provider = qualificationProvider({ plan, providerConfigBytes: config, async authorize(input) {
     decisions.push(input);
-    return input.runtime_id === expectedRuntime && input.model === MODEL && input.prompt_sha256 === plan.prompt_sha256;
+    return input.runtime_id === expectedRuntime && input.model === MODEL
+      && input.prompt_sha256 === qualificationPromptDigest(PROMPT)
+      && input.provider_config_sha256 === plan.provider_config_sha256;
   } });
   const world = await startHQ({ plugins: [referenceBroker(), provider] });
   const dir = mkdtempSync(join(tmpdir(), 'hq-qualification-http-'));
@@ -43,7 +49,7 @@ test('stock Messages HTTP reaches only a bound, one-use HQ qualification consume
   expectedRuntime = runtime.runtime_id;
   const member = await world.member();
   const unbound = await world.member();
-  const denied = await unbound.request('qualification.messages', { model: MODEL, prompt_sha256: plan.prompt_sha256 });
+  const denied = await unbound.request('qualification.messages', { model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT) });
   assert.equal(denied.ok, false);
   assert.equal(denied.refusal?.error, 'caller_mismatch');
   const challenge = await member.request('bind.challenge', { runtime_id: expectedRuntime });
@@ -55,8 +61,11 @@ test('stock Messages HTTP reaches only a bound, one-use HQ qualification consume
     if (!result.ok) throw new Error(JSON.stringify(result));
     return result.result;
   } }) };
-  const bridge = await startClaudeQualificationHttp({ socketPath: join(dir, 'broker.sock'), memberSession, plan: { model: MODEL, prompt: PROMPT } });
+  const bridge = await startClaudeQualificationHttp({ socketPath: join(dir, 'broker.sock'), peerUid: process.getuid(), memberSession, plan: { model: MODEL, prompt: PROMPT } });
   t.after(() => bridge.close());
+  const wrongPeerBridge = await startClaudeQualificationHttp({ socketPath: join(dir, 'wrong-peer.sock'), peerUid: process.getuid() + 1, memberSession, plan: { model: MODEL, prompt: PROMPT } });
+  t.after(() => wrongPeerBridge.close());
+  assert.equal((await http(wrongPeerBridge.socketPath, 'GET', '/api/claude_code/policy_limits')).status, 403);
   const policy = await http(bridge.socketPath, 'GET', '/api/claude_code/policy_limits');
   assert.equal(policy.status, 200);
   assert.deepEqual(JSON.parse(policy.body), { policy_limits: {}, restrictions: {}, compliance_taints: [] });
@@ -74,6 +83,7 @@ test('stock Messages HTTP reaches only a bound, one-use HQ qualification consume
   assert.equal(decisions.length, 1);
   assert.equal(decisions[0].plan_id, plan.plan_id);
   assert.equal(decisions[0].plan_digest, plan.plan_digest);
+  assert.equal(decisions[0].provider_config_sha256, plan.provider_config_sha256);
   assert.equal(decisions[0].runtime_id, expectedRuntime);
   const replay = await http(bridge.socketPath, 'POST', '/v1/messages', message);
   assert.equal(replay.status, 403);
@@ -82,21 +92,28 @@ test('stock Messages HTTP reaches only a bound, one-use HQ qualification consume
 
 test('unconfigured or malformed qualification plans fail closed', () => {
   assert.throws(() => qualificationProvider({}), /requires an exact plan/);
-  assert.throws(() => qualificationProvider({ plan: { plan_id: 'plan-qualification-a', plan_digest: 'a'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT), response_text: 'x', expires_at_ms: Date.now() + 1000 } }), /Machine authorization callback/);
+  const config = providerBytes('x');
+  const plan = { plan_id: 'plan-qualification-a', plan_digest: 'a'.repeat(64), provider_config_sha256: providerPin(config), expires_at_ms: Date.now() + 1000 };
+  assert.throws(() => qualificationProvider({ plan, providerConfigBytes: config }), /Machine authorization callback/);
+  assert.throws(() => qualificationProvider({ plan: { ...plan, provider_config_sha256: '0'.repeat(64) }, providerConfigBytes: config, authorize: async () => true }), /differ from the Machine pin/);
+  assert.throws(() => qualificationProvider({ plan, providerConfigBytes: Buffer.from('{"model":"changed"}'), authorize: async () => true }), /differ from the Machine pin/);
+  const duplicate = Buffer.from('{"model":"first","model":"second","prompt":"x","response_text":"y"}');
+  assert.throws(() => qualificationProvider({ plan: { ...plan, provider_config_sha256: providerPin(duplicate) }, providerConfigBytes: duplicate, authorize: async () => true }), /not strict UTF-8 JSON/);
 });
 
 test('a consumed qualification plan stays consumed after HQ restart', async (t) => {
   const home = tempHome();
-  const plan = { plan_id: 'plan-qualification-b', plan_digest: 'b'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT),
-    response_text: 'one-use result', expires_at_ms: Date.now() + 60_000 };
+  const config = providerBytes('one-use result');
+  const plan = { plan_id: 'plan-qualification-b', plan_digest: 'b'.repeat(64),
+    provider_config_sha256: providerPin(config), expires_at_ms: Date.now() + 60_000 };
   let authorizations = 0;
-  const plugins = () => [referenceBroker(), qualificationProvider({ plan, authorize: async () => { authorizations++; return true; } })];
+  const plugins = () => [referenceBroker(), qualificationProvider({ plan, providerConfigBytes: config, authorize: async () => { authorizations++; return true; } })];
   const first = await startHQ({ home, plugins: plugins() });
   const entry = await first.entry();
   const admitted = await entry.request('Hello', hello({ request_id: 'qualification_restart' }));
   assert.equal(admitted.ok, true);
   const runtime = admitted.result.admitted_runtimes[0];
-  const payload = { model: MODEL, prompt_sha256: plan.prompt_sha256 };
+  const payload = { model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT) };
   const bind = async (world) => {
     const member = await world.member();
     const challenge = await member.request('bind.challenge', { runtime_id: runtime.runtime_id });

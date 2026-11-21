@@ -5,6 +5,7 @@ import { createServer } from 'node:http';
 import { chmodSync, lstatSync, unlinkSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { qualificationPromptDigest } from './qualification-provider.mjs';
+import { authenticatePeerUid } from './owner-control.mjs';
 
 const MAX_BODY = 256 * 1024;
 const POLICY = Buffer.from('{"policy_limits":{},"restrictions":{},"compliance_taints":[]}');
@@ -39,10 +40,11 @@ async function bodyOf(request) {
 // `memberSession` comes from sdk/member-session.mjs, after a member-token
 // bootstrap and HMAC bind. Its captured request is never retried. The plan is
 // the same exact prompt/model that Machine authorized for the HQ consumer.
-export async function startClaudeQualificationHttp({ socketPath, memberSession, plan } = {}) {
+export async function startClaudeQualificationHttp({ socketPath, peerUid, memberSession, plan } = {}) {
   if (typeof socketPath !== 'string' || !socketPath || typeof memberSession?.capture !== 'function'
+    || !Number.isSafeInteger(peerUid) || peerUid < 1
     || typeof plan?.prompt !== 'string' || !plan.prompt || plan.prompt.length > 4096
-    || typeof plan.model !== 'string' || !plan.model) throw new TypeError('qualification HTTP needs a private socket, member session and exact plan');
+    || typeof plan.model !== 'string' || !plan.model) throw new TypeError('qualification HTTP needs a private socket, expected peer UID, member session and exact plan');
   const parent = lstatSync(dirname(socketPath));
   if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== process.getuid?.()
     || (parent.mode & 0o077) !== 0) throw new Error('qualification HTTP socket parent must be harness-owned mode 0700');
@@ -50,6 +52,7 @@ export async function startClaudeQualificationHttp({ socketPath, memberSession, 
   catch (error) { if (error.code !== 'ENOENT') throw error; }
 
   const handle = async (request, response) => {
+    if (!await authenticatePeerUid(request.socket, peerUid)) { response.writeHead(403); response.end(); return; }
     let path;
     try { path = new URL(request.url, 'http://unix.invalid').pathname; }
     catch { response.writeHead(400); response.end(); return; }
