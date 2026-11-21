@@ -89,14 +89,30 @@ function signerLine(g) {
 }
 
 function printStatus(s) {
+  const grant = s.hq?.enrollment?.grant;
+  const enrollment = {
+    pending: 'awaiting owner approval',
+    approved: 'approved; restart HQ to activate',
+    failed: 'failed',
+  }[grant?.state];
+  const enrollmentInProgress = grant?.state === 'pending' || grant?.state === 'approved';
+  const enrollHint = 'device not enrolled: run enroll';
+  const reasonSuffix = (reason) => {
+    if (!reason) return '';
+    if (enrollmentInProgress && (reason === enrollHint || reason === `safe mode: ${enrollHint}`)) {
+      return ` (${reason.slice(0, -': run enroll'.length)})`;
+    }
+    return ` (${reason})`;
+  };
   const lines = [
-    `HQ ${s.hq?.version ?? '?'}: ${s.mode}${s.reason ? ` (${s.reason})` : ''}; admissions ${s.admissions ? 'open' : 'closed'}`,
+    `HQ ${s.hq?.version ?? '?'}: ${s.mode}${reasonSuffix(s.reason)}; admissions ${s.admissions ? 'open' : 'closed'}`,
     `profile: ${s.profile}`,
     ...(s.hq?.profileReasons ?? []).map((r) => `  - ${r}`),
     `device: ${s.identity?.device}; identity-service link: ${s.identity?.link}`,
+    ...(enrollment ? [`enrollment: ${enrollment}`] : []),
     ...(s.hq?.signer ? [signerLine(s.hq.signer)] : []),
     `legacy daemon: ${s.legacy?.state}${s.legacy?.version ? ` ${s.legacy.version}` : ''}${s.legacy?.supervise ? ' (supervised)' : ''}`,
-    ...s.plugins.map((p) => `plugin ${p.name} ${p.version}: ${p.state}${p.reason ? ` (${p.reason})` : ''}`),
+    ...s.plugins.map((p) => `plugin ${p.name} ${p.version}: ${p.state}${reasonSuffix(p.reason)}`),
     ...(s.hq?.pluginLoad ?? []).filter((p) => p.state === 'refused').map((p) => `plugin ${p.name}: refused (${p.reason})`),
     ...(s.hq?.devPlugins ? [`dev plugins (unpinned): ${s.hq.devPlugins}`] : []),
   ];

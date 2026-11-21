@@ -187,11 +187,20 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   let active = await open();
   t.after(async () => { try { await active?.close(); } finally { for (const dir of [home, role]) rmSync(dir, { recursive: true, force: true }); } });
   assert.equal(active.status.mode, 'safe');
-  const consoleStatus = async () => (await promisify(execFile)(process.execPath, [
-    fileURLToPath(new URL('../hq/main.mjs', import.meta.url)), 'status', '--home', home,
+  const consoleStatus = async (...flags) => (await promisify(execFile)(process.execPath, [
+    fileURLToPath(new URL('../hq/main.mjs', import.meta.url)), 'status', '--home', home, ...flags,
   ])).stdout;
+  assert.match(await consoleStatus(), /^HQ .*device not enrolled: run enroll/m);
   const offer = () => active.owner.request('device.enroll', { harnesses: ['codex'] });
   assert.equal((await offer()).result.pending, true);
+  const pendingText = await consoleStatus();
+  assert.match(pendingText, /^device: unenrolled;/m);
+  assert.match(pendingText, /^enrollment: awaiting owner approval$/m);
+  assert.doesNotMatch(pendingText, /run enroll/);
+  assert.equal(JSON.parse(await consoleStatus('--json')).reason, 'device not enrolled: run enroll');
+  const pending = (await active.owner.request('device.status')).result.enrollment.grant;
+  assert.ok(!pendingText.includes(pending.user_code));
+  assert.ok(!pendingText.includes(pending.verification_uri));
   const [grant] = service.state.grants.values();
   grant.receiptErrors = ['credential_unavailable', 'temporarily_unavailable'];
   service.decide('approved');
@@ -201,9 +210,15 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.equal(service.state.devices.length, 1);
   assert.equal(existsSync(join(home, 'identity/device.json')), false);
   assert.equal(existsSync(join(home, 'identity/pending-receipt.json')), true);
+  const failedText = await consoleStatus();
+  assert.match(failedText, /^enrollment: failed$/m);
+  assert.match(failedText, /^HQ .*device not enrolled: run enroll/m);
   await active.close(); active = null;
   active = await open();
   assert.equal((await offer()).result.state, 'approved');
+  const approvedText = await consoleStatus();
+  assert.match(approvedText, /^enrollment: approved; restart HQ to activate$/m);
+  assert.doesNotMatch(approvedText, /run enroll/);
   assert.equal(options.filter((name) => name === 'enrollment-proof').length, 1);
   assert.equal(options.filter((name) => name === 'bind-enrollment').length, 2);
   await active.close(); active = null;
@@ -213,6 +228,8 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.equal(active.status.hq.signer.backend, 'machine');
   assert.equal(active.status.hq.features.hardwareSigner, false);
   const statusText = await consoleStatus();
+  assert.match(statusText, /^device: enrolled;/m);
+  assert.doesNotMatch(statusText, /^enrollment:/m);
   assert.match(statusText, /^signer: hardware key, paired Machine\/keyd backend, key /m);
   assert.doesNotMatch(statusText, /hardwareSigner|experimental feature/);
   assert.equal(existsSync(join(home, 'signer')), false);
