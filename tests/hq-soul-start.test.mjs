@@ -463,6 +463,27 @@ test('a null Machine completion cannot produce an ACP takeover or release occupa
   } finally { await control.stopAll(); rmSync(home, { recursive: true, force: true }); }
 });
 
+test('a completed runner cannot take over ACP while completion verification is pending', async () => {
+  const home = tempHome();
+  const machine = fakeMachineLaunch([]);
+  const start = machine.start.bind(machine);
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  machine.start = async (reservation) => ({ ...await start(reservation),
+    done: Promise.resolve({ contained: true, startId: reservation.startId }) });
+  machine.verifyCompletion = async () => { await held; return false; };
+  const control = starter(home, machine);
+  try {
+    await assert.rejects(control.dispatch('soul.start', startRequest(home)),
+      (error) => error.code === 'host.launch_unavailable');
+    assert.equal(control.report()[0]?.state, 'containment_unconfirmed', 'terminal occupancy remains until signed containment');
+  } finally {
+    release();
+    await control.stopAll();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('a symlink alias into HQ home cannot stage a runner copy or endpoint', async () => {
   const home = tempHome();
   const aliases = tempHome();
@@ -482,6 +503,22 @@ test('a symlink alias into HQ home cannot stage a runner copy or endpoint', asyn
       assert.equal(launches.length, 0);
       assert.deepEqual(control.report(), []);
     }
+  } finally { rmSync(aliases, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
+});
+
+test('a dangling symlink toward HQ home cannot be treated as a missing runner copy', async () => {
+  const home = tempHome();
+  const aliases = tempHome();
+  const alias = join(aliases, 'future-private');
+  symlinkSync(join(home, 'not-yet-provisioned'), alias);
+  const launches = [];
+  const machine = fakeMachineLaunch(launches, { runnerPackagePath: join(alias, 'copy') });
+  const control = starter(home, machine);
+  try {
+    await assert.rejects(control.dispatch('soul.start', startRequest(home)),
+      (error) => error.code === 'host.launch_unavailable');
+    assert.equal(launches.length, 0);
+    assert.deepEqual(control.report(), []);
   } finally { rmSync(aliases, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
 });
 

@@ -83,6 +83,9 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
         try { return join(realpathSync(existing), ...missing); }
         catch (error) {
           if (error?.code !== 'ENOENT') throw error;
+          // A dangling symlink is an existing path component, not an absent
+          // leaf that Machine may safely fill after reservation.
+          if (lstatSync(existing, { throwIfNoEntry: false })) throw new Error('runner path contains an unresolved symlink');
           const parent = dirname(existing);
           if (parent === existing) throw error;
           missing.unshift(basename(existing));
@@ -178,6 +181,10 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
     item.pid = launch?.pid ?? null;
     item.done = Promise.resolve(launch?.done).then((result) => result,
       () => ({ contained: false, exit_code: null, signal: null })).then(async (result) => {
+      // Completion is terminal immediately. Verification may block, but no
+      // ACP takeover may begin while its signed containment is pending.
+      item.terminal = true;
+      item.state = 'containment_unconfirmed';
       const safeResult = result && typeof result === 'object' ? result : {};
       const { exit_code = null, signal = null, contained = false } = safeResult;
       let confirmed = false;
@@ -191,7 +198,6 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
           }) === true;
         } catch { /* an unverifiable completion keeps the slot occupied */ }
       }
-      item.terminal = true;
       if (confirmed === true) {
         starts.delete(id);
         byPath.delete(path);
