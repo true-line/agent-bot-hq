@@ -122,7 +122,7 @@ test('transactional audit rows share the plugin write and remain receipt-service
     assert.throws(() => storeOnlyContext.receipts, /did not declare the receipts service/);
     assert.equal(storeOnlyCore.receipts.length, 0);
 
-    const sinkCore = createCore({ persistReceipt: async (entry) => ({ ...entry, seq: 1 }) });
+    const sinkCore = createCore({ persistReceipt: async (entry) => ({ ...entry, seq: 1 }), atomicReceiptWrites: true });
     sinkCore.phases.set('p', 'running');
     assert.equal('appendIn' in bindServices(sinkCore, plugin).receipts, false, 'a separate receipt sink cannot claim grouped persistence');
     const storeOverrideCore = createCore();
@@ -140,31 +140,16 @@ test('transactional audit rows share the plugin write and remain receipt-service
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('a failed generic plugin publication removes only its own staged audit row', async () => {
-  let releaseFirst;
-  let enteredFirst;
-  const firstEntered = new Promise((resolve) => { enteredFirst = resolve; });
-  const waitFirst = new Promise((resolve) => { releaseFirst = resolve; });
-  let writes = 0;
-  const core = createCore({ atomicReceiptWrites: true, persist: async () => {
-    writes += 1;
-    if (writes === 1) { enteredFirst(); await waitFirst; throw new Error('fixture write failed'); }
-  } });
-  core.phases.set('p', 'running');
-  const services = bindServices(core, plugin);
-  const failed = services.store.tx((tx) => {
-    tx.put('rows', 'rolled-back', true);
-    services.receipts.appendIn(tx, { kind: 'task.failed' });
-  });
-  await firstEntered;
-  await services.receipts.append({ kind: 'unrelated' });
-  releaseFirst();
-  await assert.rejects(failed, /fixture write failed/);
-  assert.equal(await services.store.tx((tx) => tx.get('rows', 'rolled-back')), undefined);
-  assert.deepEqual(core.receipts.map((r) => r.kind), ['unrelated']);
-  assert.equal(core.receipts[0].seq, 2, 'unrelated receipt keeps its own sequence');
-  await services.receipts.append({ kind: 'after_failure' });
-  assert.deepEqual(core.receipts.map((r) => [r.kind, r.seq]), [['unrelated', 2], ['after_failure', 3]]);
+test('generic persist and receipt-only sinks cannot claim grouped audit without a combined hook', () => {
+  for (const options of [
+    { persist: async () => {}, atomicReceiptWrites: true },
+    { persistReceipt: async (entry) => ({ ...entry, seq: 1 }), atomicReceiptWrites: true },
+    { persistPluginWrite: (change) => change({ appendReceipt() {} }) },
+  ]) {
+    const core = createCore(options);
+    core.phases.set('p', 'running');
+    assert.equal('appendIn' in bindServices(core, plugin).receipts, false);
+  }
 });
 
 test('an audit transaction cannot finish after its plugin context is revoked', async () => {

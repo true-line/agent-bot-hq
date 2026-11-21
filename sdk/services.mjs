@@ -140,10 +140,13 @@ export function fakeSigner({ device = 'enrolled' } = {}) {
 // atomicReceiptWrites is an explicit claim that the grouped receipt callback
 // participates in that publication. With no persistence hooks, the in-memory
 // host provides the same grouped transaction semantics.
-export function createCore({ clock = testClock(), random = testRandom(), profile = 'managed-cooperative', config = {}, identity = fakeIdentityService(), signer = fakeSigner(), budgets = {}, persist, persistReceipt, persistPluginWrite, atomicReceiptWrites = !persist && !persistReceipt && !persistPluginWrite } = {}) {
+export function createCore({ clock = testClock(), random = testRandom(), profile = 'managed-cooperative', config = {}, identity = fakeIdentityService(), signer = fakeSigner(), budgets = {}, persist, persistReceipt, persistPluginWrite, atomicReceiptWrites } = {}) {
   if (!PROFILES.includes(profile)) throw new TypeError(`profile is one of ${PROFILES}`);
+  if (atomicReceiptWrites !== undefined && typeof atomicReceiptWrites !== 'boolean') throw new TypeError('atomicReceiptWrites must be a boolean');
+  const groupedReceipts = atomicReceiptWrites === true && typeof persistPluginWrite === 'function'
+    || atomicReceiptWrites !== false && !persist && !persistReceipt && !persistPluginWrite;
   const core = {
-    clock, random, profile, identity, signer, persist, persistReceipt, persistPluginWrite, atomicReceiptWrites,
+    clock, random, profile, identity, signer, persist, persistReceipt, persistPluginWrite, atomicReceiptWrites: groupedReceipts,
     config: deepFreeze(clone(config)),
     tables: new Map(),          // `${plugin}\0${table}` → Map(key → value)
     blobs: new Map(),           // `${plugin}\0${digest}` → Buffer
@@ -278,6 +281,7 @@ function storeService(core, plugin, lease = { live: true }) {
       checkLive();
       rollback = change({ appendReceipt: (entry) => {
         checkLive();
+        if (core.persist) throw new Error('grouped receipt writes need a combined persistPluginWrite hook');
         let seq;
         try { seq = nextReceiptSeq(core); }
         catch { fail('host.invalid_request', 'receipt sequence is exhausted'); }
