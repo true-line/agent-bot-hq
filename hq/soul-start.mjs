@@ -14,27 +14,34 @@ const SOUL_ID = /^agent_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 const INSTALLATION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 
-// launchRunner is supplied only by a verified Machine launcher wired into
-// HQ's trusted entry point. It must return a confirmed non-HQ UID, fixed
-// start/path identity, bounded stop(), completion promise and ACP streams.
-// Production passes no launcher until Machine #630 defines that contract.
-export function createSoulStarter({ core, home, launchRunner, mode, hqUid = process.getuid?.() } = {}) {
+// machineLaunch is supplied only by a trusted Machine client wired into HQ's
+// entry point. reserve() must not start a process; verifyMachineReservation()
+// must authenticate Machine's one-use binding independently of that client.
+// Production passes no client until Machine #629/#630 implement that proof.
+export function createSoulStarter({ core, home, machineLaunch, verifyMachineReservation, verifyMachineCompletion,
+  mode, hqUid = process.getuid?.() } = {}) {
+  const hqEpoch = `he_${core.random.hex(12)}`;
   const starts = new Map();
   const byPath = new Map();
   const byInstallation = new Map();
   const byUid = new Map();
-  const report = () => [...starts.values()].map(({ id, path, pid, uid, gid, soulId, installationId, startedAt, state }) => ({
+  const report = () => [...starts.values()].map(({ id, path, pid, uid, gid, soulId, installationId, packageDigest, startedAt, state }) => ({
     start_id: id, package_path: path, pid, runner_uid: uid, runner_gid: gid,
-    soul_id: soulId, installation_id: installationId, started_at: startedAt, state,
+    soul_id: soulId, installation_id: installationId, package_digest: packageDigest,
+    hq_epoch: hqEpoch, started_at: startedAt, state,
   }));
 
   function stop(item) {
-    if (item.stopping) return item.done;
+    if (item.stopping) return item.stopPromise;
     item.stopping = true;
+    item.state = 'stopping';
     // Machine owns group termination and must confirm containment. HQ keeps
     // the live slot until its completion report; no local signal is enough.
-    Promise.resolve().then(() => item.launch.stop()).catch(() => {});
-    return item.done;
+    item.stopPromise = Promise.resolve().then(() => item.launch.stop()).then(
+      () => item.done,
+      () => { item.state = 'containment_unconfirmed'; },
+    );
+    return item.stopPromise;
   }
 
   async function dispatch(op, { auth, payload, takeover: canTakeOver }) {
@@ -46,7 +53,11 @@ export function createSoulStarter({ core, home, launchRunner, mode, hqUid = proc
     if (auth !== 'owner') fail('host.auth_mismatch', 'Soul start is owner-only');
     if (!canTakeOver) fail('host.invalid_request', 'soul.start must be the first request on a new owner connection');
     if (mode() !== 'running') fail('host.launch_unavailable', 'HQ is not running admissions');
-    if (!launchRunner) fail('host.launch_unavailable', 'Machine has not provisioned a separate Soul runner launch route');
+    if (!machineLaunch || typeof machineLaunch.reserve !== 'function'
+      || typeof verifyMachineReservation !== 'function' || typeof verifyMachineCompletion !== 'function'
+      || typeof machineLaunch.start !== 'function') {
+      fail('host.launch_unavailable', 'Machine has not provisioned an authenticated Soul runner launch route');
+    }
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)
       || Object.keys(payload).some((k) => k !== 'package_path')
       || typeof payload.package_path !== 'string' || !isAbsolute(payload.package_path)) {
@@ -63,57 +74,92 @@ export function createSoulStarter({ core, home, launchRunner, mode, hqUid = proc
     // Reserve before the first await so concurrent owner requests cannot
     // start the same package twice.
     byPath.set(path, id);
-    let launch;
+    const request = { startId: id, packagePath: path, hqEpoch, hqHome: home,
+      profile: 'managed-cooperative', requireHqLaunch: true };
+    let reservation;
     try {
-      launch = await launchRunner({ startId: id, packagePath: path, hqHome: home,
-        profile: 'managed-cooperative', requireHqLaunch: true });
+      reservation = Object.freeze(await machineLaunch.reserve(request));
+      const valid = reservation?.startId === id && reservation.packagePath === path
+        && reservation.hqEpoch === hqEpoch
+        && Number.isSafeInteger(reservation.uid) && reservation.uid > 0 && reservation.uid !== hqUid
+        && Number.isSafeInteger(reservation.gid) && reservation.gid > 0
+        && SOUL_ID.test(reservation.soulId ?? '') && INSTALLATION_ID.test(reservation.installationId ?? '')
+        && DIGEST.test(reservation.definitionDigest ?? '') && DIGEST.test(reservation.packageDigest ?? '');
+      if (!valid || await verifyMachineReservation(reservation, request) !== true) {
+        fail('host.launch_unavailable', 'Machine reservation lacks an authenticated per-installation runner binding');
+      }
     } catch (error) {
       byPath.delete(path);
-      fail('host.launch_unavailable', `Machine refused Soul runner launch: ${error?.code ?? error?.message ?? 'unavailable'}`);
+      fail('host.launch_unavailable', `Machine refused Soul runner reservation: ${error?.code ?? error?.message ?? 'unavailable'}`);
     }
-    const valid = launch && launch.startId === id && launch.packagePath === path
-      && Number.isSafeInteger(launch.uid) && launch.uid > 0 && launch.uid !== hqUid
-      && Number.isSafeInteger(launch.gid) && launch.gid > 0
-      && SOUL_ID.test(launch.soulId ?? '') && INSTALLATION_ID.test(launch.installationId ?? '')
-      && DIGEST.test(launch.definitionDigest ?? '')
-      && Number.isSafeInteger(launch.pid) && launch.pid > 1
-      && typeof launch.stdin?.write === 'function' && typeof launch.stdout?.pipe === 'function'
-      && typeof launch.stop === 'function' && typeof launch.done?.then === 'function';
-    if (!valid) {
+    // No process has been started yet. All three maps are occupied before
+    // awaiting Machine.start, including when another path races this one.
+    if (byInstallation.has(reservation.installationId) || byUid.has(reservation.uid)) {
       byPath.delete(path);
-      try { await launch?.stop?.(); } catch { /* no usable start record */ }
-      fail('host.launch_unavailable', 'Machine launch did not return a separate runner UID, installation identity and bounded stream');
-    }
-    if (byInstallation.has(launch.installationId) || byUid.has(launch.uid)) {
-      byPath.delete(path);
-      try { await launch.stop(); } catch { /* a duplicate launch is never admitted */ }
+      try { await reservation.cancel?.(); } catch { /* reservation can expire in Machine */ }
       fail('host.launch_busy', 'Soul installation or runner account already has a live start');
     }
-    const item = { id, path, pid: launch.pid, uid: launch.uid, gid: launch.gid,
-      soulId: launch.soulId, installationId: launch.installationId, definitionDigest: launch.definitionDigest,
-      launch, startedAt: new Date(core.clock.now()).toISOString(), state: 'running', stopping: false };
-    item.done = Promise.resolve(launch.done).then((result) => result,
+    const item = { id, path, pid: null, uid: reservation.uid, gid: reservation.gid,
+      soulId: reservation.soulId, installationId: reservation.installationId,
+      definitionDigest: reservation.definitionDigest, packageDigest: reservation.packageDigest,
+      launch: null, startedAt: new Date(core.clock.now()).toISOString(), state: 'starting', stopping: false };
+    starts.set(id, item);
+    byInstallation.set(item.installationId, id);
+    byUid.set(item.uid, id);
+    let launch;
+    try { launch = await machineLaunch.start(reservation); }
+    catch (error) {
+      // A transport error after Machine accepted start may hide a live process.
+      // Keep all reservations until a future authenticated reconciliation.
+      item.state = 'containment_unconfirmed';
+      fail('host.launch_unavailable', `Machine Soul runner start is unconfirmed: ${error?.code ?? error?.message ?? 'unavailable'}`);
+    }
+    item.launch = launch;
+    item.pid = launch?.pid ?? null;
+    item.done = Promise.resolve(launch?.done).then((result) => result,
       () => ({ contained: false, exit_code: null, signal: null })).then(async (result = {}) => {
       const { exit_code = null, signal = null, contained = false } = result;
+      let confirmed = false;
       if (contained === true) {
+        try {
+          confirmed = await verifyMachineCompletion(result, {
+            startId: id, hqEpoch, packagePath: path, uid: item.uid, gid: item.gid,
+            soulId: item.soulId, installationId: item.installationId,
+            definitionDigest: item.definitionDigest, packageDigest: item.packageDigest,
+          }) === true;
+        } catch { /* an unverifiable completion keeps the slot occupied */ }
+      }
+      if (confirmed === true) {
         starts.delete(id);
         byPath.delete(path);
         byInstallation.delete(item.installationId);
         byUid.delete(item.uid);
       } else {
-        // A lost Machine completion report cannot free the UID or path for
-        // another launch. Reconciliation must establish containment first.
         item.state = 'containment_unconfirmed';
       }
-      await pushReceipt(core, { plugin: 'hq', kind: 'hq.soul.exited', start_id: id, exit_code, signal,
-        contained: contained === true }).catch(() => {});
+      await pushReceipt(core, { plugin: 'hq', kind: 'hq.soul.exited', start_id: id,
+        installation_id: item.installationId, hq_epoch: hqEpoch, exit_code, signal,
+        contained: confirmed === true }).catch(() => {});
     });
-    starts.set(id, item);
-    byInstallation.set(item.installationId, id);
-    byUid.set(item.uid, id);
+    const validLaunch = launch?.startId === id && launch.packagePath === path
+      && launch.hqEpoch === hqEpoch && launch.uid === item.uid && launch.gid === item.gid
+      && launch.soulId === item.soulId && launch.installationId === item.installationId
+      && launch.definitionDigest === item.definitionDigest && launch.packageDigest === item.packageDigest
+      && Number.isSafeInteger(launch.pid) && launch.pid > 1
+      && typeof launch.stdin?.write === 'function' && typeof launch.stdout?.pipe === 'function'
+      && typeof launch.stop === 'function' && typeof launch.done?.then === 'function';
+    if (!validLaunch) {
+      if (typeof launch?.stop === 'function') await stop(item);
+      else item.state = 'containment_unconfirmed';
+      fail('host.launch_unavailable', 'Machine launch response did not match its authenticated reservation');
+    }
+    item.state = 'running';
+    launch.stdin.on?.('error', () => {});
+    launch.stdout.on?.('error', () => {});
     try {
       await pushReceipt(core, { plugin: 'hq', kind: 'hq.soul.started', start_id: id, package_path: path,
         soul_id: item.soulId, installation_id: item.installationId, definition_digest: item.definitionDigest,
+        package_digest: item.packageDigest, hq_epoch: hqEpoch,
         pid: item.pid, runner_uid: item.uid, runner_gid: item.gid });
     } catch (error) {
       await stop(item);
@@ -122,6 +168,7 @@ export function createSoulStarter({ core, home, launchRunner, mode, hqUid = proc
     if (!starts.has(id)) fail('host.launch_unavailable', 'Soul runner exited before its ACP stream was attached');
     const result = { start_id: id, package_path: path, pid: item.pid, runner_uid: item.uid, runner_gid: item.gid,
       soul_id: item.soulId, installation_id: item.installationId, definition_digest: item.definitionDigest,
+      package_digest: item.packageDigest, hq_epoch: hqEpoch,
       profile: 'managed-cooperative', protected: false };
     return takeover(result, {
       open: () => (socket) => {

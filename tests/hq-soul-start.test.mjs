@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { realpathSync, rmSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -16,20 +16,60 @@ const waitFor = async (check) => {
   assert.fail('timed out waiting for Soul runner to stop');
 };
 
-function fakeMachineLaunch(calls, overrides = {}, completion = { exit_code: 0, signal: 'TERM', contained: true }) {
-  return async ({ startId, packagePath, ...request }) => {
-    calls.push({ startId, packagePath, ...request });
-    const stdin = new PassThrough();
-    const stdout = new PassThrough();
-    stdin.on('data', (chunk) => stdout.write(`ACP:${chunk}`));
-    let finish;
-    const done = new Promise((resolve) => { finish = resolve; });
-    return { startId, packagePath, uid: 61001, gid: 61001, pid: 4242,
-      soulId: SOUL, installationId: 'inst_fixture', definitionDigest: DIGEST,
-      stdin, stdout, done,
-      async stop() { stdin.destroy(); stdout.end(); finish(completion); },
-      ...overrides };
+function fakeMachineLaunch(calls, overrides = {}, completion = { exit_code: 0, signal: 'TERM', contained: true }, launchOverrides = {}) {
+  const trusted = new WeakSet();
+  const completed = new WeakSet();
+  return {
+    async reserve(request) {
+      const extra = typeof overrides === 'function' ? overrides(request) : overrides;
+      const reservation = { ...request, uid: 61001, gid: 61001,
+        soulId: SOUL, installationId: 'inst_fixture', definitionDigest: DIGEST, packageDigest: DIGEST,
+        async cancel() {}, ...extra };
+      trusted.add(reservation);
+      return reservation;
+    },
+    async verifyReservation(reservation, request) {
+      return trusted.has(reservation) && reservation.startId === request.startId
+        && reservation.packagePath === request.packagePath && reservation.hqEpoch === request.hqEpoch;
+    },
+    async verifyCompletion(report, binding) {
+      return completed.has(report) && report.startId === binding.startId
+        && report.hqEpoch === binding.hqEpoch && report.uid === binding.uid
+        && report.installationId === binding.installationId
+        && report.packageDigest === binding.packageDigest;
+    },
+    async start(reservation) {
+      assert.equal(trusted.has(reservation), true);
+      calls.push(reservation);
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      stdin.on('data', (chunk) => stdout.write(`ACP:${chunk}`));
+      let finish;
+      const done = new Promise((resolve) => { finish = resolve; });
+      return { ...reservation, pid: 4242, stdin, stdout, done,
+        async stop() {
+          stdin.destroy(); stdout.end();
+          const report = { ...completion, startId: reservation.startId, hqEpoch: reservation.hqEpoch,
+            uid: reservation.uid, installationId: reservation.installationId,
+            packageDigest: reservation.packageDigest };
+          completed.add(report);
+          finish(report);
+        },
+        ...launchOverrides };
+    },
   };
+}
+const machineOptions = (machine) => ({ soulLaunch: machine, soulVerifier: machine.verifyReservation,
+  soulCompletionVerifier: machine.verifyCompletion });
+
+async function rawStart(t, path) {
+  const stream = connect(t.hq.paths.control);
+  await new Promise((resolve, reject) => { stream.once('connect', resolve); stream.once('error', reject); });
+  let text = '';
+  stream.on('data', (chunk) => { text += chunk; });
+  stream.write(`${JSON.stringify({ id: 1, op: 'soul.start', payload: { package_path: path } })}\n`);
+  await waitFor(() => text.includes('\n'));
+  return { stream, response: JSON.parse(text.slice(0, text.indexOf('\n'))) };
 }
 
 test('the owner cannot configure arbitrary code to run in HQ account', () => {
@@ -39,7 +79,8 @@ test('the owner cannot configure arbitrary code to run in HQ account', () => {
 test('only the owner can request a separate Machine runner; the ACP stream stops with its owner connection', { timeout: 10000 }, async () => {
   const home = tempHome();
   const launches = [];
-  const t = await startHQ({ home, config: { acceptedDefinitions: {} }, soulLaunch: fakeMachineLaunch(launches) });
+  const t = await startHQ({ home, config: { acceptedDefinitions: {} },
+    ...machineOptions(fakeMachineLaunch(launches)) });
   let stream;
   try {
     const entry = await t.entry();
@@ -83,14 +124,29 @@ test('only the owner can request a separate Machine runner; the ACP stream stops
 
 test('HQ rejects a runner in its own UID and does not record a managed start', async () => {
   const launches = [];
-  const t = await startHQ({ soulLaunch: fakeMachineLaunch(launches, { uid: process.getuid() }) });
+  const t = await startHQ(machineOptions(fakeMachineLaunch(launches, { uid: process.getuid() })));
   try {
     const owner = await t.owner();
     const refused = await owner.request('soul.start', { package_path: t.home });
     assert.equal(refused.host_refusal.code, 'host.launch_unavailable');
-    assert.equal(launches.length, 1);
+    assert.equal(launches.length, 0);
     assert.deepEqual(t.hq.status().hq.soulStarts, []);
     assert.equal(t.hq.core.receipts.some((r) => r.kind === 'hq.soul.started'), false);
+  } finally { await t.done(); }
+});
+
+test('HQ rejects a self-asserted Machine reservation before starting a process', async () => {
+  const launches = [];
+  const machine = fakeMachineLaunch(launches);
+  const reserve = machine.reserve.bind(machine);
+  machine.reserve = async (request) => ({ ...await reserve(request), claimed_valid: true });
+  const t = await startHQ(machineOptions(machine));
+  try {
+    const owner = await t.owner();
+    const refused = await owner.request('soul.start', { package_path: t.home });
+    assert.equal(refused.host_refusal.code, 'host.launch_unavailable');
+    assert.equal(launches.length, 0);
+    assert.deepEqual(t.hq.status().hq.soulStarts, []);
   } finally { await t.done(); }
 });
 
@@ -98,10 +154,8 @@ test('a live Soul installation keeps its own runner UID', { timeout: 10000 }, as
   const home = tempHome();
   const other = tempHome();
   const launches = [];
-  const fake = fakeMachineLaunch(launches);
-  const t = await startHQ({ home, soulLaunch: async (request) => ({
-    ...await fake(request), installationId: request.packagePath === realpathSync(home) ? 'inst_one' : 'inst_two',
-  }) });
+  const t = await startHQ({ home, ...machineOptions(fakeMachineLaunch(launches,
+    (request) => ({ installationId: request.packagePath === realpathSync(home) ? 'inst_one' : 'inst_two' }))) });
   let stream;
   try {
     stream = connect(t.hq.paths.control);
@@ -115,16 +169,106 @@ test('a live Soul installation keeps its own runner UID', { timeout: 10000 }, as
     const refused = await owner.request('soul.start', { package_path: other });
     assert.equal(refused.host_refusal.code, 'host.launch_busy');
     assert.equal(t.hq.status().hq.soulStarts.length, 1);
-  } finally { stream?.destroy(); await t.done(); }
+  } finally { stream?.destroy(); await t.done(); rmSync(other, { recursive: true, force: true }); }
+});
+
+test('concurrent paths sharing a runner UID reserve before either process starts', { timeout: 10000 }, async () => {
+  const home = tempHome();
+  const other = tempHome();
+  const launches = [];
+  const machine = fakeMachineLaunch(launches,
+    (request) => ({ installationId: request.packagePath === realpathSync(home) ? 'inst_one' : 'inst_two' }));
+  const reserve = machine.reserve.bind(machine);
+  let count = 0;
+  let release;
+  const bothReserved = new Promise((resolve) => { release = resolve; });
+  machine.reserve = async (request) => {
+    const reservation = await reserve(request);
+    if (++count === 2) release();
+    await bothReserved;
+    return reservation;
+  };
+  const t = await startHQ({ home, ...machineOptions(machine) });
+  let first;
+  let second;
+  try {
+    [first, second] = await Promise.all([rawStart(t, home), rawStart(t, other)]);
+    assert.deepEqual([first.response.ok, second.response.ok].sort(), [false, true]);
+    assert.equal([first.response, second.response].find((r) => !r.ok).host_refusal.code, 'host.launch_busy');
+    assert.equal(launches.length, 1);
+    assert.equal(t.hq.status().hq.soulStarts.length, 1);
+  } finally { first?.stream.destroy(); second?.stream.destroy(); await t.done(); rmSync(other, { recursive: true, force: true }); }
+});
+
+test('a failed Machine stop keeps the runner UID and package occupied', { timeout: 10000 }, async () => {
+  const home = tempHome();
+  const other = tempHome();
+  const launches = [];
+  const t = await startHQ({ home, ...machineOptions(fakeMachineLaunch(launches,
+    (request) => ({ installationId: request.packagePath === realpathSync(home) ? 'inst_one' : 'inst_two' }),
+    undefined, { async stop() { throw new Error('Machine stop unavailable'); } })) });
+  let first;
+  try {
+    first = await rawStart(t, home);
+    assert.equal(first.response.ok, true);
+    first.stream.destroy();
+    await waitFor(() => t.hq.status().hq.soulStarts[0]?.state === 'containment_unconfirmed');
+    const second = await rawStart(t, other);
+    assert.equal(second.response.host_refusal.code, 'host.launch_busy');
+    second.stream.destroy();
+    assert.equal(launches.length, 1);
+    assert.equal(t.hq.status().hq.soulStarts.length, 1);
+  } finally { first?.stream.destroy(); await t.done(); rmSync(other, { recursive: true, force: true }); }
+});
+
+test('an invalid post-start identity with failed stop remains occupied', { timeout: 10000 }, async () => {
+  const home = tempHome();
+  const other = tempHome();
+  const launches = [];
+  const machine = fakeMachineLaunch(launches,
+    (request) => ({ installationId: request.packagePath === realpathSync(home) ? 'inst_one' : 'inst_two' }),
+    undefined, { uid: 61002, async stop() { throw new Error('stop unavailable'); } });
+  const t = await startHQ({ home, ...machineOptions(machine) });
+  try {
+    const first = await rawStart(t, home);
+    assert.equal(first.response.host_refusal.code, 'host.launch_unavailable');
+    first.stream.destroy();
+    assert.equal(t.hq.status().hq.soulStarts[0]?.state, 'containment_unconfirmed');
+    const second = await rawStart(t, other);
+    assert.equal(second.response.host_refusal.code, 'host.launch_busy');
+    second.stream.destroy();
+    assert.equal(launches.length, 1);
+  } finally { await t.done(); rmSync(other, { recursive: true, force: true }); }
+});
+
+test('an unsigned claim of containment cannot free a runner UID', { timeout: 10000 }, async () => {
+  const home = tempHome();
+  const other = tempHome();
+  const launches = [];
+  const machine = fakeMachineLaunch(launches,
+    (request) => ({ installationId: request.packagePath === realpathSync(home) ? 'inst_one' : 'inst_two' }));
+  machine.verifyCompletion = async () => false;
+  const t = await startHQ({ home, ...machineOptions(machine) });
+  let first;
+  try {
+    first = await rawStart(t, home);
+    assert.equal(first.response.ok, true);
+    first.stream.destroy();
+    await waitFor(() => t.hq.status().hq.soulStarts[0]?.state === 'containment_unconfirmed');
+    const second = await rawStart(t, other);
+    assert.equal(second.response.host_refusal.code, 'host.launch_busy');
+    second.stream.destroy();
+    assert.equal(launches.length, 1);
+    assert.ok(t.hq.core.receipts.some((r) => r.kind === 'hq.soul.exited' && r.contained === false));
+  } finally { first?.stream.destroy(); await t.done(); rmSync(other, { recursive: true, force: true }); }
 });
 
 test('an unconfirmed Machine stop retains the runner UID and installation slot', { timeout: 10000 }, async () => {
   const home = tempHome();
   const other = tempHome();
-  const fake = fakeMachineLaunch([], {}, { exit_code: null, signal: null, contained: false });
-  const t = await startHQ({ home, soulLaunch: async (request) => ({
-    ...await fake(request), installationId: request.packagePath === realpathSync(home) ? 'inst_one' : 'inst_two',
-  }) });
+  const t = await startHQ({ home, ...machineOptions(fakeMachineLaunch([],
+    (request) => ({ installationId: request.packagePath === realpathSync(home) ? 'inst_one' : 'inst_two' }),
+    { exit_code: null, signal: null, contained: false })) });
   let stream;
   try {
     stream = connect(t.hq.paths.control);
@@ -141,7 +285,7 @@ test('an unconfirmed Machine stop retains the runner UID and installation slot',
     assert.equal(refused.host_refusal.code, 'host.launch_busy');
     assert.equal(t.hq.status().hq.soulStarts.length, 1);
     assert.ok(t.hq.core.receipts.some((r) => r.kind === 'hq.soul.exited' && r.contained === false));
-  } finally { stream?.destroy(); await t.done(); }
+  } finally { stream?.destroy(); await t.done(); rmSync(other, { recursive: true, force: true }); }
 });
 
 test('an unconfigured HQ refuses Soul start and never reports a live start', async () => {
