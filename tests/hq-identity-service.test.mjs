@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { createEnrollment } from '../hq/enrollment.mjs';
 import { createSigner } from '../hq/signer.mjs';
 import { startHQ, tempHome } from './hq-harness.mjs';
-import { fakeIdentityService } from './identity-service-fixture.mjs';
+import { fakeIdentityService, testSessionCustody } from './identity-service-fixture.mjs';
 
 const SERVER = 'https://identity.example.test';
 const before = '2026-01-01T00:00:00Z', after = '2027-01-01T00:00:00Z';
@@ -82,28 +82,10 @@ function fixture({ server = SERVER, device = generateKeyPairSync('ec', { namedCu
     return new Response(out.text, { status: out.status, headers: out.headers });
   };
   const make = (over = {}) => {
-    const sessions = new Map();
-    const custody = {
-      openSession() {
-        if (state.custodyError) throw state.custodyError;
-        const id = String(sessions.size + 1);
-        const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
-        const ephemeralJwk = publicKey.export({ format: 'jwk' });
-        sessions.set(id, { privateKey, ephemeralJwk });
-        return { session: id, ephemeralJwk, assertion: (over.enrollment ?? enrollment).assertion({ ephemeralJwk }) };
-      },
-      bindAccess({ session }) {
-        assert.ok(sessions.has(session));
-        return { expiresAt: clock.now() + 900_000, recheck };
-      },
-      requestProof({ session, method, path, ath, jti }) {
-        const { privateKey, ephemeralJwk } = sessions.get(session);
-        const header = { alg: 'ES256', typ: 'dpop+jwt', jwk: ephemeralJwk };
-        const payload = { htm: method, htu: server + path, iat: Math.floor(clock.now() / 1000), jti, ath };
-        const unsigned = [header, payload].map((v) => Buffer.from(JSON.stringify(v)).toString('base64url')).join('.');
-        return unsigned + '.' + sign('sha256', Buffer.from(unsigned), { key: privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url');
-      },
-    };
+    const custody = testSessionCustody({
+      server, clock, recheck, assertion: (args) => (over.enrollment ?? enrollment).assertion(args),
+      beforeOpen() { if (state.custodyError) throw state.custodyError; },
+    });
     return createIdentityService({ server, enrollment, keySet, fetchImpl, clock, custody, ...over });
   };
   return { state, keySet, clock, enrollment, make, fetchImpl };
