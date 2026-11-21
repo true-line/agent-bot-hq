@@ -247,6 +247,36 @@ node hq/main.mjs machine harness-account-provision approve --challenge-file "$ch
 To discard the request, use `cancel --challenge-file "$challenge_file" --socket "$socket"`
 in place of `approve` and its arguments. A replacement challenge requires a fresh proof.
 
+### Enable the approved harness broker sockets
+
+Once Machine applies the account plan, check that its receipt lists the intended
+accounts and the directory `/Library/Application Support/ai.true-line.agent-bot-hq/ipc`.
+HQ reads its adapter-to-account mapping at startup. For a dedicated service
+with Codex and Claude Code, merge this section into the HQ home's `config.json`.
+Preserve existing settings. The file must belong to the dedicated HQ account.
+Use mode `0600`.
+
+```json
+{
+  "harnesses": {
+    "dir": "/Library/Application Support/ai.true-line.agent-bot-hq/ipc",
+    "accounts": {
+      "codex": "_codex",
+      "claude-code": "_claude-code"
+    }
+  }
+}
+```
+
+At a suitable break in active work, restart the installed LaunchDaemon with
+`sudo launchctl kickstart -k system/ai.true-line.agent-bot-hq`. From the
+configured owner account, run `node hq/main.mjs status --owner-control --json`
+with the installed HQ release and its Node binary. In `hq.sockets.harnesses`,
+check the account, adapter and socket path for each mapping. Each socket should
+have mode `0660`, with HQ as owner and the harness account's private group.
+Check `hq.launch.accounts` separately for launch availability. A connected
+account still needs its admitted runtime's keyed proof to bind to the broker.
+
 ### Review a dedicated macOS harness launch policy
 
 Use the paired dedicated HQ account and the Machine pin saved during verified
