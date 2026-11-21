@@ -31,6 +31,14 @@ deployment operator owns client inventory, installation, monitoring and rollback
    Compare SHA-256 of the two archives. Record source commit, contracts commit,
    contracts digest, artifact SHA-256, builder/tool versions and both results.
    A mismatch blocks publication. Obtain the owner's approval of those bytes.
+   To stage Soul runner source as inert evidence, add `--soul-runner-source
+   <local-agent-bot-souls-repo>` to either build. The builder reads only Git
+   blobs at the exact commit pinned in `governance/soul-runner.json`, checks the
+   complete file-and-mode digest, and records `source_status:
+   "unreleased-source"` in artifact metadata. This is not a Souls release or
+   launch approval. The HQ entry point still refuses `soul.start`: Machine must
+   provision a separate untrusted Soul-runner account and reviewed launch route
+   before any package bytes run, and protected qualification remains closed.
 4. Verify the artifact digest against the approved record before extracting on
    each host. Reject paths escaping the target and unexpected symlinks. Extract
    under a new versioned directory writable only by the deployment operator;

@@ -8,11 +8,18 @@ import { tmpdir } from 'node:os';
 import { resolve, join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { readPin, verifyVendored } from './soul-contracts.mjs';
+import { readSoulRunnerPin, stageSoulRunner } from './soul-runner.mjs';
 
 const [commit, contracts, output, ...options] = process.argv.slice(2);
-const darwinTarget = options.length === 2 && options[0] === '--target' && options[1] === 'darwin';
-if (!/^[0-9a-f]{40}$/.test(commit ?? '') || !contracts || !output || (options.length && !darwinTarget)) {
-  throw new Error('usage: node scripts/build-interim-release.mjs <full-commit> <verified-contracts-dir> <output.tar> [--target darwin]');
+let darwinTarget = false;
+let soulRunnerSource;
+for (let i = 0; i < options.length; i += 2) {
+  if (options[i] === '--target' && options[i + 1] === 'darwin') darwinTarget = true;
+  else if (options[i] === '--soul-runner-source' && options[i + 1] && !soulRunnerSource) soulRunnerSource = options[i + 1];
+  else throw new Error(`unknown builder option ${options[i]}`);
+}
+if (!/^[0-9a-f]{40}$/.test(commit ?? '') || !contracts || !output) {
+  throw new Error('usage: node scripts/build-interim-release.mjs <full-commit> <verified-contracts-dir> <output.tar> [--target darwin] [--soul-runner-source DIR]');
 }
 if (process.platform !== 'linux' && !(darwinTarget && process.platform === 'darwin')) {
   throw new Error('build the Linux target on Linux, or the Darwin target on Linux or macOS with GNU tar');
@@ -33,6 +40,7 @@ for (const row of git(['ls-tree', '-rz', '--full-tree', commit]).toString('utf8'
     || path.split('/').some((part) => !part || part === '.' || part === '..') || /[\x00-\x1f\x7f]/.test(path)
     || path === 'hq/interim-core.mjs' || path === 'governance/interim-release.json'
     || path === 'vendor' || path === 'governance' || path === 'vendor/plugins' || path.startsWith('vendor/plugins/')
+    || path === 'vendor/agent-bot-souls' || path.startsWith('vendor/agent-bot-souls/')
     || path === 'vendor/soul-contracts' || path.startsWith('vendor/soul-contracts/')) {
     throw new Error(`unsupported source tree entry: ${path}`);
   }
@@ -53,8 +61,12 @@ try {
   mkdirSync(vendor, { recursive: true });
   for (const path of pin.paths) cpSync(join(resolve(contracts), path), join(vendor, path), { recursive: true, dereference: false, preserveTimestamps: false });
   verifyVendored(vendor, pin);
+  const runnerPin = soulRunnerSource ? readSoulRunnerPin() : undefined;
+  if (runnerPin) stageSoulRunner(soulRunnerSource, join(tree, 'vendor/agent-bot-souls'), runnerPin);
   const broker = darwinTarget ? (await import('./darwin-broker.mjs')).stageDarwinBroker(tree, work) : undefined;
-  writeFileSync(join(tree, 'governance/interim-release.json'), `${JSON.stringify({ schema_version: 1, hq_commit: commit, contracts_commit: pin.commit, contracts_digest: pin.digest, ...(darwinTarget ? { target_platform: target, owner_control_capability: 'darwin-owner-control/v2', broker } : {}) }, null, 2)}\n`);
+  writeFileSync(join(tree, 'governance/interim-release.json'), `${JSON.stringify({ schema_version: 1, hq_commit: commit, contracts_commit: pin.commit, contracts_digest: pin.digest,
+    ...(runnerPin ? { soul_runner: { source_commit: runnerPin.source_commit, source_status: runnerPin.source_status, digest: runnerPin.digest } } : {}),
+    ...(darwinTarget ? { target_platform: target, owner_control_capability: 'darwin-owner-control/v2', broker } : {}) }, null, 2)}\n`);
   renameSync(join(tree, 'hq/main.mjs'), join(tree, 'hq/interim-core.mjs'));
   writeFileSync(join(tree, 'hq/main.mjs'), `// Interim artifact entrypoint: verify vendored contracts without network fallback.\nif (process.platform !== '${target}') throw new Error('interim artifact runs on ${darwinTarget ? 'macOS' : 'Linux'} only');\nprocess.env.HQ_INTERIM_OFFLINE = '1';\nawait import('./interim-core.mjs');\n`);
   const temporaryTar = join(outputWork, 'artifact.tar');

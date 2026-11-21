@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/true-line/agent-bot-souls.git",
+  "source_commit": "71b3728eae24287ab0cbb1e8a8a660ad60acb055",
+  "source_status": "unreleased-source",
+  "paths": [
+    "bin",
+    "governance",
+    "lib",
+    "package.json"
+  ],
+  "digest_algorithm": "sha256-manifest-v1",
+  "digest": "sha256:133ad2c82770307fc3e73744f57e6a0cfdb07dd249a9c8a2fc286f95d1a67075",
+  "files": 27
+}
