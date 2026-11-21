@@ -3,8 +3,13 @@
 // refusal shapes, owner sessions in the store, and restart.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { once } from 'node:events';
 import { chmodSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { validate } from '../sdk/wire/schema.mjs';
 import { createCore } from '../sdk/services.mjs';
 import { createHQ } from '../hq/hq.mjs';
@@ -30,6 +35,81 @@ test('status over the control socket reports managed-cooperative honestly, with 
     assert.match(s.hq.sockets.access, /no peer-credential check/);
     assert.deepEqual(s.plugins.map((p) => [p.name, p.state]), [['hq-admission', 'running'], ['hq-notices', 'running'], ['hq-tasks', 'running']]);
   } finally { await t.done(); }
+});
+
+test('the minimal client resolves requests and raw frames after close', { timeout: 5000 }, async () => {
+  const t = await startHQ();
+  try {
+    const client = await t.owner();
+    await client.close();
+    const closed = { ok: false, transport_error: 'connection closed' };
+    assert.deepEqual(await client.request('status'), closed);
+    assert.deepEqual(await client.raw('{"op":"status"}\n'), closed);
+  } finally { await t.done(); }
+});
+
+test('enroll reports the outcome of polling a pending grant', { concurrency: true }, async (t) => {
+  const pending = { pending: true, user_code: 'LOCAL', key_storage: 'hardware',
+    key_thumbprint: 'fixture-thumbprint', key_generation: 1, expires_at: '2099-01-01T00:00:00Z' };
+  const refusal = { ok: false, refusal: { error: 'credential_unavailable', explanation: 'private-refusal-canary' } };
+  const hostRefusal = { ok: false, host_refusal: { code: 'host.internal', explanation: 'private-refusal-canary' } };
+  const approved = { ok: true, result: { enrollment: { grant: { state: 'approved', device_id: 'dev_fixture' } } } };
+  const cases = [
+    ['disconnect between polls', null, true, /Lost connection to HQ/, ['device.enroll']],
+    ['disconnect during a poll', null, false, /Lost connection to HQ/, ['device.enroll', 'device.status']],
+    ['status refusal', refusal, false, /Enrollment status unavailable \(credential_unavailable\)/, ['device.enroll', 'device.status']],
+    ['host status refusal', hostRefusal, false, /Enrollment status unavailable \(host.internal\)/, ['device.enroll', 'device.status']],
+    ['missing grant', { ok: true, result: { enrollment: {} } }, false, /HQ is no longer tracking this enrollment/, ['device.enroll', 'device.status']],
+    ['approved grant', approved, false, null, ['device.enroll', 'device.status']],
+  ];
+  await Promise.all(cases.map(([label, status, closeEarly, diagnostic, expectedOps]) =>
+    t.test(label, { timeout: 7000 }, async () => {
+      const home = tempHome();
+      const calls = [];
+      const server = createServer((socket) => {
+        socket.setEncoding('utf8');
+        let buffer = '';
+        socket.on('data', (chunk) => {
+          buffer += chunk;
+          let newline;
+          while ((newline = buffer.indexOf('\n')) !== -1) {
+            const { id, op } = JSON.parse(buffer.slice(0, newline));
+            buffer = buffer.slice(newline + 1);
+            calls.push(op);
+            const reply = op === 'device.enroll' ? { ok: true, result: pending } : status;
+            if (!reply) socket.end();
+            else {
+              const frame = JSON.stringify({ id, ...reply }) + '\n';
+              if (closeEarly) socket.end(frame);
+              else socket.write(frame);
+            }
+          }
+        });
+      });
+      server.listen(join(home, 'control.sock'));
+      await once(server, 'listening');
+      try {
+        const entry = fileURLToPath(new URL('../hq/main.mjs', import.meta.url));
+        const enroll = promisify(execFile)(process.execPath, [entry, 'enroll', '--home', home], { timeout: 5500 });
+        if (diagnostic) {
+          await assert.rejects(enroll, error => {
+            assert.equal(error.code, 1);
+            assert.match(error.stdout, /Waiting for approval/);
+            assert.match(error.stderr, diagnostic);
+            assert.doesNotMatch(error.stderr, /private-refusal-canary/);
+            return true;
+          });
+        } else {
+          const { stdout, stderr } = await enroll;
+          assert.match(stdout, /Enrolled as device dev_fixture/);
+          assert.equal(stderr, '');
+        }
+        assert.deepEqual(calls, expectedOps);
+      } finally {
+        await new Promise(resolve => server.close(resolve));
+        rmSync(home, { recursive: true, force: true });
+      }
+    })));
 });
 
 test('the auth class is the socket: no entry-point operation on the control socket, no owner operation on the admission socket', async () => {

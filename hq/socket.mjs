@@ -272,18 +272,29 @@ export function connectSocket(path) {
         if (waiter) { pending.delete(key); waiter(msg); }
       }
     });
-    const fail = (e) => { for (const w of pending.values()) w({ ok: false, transport_error: String(e?.message ?? e) }); pending.clear(); };
-    socket.on('close', () => fail(new Error('connection closed')));
-    socket.once('error', (e) => { reject(e); fail(e); });
+    let failure;
+    const fail = (message) => {
+      failure ??= message;
+      for (const w of pending.values()) w({ ok: false, transport_error: failure });
+      pending.clear();
+    };
+    const send = (key, text) => new Promise((res) => {
+      if (failure || socket.destroyed || !socket.writable) {
+        res({ ok: false, transport_error: failure ?? 'connection closed' });
+        return;
+      }
+      pending.set(key, res);
+      socket.write(text);
+    });
+    socket.on('close', () => fail('connection closed'));
+    socket.once('error', (e) => { reject(e); fail(e.message); });
     socket.once('connect', () => resolve({
-      request(op, payload) {
+      async request(op, payload) {
         const id = next++;
-        return new Promise((res) => { pending.set(id, res); socket.write(`${JSON.stringify({ id, op, ...(payload === undefined ? {} : { payload }) })}\n`); });
+        return send(id, `${JSON.stringify({ id, op, ...(payload === undefined ? {} : { payload }) })}\n`);
       },
       // Send raw text (tests of the framing); resolves with the next response.
-      raw(text) {
-        return new Promise((res) => { pending.set(null, res); socket.write(text); });
-      },
+      raw: (text) => send(null, text),
       close: () => new Promise((res) => {
         if (socket.closed || socket.destroyed) { res(); return; }
         socket.once('close', res);

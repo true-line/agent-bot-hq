@@ -32,6 +32,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { verify } from '../scripts/soul-contracts.mjs';
+import { HOST_CODES, REGISTRY_CODES } from '../sdk/errors.mjs';
 import { SCHEMA_NAMES } from './admission.mjs';
 import { NOTICE_SCHEMA_NAMES } from './notices.mjs';
 import { TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES } from './tasks.mjs';
@@ -179,9 +180,17 @@ async function main(argv) {
       console.log(`Approve this device at the identity service.\n  code: ${g.user_code}\n  open: ${g.verification_uri_complete ?? g.verification_uri ?? '(the identity service\'s device page)'}\n  key:  ${g.key_storage} key ${g.key_thumbprint.slice(0, 12)}, generation ${g.key_generation}\nWaiting for approval (until ${g.expires_at})...`);
       for (;;) {
         await new Promise((r) => setTimeout(r, 2000));
-        const s = (await client.request('device.status')).result?.enrollment?.grant;
+        const status = await client.request('device.status');
+        if (status.transport_error) throw new Error('Lost connection to HQ while waiting for enrollment. Check HQ status before retrying.');
+        if (!status.ok) {
+          const code = status.refusal?.error ?? status.host_refusal?.code;
+          const known = typeof code === 'string' && (Object.hasOwn(REGISTRY_CODES, code) || HOST_CODES.includes(code));
+          throw new Error(`Enrollment status unavailable${known ? ` (${code})` : ''}. Check HQ status before retrying.`);
+        }
+        const s = status.result?.enrollment?.grant;
         if (s?.state === 'approved') { console.log(`Enrolled as device ${s.device_id}. Restart HQ to leave safe mode.`); return; }
         if (s?.state === 'failed') { console.error(`Enrollment failed: ${s.reason}`); process.exitCode = 1; return; }
+        if (s?.state !== 'pending') throw new Error('HQ is no longer tracking this enrollment. Check HQ status before retrying.');
       }
     } finally { await client.close(); }
   }
