@@ -17,6 +17,8 @@ const SPKI = Buffer.from('302a300506032b6570032100', 'hex');
 const HEX_KEY = /^[0-9a-f]{64}$/i;
 const MAX_MESSAGE = 64 * 1024;
 const fingerprint = (raw) => createHash('sha256').update(raw).digest('hex');
+const disconnectedPairs = new WeakMap();
+export const disconnectedMachinePair = (error) => disconnectedPairs.get(error);
 
 function checkAcl(path, allowDeny = false) {
   if (process.platform === 'darwin') {
@@ -185,7 +187,9 @@ function exchange(socketPath, request) {
     });
     stream.on('error', error => {
       if (request.verb === 'hq-device' && error.syscall === 'connect' && (error.code === 'ENOENT' || error.code === 'ECONNREFUSED')) {
-        reject(new HostError('credential_unavailable', 'HQ could not connect to the paired Machine. Ask the prefix owner to check that Machine is running, then retry.'));
+        const unavailable = new HostError('credential_unavailable', 'HQ could not connect to the paired Machine. Ask the prefix owner to check that Machine is running, then retry.');
+        disconnectedPairs.set(unavailable, undefined);
+        reject(unavailable);
       } else reject(error);
     });
     stream.on('close', () => {
@@ -223,12 +227,12 @@ function roleAccount(dedicatedOnly) {
   return machineAccountLayout(userInfo(), process.platform, process.getuid?.(), process.geteuid?.(), dedicatedOnly);
 }
 
-export function machineRoleDevice(option, fields) {
+export function machineRoleDevice(option, fields, expectedPair) {
   const { account, ordinary } = roleAccount(false);
   const prefix = process.platform === 'darwin' && process.arch === 'arm64' ? '/opt/homebrew'
     : process.platform === 'linux' && ['x64', 'arm64'].includes(process.arch) ? '/home/linuxbrew/.linuxbrew' : null;
   if (!prefix) throw new Error('Machine device custody is unavailable on this platform');
-  return machineCommandInHome(['hq-device', option, '--socket', join(prefix, 'var/agent-machine/daemon.sock')], account.homedir, account.uid, fields, ordinary);
+  return machineCommandInHome(['hq-device', option, '--socket', join(prefix, 'var/agent-machine/daemon.sock')], account.homedir, account.uid, fields, ordinary, account.uid, expectedPair);
 }
 
 export function machineRoleCommand(argv) {
@@ -240,7 +244,7 @@ export function machineRoleCommand(argv) {
 
 // Also exercised with a temporary private home in the protocol tests. The CLI
 // always obtains its home and UID from the kernel-backed account lookup above.
-export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false, roleUid = uid) {
+export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false, roleUid = uid, expectedPair) {
   const [verb, ...args] = argv;
   const identity = verb === 'identity' && !args.length;
   let socket, hex, handoff, option = '', planID = '';
@@ -294,6 +298,10 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     if (verb !== 'status') throw new Error(`${verb} requires the daemon pin saved by verified Machine status`);
     throw new Error('first signed status requires the prefix owner’s verified --daemon-key HEX');
   }
+  // Only the read-only recovery probe can bind a request to its original
+  // local pairing. Compare both keys before opening the channel.
+  const pair = verb === 'hq-device' && option === 'identity' ? fingerprint(Buffer.concat([pub, daemon])) : undefined;
+  if (expectedPair !== undefined && expectedPair !== pair) throw new Error('the local Machine pairing changed after HQ started');
   async function send(fields) {
     const timestamp = Math.floor(Date.now() / 1000);
     const nonce = randomBytes(16).toString('base64url');
@@ -322,6 +330,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   } else if (deviceFields !== undefined) throw new Error('unexpected Machine device fields');
   const fields = { verb, ...deviceFields, ...(option && { option }), ...(planID && { plan_id: planID }) };
   const { response: r } = await send(fields).catch(error => {
+    if (pair && disconnectedPairs.has(error)) disconnectedPairs.set(error, pair);
     // keyd binds this exact signed receipt idempotently. Reconnect once with
     // a fresh channel nonce if Machine closed without returning any bytes.
     if (verb === 'hq-device' && option === 'bind-access' && error instanceof MissingMachineReply) return send(fields);

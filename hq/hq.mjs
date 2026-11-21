@@ -226,7 +226,11 @@ export function createHQ({
     enrollment ??= (s) => createEnrollment({ home, signer: s, server: cfg.enrollment?.server, uid, clock, onEvent: onEnrollmentEvent });
     const factory = cfg.signer?.backend === 'secure-enclave' ? createStandaloneDeviceSigner : createDeviceSigner;
     signer ??= factory({ home, enrollment, clock });
-    const signerReport = () => (typeof signer.report === 'function' ? signer.report() : undefined);
+    let restartRequired = false;
+    const signerReport = () => {
+      const report = typeof signer.report === 'function' ? signer.report() : undefined;
+      return restartRequired && report?.available ? { ...report, restart_required: true } : report;
+    };
     const hostProfile = (harnessAccounts) => {
       const report = signerReport();
       return detectProfile({
@@ -359,11 +363,25 @@ export function createHQ({
         legacy: legacyRunner.report(),
       }),
     });
-    await host.start();
+    const startup = await host.start();
+    const disconnectedPair = startup.mode === 'safe' ? signer.disconnectedPair?.() : undefined;
+    let checkingPair;
+    async function ownerDispatch(op, meta) {
+      // A cold connection refusal must leave HQ in safe mode. A requested
+      // status can verify the original pairing and guide the explicit restart.
+      if (op === 'status' && disconnectedPair && host.mode === 'safe') {
+        checkingPair ??= signer.recheckPair(disconnectedPair).then(
+          state => { restartRequired = state === 'enrolled'; },
+          () => { restartRequired = false; },
+        ).finally(() => { checkingPair = undefined; });
+        await checkingPair;
+      }
+      return host.dispatch(op, meta);
+    }
 
     try {
       sockets = [
-        await listenSocket({ path: paths.control, auth: 'owner', dispatch: host.dispatch, core, newSession: openSession, endSession: closeSession }),
+        await listenSocket({ path: paths.control, auth: 'owner', dispatch: ownerDispatch, core, newSession: openSession, endSession: closeSession }),
         // Agent launch is HQ core's own framing on this socket (hq/launch.mjs);
         // launch.attach takes its connection over, so only this listener allows it.
         await listenSocket({
@@ -381,7 +399,7 @@ export function createHQ({
       ];
       if (ownerControl) {
         sockets.push(await listenSocket({
-          path: OWNER_CONTROL_PATH, activated: ownerControl, auth: 'owner', core, dispatch: host.dispatch,
+          path: OWNER_CONTROL_PATH, activated: ownerControl, auth: 'owner', core, dispatch: ownerDispatch,
           newSession: () => openSession(ownerControl.account, ownerControl.uid), endSession: closeSession,
         }));
       }

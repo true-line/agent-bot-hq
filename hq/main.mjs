@@ -91,6 +91,7 @@ function signerLine(g) {
 
 function printStatus(s) {
   const grant = s.hq?.enrollment?.grant;
+  const restartForCustody = s.hq?.signer?.restart_required === true;
   const enrollment = {
     pending: 'awaiting owner approval',
     approved: 'approved; restart HQ to activate',
@@ -100,6 +101,7 @@ function printStatus(s) {
   const enrollHint = 'device not enrolled: run enroll';
   const reasonSuffix = (reason) => {
     if (!reason) return '';
+    if (restartForCustody && (reason === s.reason || reason === `safe mode: ${s.reason}`)) return '';
     if (enrollmentInProgress && (reason === enrollHint || reason === `safe mode: ${enrollHint}`)) {
       return ` (${reason.slice(0, -': run enroll'.length)})`;
     }
@@ -112,6 +114,7 @@ function printStatus(s) {
     `device: ${s.identity?.device}; identity-service link: ${s.identity?.link}`,
     ...(enrollment ? [`enrollment: ${enrollment}`] : []),
     ...(s.hq?.signer ? [signerLine(s.hq.signer)] : []),
+    ...(restartForCustody ? ['Machine custody recovered; restart HQ to reopen admissions.'] : []),
     `legacy daemon: ${s.legacy?.state}${s.legacy?.version ? ` ${s.legacy.version}` : ''}${s.legacy?.supervise ? ' (supervised)' : ''}`,
     ...s.plugins.map((p) => `plugin ${p.name} ${p.version}: ${p.state}${reasonSuffix(p.reason)}`),
     ...(s.hq?.pluginLoad ?? []).filter((p) => p.state === 'refused').map((p) => `plugin ${p.name}: refused (${p.reason})`),
