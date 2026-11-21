@@ -22,7 +22,9 @@ export function fixtureBroker(repo, tmp, root) {
   git('init', '-q');
   git('add', '.');
   git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', '-c', 'commit.gpgSign=false', 'commit', '-qm', 'fixture broker');
-  const broker = { ...identity, sha256: treeDigest(template), source_repository: 'https://github.com/true-line/agent-bot-comms.git', source_commit: git('rev-parse', 'HEAD') };
+  git('tag', 'v0.0.1');
+  const broker = { ...identity, sha256: treeDigest(template), source_repository: 'https://github.com/true-line/agent-bot-comms.git',
+    source_commit: git('rev-parse', 'HEAD'), source_tag: 'v0.0.1', release_asset_sha256: `sha256:${'a'.repeat(64)}` };
   cpSync(join(root, 'scripts/darwin-broker.mjs'), join(repo, 'scripts/darwin-broker.mjs'));
   cpSync(join(root, 'hq/plugins.mjs'), join(repo, 'hq/plugins.mjs'));
   cpSync(join(root, 'sdk'), join(repo, 'sdk'), { recursive: true });

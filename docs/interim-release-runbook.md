@@ -39,6 +39,11 @@ deployment operator owns client inventory, installation, monitoring and rollback
    launch approval. The HQ entry point still refuses `soul.start`: Machine must
    provision a separate untrusted Soul-runner account and reviewed launch route
    before any package bytes run, and protected qualification remains closed.
+   For Darwin's bundled communications broker, the pin records the published
+   agent-comms release tag, source commit, built plugin tree digest and release
+   asset SHA-256. The builder checks the tag-to-commit binding and verifies the
+   staged plugin tree. Verify the published archive against its recorded asset
+   SHA-256 separately; the builder reads source Git blobs, not that archive.
 4. Verify the artifact digest against the approved record before extracting on
    each host. Reject paths escaping the target and unexpected symlinks. Extract
    under a new versioned directory writable only by the deployment operator;
