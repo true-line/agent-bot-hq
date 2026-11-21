@@ -121,12 +121,14 @@ export function fakeSigner({ device = 'enrolled' } = {}) {
 // State shared by every plugin's services inside one host. The host owns it;
 // plugins only reach it through their bound services.
 // `persist`, when given, is called after every committed write (store
-// transaction, blob, receipt) and must make the state durable; HQ passes its
-// file store (hq/store.mjs). A persist that throws rolls the write back.
-export function createCore({ clock = testClock(), random = testRandom(), profile = 'managed-cooperative', config = {}, identity = fakeIdentityService(), signer = fakeSigner(), budgets = {}, persist } = {}) {
+// transaction, blob, receipt) and must make the state durable. The generic
+// callback observes live state and retains its existing optimistic rollback
+// contract. A host that snapshots receipt writes concurrently must supply a
+// persistReceipt hook that owns publication in its store's write queue.
+export function createCore({ clock = testClock(), random = testRandom(), profile = 'managed-cooperative', config = {}, identity = fakeIdentityService(), signer = fakeSigner(), budgets = {}, persist, persistReceipt } = {}) {
   if (!PROFILES.includes(profile)) throw new TypeError(`profile is one of ${PROFILES}`);
   const core = {
-    clock, random, profile, identity, signer, persist,
+    clock, random, profile, identity, signer, persist, persistReceipt,
     config: deepFreeze(clone(config)),
     tables: new Map(),          // `${plugin}\0${table}` → Map(key → value)
     blobs: new Map(),           // `${plugin}\0${digest}` → Buffer
@@ -190,7 +192,9 @@ export function revokeDevice(core, why = 'identity service reported the device r
 // Append an HQ receipt (sequence, time and profile added here) and make it
 // durable. If persisting fails the receipt is removed and the error raised.
 export async function pushReceipt(core, record) {
-  const r = { ...record, seq: core.receipts.length + 1, at: core.clock.now(), profile: core.profile };
+  const entry = { ...record, at: core.clock.now(), profile: core.profile };
+  if (core.persistReceipt) return core.persistReceipt(entry);
+  const r = { ...entry, seq: core.receipts.length + 1 };
   core.receipts.push(r);
   if (!core.persist) return r;
   try {

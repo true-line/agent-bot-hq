@@ -3,17 +3,24 @@
 // back, and an unreadable store is refused rather than overwritten.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createCore, bindServices } from '../sdk/services.mjs';
-import { openStore, StoreError, STORE_FORMAT } from '../hq/store.mjs';
+import { coreTable, openStore, StoreError, STORE_FORMAT } from '../hq/store.mjs';
 import { tempHome } from './hq-harness.mjs';
 
 const plugin = { name: 'p', services: ['store', 'receipts'], identityServiceRoutes: [] };
 
-function open(dir) {
+function configureStore(dir) {
   const store = openStore(dir);
-  const core = createCore({ persist: () => store.persist() });
+  const core = createCore({ persist: () => store.persist(), persistReceipt: entry => store.persistReceipt(entry) });
+  return { store, core };
+}
+
+function open(dir) {
+  const { store, core } = configureStore(dir);
   store.load(core);
   core.phases.set('p', 'running');
   return { store, core, services: bindServices(core, plugin) };
@@ -43,14 +50,13 @@ test('a large receipt history reopens in order and accepts another append', asyn
     const path = join(dir, 'store.json');
     writeFileSync(path, JSON.stringify({ format: STORE_FORMAT, tables: [], blobs: [], receipts }), { mode: 0o600 });
 
-    const store = openStore(dir);
-    const core = createCore({ persist: () => store.persist() });
+    const { store, core } = configureStore(dir);
     const original = core.receipts;
     assert.equal(store.load(core).receipts, receipts.length);
     assert.strictEqual(core.receipts, original);
     assert.deepEqual(core.receipts, receipts);
     core.phases.set('p', 'running');
-    await bindServices(core, plugin).receipts.append({ kind: 'tail' });
+    assert.equal(await bindServices(core, plugin).receipts.append({ kind: 'tail' }), receipts.length + 1);
     assert.equal(statSync(path).mode & 0o777, 0o600);
 
     const reopened = open(dir);
@@ -79,6 +85,130 @@ test('a failed persist rolls the write back in memory and raises', async () => {
   assert.equal(await services.store.tx((tx) => tx.get('rows', 'k')), undefined);
   await assert.rejects(services.receipts.append({ kind: 'x' }), /disk full/);
   assert.equal(core.receipts.length, 0);
+});
+
+function failPublication(t, store, attempt) {
+  const rename = fs.renameSync;
+  let writes = 0;
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (to === store.path && ++writes === attempt) throw new Error('fixture write failed');
+    return rename(from, to);
+  });
+  syncBuiltinESMExports();
+  return () => { t.mock.restoreAll(); syncBuiltinESMExports(); };
+}
+
+const receiptValues = core => core.receipts.map(({ kind, seq }) => [kind, seq]);
+
+for (const attempt of [1, 2]) test(`overlapping receipts remain consistent when write ${attempt} fails`, async (t) => {
+  const dir = tempHome();
+  const { store, core, services } = open(dir);
+  const restore = failPublication(t, store, attempt);
+  try {
+    const pending = ['first', 'second'].map(kind => services.receipts.append({ kind }));
+    assert.deepEqual(core.receipts, [], 'uncommitted receipts must not be visible');
+    const results = await Promise.allSettled(pending);
+    const kept = attempt === 1 ? 'second' : 'first';
+    assert.match(results[attempt - 1].reason.message, /fixture write failed/);
+    assert.deepEqual(results[2 - attempt], { status: 'fulfilled', value: 1 });
+    assert.deepEqual(receiptValues(core), [[kept, 1]]);
+    assert.deepEqual(receiptValues(open(dir).core), [[kept, 1]]);
+    assert.equal(await services.receipts.append({ kind: 'next' }), 2);
+    const reopened = open(dir);
+    assert.deepEqual(receiptValues(reopened.core), [[kept, 1], ['next', 2]]);
+    assert.equal(await reopened.services.receipts.append({ kind: 'reopened' }), 3);
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an earlier unrelated state snapshot never saves a later rejected receipt', async (t) => {
+  const dir = tempHome();
+  const { store, core, services } = open(dir);
+  const restore = failPublication(t, store, 2);
+  try {
+    coreTable(core, 'sample').set('written', true);
+    const state = store.persist();
+    const receipt = services.receipts.append({ kind: 'rejected' });
+    await Promise.all([state, assert.rejects(receipt, /fixture write failed/)]);
+    const reopened = open(dir);
+    assert.equal(coreTable(reopened.core, 'sample').get('written'), true);
+    assert.deepEqual(reopened.core.receipts, []);
+    assert.equal(await reopened.services.receipts.append({ kind: 'next' }), 1);
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('failure to open the directory leaves a receipt unpublished', async (t) => {
+  const dir = tempHome();
+  const { core, services } = open(dir);
+  const openSync = fs.openSync;
+  try {
+    await services.receipts.append({ kind: 'initial' });
+    t.mock.method(fs, 'openSync', (path, ...args) => {
+      if (path === dir) throw new Error('fixture directory open failed');
+      return openSync(path, ...args);
+    });
+    syncBuiltinESMExports();
+    await assert.rejects(services.receipts.append({ kind: 'rejected' }), /fixture directory open failed/);
+    assert.deepEqual(receiptValues(core), [['initial', 1]]);
+    assert.deepEqual(receiptValues(open(dir).core), [['initial', 1]]);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('directory close cannot turn a published receipt into a reported failure', async (t) => {
+  const dir = tempHome();
+  const { core, services } = open(dir);
+  const close = fs.closeSync;
+  try {
+    t.mock.method(fs, 'closeSync', fd => {
+      const directory = fs.fstatSync(fd).isDirectory();
+      close(fd);
+      if (directory) throw new Error('fixture directory close failed');
+    });
+    syncBuiltinESMExports();
+    assert.equal(await services.receipts.append({ kind: 'saved' }), 1);
+    assert.deepEqual(receiptValues(core), [['saved', 1]]);
+    assert.deepEqual(receiptValues(open(dir).core), [['saved', 1]]);
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+for (const [condition, legacy, sequence] of [
+  ['a legacy gap, duplicate or out-of-order sequence',
+    [{ kind: 'old-a', seq: 7 }, { kind: 'old-b', seq: 7 }, { kind: 'old-c', seq: 2 }], 8],
+  ['legacy receipts without sequence numbers',
+    [{ kind: 'old-a' }, { kind: 'old-b', seq: 1 }, { kind: 'old-c' }], 4],
+]) test(`new receipts preserve ${condition}`, async () => {
+  const dir = tempHome();
+  try {
+    const { store, core } = open(dir);
+    core.receipts.push(...legacy);
+    await store.persist();
+    const reopened = open(dir);
+    assert.equal(await reopened.services.receipts.append({ kind: 'new' }), sequence);
+    assert.deepEqual(open(dir).core.receipts.slice(0, 3), legacy);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('in-memory receipt appends remain synchronously visible', async () => {
+  const core = createCore();
+  core.phases.set('p', 'running');
+  const services = bindServices(core, plugin);
+  const first = services.receipts.append({ kind: 'first' });
+  const second = services.receipts.append({ kind: 'second' });
+  assert.deepEqual(receiptValues(core), [['first', 1], ['second', 2]]);
+  assert.deepEqual(await Promise.all([first, second]), [1, 2]);
 });
 
 test('the state directory must be private and owned by HQ', () => {
