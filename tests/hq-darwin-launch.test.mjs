@@ -5,6 +5,7 @@ import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
+import { isDeepStrictEqual } from 'node:util';
 import { createCore } from '../sdk/services.mjs';
 import { approvedDarwinAdapter, DARWIN_LAUNCHER, decodeDarwinGrant } from '../hq/darwin-launch-grant.mjs';
 import { supervisorReceipts } from '../hq/darwin-launch-receipts.mjs';
@@ -51,7 +52,9 @@ test('the supervisor must confirm its own group closed with an ordered final rec
   }
 });
 
-function setup({ qualified, permission = true, finish = 0 } = {}) {
+const matchesReviewedAdapter = candidate => isDeepStrictEqual(candidate, a);
+
+function setup({ qualification, permission = true, finish = 0 } = {}) {
   const core = createCore();
   const calls = [];
   const state = { grant };
@@ -76,7 +79,7 @@ function setup({ qualified, permission = true, finish = 0 } = {}) {
   }
   const launcher = createLauncher({ core, platform: 'darwin', configured: true, spawn,
     installedDarwinGrant: () => state.grant,
-    ...(qualified ? { qualifiedDarwinAdapter: candidate => candidate.sha256 === a.sha256 } : {}),
+    ...(qualification ? { qualifiedDarwinAdapter: qualification } : {}),
     harnesses: { endpoints:[endpoint], accountOf: () => endpoint },
     withLiveRuntime: (_, __, fn) => fn({ soul_id:SOUL, member_id:'member', role:'lead', adapter_id:a.adapter_id, harness_uid:a.uid }),
   });
@@ -84,7 +87,7 @@ function setup({ qualified, permission = true, finish = 0 } = {}) {
 }
 
 test('production qualification stays unavailable even when the specific installed sudo command is permitted', async () => {
-  for (const options of [{}, { qualified:true, permission:false }]) {
+  for (const options of [{}, { qualification:matchesReviewedAdapter, permission:false }]) {
     const f = setup(options); await f.launcher.probe();
     assert.deepEqual(f.calls[0].args, ['-n','-l','-u',a.account,'--',DARWIN_LAUNCHER,'harness-run']);
     assert.equal(f.launcher.accounts()[0].available, false);
@@ -94,7 +97,7 @@ test('production qualification stays unavailable even when the specific installe
 });
 
 for (const status of [0, 70]) test(`attached Darwin launch uses a private header then ACP, stops by EOF, supervisor exit ${status}`, async t => {
-  const f = setup({ qualified:true, finish:status }); await f.launcher.probe();
+  const f = setup({ qualification:matchesReviewedAdapter, finish:status }); await f.launcher.probe();
   const dir = mkdtempSync(join(tmpdir(),'hqr-')); const path = join(dir,'admission.sock');
   const srv = await listenSocket({ path, core:f.core, auth:'entry-point', takeover:true, newSession:() => 'entry', dispatch:f.launcher.dispatch });
   const entry = await connectSocket(path);
@@ -125,7 +128,7 @@ for (const status of [0, 70]) test(`attached Darwin launch uses a private header
 });
 
 test('a pre-spawn supervisor refusal records no adapter start and releases the member slot', async t => {
-  const f = setup({ qualified:true, finish:78 }); await f.launcher.probe();
+  const f = setup({ qualification:matchesReviewedAdapter, finish:78 }); await f.launcher.probe();
   const dir = mkdtempSync(join(tmpdir(),'hqr-')); const path = join(dir,'admission.sock');
   const srv = await listenSocket({ path, core:f.core, auth:'entry-point', takeover:true, newSession:() => 'entry', dispatch:f.launcher.dispatch });
   const entry = await connectSocket(path);
@@ -146,7 +149,7 @@ test('a pre-spawn supervisor refusal records no adapter start and releases the m
 });
 
 test('retirement or replacement after reservation refuses attach before any process is started', async t => {
-  const f = setup({ qualified:true }); await f.launcher.probe();
+  const f = setup({ qualification:matchesReviewedAdapter }); await f.launcher.probe();
   const dir = mkdtempSync(join(tmpdir(),'hqr-')); const path = join(dir,'admission.sock');
   const server = await listenSocket({ path, core:f.core, auth:'entry-point', takeover:true, newSession:() => 'entry', dispatch:f.launcher.dispatch });
   const entry = await connectSocket(path);
@@ -162,4 +165,36 @@ test('retirement or replacement after reservation refuses attach before any proc
     assert.equal(f.calls.length,1);
     assert.equal(f.launcher.report().launches.length,0);
   }
+});
+
+test('Darwin rechecks qualification of the exact reviewed command at reservation and attach', async t => {
+  // Both rows of the Machine fixture refer to the same executable bytes. Its
+  // second adapter has another ID, target account and argument list.
+  const sibling = grant.policy.adapters[1];
+  assert.equal(sibling.executable, a.executable);
+  assert.equal(sibling.sha256, a.sha256);
+  assert.notDeepEqual(sibling.args, a.args);
+  let current = a;
+  const f = setup({ qualification: candidate => isDeepStrictEqual(candidate, current) });
+  await f.launcher.probe();
+  assert.equal(f.launcher.accounts()[0].available, true);
+  const dir = mkdtempSync(join(tmpdir(), 'hqr-'));
+  const path = join(dir, 'admission.sock');
+  const server = await listenSocket({ path, core:f.core, auth:'entry-point', takeover:true, newSession:() => 'entry', dispatch:f.launcher.dispatch });
+  const entry = await connectSocket(path);
+  t.after(async () => { await entry.close(); await f.launcher.stopAll(); await server.close(); rmSync(dir,{recursive:true,force:true}); });
+
+  current = sibling;
+  assert.equal((await entry.request('launch', payload)).host_refusal.code, 'host.launch_unavailable');
+  current = a;
+  const reserved = (await entry.request('launch', payload)).result;
+  current = sibling;
+  const conn = await attachTo(path, { launch_id:reserved.launch_id, attach:reserved.attach });
+  assert.equal(conn.answer.host_refusal.code, 'host.launch_unavailable');
+  await conn.closed;
+  assert.equal(f.calls.length, 1); // Only the startup sudo permission check.
+  assert.equal(f.launcher.report().launches.length, 0);
+  assert.ok(!f.core.receipts.some(r => r.kind === 'hq.launch'));
+  current = a;
+  assert.equal((await entry.request('launch', payload)).ok, true);
 });
