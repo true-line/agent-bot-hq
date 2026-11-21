@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createCore, bindServices } from '../sdk/services.mjs';
-import { openStore, StoreError } from '../hq/store.mjs';
+import { openStore, StoreError, STORE_FORMAT } from '../hq/store.mjs';
 import { tempHome } from './hq-harness.mjs';
 
 const plugin = { name: 'p', services: ['store', 'receipts'], identityServiceRoutes: [] };
@@ -33,6 +33,30 @@ test('committed tables, blobs and receipts survive a reopen; the file is 0600', 
     assert.equal((await b.services.store.blob.get(digest)).toString(), 'hello');
     assert.equal(b.core.receipts.length, 1);
     assert.equal(b.core.receipts[0].kind, 'test');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a large receipt history reopens in order and accepts another append', async () => {
+  const dir = tempHome();
+  try {
+    const receipts = Array.from({ length: 200_000 }, (_, sequence) => ({ kind: 'audit', sequence, note: 'café' }));
+    const path = join(dir, 'store.json');
+    writeFileSync(path, JSON.stringify({ format: STORE_FORMAT, tables: [], blobs: [], receipts }), { mode: 0o600 });
+
+    const store = openStore(dir);
+    const core = createCore({ persist: () => store.persist() });
+    const original = core.receipts;
+    assert.equal(store.load(core).receipts, receipts.length);
+    assert.strictEqual(core.receipts, original);
+    assert.deepEqual(core.receipts, receipts);
+    core.phases.set('p', 'running');
+    await bindServices(core, plugin).receipts.append({ kind: 'tail' });
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+
+    const reopened = open(dir);
+    assert.equal(reopened.core.receipts.length, receipts.length + 1);
+    assert.deepEqual(reopened.core.receipts.slice(0, -1), receipts);
+    assert.equal(reopened.core.receipts.at(-1).kind, 'tail');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

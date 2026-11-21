@@ -15,7 +15,7 @@
 // group and others (0700), and the file is written 0600. HQ refuses to start
 // on a wider directory or a store it cannot parse; it never overwrites a
 // store it could not read.
-import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const STORE_FORMAT = 'agent-bot-hq-store/1';
@@ -39,7 +39,7 @@ function writeAtomic(path, text) {
   const tmp = `${path}.tmp-${process.pid}`;
   const fd = openSync(tmp, 'w', 0o600);
   try {
-    writeSync(fd, text);
+    writeFileSync(fd, text);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
@@ -92,7 +92,7 @@ export function openStore(dir, { uid } = {}) {
       if (!data) return { fresh: true };
       for (const [key, rows] of data.tables) core.tables.set(key, new Map(rows));
       for (const [key, b64] of data.blobs) core.blobs.set(key, Buffer.from(b64, 'base64'));
-      core.receipts.push(...data.receipts);
+      for (const receipt of data.receipts) core.receipts.push(receipt);
       return { fresh: false, tables: data.tables.length, receipts: data.receipts.length };
     },
     persist() {
