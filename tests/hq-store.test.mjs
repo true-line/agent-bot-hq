@@ -20,6 +20,7 @@ function configureStore(dir) {
     persist: () => store.persist(),
     persistReceipt: entry => store.persistReceipt(entry),
     persistPluginWrite: store.persistPluginWrite,
+    atomicReceiptWrites: true,
   });
   return { store, core };
 }
@@ -90,6 +91,106 @@ test('a failed persist rolls the write back in memory and raises', async () => {
   assert.equal(await services.store.tx((tx) => tx.get('rows', 'k')), undefined);
   await assert.rejects(services.receipts.append({ kind: 'x' }), /disk full/);
   assert.equal(core.receipts.length, 0);
+});
+
+test('transactional audit rows share the plugin write and remain receipt-service scoped', async () => {
+  const dir = tempHome();
+  try {
+    const { core, services } = open(dir);
+    core.tokens.set('fixture', { token: 'TX_CANARY_SECRET' });
+    await services.store.tx((tx) => {
+      tx.put('rows', 'audited', true);
+      services.receipts.appendIn(tx, { kind: 'task.fixture', text: 'token TX_CANARY_SECRET', profile: 'incorrect' });
+    });
+    const row = core.receipts.find((r) => r.kind === 'task.fixture');
+    assert.deepEqual(row, {
+      kind: 'task.fixture', text: 'token [redacted]', profile: 'managed-cooperative',
+      plugin: 'p', at: core.clock.now(), seq: 1,
+    });
+    const reopened = open(dir);
+    assert.deepEqual(reopened.core.receipts, [row]);
+    assert.equal(await reopened.services.store.tx((tx) => tx.get('rows', 'audited')), true);
+
+    const storeOnlyCore = createCore();
+    storeOnlyCore.phases.set('store-only', 'running');
+    const storeOnlyContext = bindServices(storeOnlyCore, { name: 'store-only', services: ['store'] });
+    const storeOnly = storeOnlyContext.store;
+    await storeOnly.tx((tx) => {
+      assert.equal('appendReceipt' in tx, false);
+      tx.put('rows', 'ordinary', true);
+    });
+    assert.throws(() => storeOnlyContext.receipts, /did not declare the receipts service/);
+    assert.equal(storeOnlyCore.receipts.length, 0);
+
+    const sinkCore = createCore({ persistReceipt: async (entry) => ({ ...entry, seq: 1 }), atomicReceiptWrites: true });
+    sinkCore.phases.set('p', 'running');
+    assert.equal('appendIn' in bindServices(sinkCore, plugin).receipts, false, 'a separate receipt sink cannot claim grouped persistence');
+    const storeOverrideCore = createCore();
+    storeOverrideCore.phases.set('p', 'running');
+    const overridden = bindServices(storeOverrideCore, plugin, { store: () => ({ tx: async () => {}, blob: {}, lock() {} }) });
+    assert.equal('appendIn' in overridden.receipts, false, 'an unpaired store override cannot claim grouped persistence');
+
+    let expiredTransaction;
+    await services.store.tx((tx) => { expiredTransaction = tx; });
+    assert.throws(() => services.receipts.appendIn(expiredTransaction, { kind: 'too-late' }), /active store transaction/);
+    const foreignCore = createCore();
+    foreignCore.phases.set('p', 'running');
+    const foreign = bindServices(foreignCore, plugin);
+    await assert.rejects(foreign.store.tx((tx) => services.receipts.appendIn(tx, { kind: 'cross-core' })), /active store transaction/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('generic persist and receipt-only sinks cannot claim grouped audit without a combined hook', () => {
+  for (const options of [
+    { persist: async () => {}, atomicReceiptWrites: true },
+    { persistReceipt: async (entry) => ({ ...entry, seq: 1 }), atomicReceiptWrites: true },
+    { persistPluginWrite: (change) => change({ appendReceipt() {} }) },
+  ]) {
+    const core = createCore(options);
+    core.phases.set('p', 'running');
+    assert.equal('appendIn' in bindServices(core, plugin).receipts, false);
+  }
+});
+
+test('an audit transaction cannot finish after its plugin context is revoked', async () => {
+  const core = createCore();
+  core.phases.set('p', 'running');
+  const lease = { live: true, why: 'test stop' };
+  const services = bindServices(core, plugin, {}, lease);
+  let release;
+  let entered;
+  const ready = new Promise((resolve) => { entered = resolve; });
+  const wait = new Promise((resolve) => { release = resolve; });
+  const pending = services.store.tx(async (tx) => {
+    tx.put('rows', 'late', true);
+    services.receipts.appendIn(tx, { kind: 'task.late' });
+    entered();
+    await wait;
+  });
+  await ready;
+  lease.live = false;
+  release();
+  await assert.rejects(pending, (error) => error.code === 'host.context_revoked');
+  assert.equal(await core.tables.get('p\0rows')?.get('late'), undefined);
+  assert.deepEqual(core.receipts, []);
+});
+
+test('legacy persistPluginWrite(change) hooks retain table, blob and separate receipt writes', async () => {
+  const core = createCore({ persistPluginWrite: (change) => change() });
+  core.phases.set('store-only', 'running');
+  const storeOnly = bindServices(core, { name: 'store-only', services: ['store'] }).store;
+  await storeOnly.tx((tx) => tx.put('rows', 'kept', true));
+  const digest = await storeOnly.blob.put(Buffer.from('ordinary blob'));
+  assert.equal(await storeOnly.tx((tx) => tx.get('rows', 'kept')), true);
+  assert.equal((await storeOnly.blob.get(digest)).toString(), 'ordinary blob');
+
+  core.phases.set('p', 'running');
+  const services = bindServices(core, plugin);
+  assert.equal('appendIn' in services.receipts, false, 'the old hook does not claim atomic audit support');
+  await services.store.tx((tx) => tx.put('rows', 'legacy-task-state', true));
+  await services.receipts.append({ kind: 'legacy.task.audit' });
+  assert.equal(await services.store.tx((tx) => tx.get('rows', 'legacy-task-state')), true);
+  assert.deepEqual(core.receipts.map((receipt) => receipt.kind), ['legacy.task.audit']);
 });
 
 function failPublication(t, store, attempt) {

@@ -282,3 +282,15 @@ single metadata sample.
 Use the numeric observation alone for an unknown code, an unrecognized
 diagnostics version, or an older artifact. Exit 1 can come from several
 startup or runtime failures. A launchd signal is a separate observation.
+
+### Task decision receipts
+
+HQ commits each new task offer, lead commitment, specialist proposal, owner or
+HQ wait/cancel, and deadline expiration with its task rows and operation key
+in one store publication. An exact replay returns its stored result without
+adding another decision receipt. Refusal receipts remain a separate audit
+event because no task decision was committed. Older stores may contain task
+decisions without matching receipts: HQ does not infer or synthesize historical
+audit evidence during upgrade or restart. A custom SDK host without the grouped
+receipt capability retains the prior separate task-store and receipt append
+path; it does not claim cross-store atomicity.
