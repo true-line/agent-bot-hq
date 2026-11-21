@@ -22,9 +22,21 @@ export const DEVICE_STATES = Object.freeze(['enrolled', 'unenrolled', 'revoked']
 export const IDENTITY_LINK_STATES = Object.freeze(['ok', 'unreachable']);
 
 const TABLE = /^[a-z][a-z0-9_]{0,63}$/;
+const RECEIPT_TRANSACTIONS = new WeakMap();
+const RECEIPT_SEQUENCE = new WeakMap();
 // Env names that carry a secret. A *_REF holding a credential reference is fine.
 const SECRET_NAME = /(TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|API_KEY)/i;
 const clone = (v) => (v === undefined ? undefined : structuredClone(v));
+function nextReceiptSeq(core) {
+  let last = RECEIPT_SEQUENCE.get(core);
+  if (last === undefined) {
+    last = 0;
+    for (const receipt of core.receipts) if (Number.isSafeInteger(receipt?.seq) && receipt.seq > last) last = receipt.seq;
+  }
+  if (last === Number.MAX_SAFE_INTEGER) throw new Error('receipt sequence is exhausted');
+  RECEIPT_SEQUENCE.set(core, last + 1);
+  return last + 1;
+}
 const deepFreeze = (v) => {
   if (v && typeof v === 'object') { Object.values(v).forEach(deepFreeze); Object.freeze(v); }
   return v;
@@ -124,11 +136,14 @@ export function fakeSigner({ device = 'enrolled' } = {}) {
 // transaction, blob, receipt) and must make the state durable. The generic
 // callback observes live state and retains its existing optimistic rollback
 // contract. HQ supplies persistReceipt and persistPluginWrite to publish
-// receipts, table transactions and blobs inside its shared store queue.
-export function createCore({ clock = testClock(), random = testRandom(), profile = 'managed-cooperative', config = {}, identity = fakeIdentityService(), signer = fakeSigner(), budgets = {}, persist, persistReceipt, persistPluginWrite } = {}) {
+// receipts, table transactions and blobs inside its shared store queue;
+// atomicReceiptWrites is an explicit claim that the grouped receipt callback
+// participates in that publication. With no persistence hooks, the in-memory
+// host provides the same grouped transaction semantics.
+export function createCore({ clock = testClock(), random = testRandom(), profile = 'managed-cooperative', config = {}, identity = fakeIdentityService(), signer = fakeSigner(), budgets = {}, persist, persistReceipt, persistPluginWrite, atomicReceiptWrites = !persist && !persistReceipt && !persistPluginWrite } = {}) {
   if (!PROFILES.includes(profile)) throw new TypeError(`profile is one of ${PROFILES}`);
   const core = {
-    clock, random, profile, identity, signer, persist, persistReceipt, persistPluginWrite,
+    clock, random, profile, identity, signer, persist, persistReceipt, persistPluginWrite, atomicReceiptWrites,
     config: deepFreeze(clone(config)),
     tables: new Map(),          // `${plugin}\0${table}` → Map(key → value)
     blobs: new Map(),           // `${plugin}\0${digest}` → Buffer
@@ -193,8 +208,12 @@ export function revokeDevice(core, why = 'identity service reported the device r
 // durable. If persisting fails the receipt is removed and the error raised.
 export async function pushReceipt(core, record) {
   const entry = { ...record, at: core.clock.now(), profile: core.profile };
-  if (core.persistReceipt) return core.persistReceipt(entry);
-  const r = { ...entry, seq: core.receipts.length + 1 };
+  if (core.persistReceipt) {
+    const receipt = await core.persistReceipt(entry);
+    if (Number.isSafeInteger(receipt?.seq) && receipt.seq > (RECEIPT_SEQUENCE.get(core) ?? 0)) RECEIPT_SEQUENCE.set(core, receipt.seq);
+    return receipt;
+  }
+  const r = { ...entry, seq: nextReceiptSeq(core) };
   core.receipts.push(r);
   if (!core.persist) return r;
   try {
@@ -219,8 +238,10 @@ async function viaIdentity(core, fn) {
   }
 }
 
-function storeService(core, plugin) {
+function storeService(core, plugin, lease = { live: true }) {
+  const checkLive = () => { if (!lease.live) fail('host.context_revoked', `${plugin}: this context is no longer live (${lease.why})`); };
   const tableKey = (table) => {
+    checkLive();
     if (typeof table !== 'string' || !TABLE.test(table)) fail('host.invalid_request', `table ${JSON.stringify(table)} must match ${TABLE}`);
     return `${plugin}\0${table}`;
   };
@@ -235,15 +256,48 @@ function storeService(core, plugin) {
     try { return await fn(); } finally { release(); if (core.locks.get(key) === tail) core.locks.delete(key); }
   };
   async function publish(change) {
-    if (core.persistPluginWrite) return core.persistPluginWrite(change);
-    const rollback = change();
+    checkLive();
+    const prepare = (entry) => ({ ...redact(core, entry), plugin, at: entry.at ?? core.clock.now(), profile: entry.profile ?? core.profile });
+    if (core.persistPluginWrite) return core.persistPluginWrite((context = {}) => {
+      checkLive();
+      return change({ appendReceipt: (entry) => {
+        checkLive();
+        if (typeof context.appendReceipt !== 'function') throw new Error('the configured store cannot atomically append receipts');
+        return context.appendReceipt(prepare(entry));
+      } });
+    });
+    const ownedReceipts = [];
+    const removeOwnedReceipts = () => {
+      for (const receipt of ownedReceipts) {
+        const index = core.receipts.indexOf(receipt);
+        if (index !== -1) core.receipts.splice(index, 1);
+      }
+    };
+    let rollback;
+    try {
+      checkLive();
+      rollback = change({ appendReceipt: (entry) => {
+        checkLive();
+        let seq;
+        try { seq = nextReceiptSeq(core); }
+        catch { fail('host.invalid_request', 'receipt sequence is exhausted'); }
+        const receipt = { ...prepare(entry), seq };
+        core.receipts.push(receipt);
+        ownedReceipts.push(receipt);
+        return receipt;
+      } });
+    } catch (error) {
+      removeOwnedReceipts();
+      throw error;
+    }
     if (rollback && core.persist) {
       try { await core.persist(); }
-      catch (error) { rollback(); throw error; }
+      catch (error) { rollback(); removeOwnedReceipts(); throw error; }
     }
   }
   async function runTx(fn) {
     const staged = new Map();
+    const stagedReceipts = [];
     const view = (table) => {
       const key = tableKey(table);
       if (!staged.has(key)) staged.set(key, new Map(core.tables.get(key) ?? []));
@@ -257,10 +311,24 @@ function storeService(core, plugin) {
       put: (table, key, value) => { noInitWrite(); requireString(key, 'key'); wrote = true; view(table).set(key, clone(value)); },
       delete: (table, key) => { noInitWrite(); wrote = true; return view(table).delete(key); },
     });
-    const result = await fn(tx);
-    if (wrote) await publish(() => {
+    const receiptTransaction = { core, plugin, receipts: stagedReceipts, active: true, checkLive };
+    RECEIPT_TRANSACTIONS.set(tx, receiptTransaction);
+    let result;
+    try { result = await fn(tx); }
+    finally { receiptTransaction.active = false; }
+    checkLive();
+    if (wrote || stagedReceipts.length) await publish(({ appendReceipt }) => {
       const before = new Map([...staged.keys()].map((key) => [key, core.tables.get(key)]));
-      for (const [key, rows] of staged) core.tables.set(key, rows);
+      try {
+        for (const [key, rows] of staged) core.tables.set(key, rows);
+        for (const receipt of stagedReceipts) appendReceipt(receipt);
+      } catch (error) {
+        for (const [key, rows] of before) {
+          if (rows === undefined) core.tables.delete(key);
+          else core.tables.set(key, rows);
+        }
+        throw error;
+      }
       return () => {
         for (const [key, rows] of before) {
           if (rows === undefined) core.tables.delete(key);
@@ -539,8 +607,8 @@ export function dropSubscriptions(core, plugin, { phase } = {}) {
   for (const subs of core.subscriptions.values()) for (const s of subs) if (s.plugin === plugin && (!phase || s.phase === phase)) subs.delete(s);
 }
 
-function receiptsService(core, plugin) {
-  return Object.freeze({
+function receiptsService(core, plugin, atomicReceiptWrites = core.atomicReceiptWrites) {
+  const service = {
     // Receipt fields per 0.4 §7; HQ adds sequence, time, plugin and profile.
     async append(record) {
       refuseInInit(core, plugin, 'append receipts');
@@ -548,7 +616,16 @@ function receiptsService(core, plugin) {
       const r = await pushReceipt(core, { ...redact(core, record), plugin });
       return r.seq;
     },
-  });
+  };
+  if (atomicReceiptWrites) service.appendIn = (tx, record) => {
+      refuseInInit(core, plugin, 'append receipts');
+      const transaction = tx && RECEIPT_TRANSACTIONS.get(tx);
+      if (!transaction || transaction.core !== core || transaction.plugin !== plugin || !transaction.active) fail('host.invalid_request', 'appendIn needs this plugin\'s active store transaction');
+      transaction.checkLive();
+      if (!record || typeof record !== 'object' || Array.isArray(record)) fail('host.invalid_request', 'a receipt is an object');
+      transaction.receipts.push({ ...redact(core, record), plugin, at: core.clock.now(), profile: core.profile });
+  };
+  return Object.freeze(service);
 }
 
 function logService(core, plugin) {
@@ -608,7 +685,13 @@ export function bindServices(core, plugin, overrides = {}, lease = { live: true 
       enumerable: declared.has(name),
       get() {
         if (!declared.has(name)) fail('host.undeclared_service', `${plugin.name} did not declare the ${name} service`, { service: name });
-        instance ??= leased(overrides[name] ? overrides[name](core, plugin.name) : FACTORIES[name](core, plugin.name, plugin.identityServiceRoutes), lease, plugin.name);
+        instance ??= leased(overrides[name]
+          ? overrides[name](core, plugin.name)
+          : name === 'store'
+            ? FACTORIES[name](core, plugin.name, lease)
+            : name === 'receipts'
+              ? FACTORIES[name](core, plugin.name, core.atomicReceiptWrites && declared.has('store') && !overrides.store)
+              : FACTORIES[name](core, plugin.name, plugin.identityServiceRoutes), lease, plugin.name);
         return instance;
       },
     });

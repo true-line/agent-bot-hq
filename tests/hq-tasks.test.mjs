@@ -3,6 +3,9 @@
 // exclusion, and the stage 1 gate T04, T05 and T20 (0.4 §14).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { join } from 'node:path';
 import { admissionPlugin } from '../hq/admission.mjs';
 import { validateConfig } from '../hq/hq.mjs';
 import { deadlineMs, overlapAllowed, scopeOverlap, tasksPlugin } from '../hq/tasks.mjs';
@@ -14,9 +17,10 @@ const OTHER_SOUL = 'agent_11111111-2222-4333-8444-555555555555';
 const PEER = 'agent_99999999-8888-4777-8666-555555555555';
 const code = (c) => (e) => { assert.equal(e.code, c, e.message); return true; };
 
-async function setup({ concurrentWriters = [] } = {}) {
+async function setup({ concurrentWriters = [], services } = {}) {
   const host = createTestHost({
     plugins: [admissionPlugin({ schemas }), tasksPlugin({ schemas })],
+    ...(services ? { services } : {}),
     config: { 'hq-admission': { acceptedDefinitions: { [SOUL]: [DIGEST], [OTHER_SOUL]: [DIGEST] } }, 'hq-tasks': { concurrentWriters } },
   });
   await host.start();
@@ -82,7 +86,8 @@ test('T20: a specialist\'s final answer is recorded as a proposal; only the lead
   await t.commit(t.lead, (task = await t.record(task.task_id)), 'running');
   task = await t.record(task.task_id);
 
-  const proposed = await t.commit(t.spec, task, 'completed', { result_ref: 'artifact_spec' });
+  const proposalRequest = t.request(t.spec, task, 'completed', { result_ref: 'artifact_spec' });
+  const proposed = await t.tasks.commit(proposalRequest, { session: t.spec.session });
   assert.equal(proposed.outcome, 'proposal');
   assert.equal(proposed.profile, 'managed-cooperative');
   assert.match(proposed.proposal_id, /^prop_/);
@@ -90,6 +95,13 @@ test('T20: a specialist\'s final answer is recorded as a proposal; only the lead
   assert.deepEqual(after, task, 'the task did not move');
   const { proposals } = await t.tasks.get(task.task_id);
   assert.deepEqual(proposals.map((p) => [p.member_id, p.role, p.transition, p.evidence]), [['m_spec', 'specialist', 'completed', ['artifact_spec']]]);
+  const proposalRows = t.host.receipts().filter((r) => r.kind === 'task.commit' && r.operation_id === proposalRequest.operation_id);
+  assert.equal(proposalRows.length, 1);
+  assert.equal(proposalRows[0].receipt_id, proposed.receipt_id);
+  assert.equal(proposalRows[0].outcome, 'proposal');
+  assert.equal(proposalRows[0].profile, 'managed-cooperative');
+  assert.deepEqual(await t.tasks.commit(structuredClone(proposalRequest), { session: t.spec.session }), proposed);
+  assert.equal(t.host.receipts().filter((r) => r.kind === 'task.commit' && r.operation_id === proposalRequest.operation_id).length, 1);
 
   // A specialist cannot cancel or fail the task either: everything it sends proposes.
   assert.equal((await t.commit(t.spec, task, 'canceled')).outcome, 'proposal');
@@ -115,6 +127,9 @@ test('T05: an identical request delivered repeatedly commits once and returns th
   const after = await t.record(task.task_id);
   assert.equal(after.revision, 1);
   assert.equal(t.host.receipts().filter((r) => r.kind === 'task.commit').length, 1);
+  const committedRows = t.host.receipts().filter((r) => r.kind === 'task.commit' && r.operation_id === req.operation_id);
+  assert.equal(committedRows.length, 1);
+  assert.equal(committedRows[0].receipt_id, first.receipt_id);
 
   // The repeat is answered even after the task moved on.
   await t.commit(t.lead, after, 'running');
@@ -128,6 +143,7 @@ test('T05: an identical request delivered repeatedly commits once and returns th
   const input = { operation_id: 'offer_same', objective: 'x', done_criteria: 'y', accountable_soul: SOUL };
   const o1 = await t.tasks.offer(input, { from: { kind: 'owner' } });
   assert.deepEqual(await t.tasks.offer({ ...input }, { from: { kind: 'owner' } }), o1);
+  assert.equal(t.host.receipts().filter((r) => r.kind === 'task.offer' && r.operation_id === input.operation_id).length, 1);
   await assert.rejects(t.tasks.offer({ ...input }, { from: { kind: 'peer', soul: PEER } }), code('caller_mismatch'));
   assert.equal((await t.tasks.list()).length, 2);
 });
@@ -142,6 +158,10 @@ test('CAS: a stale expected revision is revision_conflict; a cancel and a comple
 
   // Both race from revision 1: the owner's cancel commits first, so the completion loses.
   await t.tasks.cancel({ task_id: task.task_id, expected_revision: 1, operation_id: 'cancel_1' }, { from: { kind: 'owner' } });
+  const cancelAudit = t.host.receipts().filter((r) => r.kind === 'task.cancel' && r.operation_id === 'cancel_1');
+  assert.equal(cancelAudit.length, 1);
+  assert.equal(cancelAudit[0].task_id, task.task_id);
+  assert.equal(cancelAudit[0].by, 'owner');
   await assert.rejects(t.commit(t.lead, task, 'completed'), code('host.invalid_request'), 'the task is canceled');
   const other = await t.offer({ write_scope: ['workspace:other'] });
   await t.commit(t.lead, other, 'accepted');
@@ -185,6 +205,11 @@ test('the lead cannot cancel or enter waiting itself, and resumes only from a re
   await assert.rejects(t.commit(t.lead, task, 'accepted'), code('host.invalid_request'), 'running cannot go back to accepted');
 
   await t.tasks.wait({ task_id: task.task_id, expected_revision: task.revision, operation_id: 'wait_1', reason: 'credential_unavailable' }, { from: { kind: 'hq' } });
+  const waitAudit = t.host.receipts().filter((r) => r.kind === 'task.wait' && r.operation_id === 'wait_1');
+  assert.equal(waitAudit.length, 1);
+  assert.equal(waitAudit[0].task_id, task.task_id);
+  assert.equal(waitAudit[0].by, 'hq');
+  assert.equal(waitAudit[0].profile, 'managed-cooperative');
   task = await t.record(task.task_id);
   valid(task);
   assert.equal(task.waiting_reason, 'credential_unavailable');
@@ -316,6 +341,13 @@ test('the deadline sweep expires offers, and accepted or waiting tasks without a
   const done = await t.tasks.expire();
   assert.deepEqual(done.map((r) => r.task_id).sort(), [offered.task_id, accepted.task_id].sort());
   for (const x of [offered, accepted]) { const r = await t.record(x.task_id); valid(r); assert.equal(r.status, 'expired'); }
+  for (const x of [offered, accepted]) {
+    const rows = t.host.receipts().filter((r) => r.kind === 'task.expire' && r.task_id === x.task_id);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].operation_id, done.find((receipt) => receipt.task_id === x.task_id).operation_id);
+    assert.equal(rows[0].status, 'expired');
+    assert.equal(rows[0].profile, 'managed-cooperative');
+  }
   assert.equal((await t.record(running.task_id)).status, 'running');
   assert.equal((await t.record(later.task_id)).status, 'offered');
   assert.deepEqual(await t.tasks.expire(), [], 'an expired task does not expire twice');
@@ -386,7 +418,83 @@ test('HQ runs the task service as a built-in plugin, and tasks persist in its st
     const due = await t.hq.host.provided('hq-tasks').offer({ operation_id: 'durable_due', objective: 'x', done_criteria: 'y', accountable_soul: SOUL, deadline: '2026-11-01T00:00:00Z' }, { from: { kind: 'owner' } });
     assert.deepEqual((await t.hq.sweepTasks()).map((x) => x.task_id), [due.task_id]);
     assert.equal((await t.hq.host.provided('hq-tasks').get(due.task_id)).task.status, 'expired');
+    const expiredRows = t.hq.core.receipts.filter((r) => r.kind === 'task.expire' && r.operation_id === `expire:${due.task_id}:0`);
+    assert.equal(expiredRows.length, 1);
+    await t.hq.stop();
+    await t.hq.start();
+    assert.deepEqual(t.hq.core.receipts.filter((r) => r.kind === 'task.expire' && r.operation_id === `expire:${due.task_id}:0`), expiredRows);
   } finally { await t.done(); }
+});
+
+test('a custom receipt service without appendIn keeps the existing task API and append path', async () => {
+  const appended = [];
+  const t = await setup({ services: { receipts: (core, plugin) => ({
+    async append(record) {
+      const receipt = { ...record, plugin, at: core.clock.now(), profile: core.profile, seq: core.receipts.length + 1 };
+      core.receipts.push(receipt);
+      appended.push(receipt);
+      return receipt.seq;
+    },
+  }) } });
+  try {
+    const task = await t.offer();
+    assert.equal(task.status, 'offered');
+    assert.equal(appended.filter((r) => r.kind === 'task.offer' && r.task_id === task.task_id).length, 1);
+  } finally { await t.host.stop(); }
+});
+
+test('an owner offer and its audit row publish together across a failed socket write, restart and retry', async (tcase) => {
+  const input = { operation_id: 'retry_after_store_failure', objective: 'Persist once', done_criteria: 'One matching audit row', accountable_soul: SOUL };
+  let t = await startHQ();
+  const home = t.home;
+  const owner = await t.owner();
+  const originalRename = fs.renameSync;
+  let injected = false;
+  tcase.mock.method(fs, 'renameSync', (from, to) => {
+    if (to === join(home, 'store.json') && !injected) {
+      const snapshot = JSON.parse(fs.readFileSync(from, 'utf8'));
+      if (snapshot.receipts.some((r) => r.kind === 'task.offer' && r.operation_id === input.operation_id)) {
+        injected = true;
+        throw new Error('fixture write failed before audit snapshot rename');
+      }
+    }
+    return originalRename(from, to);
+  });
+  syncBuiltinESMExports();
+  try {
+    const failed = await owner.request('tasks.offer', input);
+    assert.equal(injected, true, 'the fixture failed the actual store rename');
+    assert.equal(failed.ok, false, JSON.stringify(failed));
+    assert.deepEqual(await t.hq.host.provided('hq-tasks').list(), [], 'the refused offer was rolled back in memory');
+    tcase.mock.restoreAll();
+    syncBuiltinESMExports();
+    await t.done({ keep: true });
+
+    t = await startHQ({ home });
+    assert.deepEqual(await t.hq.host.provided('hq-tasks').list(), [], 'the unacknowledged task was not recovered');
+    assert.equal(t.hq.core.receipts.some((r) => r.kind === 'task.offer' && r.operation_id === input.operation_id), false);
+    assert.equal(t.hq.core.tables.get('hq-tasks\0operations')?.has(input.operation_id) ?? false, false);
+    const restartedOwner = await t.owner();
+    const retried = await restartedOwner.request('tasks.offer', input);
+    assert.equal(retried.ok, true, JSON.stringify(retried));
+    const matching = t.hq.core.receipts.filter((r) => r.kind === 'task.offer' && r.operation_id === input.operation_id);
+    assert.equal(matching.length, 1);
+    assert.equal(matching[0].task_id, retried.result.task_id);
+    assert.equal(matching[0].receipt_id, retried.result.receipt_id);
+    assert.equal(matching[0].profile, retried.result.profile);
+
+    const state = await t.hq.host.provided('hq-tasks').get(retried.result.task_id);
+    assert.equal(state.task.status, 'offered');
+    assert.equal(state.task.revision, 0);
+    await t.hq.stop();
+    await t.hq.start();
+    assert.deepEqual(t.hq.core.receipts.filter((r) => r.kind === 'task.offer' && r.operation_id === input.operation_id), matching);
+    assert.equal((await t.hq.host.provided('hq-tasks').get(retried.result.task_id)).task.status, 'offered');
+  } finally {
+    tcase.mock.restoreAll();
+    syncBuiltinESMExports();
+    await t.done();
+  }
 });
 
 test('T21: task replies and audit entries record the profile at commitment, including after restart', async () => {

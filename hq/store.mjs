@@ -122,11 +122,28 @@ export function openStore(dir, { uid } = {}) {
       return enqueue(() => {
         // Apply, snapshot and rollback synchronously in the shared queue so
         // readers and other writes only see committed plugin changes.
-        const rollback = change();
+        const receiptCount = core.receipts.length;
+        const previousSeq = receiptSeq;
+        const appendReceipt = (entry) => {
+          if (receiptSeq === Number.MAX_SAFE_INTEGER) throw new StoreError('receipt sequence is exhausted');
+          const receipt = { ...entry, seq: receiptSeq + 1 };
+          core.receipts.push(receipt);
+          receiptSeq = receipt.seq;
+          return receipt;
+        };
+        let rollback;
+        try { rollback = change({ appendReceipt }); }
+        catch (error) {
+          core.receipts.length = receiptCount;
+          receiptSeq = previousSeq;
+          throw error;
+        }
         if (!rollback) return;
         try { writeAtomic(path, JSON.stringify(snapshot(core))); }
         catch (error) {
           rollback();
+          core.receipts.length = receiptCount;
+          receiptSeq = previousSeq;
           throw error;
         }
       });

@@ -125,6 +125,7 @@ export function tasksPlugin({ schemas }) {
     services: ['store', 'receipts', 'clock', 'random', 'config', 'log', 'profile'],
     async init(ctx) {
       const { store, receipts, clock, random, config, profile } = ctx.services;
+      const atomicAudit = typeof receipts.appendIn === 'function';
       const admission = ctx.deps['hq-admission'];
       for (const f of ['withLiveRuntime', 'withLeases', 'withBoundRuntime']) if (typeof admission?.[f] !== 'function') throw new Error(`hq-admission does not provide ${f}`);
       const concurrent = () => config.get('concurrentWriters') ?? [];
@@ -164,13 +165,21 @@ export function tasksPlugin({ schemas }) {
       async function receipted(kind, details, fn) {
         try {
           const out = await fn();
-          if (out.fresh) await receipts.append({ kind, ...details, ...out.receipt });
+          if (out.fresh && !atomicAudit) await receipts.append({ kind, ...details, ...out.receipt });
           return out.receipt;
         } catch (e) {
           if (e instanceof HostError) await receipts.append({ kind: `${kind}.refused`, code: e.code, ...details }).catch(() => {});
           throw e;
         }
       }
+
+      // The task table, operation key, and its audit row are one store
+      // transaction. Replays return the original result without another row.
+      const decisionTx = (kind, details, fn) => store.tx((tx) => {
+        const out = fn(tx);
+        if (out.fresh && atomicAudit) receipts.appendIn(tx, { kind, ...details, ...out.receipt });
+        return out;
+      });
 
       // An offer: from the owner, from HQ, or from a peer Soul. `from` is set
       // by the caller inside HQ from the authenticated source, never parsed
@@ -194,7 +203,7 @@ export function tasksPlugin({ schemas }) {
             reference = { ...reference, peer_soul_id: from.soul };
           }
           const digest = canonicalDigest({ op: 'offer', input });
-          return store.tx((tx) => {
+          return decisionTx('task.offer', { requester, ...(operationId ? { operation_id: operationId } : {}) }, (tx) => {
           const prior = repeated(tx, operationId, requester, digest);
           if (prior) return { receipt: prior, fresh: false };
           const task = { task_id: id('task'), ...fields, ...(reference ? { parent_or_peer_reference: reference } : {}), requester, revision: 0, status: 'offered' };
@@ -222,7 +231,7 @@ export function tasksPlugin({ schemas }) {
           if (viaBroker && request.runtime_id !== bound) fail('caller_mismatch', `the connection is bound to runtime ${bound}, not ${request.runtime_id}`);
           const digest = canonicalDigest({ op: 'commit', request });
           const withRuntime = viaBroker ? (fn) => admission.withBoundRuntime(bound, fn) : (fn) => admission.withLiveRuntime(request.runtime_id, session, fn);
-          return withRuntime((rt) => store.tx((tx) => {
+          return withRuntime((rt) => decisionTx('task.commit', details, (tx) => {
           const prior = repeated(tx, request.operation_id, caller, digest);
           if (prior) return { receipt: prior, fresh: false };
           if (request.installation_epoch !== rt.epoch) fail('stale_epoch', `runtime ${request.runtime_id} is at epoch ${rt.epoch}, not ${request.installation_epoch}`);
@@ -276,7 +285,7 @@ export function tasksPlugin({ schemas }) {
           if (!WAITING_REASONS.includes(reason)) fail('host.invalid_request', `waiting reason is one of ${WAITING_REASONS.join(', ')}`);
           if (typeof operationId !== 'string' || !OPERATION_ID.test(operationId)) fail('host.invalid_request', 'waiting needs an operation_id');
           const digest = canonicalDigest({ op: 'wait', taskId, expectedRevision, reason });
-          return store.tx((tx) => {
+          return decisionTx('task.wait', { operation_id: operationId, task_id: taskId, by }, (tx) => {
           const prior = repeated(tx, operationId, by, digest);
           if (prior) return { receipt: prior, fresh: false };
           const task = taskOf(tx, taskId);
@@ -294,7 +303,7 @@ export function tasksPlugin({ schemas }) {
           if (!by) fail('host.invalid_request', 'only the owner or HQ cancels a task');
           if (typeof operationId !== 'string' || !OPERATION_ID.test(operationId)) fail('host.invalid_request', 'a cancel needs an operation_id');
           const digest = canonicalDigest({ op: 'cancel', taskId, expectedRevision });
-          return store.tx((tx) => {
+          return decisionTx('task.cancel', { operation_id: operationId, task_id: taskId, by }, (tx) => {
           const prior = repeated(tx, operationId, by, digest);
           if (prior) return { receipt: prior, fresh: false };
           const task = taskOf(tx, taskId);
@@ -319,11 +328,13 @@ export function tasksPlugin({ schemas }) {
             if (!['offered', 'accepted', 'waiting'].includes(task.status)) continue;
             if (task.status !== 'offered' && task.lease_generation !== undefined && held(task.accountable_soul, task.lease_generation)) continue;
             const operationId = `expire:${task.task_id}:${task.revision}`;
-            out.push(transition(tx, task, { operationId, caller: 'hq', digest: canonicalDigest({ op: 'expire', task: task.task_id, revision: task.revision }), expectedRevision: task.revision, to: 'expired', by: 'hq' }));
+            const receipt = transition(tx, task, { operationId, caller: 'hq', digest: canonicalDigest({ op: 'expire', task: task.task_id, revision: task.revision }), expectedRevision: task.revision, to: 'expired', by: 'hq' });
+            if (atomicAudit) receipts.appendIn(tx, { kind: 'task.expire', ...receipt });
+            out.push(receipt);
           }
           return out;
         }));
-        for (const r of done) await receipts.append({ kind: 'task.expire', ...r });
+        if (!atomicAudit) for (const r of done) await receipts.append({ kind: 'task.expire', ...r });
         return done;
       }
 
