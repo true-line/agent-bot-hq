@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, symlinkSync, readFileSync, writeFileSync } from 'n
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { qualificationApprovalDetail, qualificationPurpose } from '../hq/machine-harness-qualification.mjs';
 import { machineCommandInHome } from '../hq/machine-channel.mjs';
 
 const action = 'hq-service-recovery';
@@ -40,7 +41,9 @@ async function fixture(t, purpose = action, roleUid = 300) {
   const client = createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: Buffer.from(identity.public_key, 'hex').toString('base64url') }, format: 'jwk' });
   const socket = join(home, 'daemon.sock');
   const requests = [];
-  const state = { saved: purpose === action ? savedPlan() : upgradePlan(), tweak: () => {} };
+  const saved = purpose === action ? savedPlan()
+    : purpose === qualificationPurpose ? qualificationPlan() : upgradePlan();
+  const state = { saved, tweak: () => {} };
   let pending;
   const server = createServer((stream) => {
     let input = '';
@@ -87,6 +90,8 @@ async function fixture(t, purpose = action, roleUid = 300) {
             assert.ok(verify('sha256', Buffer.from(canonical), owner.publicKey, Buffer.from(r.owner_signature, 'base64')));
             body.approved_at = new Date(timestamp * 1000).toISOString().replace('.000Z', 'Z');
             body.expires_at = new Date((timestamp + 600) * 1000).toISOString().replace('.000Z', 'Z');
+            state.approvedAt = body.approved_at;
+            state.expiresAt = body.expires_at;
           }
           pending = undefined;
         }
@@ -478,4 +483,106 @@ test('paired account scope bounds the canonical bytes even for an otherwise vali
   const before = f.requests.length;
   await assert.rejects(f.issue(), /unsupported structure/);
   assert.deepEqual(f.requests.slice(before).map(r => r.verb), ['members-plans']);
+});
+
+function qualificationPlan(change, { previewOnly = false } = {}) {
+  const raw = readFileSync(new URL('./fixtures/machine-harness-qualification/plan.json', import.meta.url), 'utf8');
+  const plan = JSON.parse(raw);
+  if (!previewOnly) plan.steps[0].detail = qualificationApprovalDetail;
+  if (change) {
+    const run = JSON.parse(plan.steps[0].content);
+    change(plan, run);
+    plan.steps[0].content = JSON.stringify(run);
+  }
+  const plan_canonical = JSON.stringify(plan) + '\n';
+  return { plan_id: id, plan_digest: createHash('sha256').update(plan_canonical).digest('hex'), plan_canonical };
+}
+
+test('paired qualification transfers only the exact signed plan and accepts a purpose-bound proof', arm, async (t) => {
+  const f = await fixture(t, qualificationPurpose);
+  await assert.rejects(machineCommandInHome(
+    [qualificationPurpose, 'export', id, '--socket', f.socket], f.home, process.getuid(), undefined, true,
+  ), /requires the dedicated HQ service account/);
+  await assert.rejects(f.issue(), /pin saved by verified Machine status/);
+  assert.equal(f.requests.length, 0);
+  await f.pin();
+  const line = await f.issue();
+  assert.equal(line, f.state.raw);
+  const c = JSON.parse(line).body;
+  assert.equal(c.action, qualificationPurpose);
+  assert.equal(c.plan_canonical, f.state.saved.plan_canonical);
+  assert.notEqual(c.plan_digest, qualificationPlan(undefined, { previewOnly: true }).plan_digest);
+  writeFileSync(f.challengeFile, line + '\n');
+  const wrongPurpose = ['agent-bot-machine-owner/v1', 'harness-launch-install', c.machine_key, c.hq_key,
+    c.owner_key, c.plan_id, c.plan_digest, c.nonce, c.expires_at, ''].join('\n');
+  writeFileSync(f.proofFile, JSON.stringify(proof(c, f.owner, wrongPurpose)));
+  await assert.rejects(f.approve(), /invalid owner signature/);
+  assert.deepEqual(f.requests.map(r => r.option ?? r.verb), ['status', 'get', 'challenge']);
+  writeFileSync(f.proofFile, JSON.stringify(proof(c, f.owner)));
+  assert.deepEqual(await f.approve(), {
+    state: 'approved', plan_id: c.plan_id, plan_digest: c.plan_digest,
+    approved_at: f.state.approvedAt, expires_at: f.state.expiresAt,
+  });
+  await assert.rejects(f.approve(), /MM_DAEMON_PEER_REFUSED/);
+  const second = await f.issue();
+  writeFileSync(f.challengeFile, second + '\n');
+  assert.equal((await f.cancel()).state, 'cancelled');
+  f.state.tweak = challenge => {
+    Object.assign(challenge, qualificationPlan((_plan, run) => {
+      run.request.test_provider.configuration_sha256 = 'f'.repeat(64);
+    }));
+  };
+  await assert.rejects(f.issue(), /challenge differs from the retrieved plan/);
+});
+
+test('paired qualification refuses a re-digested plan outside the fixed test scope before challenge', arm, async (t) => {
+  const f = await fixture(t, qualificationPurpose);
+  await f.pin();
+  for (const change of [
+    (plan) => { plan.steps[0].action = 'create'; },
+    (_plan, run) => { run.one_use = false; },
+    (_plan, run) => { run.member_state = 'ambient'; },
+    (_plan, run) => { run.gates[3].profile = 'managed-protected'; },
+    (_plan, run) => { run.request.runner.command = '/usr/bin/true'; },
+    (_plan, run) => { run.request.test_provider.configuration_sha256 = 'missing'; },
+  ]) {
+    f.state.saved = qualificationPlan(change);
+    const before = f.requests.length;
+    await assert.rejects(f.issue(), /unsupported structure/);
+    assert.equal(f.requests.length, before + 1);
+    assert.equal(f.requests.at(-1).option, 'get');
+  }
+  f.state.saved = qualificationPlan();
+  const before = f.requests.length;
+  await assert.rejects(f.run('harness-launch-install', 'export', id, '--socket', f.socket),
+    /outside the paired HQ qualification plan scope/);
+  assert.equal(f.requests.length, before + 1);
+  assert.equal(f.requests.at(-1).option, 'get');
+});
+
+test('paired qualification keeps legacy previews readable and refuses them for a proof exchange', arm, async (t) => {
+  const f = await fixture(t, qualificationPurpose);
+  await f.pin();
+  const current = f.state.saved;
+  const old = qualificationPlan(undefined, { previewOnly: true });
+  assert.equal(old.plan_digest, 'bcb92029dfefdc36c87eb6d48b0d851216206b68c659e940fc659c992767889a');
+  f.state.saved = old;
+  const read = await f.run('members-plans', 'get', id, '--socket', f.socket);
+  assert.equal(read.state, 'found');
+  const { plan_id, plan_digest, plan_canonical } = read;
+  assert.deepEqual({ plan_id, plan_digest, plan_canonical }, old);
+  await assert.rejects(f.issue(), /outside the paired HQ qualification plan scope/);
+  assert.deepEqual(f.requests.map(r => r.option ?? r.verb), ['status', 'get', 'get']);
+
+  // A correctly signed challenge from an earlier peer still cannot turn
+  // preview-only bytes into an approval operation.
+  f.state.saved = current;
+  f.state.tweak = challenge => Object.assign(challenge, old);
+  await assert.rejects(f.issue(), /outside the paired HQ qualification plan scope/);
+  const line = f.state.raw;
+  writeFileSync(f.challengeFile, line + '\n');
+  writeFileSync(f.proofFile, JSON.stringify(proof(JSON.parse(line).body, f.owner)));
+  const before = f.requests.length;
+  await assert.rejects(f.approve(), /outside the paired HQ qualification plan scope/);
+  assert.equal(f.requests.length, before);
 });

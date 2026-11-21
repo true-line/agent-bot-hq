@@ -6,11 +6,12 @@ import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
 import { validatedMembersPlan, validPlanId } from './machine-members-plans.mjs';
 import { accountsPurpose } from './machine-harness-accounts.mjs';
+import { qualificationApprovalDetail, qualificationPurpose } from './machine-harness-qualification.mjs';
 import { checkUpgradeRecords } from './machine-service-upgrade.mjs';
 import { checkHarnessLaunchPlan, isHarnessLaunchHandoff } from './machine-harness-launch.mjs';
 
 export const isServiceHandoff = (verb) => verb === 'hq-service-recovery' || verb === 'hq-service-upgrade' ||
-  isHarnessLaunchHandoff(verb) || verb === accountsPurpose;
+  isHarnessLaunchHandoff(verb) || verb === accountsPurpose || verb === qualificationPurpose;
 const role = '_agent-bot-hq';
 const maxFrame = 64 * 1024;
 const fieldsAre = (o, names) => o && typeof o === 'object' && !Array.isArray(o) &&
@@ -56,6 +57,12 @@ function ownerPublicKey(encoded) {
 }
 
 function checkPlanScope(plan, action, id, roleUid) {
+  if (action === qualificationPurpose || plan.purpose === qualificationPurpose) {
+    if (action !== plan.purpose || plan.steps[0].detail !== qualificationApprovalDetail) {
+      throw new Error('outside the paired HQ qualification plan scope');
+    }
+    return;
+  }
   if (action === accountsPurpose || plan.purpose === accountsPurpose) {
     if (action !== plan.purpose || plan.steps[0].uid !== roleUid) throw new Error('outside the paired HQ harness account scope');
     return;

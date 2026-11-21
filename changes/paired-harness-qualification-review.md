@@ -1,0 +1,1 @@
+Dedicated macOS HQ can export a signed qualification plan for owner review and submit the purpose-bound proof to Machine. The proof binds the exact candidate, runner, test provider, and gate assignments for a single use.
