@@ -12,13 +12,14 @@ const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 export function qualificationProvider({ plan, authorize, now = () => Date.now() } = {}) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)
+    || typeof plan.plan_id !== 'string' || !ID.test(plan.plan_id)
     || typeof plan.plan_digest !== 'string' || !PLAN_DIGEST.test(plan.plan_digest)
     || typeof plan.model !== 'string' || !ID.test(plan.model)
     || typeof plan.prompt_sha256 !== 'string' || !HEX_DIGEST.test(plan.prompt_sha256)
     || typeof plan.response_text !== 'string' || !plan.response_text || plan.response_text.length > 4096
     || !Number.isSafeInteger(plan.expires_at_ms) || plan.expires_at_ms <= 0
     || typeof authorize !== 'function') throw new TypeError('qualification provider requires an exact plan and Machine authorization callback');
-  plan = Object.freeze({ plan_digest: plan.plan_digest, model: plan.model, prompt_sha256: plan.prompt_sha256,
+  plan = Object.freeze({ plan_id: plan.plan_id, plan_digest: plan.plan_digest, model: plan.model, prompt_sha256: plan.prompt_sha256,
     response_text: plan.response_text, expires_at_ms: plan.expires_at_ms });
   let used = false;
   return definePlugin({
@@ -36,11 +37,11 @@ export function qualificationProvider({ plan, authorize, now = () => Date.now() 
         return ctx.deps['hq-admission'].withBoundRuntime(meta.runtime_id, (runtime) => store.tx(async (tx) => {
           if (now() > plan.expires_at_ms) fail('lease_expired', 'qualification plan expired');
           if (used || tx.has('used_plans', plan.plan_digest)) fail('host.invalid_request', 'qualification plan was already consumed');
-          if (await authorize({ plan_digest: plan.plan_digest, runtime_id: meta.runtime_id, runtime, model: message.model, prompt_sha256: message.prompt_sha256 }) !== true) {
+          if (await authorize({ plan_id: plan.plan_id, plan_digest: plan.plan_digest, runtime_id: meta.runtime_id, runtime, model: message.model, prompt_sha256: message.prompt_sha256 }) !== true) {
             fail('caller_mismatch', 'Machine did not authorize this bound runtime and request');
           }
           if (now() > plan.expires_at_ms) fail('lease_expired', 'qualification plan expired during authorization');
-          tx.put('used_plans', plan.plan_digest, { runtime_id: meta.runtime_id, prompt_sha256: message.prompt_sha256, consumed_at_ms: now() });
+          tx.put('used_plans', plan.plan_digest, { plan_id: plan.plan_id, runtime_id: meta.runtime_id, prompt_sha256: message.prompt_sha256, consumed_at_ms: now() });
           return { model: plan.model, text: plan.response_text, stop_reason: 'end_turn', usage: { input_tokens: 7, output_tokens: 3 } };
         })).then((result) => { used = true; return result; });
       } });

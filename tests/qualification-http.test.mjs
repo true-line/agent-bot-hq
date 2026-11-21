@@ -27,7 +27,7 @@ async function http(socketPath, method, path, body) {
 test('stock Messages HTTP reaches only a bound, one-use HQ qualification consumer', async (t) => {
   let expectedRuntime;
   const decisions = [];
-  const plan = { plan_digest: 'a'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT), response_text: 'Stage 2a brokered fixture turn.', expires_at_ms: Date.now() + 60_000 };
+  const plan = { plan_id: 'plan-qualification-a', plan_digest: 'a'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT), response_text: 'Stage 2a brokered fixture turn.', expires_at_ms: Date.now() + 60_000 };
   const provider = qualificationProvider({ plan, async authorize(input) {
     decisions.push(input);
     return input.runtime_id === expectedRuntime && input.model === MODEL && input.prompt_sha256 === plan.prompt_sha256;
@@ -72,6 +72,7 @@ test('stock Messages HTTP reaches only a bound, one-use HQ qualification consume
   assert.match(turn.body, /Stage 2a brokered fixture turn/);
   assert.match(turn.body, /event: message_stop/);
   assert.equal(decisions.length, 1);
+  assert.equal(decisions[0].plan_id, plan.plan_id);
   assert.equal(decisions[0].plan_digest, plan.plan_digest);
   assert.equal(decisions[0].runtime_id, expectedRuntime);
   const replay = await http(bridge.socketPath, 'POST', '/v1/messages', message);
@@ -81,12 +82,12 @@ test('stock Messages HTTP reaches only a bound, one-use HQ qualification consume
 
 test('unconfigured or malformed qualification plans fail closed', () => {
   assert.throws(() => qualificationProvider({}), /requires an exact plan/);
-  assert.throws(() => qualificationProvider({ plan: { plan_digest: 'a'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT), response_text: 'x', expires_at_ms: Date.now() + 1000 } }), /Machine authorization callback/);
+  assert.throws(() => qualificationProvider({ plan: { plan_id: 'plan-qualification-a', plan_digest: 'a'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT), response_text: 'x', expires_at_ms: Date.now() + 1000 } }), /Machine authorization callback/);
 });
 
 test('a consumed qualification plan stays consumed after HQ restart', async (t) => {
   const home = tempHome();
-  const plan = { plan_digest: 'b'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT),
+  const plan = { plan_id: 'plan-qualification-b', plan_digest: 'b'.repeat(64), model: MODEL, prompt_sha256: qualificationPromptDigest(PROMPT),
     response_text: 'one-use result', expires_at_ms: Date.now() + 60_000 };
   const plugins = () => [referenceBroker(), qualificationProvider({ plan, authorize: async () => true })];
   const first = await startHQ({ home, plugins: plugins() });
