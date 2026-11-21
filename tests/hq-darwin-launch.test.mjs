@@ -54,7 +54,7 @@ test('the supervisor must confirm its own group closed with an ordered final rec
 
 const matchesReviewedAdapter = candidate => isDeepStrictEqual(candidate, a);
 
-function setup({ qualification, permission = true, finish = 0 } = {}) {
+function setup({ qualification, permission = true, finish = 0, configuredEndpoint = endpoint } = {}) {
   const core = createCore();
   const calls = [];
   const state = { grant };
@@ -80,7 +80,7 @@ function setup({ qualification, permission = true, finish = 0 } = {}) {
   const launcher = createLauncher({ core, platform: 'darwin', configured: true, spawn,
     installedDarwinGrant: () => state.grant,
     ...(qualification ? { qualifiedDarwinAdapter: qualification } : {}),
-    harnesses: { endpoints:[endpoint], accountOf: () => endpoint },
+    harnesses: { endpoints:[configuredEndpoint], accountOf: () => configuredEndpoint },
     withLiveRuntime: (_, __, fn) => fn({ soul_id:SOUL, member_id:'member', role:'lead', adapter_id:a.adapter_id, harness_uid:a.uid }),
   });
   return { core, calls, state, launcher, get child() { return child; } };
@@ -93,6 +93,40 @@ test('production qualification stays unavailable even when the specific installe
     assert.equal(f.launcher.accounts()[0].available, false);
     await assert.rejects(f.launcher.dispatch('launch', { ...meta, payload }), { code: 'host.launch_unavailable' });
     assert.equal(f.calls.length, 1);
+  }
+});
+
+test('Darwin status identifies which launch prerequisite could not be verified', async () => {
+  const id = a.adapter_id;
+  const missing = setup();
+  missing.state.grant = undefined;
+  const unmapped = setup({ configuredEndpoint: { ...endpoint, adapters: ['other'] } });
+  const permission = setup({ permission: false, qualification: matchesReviewedAdapter });
+  const unqualified = setup();
+  const partial = setup({ qualification: matchesReviewedAdapter, configuredEndpoint: { ...endpoint, adapters: [id, 'other'] } });
+  const both = setup({ configuredEndpoint: { ...endpoint, adapters: [id, 'other'] } });
+  for (const [f, reason, installed, usable, probes] of [
+    [missing, 'HQ could not verify the installed Darwin launch grant', undefined, undefined, 0],
+    [unmapped, 'no configured adapter has a reviewed mapping for this account', [], undefined, 0],
+    [permission, 'HQ could not confirm noninteractive permission for the Darwin supervisor', [id], undefined, 1],
+    [unqualified, 'missing verified Darwin package qualification', [id], [], 1],
+    [partial, 'missing reviewed adapter mapping', [id], [id], 1],
+    [both, 'missing reviewed adapter mapping; missing verified Darwin package qualification', [id], [], 1],
+  ]) {
+    await f.launcher.probe();
+    const [account] = f.launcher.report().accounts;
+    assert.equal(account.available, false);
+    assert.equal(account.reason, reason);
+    assert.deepEqual(account.installed_adapters, installed);
+    assert.deepEqual(account.adapters, usable);
+    assert.equal(f.calls.length, probes);
+  }
+  try {
+    const reservation = await partial.launcher.dispatch('launch', { ...meta, payload });
+    assert.ok(reservation.launch_id);
+    await assert.rejects(both.launcher.dispatch('launch', { ...meta, payload }), { code: 'host.launch_unavailable' });
+  } finally {
+    await partial.launcher.stopAll();
   }
 });
 

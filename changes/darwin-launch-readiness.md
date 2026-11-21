@@ -1,0 +1,1 @@
+macOS launch status distinguishes grant verification, missing account mappings, supervisor permission and adapter package qualification. It retains verified mapping IDs when the permission check fails.

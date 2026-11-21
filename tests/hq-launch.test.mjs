@@ -763,7 +763,7 @@ test('a spawn that fails after attach answered: spawn-failed receipt with the co
     const a = s.hq.launch.accounts.find((x) => x.account === A);
     assert.equal(a.available, false);
     assert.match(a.reason, /sudo could not be run for a launch \(ENOENT\)/);
-    assert.ok(s.hq.profileReasons.some((x) => /harness launch is not available for hqm_a \(sudo could not be run/.test(x)));
+    assert.ok(s.hq.profileReasons.some((x) => /one or more configured adapters cannot launch in hqm_a \(sudo could not be run/.test(x)));
     // Later launches in that account are unavailable, not busy; the other account is untouched.
     assert.match(refused(await t.launch(), 'host.launch_unavailable'), /sudo could not be run for a launch \(ENOENT\)/);
     assert.equal((await t.launch(t.spec)).ok, true);
@@ -845,7 +845,7 @@ test('the profile reasons name what keeps agents from their harness accounts, an
   assert.deepEqual(none.d7, ['agents of every harness share one account: no OS account per harness credential (D7)']);
   const rule = await reasons({ rule: false });
   assert.equal(rule.d7.length, 1);
-  assert.match(rule.d7[0], /^harness launch is not available for hqm_a \(.*\); hqm_b \(.*\), so HQ cannot start agents in those accounts \(D7\)$/);
+  assert.match(rule.d7[0], /^one or more configured adapters cannot launch in hqm_a \(.*\); hqm_b \(.*\) \(D7\)$/);
   const partial = await reasons({ accounts: { 'adapter-a': A } });
   assert.deepEqual(partial.d7, [`agents whose harness has no account of its own: ${SOUL}/m_spec (adapter adapter-b) (D7)`]);
   // The Hello that admitted that agent already said so.

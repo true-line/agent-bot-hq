@@ -371,19 +371,31 @@ export function createLauncher({
       let grant;
       try { grant = installedDarwinGrant(); } catch { /* a missing grant leaves the broker available */ }
       await Promise.all(harnesses.endpoints.map(async e => {
-        const unavailable = { available: false, reason: 'reviewed Darwin launcher or its dedicated permission is unavailable' };
-        if (!grant) { readiness.set(e.account, unavailable); return; }
-        const supported = e.adapters.filter(id => {
+        if (!grant) {
+          readiness.set(e.account, { available: false, reason: 'HQ could not verify the installed Darwin launch grant' });
+          return;
+        }
+        const installed = e.adapters.filter(id => {
           try { approvedDarwinAdapter(grant, e, id); return true; } catch { return false; }
         });
-        const r = supported.length && await runOnce(supervisorListArgv(e.account), PROBE_TIMEOUT_MS, ['ignore', 'ignore', 'pipe']);
-        if (!r || r.code !== 0 || r.timedOut || r.error) { readiness.set(e.account, unavailable); return; }
-        const qualified = supported.filter(id => {
+        if (!installed.length) {
+          readiness.set(e.account, { available: false, installed_adapters: installed, reason: 'no configured adapter has a reviewed mapping for this account' });
+          return;
+        }
+        const permission = await runOnce(supervisorListArgv(e.account), PROBE_TIMEOUT_MS, ['ignore', 'ignore', 'pipe']);
+        if (permission.code !== 0 || permission.timedOut || permission.error) {
+          readiness.set(e.account, { available: false, installed_adapters: installed, reason: 'HQ could not confirm noninteractive permission for the Darwin supervisor' });
+          return;
+        }
+        const qualified = installed.filter(id => {
           try { return qualifiedDarwinAdapter(approvedDarwinAdapter(grant, e, id)) === true; } catch { return false; }
         });
+        const gaps = [];
+        if (installed.length < e.adapters.length) gaps.push('missing reviewed adapter mapping');
+        if (qualified.length < installed.length) gaps.push('missing verified Darwin package qualification');
         readiness.set(e.account, {
-          available: qualified.length === e.adapters.length, adapters: qualified, installed_adapters: supported,
-          ...(qualified.length < e.adapters.length ? { reason: 'a configured adapter lacks a reviewed mapping or verified Darwin package qualification' } : {}),
+          available: qualified.length === e.adapters.length, adapters: qualified, installed_adapters: installed,
+          ...(gaps.length ? { reason: gaps.join('; ') } : {}),
         });
       }));
       return;
