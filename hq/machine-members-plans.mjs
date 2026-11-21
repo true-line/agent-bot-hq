@@ -1,6 +1,7 @@
 // Read-only responses for Machine's members-plans verb. The digest covers the
 // original Go Plan.Canonical() bytes, including its final LF.
 import { accountsPurpose, validHarnessAccounts } from './machine-harness-accounts.mjs';
+import { soulRunnerAccountsPurpose, validSoulRunnerAccounts } from './machine-soul-runner-accounts.mjs';
 import { qualificationPurpose, validHarnessQualification } from './machine-harness-qualification.mjs';
 import { createHash } from 'node:crypto';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
@@ -50,12 +51,15 @@ export function validatedMembersPlan(id, response) {
   }
   const p = parseStrict(plan_canonical, { maxDepth: 6 });
   const accounts = p?.purpose === accountsPurpose;
+  const soulRunners = p?.purpose === soulRunnerAccountsPurpose;
   const qualification = p?.purpose === qualificationPurpose;
-  const fields = accounts || qualification ? 'version,hq_account,dir,members,steps,purpose' : 'version,hq_account,dir,members,steps';
+  const fields = soulRunners ? 'version,hq_account,dir,members,steps,purpose,soul_runners'
+    : accounts || qualification ? 'version,hq_account,dir,members,steps,purpose' : 'version,hq_account,dir,members,steps';
   if (!object(p) || Object.keys(p).join(',') !== fields ||
       p.version !== 3 || !isAccount(p.hq_account) || typeof p.dir !== 'string' || !p.dir ||
       !Array.isArray(p.steps) || !p.steps.length || !validMembers(p) ||
-      (accounts ? Buffer.byteLength(plan_canonical) > 32768 || !validHarnessAccounts(p)
+      (soulRunners ? Buffer.byteLength(plan_canonical) > 32768 || !validSoulRunnerAccounts(p)
+        : accounts ? Buffer.byteLength(plan_canonical) > 32768 || !validHarnessAccounts(p)
         : qualification ? !validHarnessQualification(p, Buffer.byteLength(plan_canonical))
           : !p.steps.every(validStep))) {
     throw new Error('Machine members plan has an unsupported structure');

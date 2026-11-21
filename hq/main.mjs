@@ -42,7 +42,7 @@ import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, 
 import { connectSocket } from './socket.mjs';
 import { machineRoleCommand } from './machine-channel.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
