@@ -250,6 +250,7 @@ export function createHQ({
         ? createIdentityService({ server: cfg.enrollment?.server ?? DEFAULT_IDENTITY_SERVICE, enrollment: signer.enrollment, custody: signer.custody, keySet: serverKeys, clock })
         : unlinkedIdentity()),
       persist: () => store.persist(),
+      persistTables: (tableUpdates) => store.persist(tableUpdates),
       config: {
         'hq-admission': { acceptedDefinitions: cfg.acceptedDefinitions ?? {}, notices: cfg.notices ?? null, ...(cfg.leaseTtlMs ? { leaseTtlMs: cfg.leaseTtlMs } : {}) },
         'hq-tasks': { concurrentWriters: cfg.concurrentWriters ?? [] },
