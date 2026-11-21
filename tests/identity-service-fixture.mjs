@@ -1,4 +1,5 @@
-// A loopback issuer for device enrollment, session binding and signed self-lookup.
+// Test-only session custody and a loopback issuer for enrollment, binding and signed self-lookup.
+import assert from 'node:assert/strict';
 import { createHash, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from 'node:crypto';
 import { signatureBytes } from '../hq/identity-service.mjs';
 import { createServer } from 'node:http';
@@ -113,5 +114,31 @@ export async function fakeIdentityService({ issuer } = {}) {
     url: state.url, key: { kid: 'srv-1', x: serverKey.x, status: 'active', notBefore: '2020-01-01T00:00:00Z', notAfter: '2099-01-01T00:00:00Z' },
     decide: (decision) => { for (const g of state.grants.values()) if (g.decision === 'pending') g.decision = decision; },
     close: () => new Promise((r) => server.close(r)),
+  };
+}
+
+// Synthetic session custody shared by the fake-issuer unit suite and the real issuer test.
+export function testSessionCustody({ server, clock, assertion, beforeOpen, recheck }) {
+  const sessions = new Map();
+  return {
+    async openSession() {
+      beforeOpen?.();
+      const id = String(sessions.size + 1);
+      const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+      const ephemeralJwk = publicKey.export({ format: 'jwk' });
+      sessions.set(id, { privateKey, ephemeralJwk });
+      return { session: id, ephemeralJwk, assertion: await assertion({ ephemeralJwk }) };
+    },
+    bindAccess({ session }) {
+      assert.ok(sessions.has(session));
+      return { expiresAt: clock.now() + 900_000, recheck };
+    },
+    requestProof({ session, method, path, ath, jti }) {
+      const { privateKey, ephemeralJwk } = sessions.get(session);
+      const header = { alg: 'ES256', typ: 'dpop+jwt', jwk: ephemeralJwk };
+      const payload = { htm: method, htu: server + path, iat: Math.floor(clock.now() / 1000), jti, ath };
+      const unsigned = [header, payload].map((v) => Buffer.from(JSON.stringify(v)).toString('base64url')).join('.');
+      return unsigned + '.' + sign('sha256', Buffer.from(unsigned), { key: privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url');
+    },
   };
 }
