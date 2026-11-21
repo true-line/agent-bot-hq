@@ -42,8 +42,34 @@ fields or capability to execute the supplied path.
 
 HQ stops waiting on authorization and drops its revocation hook on disconnect, deadline or device revocation, even if the callback is still pending. Trusted authorization and provider callbacks receive the abort signal and must propagate it to their I/O. A host deadline can end signal-aware I/O and result delivery. The vendor may already have accepted or charged for a dispatched request.
 
-Before invoking a Responses producer, HQ reserves the authorized cost bound against the Soul's working ceiling and persists it in an `outcome_unknown` operation. After a measured terminal response, one store update records the actual cost and completion. HQ counts pending inference bounds and recorded inference spend against the configured working ceiling after restart. Existing unary reservations and spend share that ceiling during each process and are lost on restart. A durable ceiling across both types of spending requires separate work on unary accounting. An abort before dispatch may release the hold. After dispatch, a lost response or a failed settlement write leaves the hold in place and prevents the same Soul, task and operation from running again.
+Before invoking a Responses producer, HQ reserves the authorized cost bound
+against the Soul's working ceiling and persists it in an `outcome_unknown`
+operation. A valid terminal response records measured cost and completion
+together. Abort before dispatch may release the hold. After dispatch, a lost
+response or failed settlement leaves the hold in place and fences replay of
+the exact Soul, task and operation. A new runtime, provider destination or
+model alias does not change that identity.
 
-The new ledger lives in HQ storage under a namespace that cannot be a plugin name. When HQ starts, it snapshots the earlier draft table of the initialized inference consumer. Tables belonging to other plugins have no accounting effect. Known earlier spend counts toward the same working pool. An earlier unresolved record without a saved cost bound requires reconciliation before fresh use of that Soul's working pool. If an earlier draft workspace changes provider plugin names, reconcile the earlier table before making the change so its accounting history is carried forward. The new ledger is independent of the plugin name.
+Unary budget operations keep their existing SDK API and private plugin-owned
+reservation IDs. Pending unary holds and measured debit share the configured
+ceiling with typed inference and survive restart. A settled reservation
+cannot settle or release again. A released reservation retains its ID and
+does not consume budget. Reservations and settlements accept the existing
+nonnegative numeric amounts and use the configured pool. This change supplies
+no ceilings, units, pricing, new authorizations or cross-operation deduplication
+for unary calls. The unary API has no request or operation ID. Only the
+owning plugin can settle or release its open hold. It remains responsible
+for establishing whether release is safe after a lost outcome.
+
+Both ledgers use HQ storage under a namespace that cannot be a plugin name.
+Only the initialized inference consumer's earlier draft table can contribute
+historical inference accounting. Known earlier spend counts toward the
+working pool. Unresolved records without a saved bound, or the same operation
+in both historical and private tables, require reconciliation for that Soul
+before new working spend. The earlier workspace must reconcile its historical
+table before changing provider plugin names. Old unary records were held only
+in memory and cannot be recovered from an older store. Retention and recovery
+for durable holds, historical aliases and removal of released-ID markers
+require owner policy or a verified migration.
 
 Deployment requires approval of this private member envelope and provider routing, including cost units, a verified bound the provider can enforce, and handling of incomplete outcomes. A vendor charge that exceeds its bound and cannot be persisted still needs reconciliation. Production also needs the Identity credential operation, verified vendor cancellation and cost reporting, compatible Codex transport, and signed launch qualification. The synthetic fixture covers this draft behavior.

@@ -87,7 +87,7 @@ async function setup(produce, home, beforeAuthorize) {
     revoke() { revokeDevice(t.hq.core); },
     revocationHooks() { return t.hq.core.onDeviceRevoked.length; },
     approve(amount) {
-      t.hq.core.budgets.set(soul, { ceilings: { working: amount, maintenance: amount }, reserved: new Map() });
+      t.hq.core.budgets.set(soul, { ceilings: { working: amount, maintenance: amount } });
       grants.set(runtime.runtime_id, { destination: scope.destination, task_id: scope.task_id, models: [request.model], maxCost: 1 });
     },
     remaining: (pool) => budgets.remaining({ soul, pool }),
@@ -101,24 +101,36 @@ async function setup(produce, home, beforeAuthorize) {
     },
     failNextWrite(outcome) {
       const core = t.hq.core;
-      const persist = core.persist;
-      core.persist = async () => {
-        const rows = core.tables.get(budgetTable);
+      const persist = core.persistTables;
+      core.persistTables = async (updates) => {
+        const rows = updates?.get(budgetTable);
         if ([...(rows?.values() ?? [])].some((record) => record.outcome === outcome)) {
-          core.persist = persist;
+          core.persistTables = persist;
           throw new Error('injected budget store failure');
         }
-        return persist();
+        return persist(updates);
+      };
+    },
+    failUnaryWriteAfterUnrelatedPersist() {
+      const core = t.hq.core;
+      const persist = core.persistTables;
+      core.persistTables = async (updates) => {
+        if (updates?.has('@hq\0unary_budget')) {
+          core.persistTables = persist;
+          await core.persist(); // An independent snapshot must exclude staged budget rows.
+          throw new Error('injected unary budget store failure');
+        }
+        return persist(updates);
       };
     },
     holdNextReservationWrite() {
       const written = deferred();
       const release = deferred();
       const core = t.hq.core;
-      const persist = core.persist;
-      core.persist = async () => {
-        core.persist = persist;
-        await persist();
+      const persist = core.persistTables;
+      core.persistTables = async (updates) => {
+        core.persistTables = persist;
+        await persist(updates);
         written.resolve();
         await release.promise;
       };
@@ -411,29 +423,71 @@ test('restart preserves uncertainty and refuses to redispatch the same operation
   } finally { await restart.close(); }
 });
 
-test('two authorized turns charge one working ceiling across restart', { timeout: 5000 }, async () => {
+test('unary spending, open holds and typed inference share one ceiling across restart', { timeout: 5000 }, async () => {
   const first = await setup(async function* () { return terminal; });
+  let settled, held, released;
   try {
     await first.bind();
-    first.approve(1.5);
+    first.approve(1.75);
     assert.deepEqual(await first.client.requestResponses(first.request, () => {}), { usage: terminal.usage });
-    assert.equal(await first.remaining(), 1.25);
-    const legacy = await first.reserveUnary(0.5);
-    await first.settleUnary(legacy, 0.5);
+    settled = await first.reserveUnary(0.5);
+    await first.settleUnary(settled, 0.5);
+    held = await first.reserveUnary(0.25);
+    released = await first.reserveUnary(0.25);
+    await first.releaseUnary(released);
+    await first.reserveUnary(0.25, 'maintenance');
     assert.equal(await first.remaining(), 0.75);
+    assert.equal(await first.remaining('maintenance'), 1.5);
   } finally { await first.close({ keep: true }); }
 
   const second = await setup(async function* () { return { ...terminal, actualCost: 0.5 }; }, first.home);
   try {
     await second.bind();
-    second.approve(1.5);
-    assert.equal(await second.remaining(), 1.25);
-    assert.deepEqual(await second.client.requestResponses({ ...second.request, operation_id: 'second_turn' }, () => {}), { usage: terminal.usage });
+    second.approve(1.75);
     assert.equal(await second.remaining(), 0.75);
+    const request = { ...second.request, operation_id: 'second_turn' };
+    await assert.rejects(second.client.requestResponses(request, () => {}), code('budget_exhausted'));
+    await assert.rejects(second.client.requestResponses(second.request, () => {}), /reconcile before retrying/);
+    await assert.rejects(second.releaseUnary(released), code('host.invalid_request'));
+    await assert.rejects(second.settleUnary(settled, 0), code('host.invalid_request'));
+    await second.releaseUnary(held);
+    assert.equal(await second.remaining(), 1);
+    assert.deepEqual(await second.client.requestResponses(request, () => {}), { usage: terminal.usage });
+    assert.equal(await second.remaining(), 0.5);
     assert.deepEqual(second.records().map(({ outcome, actual_cost }) => [outcome, actual_cost]), [['completed', 0.25], ['completed', 0.5]]);
     await assert.rejects(second.client.requestResponses({ ...second.request, operation_id: 'third_turn' }, () => {}), code('budget_exhausted'));
     await assert.rejects(second.reserveUnary(1), code('budget_exhausted'));
     assert.equal(await second.remaining('maintenance'), 1.5);
+  } finally { await second.close(); }
+});
+
+test('an unrelated snapshot cannot publish a failed unary reserve, settlement or release', { timeout: 5000 }, async () => {
+  const first = await setup(async function* () { assert.fail('producer should not open'); });
+  let held;
+  try {
+    first.approve(1.25);
+    first.failUnaryWriteAfterUnrelatedPersist();
+    await assert.rejects(first.reserveUnary(0.5), /injected unary/);
+    assert.equal(await first.remaining(), 1.25);
+    held = await first.reserveUnary(1);
+    first.failUnaryWriteAfterUnrelatedPersist();
+    await assert.rejects(first.settleUnary(held, 0.25), /injected unary/);
+    assert.equal(await first.remaining(), 0.25);
+    first.failUnaryWriteAfterUnrelatedPersist();
+    await assert.rejects(first.releaseUnary(held), /injected unary/);
+    assert.equal(await first.remaining(), 0.25);
+  } finally { await first.close({ keep: true }); }
+
+  const second = await setup(async function* () { return terminal; }, first.home);
+  try {
+    await second.bind();
+    second.approve(1.25);
+    assert.equal(await second.remaining(), 0.25);
+    await assert.rejects(second.client.requestResponses(second.request, () => {}), code('budget_exhausted'));
+    await second.settleUnary(held, 0.25);
+    assert.equal(await second.remaining(), 1);
+    await second.client.requestResponses(second.request, () => {});
+    assert.equal(await second.remaining(), 0.75);
   } finally { await second.close(); }
 });
 
@@ -551,6 +605,28 @@ test('only the registered provider’s earlier draft records count after restart
     await assert.rejects(last.client.requestResponses({ ...last.request, operation_id: 'fresh_operation' }, () => {}), /accounting requires reconciliation/);
     assert.equal(await last.remaining('maintenance'), 2);
   } finally { await last.close(); }
+});
+
+test('duplicate old and current inference operation records require working-pool reconciliation', { timeout: 5000 }, async () => {
+  const first = await setup(async function* () { return terminal; });
+  try {
+    await first.bind();
+    first.approve(2);
+    await first.client.requestResponses(first.request, () => {});
+    await first.legacyRecord(first.request.operation_id, { outcome: 'completed', actual_cost: terminal.actualCost });
+  } finally { await first.close({ keep: true }); }
+
+  const next = await setup(async function* () { assert.fail('producer should not open'); }, first.home);
+  try {
+    await next.bind();
+    next.approve(2);
+    await assert.rejects(next.client.requestResponses(next.request, () => {}), /reconcile before retrying/);
+    await assert.rejects(next.reserveUnary(0), /accounting requires reconciliation/);
+    await assert.rejects(next.client.requestResponses({
+      ...next.request, operation_id: 'different_operation',
+    }, () => {}), /accounting requires reconciliation/);
+    assert.equal(await next.remaining('maintenance'), 2);
+  } finally { await next.close(); }
 });
 
 test('client abort destroys active producer I/O and preserves the unknown operation', { timeout: 5000 }, async () => {

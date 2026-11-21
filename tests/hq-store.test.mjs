@@ -13,7 +13,7 @@ const plugin = { name: 'p', services: ['store', 'receipts'], identityServiceRout
 
 function open(dir) {
   const store = openStore(dir);
-  const core = createCore({ persist: () => store.persist() });
+  const core = createCore({ persist: () => store.persist(), persistTables: (updates) => store.persist(updates) });
   store.load(core);
   core.phases.set('p', 'running');
   return { store, core, services: bindServices(core, plugin) };
@@ -55,6 +55,30 @@ test('a failed persist rolls the write back in memory and raises', async () => {
   assert.equal(await services.store.tx((tx) => tx.get('rows', 'k')), undefined);
   await assert.rejects(services.receipts.append({ kind: 'x' }), /disk full/);
   assert.equal(core.receipts.length, 0);
+});
+
+test('a released unary reservation cannot alias a new ID after the allocator restarts', async () => {
+  const dir = tempHome();
+  const configure = ({ core }) => {
+    core.budgets.set('soul', { ceilings: { working: 1 } });
+    return bindServices(core, { name: 'p', services: ['budgets'] }).budgets;
+  };
+  try {
+    const first = configure(open(dir));
+    const stale = await first.reserve({ soul: 'soul', amount: 0.25 });
+    await first.release(stale);
+
+    const reopened = open(dir); // The SDK test random source starts at the same seed.
+    const second = configure(reopened);
+    const next = await second.reserve({ soul: 'soul', amount: 0.75 });
+    assert.notEqual(next, stale);
+    const foreign = bindServices(reopened.core, { name: 'q', services: ['budgets'] }).budgets;
+    await assert.rejects(foreign.release(next), /no reservation/);
+    await assert.rejects(second.settle(stale, 0), /no reservation/);
+    await assert.rejects(second.release(stale), /no reservation/);
+    await assert.rejects(second.reserve({ soul: 'soul', pool: 'constructor', amount: 0 }), /no constructor budget/);
+    assert.equal(await second.remaining({ soul: 'soul' }), 0.25);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('the state directory must be private and owned by HQ', () => {

@@ -15,7 +15,7 @@
 // group and others (0700), and the file is written 0600. HQ refuses to start
 // on a wider directory or a store it cannot parse; it never overwrites a
 // store it could not read.
-import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const STORE_FORMAT = 'agent-bot-hq-store/1';
@@ -39,21 +39,25 @@ function writeAtomic(path, text) {
   const tmp = `${path}.tmp-${process.pid}`;
   const fd = openSync(tmp, 'w', 0o600);
   try {
-    writeSync(fd, text);
+    writeFileSync(fd, text);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
   chmodSync(tmp, 0o600);
-  renameSync(tmp, path);
   const dfd = openSync(join(path, '..'), 'r');
-  try { fsyncSync(dfd); } catch { /* some filesystems refuse a directory fsync */ } finally { closeSync(dfd); }
+  try {
+    renameSync(tmp, path);
+    try { fsyncSync(dfd); } catch { /* some filesystems refuse a directory fsync */ }
+  } finally {
+    try { closeSync(dfd); } catch { /* closing the directory cannot undo publication */ }
+  }
 }
 
-function snapshot(core) {
+function snapshot(core, tableUpdates) {
   return {
     format: STORE_FORMAT,
-    tables: [...core.tables].map(([key, rows]) => [key, [...rows]]),
+    tables: [...(tableUpdates ? new Map([...core.tables, ...tableUpdates]) : core.tables)].map(([key, rows]) => [key, [...rows]]),
     blobs: [...core.blobs].map(([key, buf]) => [key, buf.toString('base64')]),
     receipts: core.receipts,
   };
@@ -95,9 +99,14 @@ export function openStore(dir, { uid } = {}) {
       core.receipts.push(...data.receipts);
       return { fresh: false, tables: data.tables.length, receipts: data.receipts.length };
     },
-    persist() {
+    persist(tableUpdates) {
       if (!core) return Promise.reject(new StoreError('persist before load'));
-      const run = tail.then(() => writeAtomic(path, JSON.stringify(snapshot(core))));
+      const run = tail.then(() => {
+        writeAtomic(path, JSON.stringify(snapshot(core, tableUpdates)));
+        // Publish only a successful overlay, in the same queue as any
+        // other snapshot. Later writers must see the just-persisted tables.
+        if (tableUpdates) for (const [key, rows] of tableUpdates) core.tables.set(key, rows);
+      });
       tail = run.catch(() => {});
       return run;
     },
