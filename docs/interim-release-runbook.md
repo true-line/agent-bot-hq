@@ -300,3 +300,28 @@ installed plan ID and digest. Each operation requires a fresh challenge and
 its own proof. Either operation supports `cancel --challenge-file FILE
 --socket PATH`. After an approved response, the administrator applies the
 exact saved plan through the usual members apply command.
+
+### Transfer a single-use macOS qualification proof
+
+Use the dedicated paired HQ account and the Machine pin saved during verified
+status. Generate a new approval plan first if the saved plan describes itself
+as review-only. Existing review-only plans can still be read. For the new
+approval plan, export its signed challenge:
+
+```sh
+node hq/main.mjs machine harness-qualification-run export "$plan_id" --socket "$socket" > "$challenge_file"
+```
+
+Transfer the original signed line to the owner's installed macOS reviewer.
+The reviewer shows the exact candidate and native binary, disposable state,
+fixed runner, test provider, and gate profiles before owner authentication.
+Return the owner's proof to the same paired HQ account and submit it with:
+
+```sh
+node hq/main.mjs machine harness-qualification-run approve --challenge-file "$challenge_file" --proof-file "$proof_file" --socket "$socket"
+```
+
+An approved response records owner consent for this exact single-use plan.
+Execution and evidence are separate. This command does not certify the adapter
+or install a launch rule. To abandon a challenge, use
+`cancel --challenge-file FILE --socket PATH` for the same operation.
