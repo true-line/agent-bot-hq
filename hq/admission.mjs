@@ -109,6 +109,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
     services: ['store', 'receipts', 'clock', 'random', 'config', 'profile', 'log'],
     async init(ctx) {
       const { store, receipts, clock, random, config, profile } = ctx.services;
+      const atomicAudit = typeof receipts.appendIn === 'function';
       const ttl = () => config.get('leaseTtlMs') ?? DEFAULT_LEASE_TTL_MS;
       const accepted = (soul, digest) => (config.get('acceptedDefinitions')?.[soul] ?? []).includes(digest);
       const scopeOf = (assignment) => resolveNoticeScope(config.get('notices'), assignment, (harness) => {
@@ -150,7 +151,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         const now = clock.now();
         // One transaction: the repeat check, the decision and its records, so
         // two Hellos with one request_id cannot both admit.
-        const { result, repeat, unbound: after } = await store.tx(async (tx) => {
+        const { result, repeat, audit, unbound: after } = await store.tx(async (tx) => {
           const earlier = tx.get('hellos', payload.request_id);
           if (earlier) {
             if (earlier.caller !== caller) fail('caller_mismatch', `request ${payload.request_id} belongs to another connection`);
@@ -214,12 +215,12 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             });
           }
           tx.put('hellos', payload.request_id, { caller, digest, result: decision, at: now });
-          return { result: decision, repeat: false, unbound: unboundOf(tx) };
+          const audit = { kind: 'hq.admission', request_id: decision.request_id, decision_id: decision.decision_id, soul_id: payload.soul_id, installation_id: payload.installation_id, installation_epoch: decision.installation_epoch, lease_generation: decision.lease_generation, profile_in_force: decision.profile, runtimes: decision.admitted_runtimes.length, caller };
+          if (atomicAudit) receipts.appendIn(tx, audit);
+          return { result: decision, repeat: false, audit, unbound: unboundOf(tx) };
         });
         if (after) unbound = after;
-        if (!repeat) {
-          await receipts.append({ kind: 'hq.admission', request_id: result.request_id, decision_id: result.decision_id, soul_id: payload.soul_id, installation_id: payload.installation_id, installation_epoch: result.installation_epoch, lease_generation: result.lease_generation, profile_in_force: result.profile, runtimes: result.admitted_runtimes.length, caller });
-        }
+        if (!atomicAudit && !repeat) await receipts.append(audit);
         return result;
       }
 
@@ -255,11 +256,11 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           fail('host.invalid_request', 'Equip takes { runtime_id }');
         }
         const now = clock.now();
-        const record = await store.tx((tx) => {
+        const { record, audit } = await store.tx((tx) => {
           const rt = liveRuntime(tx, payload.runtime_id, caller, now);
           const handle = rt.handle ?? id('gh', 16);
           if (!rt.handle) tx.put('runtimes', payload.runtime_id, { ...rt, handle });
-          return {
+          const result = {
             contract: 'hq/v1',
             runtime_id: payload.runtime_id,
             grant_handles: [{ member_id: rt.member_id, channel_binding: rt.channel_binding, handle }],
@@ -267,9 +268,12 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             approved_destinations: [],
             budget_sub_allocations: { working: 0, maintenance: 0 },
           };
+          check('equip', result, false);
+          const audit = { kind: 'hq.equip', runtime_id: payload.runtime_id, credential_references: 0, caller };
+          if (atomicAudit) receipts.appendIn(tx, audit);
+          return { record: result, audit };
         });
-        check('equip', record, false);
-        await receipts.append({ kind: 'hq.equip', runtime_id: payload.runtime_id, credential_references: 0, caller });
+        if (!atomicAudit) await receipts.append(audit);
         return record;
       }
 
@@ -277,7 +281,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         const caller = callerOf(meta);
         check('ready-and-lease-renewal', payload, true);
         const now = clock.now();
-        const { out, unbound: after } = await store.tx((tx) => {
+        const { out, audit, unbound: after } = await store.tx((tx) => {
           const rt = liveRuntime(tx, payload.runtime_id, caller, now);
           if (payload.installation_epoch !== rt.epoch) fail('stale_epoch', `runtime ${payload.runtime_id} is at epoch ${rt.epoch}, not ${payload.installation_epoch}`);
           if (payload.lease_generation !== rt.lease_generation) fail('lease_expired', `runtime ${payload.runtime_id} holds lease generation ${rt.lease_generation}, not ${payload.lease_generation}`);
@@ -288,10 +292,13 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             ...rt, ready: true, renewal_sequence: payload.renewal_sequence, lease_expires_at: leaseExpires,
             readiness_state: payload.readiness_state, auth_state: payload.auth_state, observed_health: payload.observed_health,
           });
-          return { out: { contract: 'hq/v1', runtime_id: payload.runtime_id, installation_epoch: rt.epoch, lease_generation: rt.lease_generation, lease_expires_at: iso(leaseExpires) }, unbound: unboundOf(tx) };
+          const out = { contract: 'hq/v1', runtime_id: payload.runtime_id, installation_epoch: rt.epoch, lease_generation: rt.lease_generation, lease_expires_at: iso(leaseExpires) };
+          const audit = op === 'Ready' ? { kind: 'hq.ready', runtime_id: payload.runtime_id, readiness_state: payload.readiness_state, caller } : undefined;
+          if (audit && atomicAudit) receipts.appendIn(tx, audit);
+          return { out, audit, unbound: unboundOf(tx) };
         });
         unbound = after;
-        if (op === 'Ready') await receipts.append({ kind: 'hq.ready', runtime_id: payload.runtime_id, readiness_state: payload.readiness_state, caller });
+        if (audit && !atomicAudit) await receipts.append(audit);
         return out;
       };
 
