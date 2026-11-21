@@ -150,7 +150,7 @@ export function createHQ({
   harnessLstat,                  // how harness account paths are inspected (lstatSync by default; tests
                                  // stand in another owner for an account's home)
   launch = {},                   // the agent launcher's spawn, timers and graceMs (hq/launch.mjs defaults)
-  soulRunner,                    // release-bundled runner selected by the trusted HQ entry point; never owner config
+  soulLaunch,                    // Machine-authorized launcher under a distinct per-installation UID; never owner config
   plugins = [],                  // plugin objects (tests); installed ones come from pluginsDir
   pluginsDir,                    // installed plugins, each checked against `pins` (§4.5)
   pins = { plugins: [] },        // governance/plugins.json
@@ -285,7 +285,7 @@ export function createHQ({
         return admission.withLiveRuntime(runtimeId, caller, fn);
       },
     });
-    soulStarter = createSoulStarter({ core, home, runner: soulRunner, mode: () => host?.mode ?? 'starting' });
+    soulStarter = createSoulStarter({ core, home, launchRunner: soulLaunch, mode: () => host?.mode ?? 'starting', hqUid: uid });
     // Whether the provisioner's rule lets HQ start each harness account;
     // bounded, and a missing rule leaves HQ serving row 16a.
     await launcher.probe();

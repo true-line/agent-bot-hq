@@ -51,7 +51,7 @@ export function fakeLegacy({ device = 'enrolled', daemon = 'running' } = {}) {
   return { state, run };
 }
 
-export async function startHQ({ device = 'enrolled', daemon = 'running', supervise = false, config, home = tempHome(), plugins, pluginsDir, pins, devPlugins, account = 'user', platform = 'darwin', signer, enrollment, identity, accounts, harnessLstat, launch = {}, soulRunner, realSudo = false } = {}) {
+export async function startHQ({ device = 'enrolled', daemon = 'running', supervise = false, config, home = tempHome(), plugins, pluginsDir, pins, devPlugins, account = 'user', platform = 'darwin', signer, enrollment, identity, accounts, harnessLstat, launch = {}, soulLaunch, realSudo = false } = {}) {
   // `realSudo`: only the CI real-account tests, only on Linux with their accounts set.
   if (realSudo && !(process.platform === 'linux' && process.env.HQ_HARNESS_ACCOUNTS)) throw new Error('realSudo is for the CI real-account tests only (Linux, HQ_HARNESS_ACCOUNTS set)');
   const legacy = fakeLegacy({ device, daemon });
@@ -71,7 +71,7 @@ export async function startHQ({ device = 'enrolled', daemon = 'running', supervi
     ...(accounts ? { accounts } : {}),
     ...(harnessLstat ? { harnessLstat } : {}),
     launch: { ...launch, ...(launch.spawn || realSudo ? {} : { spawn: noRealSudo }) },
-    soulRunner,
+    soulLaunch,
     plugins,
     pluginsDir,
     pins,

@@ -1,10 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
+import { realpathSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
 import { join } from 'node:path';
-import { startHQ, tempHome } from './hq-harness.mjs';
+import { PassThrough } from 'node:stream';
+import { DIGEST, SOUL, startHQ, tempHome } from './hq-harness.mjs';
 import { validateConfig } from '../hq/hq.mjs';
 
 const waitFor = async (check) => {
@@ -15,15 +16,30 @@ const waitFor = async (check) => {
   assert.fail('timed out waiting for Soul runner to stop');
 };
 
+function fakeMachineLaunch(calls, overrides = {}, completion = { exit_code: 0, signal: 'TERM', contained: true }) {
+  return async ({ startId, packagePath, ...request }) => {
+    calls.push({ startId, packagePath, ...request });
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdin.on('data', (chunk) => stdout.write(`ACP:${chunk}`));
+    let finish;
+    const done = new Promise((resolve) => { finish = resolve; });
+    return { startId, packagePath, uid: 61001, gid: 61001, pid: 4242,
+      soulId: SOUL, installationId: 'inst_fixture', definitionDigest: DIGEST,
+      stdin, stdout, done,
+      async stop() { stdin.destroy(); stdout.end(); finish(completion); },
+      ...overrides };
+  };
+}
+
 test('the owner cannot configure arbitrary code to run in HQ account', () => {
   assert.throws(() => validateConfig({ soulRunner: { command: ['/bin/sh'] } }), /unknown key soulRunner/);
 });
 
-test('only the owner can make HQ start and own a Soul runner; the ACP stream stops with its owner connection', { timeout: 10000 }, async () => {
+test('only the owner can request a separate Machine runner; the ACP stream stops with its owner connection', { timeout: 10000 }, async () => {
   const home = tempHome();
-  const runner = join(home, 'fake-runner.mjs');
-  writeFileSync(runner, `process.stdin.on('data', chunk => process.stdout.write('ACP:' + chunk.toString()));\nprocess.stdin.on('end', () => process.exit(0));\nprocess.on('SIGTERM', () => process.exit(0));\n`);
-  const t = await startHQ({ home, config: { acceptedDefinitions: {} }, soulRunner: { command: [process.execPath, runner] } });
+  const launches = [];
+  const t = await startHQ({ home, config: { acceptedDefinitions: {} }, soulLaunch: fakeMachineLaunch(launches) });
   let stream;
   try {
     const entry = await t.entry();
@@ -45,6 +61,12 @@ test('only the owner can make HQ start and own a Soul runner; the ACP stream sto
     assert.match(first.result.start_id, /^st_[0-9a-f]{24}$/);
     assert.equal(first.result.protected, false);
     assert.equal(first.result.profile, 'managed-cooperative');
+    assert.equal(first.result.runner_uid, 61001);
+    assert.equal(first.result.runner_gid, 61001);
+    assert.equal(first.result.installation_id, 'inst_fixture');
+    assert.equal(launches.length, 1);
+    assert.equal(launches[0].requireHqLaunch, true);
+    assert.equal(launches[0].packagePath, realpathSync(home));
     assert.equal((await owner.request('soul.starts')).result.starts.length, 1);
     assert.equal((await owner.request('status')).result.hq.soulStarts.length, 1);
     const duplicate = await (await t.owner()).request('soul.start', { package_path: home });
@@ -56,6 +78,69 @@ test('only the owner can make HQ start and own a Soul runner; the ACP stream sto
     await waitFor(() => t.hq.status().hq.soulStarts.length === 0);
     assert.ok(t.hq.core.receipts.some((r) => r.kind === 'hq.soul.started' && r.start_id === first.result.start_id));
     assert.ok(t.hq.core.receipts.some((r) => r.kind === 'hq.soul.exited' && r.start_id === first.result.start_id));
+  } finally { stream?.destroy(); await t.done(); }
+});
+
+test('HQ rejects a runner in its own UID and does not record a managed start', async () => {
+  const launches = [];
+  const t = await startHQ({ soulLaunch: fakeMachineLaunch(launches, { uid: process.getuid() }) });
+  try {
+    const owner = await t.owner();
+    const refused = await owner.request('soul.start', { package_path: t.home });
+    assert.equal(refused.host_refusal.code, 'host.launch_unavailable');
+    assert.equal(launches.length, 1);
+    assert.deepEqual(t.hq.status().hq.soulStarts, []);
+    assert.equal(t.hq.core.receipts.some((r) => r.kind === 'hq.soul.started'), false);
+  } finally { await t.done(); }
+});
+
+test('a live Soul installation keeps its own runner UID', { timeout: 10000 }, async () => {
+  const home = tempHome();
+  const other = tempHome();
+  const launches = [];
+  const fake = fakeMachineLaunch(launches);
+  const t = await startHQ({ home, soulLaunch: async (request) => ({
+    ...await fake(request), installationId: request.packagePath === realpathSync(home) ? 'inst_one' : 'inst_two',
+  }) });
+  let stream;
+  try {
+    stream = connect(t.hq.paths.control);
+    await new Promise((resolve, reject) => { stream.once('connect', resolve); stream.once('error', reject); });
+    let response = '';
+    stream.on('data', (chunk) => { response += chunk; });
+    stream.write(`${JSON.stringify({ id: 1, op: 'soul.start', payload: { package_path: home } })}\n`);
+    await waitFor(() => response.includes('\n'));
+    assert.equal(JSON.parse(response.slice(0, response.indexOf('\n'))).ok, true);
+    const owner = await t.owner();
+    const refused = await owner.request('soul.start', { package_path: other });
+    assert.equal(refused.host_refusal.code, 'host.launch_busy');
+    assert.equal(t.hq.status().hq.soulStarts.length, 1);
+  } finally { stream?.destroy(); await t.done(); }
+});
+
+test('an unconfirmed Machine stop retains the runner UID and installation slot', { timeout: 10000 }, async () => {
+  const home = tempHome();
+  const other = tempHome();
+  const fake = fakeMachineLaunch([], {}, { exit_code: null, signal: null, contained: false });
+  const t = await startHQ({ home, soulLaunch: async (request) => ({
+    ...await fake(request), installationId: request.packagePath === realpathSync(home) ? 'inst_one' : 'inst_two',
+  }) });
+  let stream;
+  try {
+    stream = connect(t.hq.paths.control);
+    await new Promise((resolve, reject) => { stream.once('connect', resolve); stream.once('error', reject); });
+    let response = '';
+    stream.on('data', (chunk) => { response += chunk; });
+    stream.write(`${JSON.stringify({ id: 1, op: 'soul.start', payload: { package_path: home } })}\n`);
+    await waitFor(() => response.includes('\n'));
+    assert.equal(JSON.parse(response.slice(0, response.indexOf('\n'))).ok, true);
+    stream.destroy();
+    await waitFor(() => t.hq.status().hq.soulStarts[0]?.state === 'containment_unconfirmed');
+    const owner = await t.owner();
+    const refused = await owner.request('soul.start', { package_path: other });
+    assert.equal(refused.host_refusal.code, 'host.launch_busy');
+    assert.equal(t.hq.status().hq.soulStarts.length, 1);
+    assert.ok(t.hq.core.receipts.some((r) => r.kind === 'hq.soul.exited' && r.contained === false));
   } finally { stream?.destroy(); await t.done(); }
 });
 
