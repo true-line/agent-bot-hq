@@ -251,6 +251,7 @@ export function createHQ({
         : unlinkedIdentity()),
       persist: () => store.persist(),
       persistReceipt: (entry) => store.persistReceipt(entry),
+      persistPluginWrite: (change) => store.persistPluginWrite(change),
       config: {
         'hq-admission': { acceptedDefinitions: cfg.acceptedDefinitions ?? {}, notices: cfg.notices ?? null, ...(cfg.leaseTtlMs ? { leaseTtlMs: cfg.leaseTtlMs } : {}) },
         'hq-tasks': { concurrentWriters: cfg.concurrentWriters ?? [] },
