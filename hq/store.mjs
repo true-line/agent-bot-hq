@@ -118,6 +118,19 @@ export function openStore(dir, { uid } = {}) {
     persist() {
       return enqueue(() => writeAtomic(path, JSON.stringify(snapshot(core))));
     },
+    persistPluginWrite(change) {
+      return enqueue(() => {
+        // Apply, snapshot and rollback synchronously in the shared queue so
+        // readers and other writes only see committed plugin changes.
+        const rollback = change();
+        if (!rollback) return;
+        try { writeAtomic(path, JSON.stringify(snapshot(core))); }
+        catch (error) {
+          rollback();
+          throw error;
+        }
+      });
+    },
     persistReceipt(entry) {
       return enqueue(() => {
         if (receiptSeq === Number.MAX_SAFE_INTEGER) throw new StoreError('receipt sequence is exhausted');

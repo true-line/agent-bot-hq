@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { syncBuiltinESMExports } from 'node:module';
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -15,7 +16,11 @@ const plugin = { name: 'p', services: ['store', 'receipts'], identityServiceRout
 
 function configureStore(dir) {
   const store = openStore(dir);
-  const core = createCore({ persist: () => store.persist(), persistReceipt: entry => store.persistReceipt(entry) });
+  const core = createCore({
+    persist: () => store.persist(),
+    persistReceipt: entry => store.persistReceipt(entry),
+    persistPluginWrite: store.persistPluginWrite,
+  });
   return { store, core };
 }
 
@@ -140,6 +145,127 @@ test('an earlier unrelated state snapshot never saves a later rejected receipt',
     restore();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+function blobDigest(bytes) {
+  return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+}
+
+for (const kind of ['blob', 'table']) {
+  for (const order of ['before', 'after']) test(`a rejected ${kind} stays out of memory and disk when queued ${order} a receipt`, async (t) => {
+    const dir = tempHome();
+    const { store, core, services } = open(dir);
+    let restore;
+    try {
+      const existingBlob = Buffer.from('independent committed blob');
+      const keptDigest = await services.store.blob.put(existingBlob);
+      await services.store.tx(tx => {
+        tx.put('rows', 'old', 'keep me');
+        tx.put('unrelated', 'old', 'other table');
+      });
+      await services.receipts.append({ kind: 'existing' });
+
+      restore = failPublication(t, store, order === 'before' ? 1 : 2);
+      const bytes = Buffer.from('synthetic overlapping mutation');
+      const digest = blobDigest(bytes);
+      const appendReceipt = () => services.receipts.append({ kind: 'overlap' });
+      let receipt, pending, beforeCommit;
+      if (kind === 'blob') {
+        if (order === 'after') receipt = appendReceipt();
+        pending = services.store.blob.put(bytes);
+        beforeCommit = services.store.blob.get(digest);
+      } else {
+        let staged;
+        const prepared = new Promise(resolve => { staged = resolve; });
+        pending = services.store.tx(tx => {
+          tx.delete('rows', 'old');
+          tx.put('rows', 'new', 'uncommitted');
+          tx.put('second', 'new', 'uncommitted');
+          staged();
+        });
+        await prepared;
+        // The transaction's continuation queues the table write. Yield once
+        // here only when that write should precede the receipt in the queue.
+        if (order === 'before') await Promise.resolve();
+      }
+      receipt ??= appendReceipt();
+      const settled = Promise.allSettled([pending, receipt]);
+      if (kind === 'table') {
+        await Promise.resolve();
+        beforeCommit = core.tables.get('p\0rows').get('new');
+      }
+
+      const [result, saved] = await settled;
+      assert.equal(result.status, 'rejected');
+      assert.match(result.reason.message, /fixture write failed/);
+      assert.deepEqual(saved, { status: 'fulfilled', value: 2 });
+      assert.equal(await beforeCommit, undefined);
+
+      const reopened = open(dir);
+      assert.deepEqual(receiptValues(reopened.core), [['existing', 1], ['overlap', 2]]);
+      assert.deepEqual(await reopened.services.store.blob.get(keptDigest), existingBlob);
+      assert.equal(await reopened.services.store.blob.get(digest), undefined);
+      await reopened.services.store.tx(tx => {
+        assert.deepEqual(tx.list('rows'), [['old', 'keep me']]);
+        assert.deepEqual(tx.list('second'), []);
+        assert.equal(tx.get('unrelated', 'old'), 'other table');
+      });
+      if (kind === 'blob') {
+        assert.equal(await services.store.blob.put(bytes), digest);
+        assert.deepEqual(await open(dir).services.store.blob.get(digest), bytes);
+      } else {
+        await services.store.tx(tx => {
+          tx.delete('rows', 'old');
+          tx.put('rows', 'new', 'committed on retry');
+          tx.put('second', 'new', 'committed on retry');
+        });
+        await open(dir).services.store.tx(tx => {
+          assert.deepEqual(tx.list('rows'), [['new', 'committed on retry']]);
+          assert.deepEqual(tx.list('second'), [['new', 'committed on retry']]);
+          assert.equal(tx.get('unrelated', 'old'), 'other table');
+        });
+      }
+    } finally {
+      restore?.();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const failFirst of [false, true]) test(`duplicate blob puts wait for a durable copy (first fails: ${failFirst})`, async (t) => {
+  const dir = tempHome();
+  const { store, services } = open(dir);
+  // A second publication must be needed only if the first put failed.
+  const restore = failPublication(t, store, failFirst ? 1 : 2);
+  try {
+    const bytes = Buffer.from('duplicate synthetic blob');
+    const digest = blobDigest(bytes);
+    const attempts = [services.store.blob.put(bytes), services.store.blob.put(bytes)];
+    const uncommitted = services.store.blob.get(digest);
+    const [first, second] = await Promise.allSettled(attempts);
+    assert.equal(await uncommitted, undefined);
+    if (failFirst) {
+      assert.equal(first.status, 'rejected');
+      assert.match(first.reason.message, /fixture write failed/);
+    } else assert.deepEqual(first, { status: 'fulfilled', value: digest });
+    assert.deepEqual(second, { status: 'fulfilled', value: digest });
+    assert.deepEqual(await services.store.blob.get(digest), bytes);
+    assert.deepEqual(await open(dir).services.store.blob.get(digest), bytes);
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('in-memory blob writes remain synchronously visible to readers', async () => {
+  const core = createCore();
+  core.phases.set('p', 'running');
+  const { store } = bindServices(core, plugin);
+  const bytes = Buffer.from('in-memory blob');
+  const written = store.blob.put(bytes);
+  const immediate = store.blob.get(blobDigest(bytes));
+  assert.deepEqual(await immediate, bytes);
+  assert.equal(await written, blobDigest(bytes));
 });
 
 test('failure to open the directory leaves a receipt unpublished', async (t) => {

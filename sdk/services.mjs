@@ -123,12 +123,12 @@ export function fakeSigner({ device = 'enrolled' } = {}) {
 // `persist`, when given, is called after every committed write (store
 // transaction, blob, receipt) and must make the state durable. The generic
 // callback observes live state and retains its existing optimistic rollback
-// contract. A host that snapshots receipt writes concurrently must supply a
-// persistReceipt hook that owns publication in its store's write queue.
-export function createCore({ clock = testClock(), random = testRandom(), profile = 'managed-cooperative', config = {}, identity = fakeIdentityService(), signer = fakeSigner(), budgets = {}, persist, persistReceipt } = {}) {
+// contract. HQ supplies persistReceipt and persistPluginWrite to publish
+// receipts, table transactions and blobs inside its shared store queue.
+export function createCore({ clock = testClock(), random = testRandom(), profile = 'managed-cooperative', config = {}, identity = fakeIdentityService(), signer = fakeSigner(), budgets = {}, persist, persistReceipt, persistPluginWrite } = {}) {
   if (!PROFILES.includes(profile)) throw new TypeError(`profile is one of ${PROFILES}`);
   const core = {
-    clock, random, profile, identity, signer, persist, persistReceipt,
+    clock, random, profile, identity, signer, persist, persistReceipt, persistPluginWrite,
     config: deepFreeze(clone(config)),
     tables: new Map(),          // `${plugin}\0${table}` → Map(key → value)
     blobs: new Map(),           // `${plugin}\0${digest}` → Buffer
@@ -234,6 +234,14 @@ function storeService(core, plugin) {
     await prev;
     try { return await fn(); } finally { release(); if (core.locks.get(key) === tail) core.locks.delete(key); }
   };
+  async function publish(change) {
+    if (core.persistPluginWrite) return core.persistPluginWrite(change);
+    const rollback = change();
+    if (rollback && core.persist) {
+      try { await core.persist(); }
+      catch (error) { rollback(); throw error; }
+    }
+  }
   async function runTx(fn) {
     const staged = new Map();
     const view = (table) => {
@@ -250,18 +258,16 @@ function storeService(core, plugin) {
       delete: (table, key) => { noInitWrite(); wrote = true; return view(table).delete(key); },
     });
     const result = await fn(tx);
-    if (wrote) {
+    if (wrote) await publish(() => {
       const before = new Map([...staged.keys()].map((key) => [key, core.tables.get(key)]));
       for (const [key, rows] of staged) core.tables.set(key, rows);
-      if (core.persist) {
-        try {
-          await core.persist();
-        } catch (e) {
-          for (const [key, rows] of before) { if (rows === undefined) core.tables.delete(key); else core.tables.set(key, rows); }
-          throw e;
+      return () => {
+        for (const [key, rows] of before) {
+          if (rows === undefined) core.tables.delete(key);
+          else core.tables.set(key, rows);
         }
-      }
-    }
+      };
+    });
     return result;
   }
   return Object.freeze({
@@ -276,11 +282,11 @@ function storeService(core, plugin) {
         const buf = Buffer.from(bytes);
         const digest = `sha256:${createHash('sha256').update(buf).digest('hex')}`;
         const key = `${plugin}\0${digest}`;
-        const existed = core.blobs.has(key);
-        core.blobs.set(key, buf);
-        if (core.persist && !existed) {
-          try { await core.persist(); } catch (e) { core.blobs.delete(key); throw e; }
-        }
+        await publish(() => {
+          if (core.blobs.has(key)) return;
+          core.blobs.set(key, buf);
+          return () => core.blobs.delete(key);
+        });
         return digest;
       },
       async get(digest) {
