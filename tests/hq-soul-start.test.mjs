@@ -22,8 +22,13 @@ function fakeMachineLaunch(calls, overrides = {}, completion = { exit_code: 0, s
   return {
     async reserve(request) {
       const extra = typeof overrides === 'function' ? overrides(request) : overrides;
+      const installationId = extra.installationId ?? 'inst_fixture';
+      const directory = join('/var/tmp', 'hq-runner-fixture', installationId);
       const reservation = { ...request, uid: 61001, gid: 61001,
-        soulId: SOUL, installationId: 'inst_fixture', definitionDigest: DIGEST, packageDigest: DIGEST,
+        soulId: SOUL, installationId, definitionDigest: DIGEST, packageDigest: DIGEST,
+        runnerPackagePath: join(directory, 'package'),
+        endpoint: { directory, socketPath: join(directory, 'admission.sock'), ownerUid: process.getuid(),
+          groupGid: 61001, dirMode: 0o2750, socketMode: 0o660, peerUid: 61001 },
         async cancel() {}, ...extra };
       trusted.add(reservation);
       return reservation;
@@ -147,6 +152,22 @@ test('HQ rejects a self-asserted Machine reservation before starting a process',
     assert.equal(refused.host_refusal.code, 'host.launch_unavailable');
     assert.equal(launches.length, 0);
     assert.deepEqual(t.hq.status().hq.soulStarts, []);
+  } finally { await t.done(); }
+});
+
+test('HQ refuses a runner endpoint inside its private home', async () => {
+  const launches = [];
+  const machine = fakeMachineLaunch(launches, (request) => ({
+    endpoint: { directory: realpathSync(request.hqHome),
+      socketPath: join(realpathSync(request.hqHome), 'runner.sock'), ownerUid: process.getuid(),
+      groupGid: 61001, dirMode: 0o2750, socketMode: 0o660, peerUid: 61001 },
+  }));
+  const t = await startHQ(machineOptions(machine));
+  try {
+    const owner = await t.owner();
+    const refused = await owner.request('soul.start', { package_path: t.home });
+    assert.equal(refused.host_refusal.code, 'host.launch_unavailable');
+    assert.equal(launches.length, 0);
   } finally { await t.done(); }
 });
 

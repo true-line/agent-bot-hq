@@ -3,7 +3,7 @@
 // its private account. The owner connection becomes the runner's ACP stream.
 // This local event is not a protected qualification or signed provenance.
 import { lstatSync, realpathSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { dirname, isAbsolute, sep } from 'node:path';
 import { fail } from '../sdk/errors.mjs';
 import { pushReceipt } from '../sdk/services.mjs';
 import { takeover } from './socket.mjs';
@@ -68,6 +68,8 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       path = realpathSync(payload.package_path);
       if (!lstatSync(path).isDirectory()) throw new Error('not a directory');
     } catch { fail('host.invalid_request', 'soul.start package_path is not an existing directory'); }
+    const hqRoot = realpathSync(home);
+    const inHqHome = (candidate) => candidate === hqRoot || candidate.startsWith(`${hqRoot}${sep}`);
     if (byPath.has(path)) fail('host.launch_busy', 'HQ has already started this Soul package');
     const id = `st_${core.random.hex(12)}`;
     if (!ID.test(id)) throw new Error('invalid HQ start ID');
@@ -78,13 +80,24 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       profile: 'managed-cooperative', requireHqLaunch: true };
     let reservation;
     try {
-      reservation = Object.freeze(await machineLaunch.reserve(request));
+      reservation = await machineLaunch.reserve(request);
+      if (reservation?.endpoint && typeof reservation.endpoint === 'object') Object.freeze(reservation.endpoint);
+      Object.freeze(reservation);
       const valid = reservation?.startId === id && reservation.packagePath === path
         && reservation.hqEpoch === hqEpoch
         && Number.isSafeInteger(reservation.uid) && reservation.uid > 0 && reservation.uid !== hqUid
         && Number.isSafeInteger(reservation.gid) && reservation.gid > 0
         && SOUL_ID.test(reservation.soulId ?? '') && INSTALLATION_ID.test(reservation.installationId ?? '')
-        && DIGEST.test(reservation.definitionDigest ?? '') && DIGEST.test(reservation.packageDigest ?? '');
+        && DIGEST.test(reservation.definitionDigest ?? '') && DIGEST.test(reservation.packageDigest ?? '')
+        && typeof reservation.runnerPackagePath === 'string' && isAbsolute(reservation.runnerPackagePath)
+        && reservation.runnerPackagePath !== path && !inHqHome(reservation.runnerPackagePath)
+        && typeof reservation.endpoint?.directory === 'string' && isAbsolute(reservation.endpoint.directory)
+        && !inHqHome(reservation.endpoint.directory)
+        && typeof reservation.endpoint.socketPath === 'string'
+        && dirname(reservation.endpoint.socketPath) === reservation.endpoint.directory
+        && reservation.endpoint.ownerUid === hqUid && reservation.endpoint.groupGid === reservation.gid
+        && reservation.endpoint.dirMode === 0o2750 && reservation.endpoint.socketMode === 0o660
+        && reservation.endpoint.peerUid === reservation.uid;
       if (!valid || await verifyMachineReservation(reservation, request) !== true) {
         fail('host.launch_unavailable', 'Machine reservation lacks an authenticated per-installation runner binding');
       }
@@ -126,6 +139,7 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
             startId: id, hqEpoch, packagePath: path, uid: item.uid, gid: item.gid,
             soulId: item.soulId, installationId: item.installationId,
             definitionDigest: item.definitionDigest, packageDigest: item.packageDigest,
+            runnerPackagePath: reservation.runnerPackagePath, endpoint: reservation.endpoint,
           }) === true;
         } catch { /* an unverifiable completion keeps the slot occupied */ }
       }
@@ -145,6 +159,14 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       && launch.hqEpoch === hqEpoch && launch.uid === item.uid && launch.gid === item.gid
       && launch.soulId === item.soulId && launch.installationId === item.installationId
       && launch.definitionDigest === item.definitionDigest && launch.packageDigest === item.packageDigest
+      && launch.runnerPackagePath === reservation.runnerPackagePath
+      && launch.endpoint?.directory === reservation.endpoint.directory
+      && launch.endpoint?.socketPath === reservation.endpoint.socketPath
+      && launch.endpoint?.ownerUid === reservation.endpoint.ownerUid
+      && launch.endpoint?.groupGid === reservation.endpoint.groupGid
+      && launch.endpoint?.dirMode === reservation.endpoint.dirMode
+      && launch.endpoint?.socketMode === reservation.endpoint.socketMode
+      && launch.endpoint?.peerUid === reservation.endpoint.peerUid
       && Number.isSafeInteger(launch.pid) && launch.pid > 1
       && typeof launch.stdin?.write === 'function' && typeof launch.stdout?.pipe === 'function'
       && typeof launch.stop === 'function' && typeof launch.done?.then === 'function';
