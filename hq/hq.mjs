@@ -286,7 +286,10 @@ export function createHQ({
       // The list is bounded and the tag appended after it, so "(D7)", which
       // profileWarning looks for, always survives.
       const bound = (text) => (text.length > 360 ? `${text.slice(0, 357)}...` : text);
-      if (unready.length) return `${bound(`harness launch is not available for ${unready.map((a) => `${a.account} (${a.reason})`).join('; ')}`)}, so HQ cannot start agents in those accounts (D7)`;
+      if (unready.length) {
+        const accounts = unready.map((a) => `${a.account} (${a.reason})`).join('; ');
+        return `${bound(`one or more configured adapters cannot launch in ${accounts}`)} (D7)`;
+      }
       const others = unbound ?? host?.provided('hq-admission')?.unboundRuntimes() ?? [];
       const without = [...new Set([...pending.filter((p) => !harnessPlan.accountOf(p.adapter_id)), ...others]
         .map((p) => `${p.soul_id}/${p.member_id} (adapter ${p.adapter_id ?? 'unknown'})`))];

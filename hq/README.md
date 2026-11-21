@@ -53,6 +53,15 @@ installed adapters separately from those available for launch. Launch also
 requires independently verified Darwin package qualification for that exact
 adapter. The production verifier has no qualified adapters yet.
 
+In the owner status report, a grant verification failure means HQ could not
+validate the installed launch files. Once it can verify the grant, HQ lists the
+matching configured adapter IDs in `installed_adapters`, including when it
+cannot confirm supervisor permission. After that permission check succeeds,
+`adapters` lists the IDs that also passed package qualification. The reason
+identifies missing mappings and missing qualification separately. Granting
+supervisor permission alone cannot qualify a package. An account can report
+partial readiness while its qualified adapters remain available.
+
 A qualified launch hands the supervisor a private stdin header followed by
 ACP. Closing stdin requests shutdown of that launch's process group. HQ holds
 the slot as uncontained unless the supervisor confirms group closure or an
