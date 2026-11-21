@@ -214,6 +214,87 @@ test('a valid token survives an early refresh outage, but never its expiry or an
   refused.close();
 });
 
+test('closing while the initial custody status is pending starts no issuer request', async () => {
+  const f = fixture();
+  let release, entered;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  const custody = {
+    async deviceStatus() { entered(); return new Promise(resolve => { release = resolve; }); },
+    async openSession() { throw new Error('must not open a session after close'); },
+  };
+  const client = f.make({ custody });
+  const pending = client.call('GET', '/api/daemon/whoami');
+  const rejected = assert.rejects(pending, code('host.context_revoked'));
+  await waiting;
+  client.close();
+  release('enrolled');
+  await rejected;
+  assert.equal(f.state.requests.length, 0);
+});
+
+test('a revoked status arriving after close does not persist or notify revocation', async () => {
+  const f = fixture();
+  let release, entered, notified = 0;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  const client = f.make({ custody: {
+    async deviceStatus() { entered(); return new Promise(resolve => { release = resolve; }); },
+  } });
+  client.onRevoke(() => { notified++; });
+  const pending = client.call('GET', '/api/daemon/whoami');
+  const rejected = assert.rejects(pending, code('host.context_revoked'));
+  await waiting;
+  client.close();
+  release('revoked');
+  await rejected;
+  assert.equal(notified, 0);
+  assert.equal(f.state.revocations, 0);
+  assert.equal(f.state.requests.length, 0);
+});
+
+test('closing during a new custody session starts no issuer request', async () => {
+  const f = fixture();
+  let release, entered;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  const custody = {
+    async deviceStatus() { return 'enrolled'; },
+    async openSession() { entered(); return new Promise(resolve => { release = resolve; }); },
+  };
+  const client = f.make({ custody });
+  const pending = client.call('GET', '/api/daemon/whoami');
+  const rejected = assert.rejects(pending, code('host.context_revoked'));
+  await waiting;
+  client.close();
+  release({ session: 'fixture', ephemeralJwk: {}, assertion: 'unused' });
+  await rejected;
+  assert.equal(f.state.requests.length, 0);
+});
+
+test('concurrent cold Machine status checks still share one access session', async () => {
+  const f = fixture();
+  const custody = testSessionCustody({ server: SERVER, clock: f.clock, assertion: args => f.enrollment.assertion(args) });
+  let checks = 0;
+  custody.deviceStatus = async () => { checks++; return 'enrolled'; };
+  const client = f.make({ custody });
+  try {
+    const results = await Promise.all(Array.from({ length: 4 }, () => client.call('GET', '/api/daemon/whoami')));
+    assert.ok(results.every(result => result.status === 200));
+    assert.equal(checks, 4);
+    assert.equal(f.state.tokens, 1);
+    assert.equal(f.state.apiCalls, 4);
+  } finally { client.close(); }
+});
+
+test('a cold custody status failure is normalized without an issuer request', async () => {
+  const f = fixture();
+  const client = f.make({ custody: { async deviceStatus() { throw new Error('sensitive detail'); } } });
+  try {
+    await assert.rejects(client.call('GET', '/api/daemon/whoami'), {
+      code: 'credential_unavailable', message: 'identity service: Machine enrollment could not be verified',
+    });
+    assert.equal(f.state.requests.length, 0);
+  } finally { client.close(); }
+});
+
 test('a custody refusal while refreshing evicts the old paired token before issuer exchange', async () => {
   const f = fixture({ recheck() { assert.fail('a refused renewal must not fall back to cached access'); } });
   const client = f.make();

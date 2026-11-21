@@ -279,7 +279,7 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   const originalEpoch = identity.hq_epoch;
   identity.hq_epoch = 'cd'.repeat(32);
   await assert.rejects(lookup(), { code: 'credential_unavailable', message: /no longer matches the current pairing/ });
-  assert.deepEqual(options.slice(operationsBeforeEpochChange), ['identity']);
+  assert.deepEqual(options.slice(operationsBeforeEpochChange), ['identity', 'identity']);
   assert.equal(service.state.requests.length, requestsBeforeEpochChange);
   assert.equal(active.hq.core.identity.status().tokenCached, false);
   identity.hq_epoch = originalEpoch;
@@ -291,6 +291,31 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.equal(positive.body.device.id, binding.device_id);
   assert.equal(positive.status, 200);
   assert.equal(received(), 1);
+  // The same long-lived plugin must recover after Machine actually disappears
+  // and returns, without a periodic status probe refreshing its signer first.
+  const beforeOutage = service.state.requests.length;
+  await new Promise((resolve) => handler.close(resolve));
+  await assert.rejects(whoami(), { code: 'credential_unavailable' });
+  assert.equal(service.state.requests.length, beforeOutage, 'outage must not reach Identity');
+  assert.equal(active.hq.core.identity.status().tokenCached, false);
+  await new Promise((resolve, reject) => handler.once('error', reject).listen(socket, resolve));
+  const recovered = await whoami();
+  assert.equal(recovered.status, 200);
+  assert.equal(recovered.body.device.id, binding.device_id);
+  assert.equal(service.state.requests.length - beforeOutage, 2, 'one token exchange and one lookup, without replay');
+  assert.equal(active.hq.core.identity.status().tokenCached, true);
+  // A returned Machine cannot silently substitute a different enrollment.
+  await new Promise((resolve) => handler.close(resolve));
+  await assert.rejects(whoami(), { code: 'credential_unavailable' });
+  const beforeChangedIdentity = service.state.requests.length;
+  await new Promise((resolve, reject) => handler.once('error', reject).listen(socket, resolve));
+  const originalBinding = binding;
+  binding = { ...binding, device_id: 'dev_changed' };
+  await assert.rejects(whoami(), { code: 'credential_unavailable' });
+  assert.equal(service.state.requests.length, beforeChangedIdentity, 'changed enrollment must not reach Identity');
+  assert.equal(active.hq.core.identity.status().tokenCached, false);
+  binding = originalBinding;
+  assert.equal((await whoami()).status, 200);
   for (const change of [
     ({ claims }) => { claims.ath = 'wrong-token'; },
     ({ claims }) => { claims.jti = 'invalid'; },
@@ -306,7 +331,7 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   ]) {
     whoamiChange = change;
     await assert.rejects(whoami(), { code: 'credential_unavailable' });
-    assert.equal(received(), 1, 'an invalid Machine proof never reaches Identity');
+    assert.equal(received(), 3, 'an invalid Machine proof never reaches Identity');
   }
   whoamiChange = undefined;
   const deviceRecord = readFileSync(join(home, 'identity/device.json'));

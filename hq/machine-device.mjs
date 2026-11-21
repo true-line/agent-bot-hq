@@ -198,6 +198,10 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
     },
     accessAssertion() { unavailable('Machine credential-use and DPoP operations are unavailable'); },
     custody: {
+      // Refresh Machine identity before checking enrollment, including when a
+      // prior outage invalidated the cached signer report.
+      available: () => report().available,
+      deviceStatus: () => signer.deviceStatus(),
       checkOperation(method, path) {
         if (method === 'GET' && path === '/api/daemon/whoami') return;
         if (method !== 'GET' || !/^\/api\/daemon\/issuances\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(path)) unavailable('Machine has no authority for this credential operation');
