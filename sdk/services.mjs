@@ -136,7 +136,6 @@ export function createCore({ clock = testClock(), random = testRandom(), profile
     subscriptions: new Map(),   // type → Set({ plugin, phase, handler })
     tokens: new Map(),          // `${reference}\0${task}\0${operation}` → { token, expiresAt }
     minting: new Map(),         // same key → in-flight mint, shared by concurrent callers
-    tokenEpoch: 0,              // bumped whenever every token is dropped (stop, revocation)
     references: new Map(),      // opaque member reference → underlying reference
     approvals: new Map(),       // id → record
     budgets: new Map(Object.entries(clone(budgets)).map(([soul, pools]) => [soul, { ceilings: pools, reserved: new Map() }])),
@@ -153,7 +152,6 @@ export function createCore({ clock = testClock(), random = testRandom(), profile
 export function dropTokens(core) {
   core.tokens.clear();
   core.minting.clear();
-  core.tokenEpoch += 1;
 }
 
 // §4.4: init registers and runs read-only probes; it changes no host state.
@@ -316,12 +314,11 @@ function credentialsService(core, plugin) {
       // Concurrent callers for one (reference, task, operation) share one
       // mint, so exactly one token exists for it and it is tracked.
       if (core.minting.has(key)) return core.minting.get(key);
-      const epoch = core.tokenEpoch;
       const pending = viaIdentity(core, async () => {
         const minted = await core.identity.mint({ reference: underlying, task, operation, now, random: core.random });
-        // Tokens were dropped while this mint was in flight (stop or
-        // revocation): don't cache it, and don't hand it out.
-        if (core.tokenEpoch !== epoch) {
+        // Completion drops this operation's pending mint; stop and revocation
+        // drop all of them. Only the still-current mint can deliver its token.
+        if (core.minting.get(key) !== pending) {
           if (core.deviceRevoked) fail('device_revoked', 'device revoked: re-enroll');
           fail('host.context_revoked', 'credentials were dropped while this one was minted');
         }
@@ -334,7 +331,9 @@ function credentialsService(core, plugin) {
     // The operation reached a terminal state: drop its token.
     release({ reference, task, operation } = {}) {
       const underlying = core.references.get(reference) ?? reference;
-      return core.tokens.delete(tokenKey(underlying, task, operation));
+      const key = tokenKey(underlying, task, operation);
+      const pending = core.minting.delete(key);
+      return core.tokens.delete(key) || pending;
     },
     // For Equip: an opaque reference a member can hold. It names the
     // credential; it is not one, and resolving it needs HQ.

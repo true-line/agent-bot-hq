@@ -567,6 +567,26 @@ test('credentials: concurrent resolves share one mint; a mint in flight at revoc
   assert.equal(host.tokensHeld(), 0);
 });
 
+test('credentials: completing an operation drops its pending resolution and preserves other operations', async (t) => {
+  const p = probe('agent-comms', ['credentials']);
+  const host = createTestHost({ plugins: [p.plugin] });
+  await host.start();
+  t.after(() => host.stop());
+  const { credentials } = p.ctx.services;
+  const reference = credentials.issue('gh:repo');
+  const active = { task: 't1', operation: 'active' };
+  const done = { task: 't1', operation: 'completed' };
+  const retained = await credentials.resolve(reference, active);
+  const first = credentials.resolve(reference, done);
+  const second = credentials.resolve(reference, done);
+  assert.equal(credentials.release({ reference, ...done }), true);
+  await Promise.all([first, second].map((pending) => assert.rejects(pending, code('host.context_revoked'))));
+  assert.equal(host.tokensHeld(), 1);
+  assert.equal(await credentials.resolve(reference, active), retained);
+  assert.equal(host.identity.mints.length, 2);
+  assert.equal(credentials.release({ reference, ...done }), false);
+});
+
 test('a live token used as an object key is redacted from receipts and logs', async () => {
   const p = probe('agent-comms', ['credentials', 'receipts', 'log']);
   const host = createTestHost({ plugins: [p.plugin] });
