@@ -45,9 +45,13 @@ function writeAtomic(path, text) {
     closeSync(fd);
   }
   chmodSync(tmp, 0o600);
-  renameSync(tmp, path);
   const dfd = openSync(join(path, '..'), 'r');
-  try { fsyncSync(dfd); } catch { /* some filesystems refuse a directory fsync */ } finally { closeSync(dfd); }
+  try {
+    renameSync(tmp, path);
+    try { fsyncSync(dfd); } catch { /* some filesystems refuse a directory fsync */ }
+  } finally {
+    try { closeSync(dfd); } catch { /* closing the directory cannot undo publication */ }
+  }
 }
 
 function snapshot(core) {
@@ -59,14 +63,22 @@ function snapshot(core) {
   };
 }
 
-// Open the store in `dir`. `load(core)` fills a fresh core from disk;
-// `persist` is the hook createCore takes. Persists are serialised, so two
-// commits never interleave their writes.
+// Open the store in `dir`. `load(core)` fills a fresh core from disk.
+// State and receipt writes use one queue, and only a committed receipt
+// enters the in-memory state used by later snapshots.
 export function openStore(dir, { uid } = {}) {
   ensurePrivateDir(dir, { uid });
   const path = join(dir, 'store.json');
   let core;
+  let receiptSeq = 0;
   let tail = Promise.resolve();
+
+  function enqueue(write) {
+    if (!core) return Promise.reject(new StoreError('persist before load'));
+    const run = tail.then(write);
+    tail = run.catch(() => {});
+    return run;
+  }
 
   function read() {
     if (!existsSync(path)) return undefined;
@@ -86,20 +98,41 @@ export function openStore(dir, { uid } = {}) {
     path,
     load(target) {
       core = target;
+      receiptSeq = 0;
       // A crash mid-write leaves a temporary file beside the intact store.
       for (const f of readdirSync(dir)) if (f.startsWith('store.json.tmp-')) unlinkSync(join(dir, f));
       const data = read();
       if (!data) return { fresh: true };
       for (const [key, rows] of data.tables) core.tables.set(key, new Map(rows));
       for (const [key, b64] of data.blobs) core.blobs.set(key, Buffer.from(b64, 'base64'));
-      for (const receipt of data.receipts) core.receipts.push(receipt);
+      // Preserve numbering for old rows without seq and leave any prior
+      // gaps or duplicates untouched.
+      receiptSeq = data.receipts.length;
+      for (const receipt of data.receipts) {
+        core.receipts.push(receipt);
+        const seq = receipt?.seq;
+        if (Number.isSafeInteger(seq) && seq > receiptSeq) receiptSeq = seq;
+      }
       return { fresh: false, tables: data.tables.length, receipts: data.receipts.length };
     },
     persist() {
-      if (!core) return Promise.reject(new StoreError('persist before load'));
-      const run = tail.then(() => writeAtomic(path, JSON.stringify(snapshot(core))));
-      tail = run.catch(() => {});
-      return run;
+      return enqueue(() => writeAtomic(path, JSON.stringify(snapshot(core))));
+    },
+    persistReceipt(entry) {
+      return enqueue(() => {
+        if (receiptSeq === Number.MAX_SAFE_INTEGER) throw new StoreError('receipt sequence is exhausted');
+        const receipt = { ...entry, seq: receiptSeq + 1 };
+        // No other queued writer can observe this append before publication
+        // or before an unsuccessful publication is rolled back.
+        core.receipts.push(receipt);
+        try { writeAtomic(path, JSON.stringify(snapshot(core))); }
+        catch (error) {
+          core.receipts.pop();
+          throw error;
+        }
+        receiptSeq = receipt.seq;
+        return receipt;
+      });
     },
   };
 }
