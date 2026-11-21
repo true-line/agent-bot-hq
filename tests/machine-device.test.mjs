@@ -74,7 +74,7 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   const run = (args, fields) => machineCommandInHome(args, role, process.getuid(), fields);
   const client = await run(['identity']);
   const clientKey = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100', 'hex'), Buffer.from(client.public_key, 'hex')]), type: 'spki', format: 'der' });
-  let binding, lostReply = true, receiptJti, accessJti, session, revoked = false;
+  let binding, lostReply = true, receiptJti, accessJti, session, deviceRefusal;
   const options = [];
   const accessBindings = [];
   let accessResponse, sessionKey, accessHash, whoamiChange;
@@ -153,8 +153,8 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
       }
       if (r.option === 'bind-enrollment' && lostReply) { lostReply = false; stream.destroy(); return; }
       if (refuseAssertion === 'offline' && r.option === 'access-assertion') { stream.destroy(); return; }
-      const diagnostic = revoked ? 'MM_DAEMON_UNKNOWN_KEY' : r.option === 'bind-access' && accessResponse === 'refused'
-        ? 'MM_DAEMON_CALLER_REFUSED' : (r.option === 'access-assertion' ? refuseAssertion : undefined);
+      const diagnostic = deviceRefusal ?? (r.option === 'bind-access' && accessResponse === 'refused'
+        ? 'MM_DAEMON_CALLER_REFUSED' : (r.option === 'access-assertion' ? refuseAssertion : undefined));
       const response = { ok: !diagnostic, ...(diagnostic && { diagnostic }), state, body, timestamp: r.timestamp, nonce: randomBytes(16).toString('base64url'), request_nonce: r.nonce };
       response.signature = sign(null, Buffer.from([response.ok, response.diagnostic ?? '', '', state, JSON.stringify(body), r.timestamp, response.nonce, r.nonce].join('\n')), machine.privateKey).toString('base64');
       const send = () => stream.end(JSON.stringify(response) + '\n');
@@ -352,25 +352,33 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.equal(active.status.mode, 'running');
   await checkNoFallback();
   await active.close(); active = null;
-  revoked = true;
-  active = await open();
-  assert.equal(active.status.mode, 'safe');
-  assert.match(active.status.hq.signer.reason, /MM_DAEMON_UNKNOWN_KEY/);
-  assert.match(await consoleStatus(), /^signer: paired Machine\/keyd unavailable \(.*MM_DAEMON_UNKNOWN_KEY/m);
-  const callsBeforeRefusal = service.state.requests.length;
-  await assert.rejects(promisify(execFile)(process.execPath, [
-    fileURLToPath(new URL('../hq/main.mjs', import.meta.url)), 'enroll', '--harness', 'codex', '--home', home,
-  ]), (error) => {
-    const response = JSON.parse(error.stderr);
-    assert.equal(error.code, 1);
-    assert.equal(response.error, 'credential_unavailable');
-    assert.match(response.explanation, /MM_DAEMON_UNKNOWN_KEY.*prefix owner/);
-    return true;
-  });
-  assert.equal(service.state.requests.length, callsBeforeRefusal);
-  await checkNoFallback();
-  await active.close(); active = null;
-  revoked = false;
+  for (const [diagnostic, guidance] of [
+    ['MM_DAEMON_UNKNOWN_KEY', /MM_DAEMON_UNKNOWN_KEY.*prefix owner/],
+    ['MM_DAEMON_VERB_UNKNOWN', /does not support HQ device signing.*MM_DAEMON_VERB_UNKNOWN.*compatible Machine version/],
+  ]) {
+    deviceRefusal = diagnostic;
+    const callsBeforeRefusal = service.state.requests.length;
+    active = await open();
+    assert.equal(active.status.mode, 'safe');
+    assert.equal(active.status.hq.signer.available, false);
+    assert.match(active.status.hq.signer.reason, guidance);
+    const status = await consoleStatus();
+    assert.match(status, /^signer: paired Machine\/keyd unavailable/m);
+    assert.match(status, guidance);
+    await assert.rejects(promisify(execFile)(process.execPath, [
+      fileURLToPath(new URL('../hq/main.mjs', import.meta.url)), 'enroll', '--harness', 'codex', '--home', home,
+    ]), (error) => {
+      const response = JSON.parse(error.stderr);
+      assert.equal(error.code, 1);
+      assert.equal(response.error, 'credential_unavailable');
+      assert.match(response.explanation, guidance);
+      return true;
+    });
+    assert.equal(service.state.requests.length, callsBeforeRefusal);
+    await checkNoFallback();
+    await active.close(); active = null;
+  }
+  deviceRefusal = undefined;
   active = await open();
   const stored = JSON.parse(readFileSync(join(home, 'identity/device.json')));
   assert.equal(stored.device_id, binding.device_id);

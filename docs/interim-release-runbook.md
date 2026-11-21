@@ -106,6 +106,10 @@ paths, as `_agent-bot-hq` on macOS or `agent-bot-hq` on Linux.
    authenticated, successful reply. Later checks use
    `node hq/main.mjs machine status --socket PATH`. A different key is refused.
 
+Machine v0.12.4 supports signed status and predates the `hq-device` operation.
+If HQ reports `MM_DAEMON_VERB_UNKNOWN` for device signing, keep the existing
+pairing and use a Machine release that supports `hq-device` before enrollment.
+
 Once the daemon pin is saved, the dedicated HQ role can retrieve the prefix
 administrator's saved members plans from a Machine with paired plan lookup.
 List up to 64 plan IDs per page. If the reply includes `next_after`, pass

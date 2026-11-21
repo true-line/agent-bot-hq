@@ -157,6 +157,8 @@ function authenticatedResponse(line, nonce, pinned, verb) {
     if (verb === 'hq-device') {
       if (r.diagnostic === 'MM_DAEMON_UNKNOWN_KEY') {
         error = new HostError('credential_unavailable', "Machine could not verify this account's pairing for device signing (MM_DAEMON_UNKNOWN_KEY). Check its pairing with the prefix owner.");
+      } else if (r.diagnostic === 'MM_DAEMON_VERB_UNKNOWN') {
+        error = new HostError('credential_unavailable', 'The paired Machine daemon does not support HQ device signing (MM_DAEMON_VERB_UNKNOWN). Install a compatible Machine version before using device signing.');
       } else if (r.diagnostic === 'MM_DAEMON_PEER_REFUSED' || r.diagnostic === 'MM_DAEMON_CALLER_REFUSED') {
         error = new HostError('credential_unavailable', `Machine refused this HQ account's device request (${r.diagnostic}). Ask the prefix owner to check its pairing.`);
       }
