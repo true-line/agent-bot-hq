@@ -176,6 +176,18 @@ verified, leave the service running with its pairing, signer files, enrollment
 records and prior release intact. An absent local enrollment record cannot
 establish that the device was never enrolled. Verify its enrollment history
 with the issuer before seeking an explicitly authorized custody transition.
+
+Sign in to the original issuer as the device owner. Compare the public
+`thumbprint` in the retained `signer/pin.json` with `thumbprint` on a device
+returned by `GET /api/web/devices`. If the original device ID is known,
+check `GET /api/web/devices/{id}` as well. A matching RFC 7638 thumbprint
+confirms that key was enrolled.
+
+The fleet list omits expired devices. A retained detail record can still
+identify an expired device, but revocation removes the key metadata and
+cleanup can remove the record entirely. An empty list, a detail without
+a thumbprint, or a 404 leaves enrollment history unknown.
+
 Track that work in [the existing custody transition issue](https://github.com/true-line/agent-bot-hq/issues/188).
 
 Run the upgrade-capable HQ CLI as the existing dedicated role. Use the saved
