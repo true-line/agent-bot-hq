@@ -31,6 +31,11 @@ test('Darwin release uses the pinned source and independently verifies its stage
       rmSync(join(tree, 'vendor/plugins'), { recursive: true });
       assert.throws(() => stageDarwinBroker(tree, work), /differs from its reviewed pin/);
       assert.deepEqual(readFileSync(policy), before);
+      const wrongCommit = { ...pin, source_commit: '0'.repeat(40) };
+      writeFileSync(join(tree, 'governance/darwin-broker.json'), JSON.stringify(wrongCommit));
+      rmSync(work, { recursive: true }); mkdirSync(work);
+      rmSync(join(tree, 'vendor/plugins'), { recursive: true });
+      assert.throws(() => stageDarwinBroker(tree, work), /release tag does not name the pinned source commit/);
     } finally {
       if (original === undefined) delete process.env.HQ_COMMS_REPO; else process.env.HQ_COMMS_REPO = original;
     }
