@@ -21,6 +21,9 @@
 // common/v1 error response. A host code has no registry entry, so it goes in
 // `host_refusal` and never in a contract record. soul-contracts does not yet
 // specify the hq/v1 request envelope; this framing is HQ's until it does.
+// A member may opt in with `response: 'stream'` on a request. A trusted
+// consumer can then emit bounded `{id, ok: true, chunk}` replies followed
+// by the ordinary result (the producer's terminal value) or a refusal.
 //
 // Takeover (§9 row 16b). A listener created with `takeover: true` (only the
 // admission socket) lets the FIRST request on a connection hand the
@@ -34,11 +37,15 @@
 // internal error and is cancelled.
 import { connect as netConnect, createServer } from 'node:net';
 import { chmodSync, existsSync, lstatSync, unlinkSync } from 'node:fs';
+import { abortable, brokerStreamProducer, MODEL_CATALOG, RESPONSES, validDelta, validUsage } from '../sdk/broker-stream.mjs';
 import { HostError, REGISTRY_CODES } from '../sdk/errors.mjs';
 import { redact } from '../sdk/services.mjs';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
 
 export const MAX_LINE_BYTES = 1 << 20;
+const MAX_STREAM_BYTES = 8 * MAX_LINE_BYTES;
+const MAX_STREAM_CHUNKS = 4096;
+const STREAM_TIMEOUT_MS = 120_000;
 const REQUEST_KEYS = new Set(['id', 'op', 'payload']);
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
@@ -111,7 +118,7 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
   }
 
   // `offer`: this request may take the connection over.
-  async function handle(line, session, offer = false) {
+  async function handle(line, session, offer = false, startStream) {
     let req;
     try {
       req = parseStrict(line);
@@ -120,17 +127,28 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     }
     if (!req || typeof req !== 'object' || Array.isArray(req)) return respondError(new HostError('host.invalid_request', 'a request is a JSON object'), null);
     const id = typeof req.id === 'string' || Number.isSafeInteger(req.id) ? req.id : null;
-    const extra = Object.keys(req).filter((k) => !REQUEST_KEYS.has(k));
+    const stream = auth === 'member' && req.response === 'stream';
+    const extra = Object.keys(req).filter((k) => !REQUEST_KEYS.has(k) && !(stream && k === 'response'));
     if (extra.length) return respondError(new HostError('host.invalid_request', `unknown request field ${extra[0]}`), id);
     if (typeof req.op !== 'string') return respondError(new HostError('host.invalid_request', 'a request names its op'), id);
+    if (stream && id === null) return respondError(new HostError('host.invalid_request', 'a stream request needs an id'), id);
+    if (stream && req.op !== RESPONSES) return respondError(new HostError('host.invalid_request', 'only inference responses support streaming'), id);
+    if (auth === 'member' && req.op === RESPONSES && !stream) return respondError(new HostError('host.invalid_request', 'inference responses need a stream request'), id);
+    const inference = auth === 'member' && (stream || req.op === MODEL_CATALOG);
     try {
-      const result = await dispatch(req.op, { auth, payload: req.payload, session, ...(offer ? { takeover: true } : {}) });
+      const deliver = () => dispatch(req.op, { auth, payload: req.payload, session, ...(offer ? { takeover: true } : {}) });
+      const result = inference ? await abortable(deliver, startStream()) : await deliver();
       const t = takeoverOf(result);
       if (t) {
         if (offer) return { id, takeover: t };
         try { t.cancel(); } catch { /* the refusal below is the answer */ }
         if (!canTakeOver) throw new Error(`${req.op} tried to take over a ${auth} connection`);
         return respondError(new HostError('host.invalid_request', `${req.op} must be the first and only request on a new connection`), id, req.op);
+      }
+      const produce = brokerStreamProducer(result);
+      if (produce) {
+        if (!inference) throw new HostError('host.invalid_request', 'inference requires the member operation');
+        return { id, produce, op: req.op, stream };
       }
       return { id, ok: true, result: result === undefined ? null : result };
     } catch (e) {
@@ -163,6 +181,67 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     let first = false; // the first request of a takeover listener is in flight
     let taken = false;
     const send = (obj) => { if (!socket.destroyed) socket.write(`${JSON.stringify(obj)}\n`); };
+    async function sendReply(line) {
+      let controller;
+      const disconnect = () => controller.abort(new Error('member disconnected'));
+      let timer;
+      const startStream = () => {
+        controller = new AbortController();
+        if (socket.destroyed || socket.writableEnded) disconnect();
+        socket.once('close', disconnect);
+        timer = setTimeout(() => controller.abort(new HostError('host.timeout', 'member stream expired')), STREAM_TIMEOUT_MS);
+        timer.unref();
+        return controller.signal;
+      };
+      let iterator;
+      let done = false;
+      let writing = false;
+      let bytes = 0;
+      let chunks = 0;
+      let reply;
+      try {
+        reply = await handle(line, session, false, startStream);
+        if (!reply.produce) { send(reply); return; }
+        const { signal } = controller;
+        signal.throwIfAborted();
+        const { id, produce } = reply;
+        if (!reply.stream) {
+          const result = await abortable(() => produce(signal), signal);
+          const resultFrame = { id, ok: true, result };
+          if (Buffer.byteLength(JSON.stringify(resultFrame)) > MAX_LINE_BYTES) throw new HostError('host.internal', 'inference catalog exceeded its byte limit');
+          send(resultFrame);
+          return;
+        }
+        iterator = produce(signal)[Symbol.asyncIterator]();
+        while (true) {
+          const item = await abortable(() => iterator.next(), signal);
+          done = item.done === true;
+          if (!done && ++chunks > MAX_STREAM_CHUNKS) throw new HostError('host.invalid_request', 'member stream exceeded its chunk limit');
+          if (done ? !validUsage(item.value) : !validDelta(item.value)) throw new HostError('host.internal', 'invalid inference stream output');
+          const frame = done ? { id, ok: true, result: item.value ?? null } : { id, ok: true, chunk: item.value };
+          const line = `${JSON.stringify(frame)}\n`;
+          const length = Buffer.byteLength(line);
+          bytes += length;
+          if (length > MAX_LINE_BYTES + 1 || bytes > MAX_STREAM_BYTES) throw new HostError('host.invalid_request', 'member stream exceeded its byte limit');
+          writing = true;
+          await abortable(() => new Promise((resolve, reject) => {
+            socket.write(line, (error) => { if (error) reject(error); else resolve(); });
+          }), signal);
+          writing = false;
+          if (done) return;
+        }
+      } catch (error) {
+        // A blocked write cannot deliver a refusal either. Close instead of
+        // accumulating writes behind a peer that stopped reading.
+        if (writing) socket.destroy();
+        else if (!socket.destroyed && !socket.writableEnded) send(respondError(error, reply?.id ?? null, reply?.op));
+      } finally {
+        clearTimeout(timer);
+        socket.off('close', disconnect);
+        controller?.abort();
+        if (!done && iterator?.return) Promise.resolve().then(() => iterator.return()).catch(() => {});
+      }
+    }
     const oversize = () => {
       send(respondError(new HostError('host.invalid_request', `request line exceeds ${MAX_LINE_BYTES} bytes`), null));
       socket.end();
@@ -219,7 +298,7 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
           }, (e) => { first = false; send(respondError(e, null)); pump(); });
           return;
         }
-        queue = queue.then(() => handle(line, session)).then(send, (e) => send(respondError(e, null)));
+        queue = queue.then(() => sendReply(line)).catch((e) => send(respondError(e, null)));
       }
     }
     function onData(chunk) {
