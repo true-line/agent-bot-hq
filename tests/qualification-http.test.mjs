@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
-import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { bindProof } from '../sdk/member-session.mjs';
@@ -63,8 +63,14 @@ test('stock Messages HTTP reaches only a bound, one-use HQ qualification consume
   } }) };
   const bridge = await startClaudeQualificationHttp({ socketPath: join(dir, 'broker.sock'), peerUid: process.getuid(), memberSession, plan: { model: MODEL, prompt: PROMPT } });
   t.after(() => bridge.close());
-  const wrongPeerBridge = await startClaudeQualificationHttp({ socketPath: join(dir, 'wrong-peer.sock'), peerUid: process.getuid() + 1, memberSession, plan: { model: MODEL, prompt: PROMPT } });
+  const shared = join(dir, 'shared');
+  mkdirSync(shared);
+  chmodSync(shared, 0o2750);
+  const wrongPeerBridge = await startClaudeQualificationHttp({ socketPath: join(shared, 'broker.sock'), peerUid: process.getuid() + 1,
+    groupGid: process.getgid(), memberSession, plan: { model: MODEL, prompt: PROMPT } });
   t.after(() => wrongPeerBridge.close());
+  assert.equal(statSync(wrongPeerBridge.socketPath).mode & 0o777, 0o660);
+  assert.equal(statSync(wrongPeerBridge.socketPath).gid, process.getgid());
   assert.equal((await http(wrongPeerBridge.socketPath, 'GET', '/api/claude_code/policy_limits')).status, 403);
   const policy = await http(bridge.socketPath, 'GET', '/api/claude_code/policy_limits');
   assert.equal(policy.status, 200);
