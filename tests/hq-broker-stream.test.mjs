@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -27,6 +28,7 @@ const code = (want) => (error) => error.code === want;
 
 async function setup(produce, home, beforeAuthorize) {
   const grants = new Map();
+  let budgets;
   const consumer = definePlugin({
     name: 'fixture-inference',
     version: '0.1.0',
@@ -34,6 +36,7 @@ async function setup(produce, home, beforeAuthorize) {
     requires: { 'hq-admission': '^0.1.0' },
     services: ['budgets', 'store'],
     async init(ctx) {
+      budgets = ctx.services.budgets;
       const authorize = (payload, { runtime_id }) => ctx.deps['hq-admission'].withBoundRuntime(runtime_id, (rt) => {
         const grant = grants.get(runtime_id);
         if (!grant || !rt.handle || rt.handle !== payload.handle || grant.destination !== payload.destination
@@ -54,7 +57,7 @@ async function setup(produce, home, beforeAuthorize) {
   });
   const t = await startHQ({ home, plugins: [referenceBroker(), ...(produce ? [consumer] : [])] });
   const entry = await t.entry();
-  const { result: admission } = await entry.request('Hello', hello(home ? { request_id: 'req_after_restart' } : {}));
+  const { result: admission } = await entry.request('Hello', hello(home ? { request_id: `req_${randomUUID()}` } : {}));
   const runtime = admission.admitted_runtimes[0];
   const { result: equip } = await entry.request('Equip', { runtime_id: runtime.runtime_id });
   assert.deepEqual(equip.approved_destinations, []);
@@ -77,19 +80,56 @@ async function setup(produce, home, beforeAuthorize) {
   }
   const scope = { handle: equip.grant_handles[0].handle, destination: 'fixture-provider', task_id: 'task_fixture', operation_id: 'op_fixture' };
   const request = { ...scope, model: 'fixture-codex', input: 'two deltas' };
+  const soul = hello().soul_id;
+  const budgetTable = '@hq\0inference_budget';
   return {
     ...await openClient(), scope, request, home: t.home, openClient,
     revoke() { revokeDevice(t.hq.core); },
     revocationHooks() { return t.hq.core.onDeviceRevoked.length; },
     approve(amount) {
-      t.hq.core.budgets.set(hello().soul_id, { ceilings: { working: amount }, reserved: new Map() });
+      t.hq.core.budgets.set(soul, { ceilings: { working: amount, maintenance: amount }, reserved: new Map() });
       grants.set(runtime.runtime_id, { destination: scope.destination, task_id: scope.task_id, models: [request.model], maxCost: 1 });
     },
-    reservations() { return [...t.hq.core.budgets.get(hello().soul_id).reserved.values()]; },
+    remaining: (pool) => budgets.remaining({ soul, pool }),
+    reserveUnary: (amount, pool) => budgets.reserve({ soul, amount, pool }),
+    releaseUnary: (reservation) => budgets.release(reservation),
+    settleUnary: (reservation, cost) => budgets.settle(reservation, cost),
     records() {
       const stored = JSON.parse(readFileSync(join(t.home, 'store.json'), 'utf8'));
-      const table = stored.tables.find(([name]) => name === 'fixture-inference\0inference_operations');
+      const table = stored.tables.find(([name]) => name === budgetTable);
       return table?.[1].map(([, record]) => record) ?? [];
+    },
+    failNextWrite(outcome) {
+      const core = t.hq.core;
+      const persist = core.persist;
+      core.persist = async () => {
+        const rows = core.tables.get(budgetTable);
+        if ([...(rows?.values() ?? [])].some((record) => record.outcome === outcome)) {
+          core.persist = persist;
+          throw new Error('injected budget store failure');
+        }
+        return persist();
+      };
+    },
+    holdNextReservationWrite() {
+      const written = deferred();
+      const release = deferred();
+      const core = t.hq.core;
+      const persist = core.persist;
+      core.persist = async () => {
+        core.persist = persist;
+        await persist();
+        written.resolve();
+        await release.promise;
+      };
+      return { written: written.promise, release: release.resolve };
+    },
+    async legacyRecord(operationId, row, plugin = 'fixture-inference') {
+      const core = t.hq.core;
+      const key = `${plugin}\0inference_operations`;
+      if (!core.tables.has(key)) core.tables.set(key, new Map());
+      core.tables.get(key).set(JSON.stringify([soul, scope.task_id, operationId]), row);
+      await core.persist();
     },
     async close(options) { for (const client of clients) client.destroy(); await t.done(options); },
   };
@@ -103,6 +143,10 @@ test('the member socket has no inference operations without a registered provide
     await assert.rejects(t.client.requestResponses(t.request, () => {}), code('host.unknown_kind'));
     assert.deepEqual(t.records(), []);
   } finally { await t.close(); }
+});
+
+test('the inference ledger namespace cannot be a plugin name', () => {
+  assert.throws(() => definePlugin({ name: '@hq', hostApi: 1, version: '0.1.0', init() {} }), code('host.invalid_manifest'));
 });
 
 test('repeated aborted authorization disposes the device hooks for both registered operations', { timeout: 5000 }, async () => {
@@ -133,7 +177,7 @@ test('repeated aborted authorization disposes the device hooks for both register
       assert.equal(t.revocationHooks(), baseline);
     }
     assert.deepEqual(t.records(), []);
-    assert.deepEqual(t.reservations(), []);
+    assert.equal(await t.remaining(), 1);
     block = false;
     await t.bind();
     assert.deepEqual(await t.client.request(MODEL_CATALOG, t.scope), { models: ['fixture-codex'] });
@@ -178,8 +222,7 @@ test('typed member client enforces binding and live scope, delivers incremental 
     assert.deepEqual(chunks, [delta('one'), delta('two')]);
     assert.equal(t.records()[0].outcome, 'completed');
     assert.equal(t.records()[0].actual_cost, terminal.actualCost);
-    assert.equal(t.reservations()[0].amount, terminal.actualCost);
-    assert.equal(t.reservations()[0].settled, true);
+    assert.equal(await t.remaining(), 1 - terminal.actualCost);
     await assert.rejects(t.client.requestResponses({ ...t.request, operation_id: 'unfunded_op' }, () => {}), code('budget_exhausted'));
     assert.equal(opened, 1);
   } finally {
@@ -195,7 +238,7 @@ test('oversized data leaves its operation unknown and retains the reservation', 
     t.approve(2);
     await assert.rejects(t.client.requestResponses(t.request, () => {}), /byte limit/);
     assert.equal(t.records()[0].outcome, 'outcome_unknown');
-    assert.equal(t.reservations()[0].amount, 1);
+    assert.equal(await t.remaining(), 1);
     await assert.rejects(t.client.requestResponses(t.request, () => {}), /reconcile before retrying/);
   } finally { await t.close(); }
 });
@@ -204,18 +247,162 @@ test('restart preserves uncertainty and refuses to redispatch the same operation
   const t = await setup(async function* () { yield delta('x'.repeat(MAX_LINE_BYTES)); return terminal; });
   try {
     await t.bind();
-    t.approve(2);
+    t.approve(1.5);
     await assert.rejects(t.client.requestResponses(t.request, () => {}), /byte limit/);
   } finally { await t.close({ keep: true }); }
   let opened = 0;
   const restart = await setup(async function* () { opened++; return terminal; }, t.home);
   try {
     await restart.bind();
-    restart.approve(2);
+    restart.approve(1.5);
     assert.equal(restart.records()[0].outcome, 'outcome_unknown');
+    assert.equal(await restart.remaining(), 0.5);
+    await assert.rejects(restart.client.requestResponses({ ...restart.request, operation_id: 'different_op' }, () => {}), code('budget_exhausted'));
     await assert.rejects(restart.client.requestResponses(restart.request, () => {}), /reconcile before retrying/);
     assert.equal(opened, 0);
   } finally { await restart.close(); }
+});
+
+test('two authorized turns charge one working ceiling across restart', { timeout: 5000 }, async () => {
+  const first = await setup(async function* () { return terminal; });
+  try {
+    await first.bind();
+    first.approve(1.5);
+    assert.deepEqual(await first.client.requestResponses(first.request, () => {}), { usage: terminal.usage });
+    assert.equal(await first.remaining(), 1.25);
+    const legacy = await first.reserveUnary(0.5);
+    await first.settleUnary(legacy, 0.5);
+    assert.equal(await first.remaining(), 0.75);
+  } finally { await first.close({ keep: true }); }
+
+  const second = await setup(async function* () { return { ...terminal, actualCost: 0.5 }; }, first.home);
+  try {
+    await second.bind();
+    second.approve(1.5);
+    assert.equal(await second.remaining(), 1.25);
+    assert.deepEqual(await second.client.requestResponses({ ...second.request, operation_id: 'second_turn' }, () => {}), { usage: terminal.usage });
+    assert.equal(await second.remaining(), 0.75);
+    assert.deepEqual(second.records().map(({ outcome, actual_cost }) => [outcome, actual_cost]), [['completed', 0.25], ['completed', 0.5]]);
+    await assert.rejects(second.client.requestResponses({ ...second.request, operation_id: 'third_turn' }, () => {}), code('budget_exhausted'));
+    await assert.rejects(second.reserveUnary(1), code('budget_exhausted'));
+    assert.equal(await second.remaining('maintenance'), 1.5);
+  } finally { await second.close(); }
+});
+
+test('overlapping bound sockets and unary reservations share the ceiling without double dispatch', { timeout: 5000 }, async () => {
+  const entered = deferred();
+  const finish = deferred();
+  let opened = 0;
+  const t = await setup(async function* () {
+    opened++;
+    yield delta('started');
+    await finish.promise;
+    return terminal;
+  });
+  try {
+    await t.bind();
+    const other = await t.openClient();
+    await other.bind();
+    t.approve(1);
+    const unary = await t.reserveUnary(0.25);
+    await assert.rejects(t.client.requestResponses(t.request, () => {}), code('budget_exhausted'));
+    assert.equal(opened, 0);
+    await t.releaseUnary(unary);
+    const pending = t.client.requestResponses(t.request, () => { entered.resolve(); });
+    await Promise.race([entered.promise, pending]);
+    await assert.rejects(other.client.requestResponses(t.request, () => {}), /reconcile before retrying/);
+    await assert.rejects(other.client.requestResponses({ ...t.request, operation_id: 'another_turn' }, () => {}), code('budget_exhausted'));
+    await assert.rejects(t.reserveUnary(0.25), code('budget_exhausted'));
+    assert.equal(opened, 1);
+    finish.resolve();
+    await pending;
+  } finally { finish.resolve(); await t.close(); }
+});
+
+test('a failed reservation write does not dispatch and a failed settlement retains the durable hold', { timeout: 5000 }, async () => {
+  let opened = 0;
+  const t = await setup(async function* () { opened++; return terminal; });
+  try {
+    await t.bind();
+    t.approve(1);
+    t.failNextWrite('outcome_unknown');
+    await assert.rejects(t.client.requestResponses(t.request, () => {}), code('host.internal'));
+    assert.equal(opened, 0);
+    assert.deepEqual(t.records(), []);
+    assert.equal(await t.remaining(), 1);
+
+    t.failNextWrite('completed');
+    await assert.rejects(t.client.requestResponses(t.request, () => {}), code('host.internal'));
+    assert.equal(opened, 1);
+    assert.equal(t.records()[0].outcome, 'outcome_unknown');
+    assert.equal(t.records()[0].reserved_cost, 1);
+    assert.equal(await t.remaining(), 0);
+    await assert.rejects(t.client.requestResponses(t.request, () => {}), /reconcile before retrying/);
+    await assert.rejects(t.client.requestResponses({ ...t.request, operation_id: 'another_turn' }, () => {}), code('budget_exhausted'));
+    assert.equal(opened, 1);
+  } finally { await t.close(); }
+});
+
+test('cancelling a committed reservation before dispatch releases its hold', { timeout: 5000 }, async () => {
+  let providerSignal;
+  const t = await setup(async function* () { assert.fail('producer should not open'); }, undefined, (signal) => { providerSignal = signal; });
+  await t.bind();
+  t.approve(1);
+  const hold = t.holdNextReservationWrite();
+  try {
+    const response = t.client.requestResponses(t.request, () => {});
+    await Promise.race([hold.written, response]);
+    assert.equal(t.records()[0].outcome, 'outcome_unknown');
+    const aborted = deferred();
+    providerSignal.addEventListener('abort', aborted.resolve, { once: true });
+    t.abort();
+    await assert.rejects(response, /member cancelled/);
+    await aborted.promise;
+    hold.release();
+    for (let i = 0; i < 100 && t.records().length; i++) await setImmediate();
+    assert.deepEqual(t.records(), []);
+    assert.equal(await t.remaining(), 1);
+  } finally { hold.release(); await t.close(); }
+});
+
+test('verified spend above the reservation is charged and restricts subsequent requests', { timeout: 5000 }, async () => {
+  const t = await setup(async function* () { return { ...terminal, actualCost: 1.25 }; });
+  try {
+    await t.bind();
+    t.approve(1.5);
+    await t.client.requestResponses(t.request, () => {});
+    assert.equal(t.records()[0].actual_cost, 1.25);
+    assert.equal(await t.remaining(), 0.25);
+    await assert.rejects(t.client.requestResponses({ ...t.request, operation_id: 'another_turn' }, () => {}), code('budget_exhausted'));
+  } finally { await t.close(); }
+});
+
+test('only the registered provider’s earlier draft records count after restart', { timeout: 5000 }, async () => {
+  const first = await setup(async function* () { assert.fail('producer should not open'); });
+  try {
+    await first.legacyRecord('old_completed', { outcome: 'completed', actual_cost: 0.75 });
+    await first.legacyRecord(first.request.operation_id, { outcome: 'outcome_unknown' }, 'unrelated-plugin');
+  } finally { await first.close({ keep: true }); }
+
+  const next = await setup(async function* () { return terminal; }, first.home);
+  try {
+    await next.bind();
+    next.approve(2);
+    assert.equal(await next.remaining(), 1.25);
+    await assert.rejects(next.client.requestResponses({ ...next.request, operation_id: 'old_completed' }, () => {}), /reconcile before retrying/);
+    await next.legacyRecord('old_unknown', { outcome: 'outcome_unknown' });
+    // The loaded historical view is stable during this run.
+    assert.deepEqual(await next.client.requestResponses(next.request, () => {}), { usage: terminal.usage });
+    assert.equal(await next.remaining(), 1);
+  } finally { await next.close({ keep: true }); }
+
+  const last = await setup(async function* () { assert.fail('producer should not open'); }, first.home);
+  try {
+    await last.bind();
+    last.approve(2);
+    await assert.rejects(last.client.requestResponses({ ...last.request, operation_id: 'fresh_operation' }, () => {}), /accounting requires reconciliation/);
+    assert.equal(await last.remaining('maintenance'), 2);
+  } finally { await last.close(); }
 });
 
 test('client abort destroys active producer I/O and preserves the unknown operation', { timeout: 5000 }, async () => {
@@ -238,7 +425,7 @@ test('client abort destroys active producer I/O and preserves the unknown operat
     await destroyed.promise;
     assert.equal(io.destroyed, true);
     assert.equal(t.records()[0].outcome, 'outcome_unknown');
-    assert.equal(t.reservations()[0].settled, undefined);
+    assert.equal(await t.remaining(), 0);
   } finally { await t.close(); }
 });
 
@@ -259,7 +446,7 @@ test('device revocation returns a refusal and records uncertainty even when a pr
     t.revoke();
     await assert.rejects(response, code('credential_unavailable'));
     assert.equal(t.records()[0].outcome, 'outcome_unknown');
-    assert.equal(t.reservations()[0].settled, undefined);
+    assert.equal(await t.remaining(), 0);
     await assert.rejects(t.client.request(MODEL_CATALOG, t.scope), code('credential_unavailable'));
   } finally {
     blocked.resolve();

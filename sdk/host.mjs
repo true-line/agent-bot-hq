@@ -19,7 +19,7 @@ import { fail, HostError } from './errors.mjs';
 import { HQ_OPERATIONS, SAFE_MODE_OPERATIONS, ADMISSION_OPERATIONS } from './operations.mjs';
 import { HOST_API, supportedHostApis, validateManifest } from './plugin.mjs';
 import { satisfies } from './semver.mjs';
-import { bindServices, createCore, dropSubscriptions, dropTokens, DEVICE_STATES, pushReceipt, revokeDevice } from './services.mjs';
+import { bindServices, createCore, dropSubscriptions, dropTokens, DEVICE_STATES, inferenceBudgetService, loadLegacyInferenceBudget, pushReceipt, revokeDevice } from './services.mjs';
 import { parseStrict } from './wire/strict-json.mjs';
 
 const KIND = /^[a-z][a-z0-9_.-]{0,63}$/;
@@ -171,6 +171,7 @@ export function createHost({
           fn(responses, 'inference responses');
           const { budgets, store } = ctx.services;
           if (!budgets || !store) fail('host.invalid_request', `${name}: inference needs budgets and store services`);
+          const accounting = inferenceBudgetService(core, name);
           const checkDevice = () => {
             if (core.deviceRevoked) fail('credential_unavailable', 'the HQ device is revoked');
           };
@@ -209,7 +210,7 @@ export function createHost({
             return brokerStream(async function* (signal) {
               const device = deviceSignal(signal);
               try {
-                return yield* runInference({ budgets, store, authorize, responses, request: payload, caller, signal: device.signal });
+                return yield* runInference({ accounting, authorize, responses, request: payload, caller, signal: device.signal });
               } finally { device.close(); }
             });
           } }, 'message kind', lease);
@@ -347,6 +348,8 @@ export function createHost({
 
     // 3–4. Plugins: init, then start, in dependency order.
     for (const n of order) if (states.get(n).state === 'resolved') await initPlugin(n);
+    const inferenceOwner = registries.kinds.get(RESPONSES)?.plugin;
+    loadLegacyInferenceBudget(core, states.get(inferenceOwner)?.state === 'initialized' ? inferenceOwner : undefined);
     for (const n of order) if (states.get(n).state === 'initialized') await startPlugin(n);
     // 5. hq/v1 admissions open.
     mode = device === 'revoked' ? 'device_revoked' : 'running';
