@@ -37,7 +37,7 @@
 // internal error and is cancelled.
 import { connect as netConnect, createServer } from 'node:net';
 import { chmodSync, existsSync, lstatSync, unlinkSync } from 'node:fs';
-import { abortable, brokerStreamProducer, MODEL_CATALOG, RESPONSES, validDelta, validUsage } from '../sdk/broker-stream.mjs';
+import { abortable, brokerStreamProducer, MODEL_CATALOG, RESPONSES, validOutputChunk, validOutputTerminal } from '../sdk/broker-stream.mjs';
 import { HostError, REGISTRY_CODES } from '../sdk/errors.mjs';
 import { redact } from '../sdk/services.mjs';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
@@ -217,7 +217,7 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
           const item = await abortable(() => iterator.next(), signal);
           done = item.done === true;
           if (!done && ++chunks > MAX_STREAM_CHUNKS) throw new HostError('host.invalid_request', 'member stream exceeded its chunk limit');
-          if (done ? !validUsage(item.value) : !validDelta(item.value)) throw new HostError('host.internal', 'invalid inference stream output');
+          if (done ? !validOutputTerminal(item.value) : !validOutputChunk(item.value)) throw new HostError('host.internal', 'invalid inference stream output');
           const frame = done ? { id, ok: true, result: item.value ?? null } : { id, ok: true, chunk: item.value };
           const line = `${JSON.stringify(frame)}\n`;
           const length = Buffer.byteLength(line);

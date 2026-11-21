@@ -9,7 +9,7 @@
 // is a message kind. Nothing here holds authority: HQ decides every request.
 import { Socket } from 'node:net';
 import { addAbortSignal } from 'node:stream';
-import { MODEL_CATALOG, RESPONSES, validCatalog, validDelta, validInferenceRequest, validUsage } from './broker-stream.mjs';
+import { MODEL_CATALOG, RESPONSES, inferenceOutput, validCatalog, validInferenceRequest } from './broker-stream.mjs';
 import { parseStrict } from './wire/strict-json.mjs';
 const SCHEMAS = Object.freeze({ hello: 'hq/v1/hello.schema.json', equip: 'hq/v1/equip.schema.json', renewal: 'hq/v1/ready-and-lease-renewal.schema.json', task: 'task/v1/task-record.schema.json', commitment: 'task/v1/task-commitment.schema.json', directive: 'wire/v1/directive-or-query.schema.json', refusal: 'common/v1/error-response.schema.json' });
 import { readLines, writeLine } from './local-socket-lines.mjs';
@@ -72,7 +72,7 @@ export function connectHq(path, { contracts, signal } = {}) {
       if (!msg || typeof msg !== 'object' || Array.isArray(msg) || typeof msg.ok !== 'boolean') return poison('invalid reply envelope');
       const w = pending.get(msg.id);
       if (msg.ok && Object.hasOwn(msg, 'chunk')) {
-        if (!w?.onChunk || Object.keys(msg).length !== 3 || !validDelta(msg.chunk)) return poison('invalid inference chunk');
+        if (!w?.onChunk || Object.keys(msg).length !== 3 || !w.output.chunk(msg.chunk)) return poison('invalid inference chunk');
         try {
           const result = w.onChunk(msg.chunk);
           if (result && typeof result.then === 'function') {
@@ -96,7 +96,7 @@ export function connectHq(path, { contracts, signal } = {}) {
       try {
         if (msg.ok === true) {
           if (w.op === MODEL_CATALOG && !validCatalog(msg.result)) throw new Error('invalid inference catalog');
-          if (w.op === RESPONSES && (!w.onChunk || !validUsage(msg.result))) throw new Error('invalid inference terminal usage');
+          if (w.op === RESPONSES && !w.output?.terminal(msg.result)) throw new Error('invalid inference terminal result');
           if (w.op === 'Hello') check('admission', msg.result, w.payload);
           if (w.op === 'Equip') check('record', SCHEMAS.equip, msg.result);
           if (w.op === 'task.get') check('record', SCHEMAS.task, msg.result?.task);
@@ -137,7 +137,7 @@ export function connectHq(path, { contracts, signal } = {}) {
               if (op === RESPONSES && typeof onChunk !== 'function') throw new TypeError('inference responses need a chunk handler');
             }
           } catch (error) { rej(error); return; }
-          pending.set(id, { op, payload, onChunk, resolve: res, reject: rej });
+          pending.set(id, { op, payload, onChunk, output: onChunk ? inferenceOutput(payload) : undefined, resolve: res, reject: rej });
           writeLine(socket, { id, op, ...(payload === undefined ? {} : { payload }), ...(onChunk ? { response: 'stream' } : {}) });
         });
       }

@@ -51,7 +51,7 @@ async function setup(produce, home, beforeAuthorize) {
           return authorize(payload, caller);
         },
         catalog: (_request, grant) => ({ models: grant.models }),
-        responses: (_request, _grant, signal) => produce(signal),
+        responses: (request, _grant, signal) => produce(signal, request),
       });
     },
   });
@@ -229,6 +229,154 @@ test('typed member client enforces binding and live scope, delivers incremental 
     gate.resolve();
     await t.close();
   }
+});
+
+const readId = 'toolu_fixture_read';
+const readInput = { file_path: '/private/work/fixture.txt' };
+const readStart = { type: 'response.tool_call.start', call_id: readId, name: 'Read' };
+const readArg = (delta, call_id = readId) => ({ type: 'response.tool_call.arguments.delta', call_id, delta });
+function readTurn(scope) {
+  return {
+    ...scope,
+    model: 'fixture-codex',
+    turn: {
+      system: [
+        { type: 'text', text: 'Use the fixture tool.' },
+        { type: 'text', text: 'Return the fixture conclusion.', cache_control: { type: 'ephemeral' } },
+      ],
+      max_output_tokens: 32,
+      tools: [{ name: 'Read', description: 'Read the fixture path.', input_schema: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string', description: 'An absolute path.' },
+          offset: { type: 'number', description: 'Starting line.', minimum: 0 },
+          limit: { type: 'number', description: 'Maximum number of lines.' },
+          pages: { type: 'string', description: 'Page range for documents.' },
+        },
+        required: ['file_path'], additionalProperties: false,
+      } }],
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: 'Read one fixture file.' }, { type: 'text', text: 'Use the specified path.' },
+      ] }],
+    },
+  };
+}
+
+test('two structured requests carry a Read call and matching result through the bound broker', { timeout: 5000 }, async () => {
+  const gate = deferred();
+  const first = deferred();
+  const requests = [];
+  const t = await setup(async function* (_signal, request) {
+    requests.push(request);
+    if (requests.length === 1) {
+      yield readStart;
+      yield readArg('{"file_path":');
+      yield readArg('"/private/work/fixture.txt"}');
+      return { ...terminal, stop_reason: 'tool_use' };
+    }
+    yield delta('file ');
+    await gate.promise;
+    yield delta('read');
+    return { ...terminal, stop_reason: 'end_turn' };
+  });
+  try {
+    const initial = readTurn(t.scope);
+    await assert.rejects(t.client.requestResponses(initial, () => {}), code('caller_mismatch'));
+    await t.bind();
+    await assert.rejects(t.client.requestResponses(initial, () => {}), code('credential_unavailable'));
+    assert.deepEqual(t.records(), []);
+    t.approve(1.25);
+    await assert.rejects(t.client.requestResponses({ ...initial, input: 'mixed modes' }, () => {}), /invalid inference/);
+    await assert.rejects(t.client.requestResponses({
+      ...initial, turn: { ...initial.turn, tools: [{ ...initial.turn.tools[0], name: 'Bash' }] },
+    }, () => {}), /invalid inference/);
+    await assert.rejects(t.client.requestResponses({
+      ...initial, turn: { ...initial.turn, max_output_tokens: 128_001 },
+    }, () => {}), /invalid inference/);
+    const callChunks = [];
+    assert.deepEqual(await t.client.requestResponses(initial, (chunk) => callChunks.push(chunk)),
+      { stop_reason: 'tool_use', usage: terminal.usage });
+    assert.deepEqual(callChunks, [readStart, readArg('{"file_path":'), readArg('"/private/work/fixture.txt"}')]);
+    assert.deepEqual(requests, [initial]);
+    const toolCall = { type: 'tool_use', id: callChunks[0].call_id, name: callChunks[0].name,
+      input: JSON.parse(callChunks.slice(1).map(({ delta }) => delta).join('')) };
+    const continuation = {
+      ...initial, operation_id: 'op_fixture_continue',
+      turn: { ...initial.turn, messages: [
+        ...initial.turn.messages,
+        { role: 'assistant', content: [toolCall] },
+        { role: 'user', content: [
+          { type: 'tool_result', tool_use_id: toolCall.id, content: 'private fixture marker', is_error: false },
+        ] },
+      ] },
+    };
+    const mismatched = structuredClone(continuation);
+    mismatched.turn.messages[2].content[0].tool_use_id = 'toolu_other';
+    await assert.rejects(t.client.requestResponses(mismatched, () => {}), /invalid inference/);
+    assert.equal(await t.remaining(), 1);
+    const chunks = [];
+    const next = t.client.requestResponses(continuation, (chunk) => {
+      chunks.push(chunk);
+      first.resolve();
+    });
+    await Promise.race([first.promise, next]);
+    assert.deepEqual(chunks, [delta('file ')]);
+    assert.deepEqual(toolCall.input, readInput);
+    assert.deepEqual(requests, [initial, continuation]);
+    assert.deepEqual(t.records().map(({ outcome }) => outcome), ['completed', 'outcome_unknown']);
+    gate.resolve();
+    assert.deepEqual(await next, { stop_reason: 'end_turn', usage: terminal.usage });
+    assert.deepEqual(chunks, [delta('file '), delta('read')]);
+    assert.deepEqual(t.records().map(({ outcome, actual_cost }) => [outcome, actual_cost]), [
+      ['completed', terminal.actualCost], ['completed', terminal.actualCost],
+    ]);
+    assert.equal(await t.remaining(), 0.75);
+    await assert.rejects(t.client.requestResponses(continuation, () => {}), code('credential_unavailable'));
+    assert.equal(requests.length, 2);
+  } finally {
+    gate.resolve();
+    await t.close();
+  }
+});
+
+test('an empty Read result is a valid structured continuation', { timeout: 5000 }, async () => {
+  const t = await setup(async function* (_signal, request) {
+    assert.equal(request.turn.messages[2].content[0].content, '');
+    yield delta('empty file');
+    return { ...terminal, stop_reason: 'end_turn' };
+  });
+  try {
+    await t.bind();
+    t.approve(1);
+    const request = readTurn(t.scope);
+    request.turn.messages.push(
+      { role: 'assistant', content: [{ type: 'tool_use', id: readId, name: 'Read', input: readInput }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: readId, content: '' }] },
+    );
+    const chunks = [];
+    assert.deepEqual(await t.client.requestResponses(request, (chunk) => chunks.push(chunk)),
+      { stop_reason: 'end_turn', usage: terminal.usage });
+    assert.deepEqual(chunks, [delta('empty file')]);
+    assert.equal(t.records()[0].outcome, 'completed');
+  } finally { await t.close(); }
+});
+
+test('incoherent tool output fails with the existing unknown billing hold', { timeout: 5000 }, async () => {
+  const t = await setup(async function* (_signal, request) {
+    if (request.operation_id === 'op_mixed_output') yield delta('unrepresented transcript text');
+    yield readStart;
+    yield readArg('{"file_path":"first","file_path":"duplicate"}');
+    return { ...terminal, stop_reason: 'tool_use' };
+  });
+  try {
+    await t.bind();
+    t.approve(2);
+    await assert.rejects(t.client.requestResponses(readTurn(t.scope), () => {}), code('host.internal'));
+    const mixed = readTurn({ ...t.scope, operation_id: 'op_mixed_output' });
+    await assert.rejects(t.client.requestResponses(mixed, () => {}), code('host.internal'));
+    assert.deepEqual(t.records().map(({ outcome }) => outcome), ['outcome_unknown', 'outcome_unknown']);
+    assert.equal(await t.remaining(), 0);
+  } finally { await t.close(); }
 });
 
 test('oversized data leaves its operation unknown and retains the reservation', { timeout: 5000 }, async () => {

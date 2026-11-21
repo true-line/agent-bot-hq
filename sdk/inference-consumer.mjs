@@ -1,9 +1,10 @@
 import { fail } from './errors.mjs';
-import { abortable, validDelta, validUsage } from './broker-stream.mjs';
+import { abortable, inferenceOutput } from './broker-stream.mjs';
 
 // The registered provider adapter supplies authority from HQ and a trusted
 // producer. The wire request never supplies a charge limit or credentials.
 export async function* runInference({ accounting, authorize, responses, request, caller, signal }) {
+  const output = inferenceOutput(request);
   const grant = await abortable(() => authorize(request, caller, signal), signal);
   signal.throwIfAborted();
   if (typeof grant?.soul !== 'string' || !grant.soul.length || !Number.isFinite(grant.maxCost) || grant.maxCost < 0) {
@@ -22,13 +23,16 @@ export async function* runInference({ accounting, authorize, responses, request,
       const event = await abortable(() => producer.next(), signal);
       if (event.done) {
         finished = true;
-        const { usage, actualCost } = event.value ?? {};
-        if (!validUsage({ usage }) || !Number.isFinite(actualCost) || actualCost < 0) fail('host.internal', 'inference completed without measured usage and cost');
-        await accounting.settle(claim, usage, actualCost);
-        return { usage };
+        const { actualCost, stop_reason, usage } = event.value ?? {};
+        const result = request.turn ? { stop_reason, usage } : { usage };
+        if (!output.terminal(result) || !Number.isFinite(actualCost) || actualCost < 0) {
+          fail('host.internal', 'inference completed without a valid stop, measured usage and cost');
+        }
+        await accounting.settle(claim, result.usage, actualCost);
+        return result;
       }
       signal.throwIfAborted();
-      if (!validDelta(event.value)) fail('host.internal', 'invalid inference delta');
+      if (!output.chunk(event.value)) fail('host.internal', 'invalid inference chunk');
       yield event.value;
     }
   } finally {
