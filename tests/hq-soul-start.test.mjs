@@ -25,7 +25,7 @@ function fakeMachineLaunch(calls, overrides = {}, completion = { exit_code: 0, s
       const installationId = extra.installationId ?? 'inst_fixture';
       const directory = join('/var/tmp', 'hq-runner-fixture', installationId);
       const reservation = { ...request, uid: 61001, gid: 61001,
-        soulId: SOUL, installationId, definitionDigest: DIGEST, packageDigest: DIGEST,
+        soulId: SOUL, installationId, definitionDigest: DIGEST, packageDigest: DIGEST.slice(7),
         runnerPackagePath: join(directory, 'package'),
         endpoint: { directory, socketPath: join(directory, 'admission.sock'), ownerUid: process.getuid(),
           groupGid: 61001, dirMode: 0o2750, socketMode: 0o660, peerUid: 61001 },
@@ -112,6 +112,7 @@ test('only the owner can request a separate Machine runner; the ACP stream stops
     assert.equal(first.result.installation_id, 'inst_fixture');
     assert.equal(launches.length, 1);
     assert.equal(launches[0].requireHqLaunch, true);
+    assert.match(launches[0].hqEpoch, /^[0-9a-f]{64}$/);
     assert.equal(launches[0].packagePath, realpathSync(home));
     assert.equal((await owner.request('soul.starts')).result.starts.length, 1);
     assert.equal((await owner.request('status')).result.hq.soulStarts.length, 1);

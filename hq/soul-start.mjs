@@ -13,6 +13,7 @@ const ID = /^st_[0-9a-f]{24}$/;
 const SOUL_ID = /^agent_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const INSTALLATION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
+const PACKAGE_SHA256 = /^[0-9a-f]{64}$/;
 
 // machineLaunch is supplied only by a trusted Machine client wired into HQ's
 // entry point. reserve() must not start a process; verifyMachineReservation()
@@ -20,7 +21,8 @@ const DIGEST = /^sha256:[0-9a-f]{64}$/;
 // Production passes no client until Machine #629/#630 implement that proof.
 export function createSoulStarter({ core, home, machineLaunch, verifyMachineReservation, verifyMachineCompletion,
   mode, hqUid = process.getuid?.() } = {}) {
-  const hqEpoch = `he_${core.random.hex(12)}`;
+  // Machine's fixed SoulRunRequest header uses exactly 64 lowercase hex.
+  const hqEpoch = core.random.hex(32);
   const starts = new Map();
   const byPath = new Map();
   const byInstallation = new Map();
@@ -88,7 +90,7 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
         && Number.isSafeInteger(reservation.uid) && reservation.uid > 0 && reservation.uid !== hqUid
         && Number.isSafeInteger(reservation.gid) && reservation.gid > 0
         && SOUL_ID.test(reservation.soulId ?? '') && INSTALLATION_ID.test(reservation.installationId ?? '')
-        && DIGEST.test(reservation.definitionDigest ?? '') && DIGEST.test(reservation.packageDigest ?? '')
+        && DIGEST.test(reservation.definitionDigest ?? '') && PACKAGE_SHA256.test(reservation.packageDigest ?? '')
         && typeof reservation.runnerPackagePath === 'string' && isAbsolute(reservation.runnerPackagePath)
         && reservation.runnerPackagePath !== path && !inHqHome(reservation.runnerPackagePath)
         && typeof reservation.endpoint?.directory === 'string' && isAbsolute(reservation.endpoint.directory)
