@@ -235,6 +235,9 @@ export function createHQ({
       const report = signerReport();
       return detectProfile({
         platform, account, standalone: cfg.standalone === true, harnessAccounts,
+        // This host-wide profile is shared by external admission requests.
+        // HQ has no Soul-start operation yet; agent launch is not Soul start.
+        startedByHQ: false,
         keyStorage: report?.available ? report.key_storage : undefined, keyFiles: report?.key_files,
       });
     };

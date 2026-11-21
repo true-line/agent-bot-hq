@@ -10,10 +10,11 @@
 //     can earn managed-protected at all is unspecified (platform PDR-0053);
 //   - the host passed the hostile-member qualification (T01–T03, T21);
 //   - the HQ signer's key is a hardware key, not a key file (§9 PR 15).
+//   - HQ started this Soul through the Soul runner (platform PDR-0055).
 // Nothing in HQ sets `qualified` yet, so this code never reports
 // managed-protected.
-// managed-cooperative: the device is managed (enrolled with the identity
-// service) but containment is not enforced.
+// managed-cooperative: the released wire value for cooperative enforcement.
+// It does not establish that HQ started the Soul (platform DRIFT-018).
 // standalone-unenforced: the owner chose standalone in HQ's config.
 
 export const HQ_ACCOUNTS = Object.freeze({ darwin: '_agent-bot-hq', linux: 'agent-bot-hq' });
@@ -24,6 +25,7 @@ export function detectProfile({
   harnessAccounts = false,     // true when every admitted agent runs in its harness's own account
                                // (PR 16 / PR 29); a string ending "(D7)" says which part is missing (hq/hq.mjs)
   qualified = false,           // hostile-member suite passed on this host
+  startedByHQ = false,          // per-Soul proof that HQ started its Soul runner; never inferred from enrollment or agent launch
   standalone = false,          // owner config: run standalone, unenforced
   keyFiles,                    // known signer key files in HQ state
   keyStorage,                  // the HQ signer's custody: hardware | software (hq/signer.mjs)
@@ -37,9 +39,10 @@ export function detectProfile({
   if (keyStorage === 'software') reasons.push('the signer reports software key storage (key_storage=software)');
   else if (keyStorage !== 'hardware') reasons.push('HQ could not verify hardware custody of the device key');
   else if (keyFiles > 0) reasons.push('the previous software signer key file remains in HQ state');
+  if (startedByHQ !== true) reasons.push('HQ has not started this Soul through the Soul runner (PDR-0055)');
   if (standalone) return { profile: 'standalone-unenforced', reasons: ['the owner chose standalone in HQ config', ...reasons] };
-  // Protected only when every condition holds; this skeleton has no way to
-  // satisfy the last two, so it falls through to cooperative.
+  // Protected only when every condition holds. The current host-wide caller
+  // has no per-Soul start proof or qualification source and falls through.
   if (reasons.length === 0) return { profile: 'managed-protected', reasons };
   return { profile: 'managed-cooperative', reasons };
 }

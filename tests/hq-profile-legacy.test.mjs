@@ -9,24 +9,27 @@ import { fakeLegacy } from './hq-harness.mjs';
 test('HQ in the owner account reports managed-cooperative and every reason protected is out of reach', () => {
   const p = detectProfile({ platform: 'darwin', account: 'user' });
   assert.equal(p.profile, 'managed-cooperative');
-  assert.equal(p.reasons.length, 4);
+  assert.equal(p.reasons.length, 5);
   assert.equal(p.reasons[0], 'HQ runs in the user account, not _agent-bot-hq (D6)');
   assert.match(p.reasons[1], /share one account: no OS account per harness credential \(D7\)$/);
   assert.match(p.reasons[2], /T01–T03, T21/);
   assert.equal(p.reasons[3], 'HQ could not verify hardware custody of the device key');
+  assert.match(p.reasons[4], /HQ has not started this Soul through the Soul runner/);
   assert.match(detectProfile({ platform: 'darwin', account: 'user', keyStorage: 'software' }).reasons[3], /key_storage=software/);
-  assert.equal(detectProfile({ platform: 'darwin', account: 'user', keyStorage: 'hardware' }).reasons.length, 3);
+  assert.equal(detectProfile({ platform: 'darwin', account: 'user', keyStorage: 'hardware' }).reasons.length, 4);
 });
 
 test('even in its own account, HQ without harness accounts and qualification is not protected', () => {
   for (const [platform, account] of [['darwin', '_agent-bot-hq'], ['linux', 'agent-bot-hq']]) {
     const p = detectProfile({ platform, account, keyStorage: 'hardware' });
     assert.equal(p.profile, 'managed-cooperative', platform);
-    assert.equal(p.reasons.length, 2);
+    assert.equal(p.reasons.length, 3);
   }
   // Everything else in place, a key file still keeps the host out of protected.
   const all = { platform: 'linux', account: 'agent-bot-hq', harnessAccounts: true, qualified: true };
-  assert.equal(detectProfile({ ...all, keyStorage: 'hardware' }).profile, 'managed-protected');
+  assert.equal(detectProfile({ ...all, keyStorage: 'hardware' }).profile, 'managed-cooperative');
+  assert.equal(detectProfile({ ...all, keyStorage: 'hardware', startedByHQ: true }).profile, 'managed-protected');
+  assert.match(detectProfile({ ...all, keyStorage: 'hardware' }).reasons.at(-1), /PDR-0055/);
   assert.equal(detectProfile({ ...all, keyStorage: 'hardware', keyFiles: 1 }).profile, 'managed-cooperative');
   assert.equal(detectProfile({ ...all, keyStorage: 'software' }).profile, 'managed-cooperative');
   assert.equal(detectProfile(all).profile, 'managed-cooperative');
@@ -43,7 +46,7 @@ test('harness accounts (row 16b): a stated gap is the reason, and in place they 
   assert.match(profileWarning('managed-protected', p.profile, p.reasons), /\(agents whose harness has no account of its own/);
   const none = detectProfile({ ...base, harnessAccounts: true });
   assert.equal(none.profile, 'managed-cooperative');
-  assert.equal(none.reasons.length, 3);
+  assert.equal(none.reasons.length, 4);
   assert.ok(!none.reasons.some((r) => r.endsWith('(D7)')));
   assert.match(detectProfile({ ...base, harnessAccounts: '' }).reasons[1], /share one account/);
 });
