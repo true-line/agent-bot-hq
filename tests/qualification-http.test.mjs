@@ -65,6 +65,9 @@ test('stock Messages HTTP reaches only a bound, one-use HQ qualification consume
   t.after(() => bridge.close());
   const shared = join(dir, 'shared');
   mkdirSync(shared);
+  chmodSync(shared, 0o2770);
+  await assert.rejects(startClaudeQualificationHttp({ socketPath: join(shared, 'refused.sock'), peerUid: process.getuid() + 1,
+    groupGid: process.getgid(), memberSession, plan: { model: MODEL, prompt: PROMPT } }), /reviewed UID, group or mode/);
   chmodSync(shared, 0o2750);
   const wrongPeerBridge = await startClaudeQualificationHttp({ socketPath: join(shared, 'broker.sock'), peerUid: process.getuid() + 1,
     groupGid: process.getgid(), memberSession, plan: { model: MODEL, prompt: PROMPT } });
