@@ -110,6 +110,24 @@ test('unconfigured or malformed qualification plans fail closed', () => {
   assert.throws(() => qualificationProvider({ plan: { ...plan, provider_config_sha256: providerPin(duplicate) }, providerConfigBytes: duplicate, authorize: async () => true }), /not strict UTF-8 JSON/);
 });
 
+test('an HTTP listener cannot deliver Messages without an HQ-bound session', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'hq-qualification-unbound-'));
+  chmodSync(dir, 0o700);
+  let captures = 0;
+  const bridge = await startClaudeQualificationHttp({
+    socketPath: join(dir, 'broker.sock'), peerUid: process.getuid(),
+    memberSession: { async capture() { captures++; throw new Error('HQ bind unavailable'); } },
+    plan: { model: MODEL, prompt: PROMPT },
+  });
+  t.after(async () => { await bridge.close(); rmSync(dir, { recursive: true, force: true }); });
+  assert.equal((await http(bridge.socketPath, 'GET', '/api/claude_code/policy_limits')).status, 200);
+  const response = await http(bridge.socketPath, 'POST', '/v1/messages', {
+    model: MODEL, stream: true, messages: [{ role: 'user', content: PROMPT }],
+  });
+  assert.equal(response.status, 403);
+  assert.equal(captures, 1);
+});
+
 test('a consumed qualification plan stays consumed after HQ restart', async (t) => {
   const home = tempHome();
   const config = providerBytes('one-use result');
