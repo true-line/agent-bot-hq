@@ -60,7 +60,7 @@ export function createSoulStarter({ core, home, runner, mode, spawnProcess = spa
     let child;
     try {
       child = spawnProcess(runner.command[0], [...runner.command.slice(1), 'run', '--soul', path, '--hq-home', home, '--profile', 'managed-cooperative'], {
-        cwd: path, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? home, AGENT_BOT_HQ_HOME: home },
+        cwd: path, env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: process.env.HOME ?? home, AGENT_BOT_HQ_HOME: home, AGENT_BOT_SOULS_REQUIRE_HQ_LAUNCH: '1' },
         stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true,
       });
       await new Promise((resolve, reject) => {
