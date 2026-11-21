@@ -28,6 +28,7 @@
 // fetches it into .cache/ on first use). A release will vendor the pinned
 // tree with the plugins (§4.5) instead.
 import { readFileSync } from 'node:fs';
+import { connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,20 +43,23 @@ import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, 
 import { connectSocket } from './socket.mjs';
 import { machineRoleCommand } from './machine-channel.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
   const args = { cmd: argv[0], home: process.env.AGENT_BOT_HQ_HOME || join(homedir(), '.agent-bot-hq'), json: false };
-  if (args.cmd === 'signer') args.sub = argv[1];
-  for (let i = args.cmd === 'signer' ? 2 : 1; i < argv.length; i++) {
+  if (args.cmd === 'signer' || args.cmd === 'soul') args.sub = argv[1];
+  for (let i = args.sub ? 2 : 1; i < argv.length; i++) {
     if (argv[i] === '--home') args.home = argv[++i];
     else if (argv[i] === '--owner-account') {
       args.ownerAccount = argv[++i];
       if (!args.ownerAccount || args.cmd !== 'run') throw new Error('--owner-account NAME is only for the systemd HQ service');
     } else if (argv[i] === '--owner-control') {
-      if (!['status', 'souls', 'enroll'].includes(args.cmd)) throw new Error('--owner-control is only for owner socket clients');
+      if (!['status', 'souls', 'soul', 'enroll'].includes(args.cmd)) throw new Error('--owner-control is only for owner socket clients');
       args.ownerControl = true;
+    } else if (argv[i] === '--soul') {
+      args.soul = argv[++i];
+      if (!args.soul || args.cmd !== 'soul' || args.sub !== 'start') throw new Error('--soul DIR is only for soul start');
     } else if (argv[i] === '--json') args.json = true;
     else if (argv[i] === '--harness') (args.harnesses ??= []).push(argv[++i]);
     else if (argv[i] === '--force') args.force = true;
@@ -81,6 +85,36 @@ function loadSchemas() {
 async function ask(controlPath, op) {
   const client = await connectSocket(controlPath);
   try { return await client.request(op); } finally { await client.close(); }
+}
+
+async function startSoul(controlPath, path) {
+  if (!path) throw new Error('soul start needs --soul DIR');
+  const socket = netConnect(controlPath);
+  await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
+  try {
+    socket.write(`${JSON.stringify({ id: 1, op: 'soul.start', payload: { package_path: path } })}\n`);
+    let buf = Buffer.alloc(0);
+    const response = await new Promise((resolve, reject) => {
+      const onData = (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        const nl = buf.indexOf(0x0a);
+        if (nl < 0) { if (buf.length > 1 << 20) reject(new Error('HQ start reply is too large')); return; }
+        socket.off('data', onData);
+        socket.off('close', onClose);
+        try { resolve({ answer: JSON.parse(buf.subarray(0, nl).toString('utf8')), rest: buf.subarray(nl + 1) }); }
+        catch (error) { reject(error); }
+      };
+      const onClose = () => reject(new Error('HQ closed the Soul start connection'));
+      socket.on('data', onData);
+      socket.once('close', onClose);
+    });
+    if (!response.answer.ok) throw new Error(JSON.stringify(response.answer.refusal ?? response.answer.host_refusal ?? response.answer));
+    process.stderr.write(`HQ started Soul runner ${response.answer.result.start_id} (pid ${response.answer.result.pid}); protected qualification remains unavailable\n`);
+    if (response.rest.length) process.stdout.write(response.rest);
+    process.stdin.pipe(socket);
+    socket.pipe(process.stdout);
+    await new Promise((resolve) => socket.once('close', resolve));
+  } finally { socket.destroy(); }
 }
 
 function signerLine(g) {
@@ -196,6 +230,11 @@ async function main(argv) {
         if (s?.state !== 'pending') throw new Error('HQ is no longer tracking this enrollment. Check HQ status before retrying.');
       }
     } finally { await client.close(); }
+  }
+  if (args.cmd === 'soul') {
+    if (args.sub !== 'start') throw new Error(USAGE);
+    await startSoul(controlPath, args.soul);
+    return;
   }
   if (args.cmd === 'signer') {
     if (args.sub !== 'rekey') throw new Error(USAGE);
