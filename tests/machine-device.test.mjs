@@ -164,7 +164,8 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   });
   await new Promise((resolve, reject) => handler.once('error', reject).listen(socket, resolve));
   t.after(() => new Promise((resolve) => handler.close(resolve)));
-  const request = (option, fields) => run(['hq-device', option, '--socket', socket], fields);
+  const request = (option, fields, expectedPair) => machineCommandInHome(
+    ['hq-device', option, '--socket', socket], role, process.getuid(), fields, false, process.getuid(), expectedPair);
   await assert.rejects(request('identity'), /requires the daemon pin/);
   const machineKey = machine.publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
   await run(['status', '--socket', socket, '--daemon-key', machineKey.toString('hex')]);
@@ -388,8 +389,46 @@ test('paired HQ enrolls through admin custody, retries lost binding, and authent
   assert.equal(active.status.mode, 'safe');
   assert.equal(active.status.hq.signer.available, false);
   await checkNoFallback();
-  await active.close(); active = null;
+  const beforeRecovery = service.state.requests.length;
+  assert.equal(JSON.parse(await consoleStatus('--json')).hq.signer.available, false);
   await new Promise((resolve, reject) => handler.once('error', reject).listen(socket, resolve));
+  const pin = join(role, '.config/agent-machine/daemon.pub');
+  const originalPin = readFileSync(pin);
+  const changedPin = generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+  const beforePinChange = options.length;
+  writeFileSync(pin, changedPin);
+  const changedPair = JSON.parse(await consoleStatus('--json'));
+  assert.equal(changedPair.hq.signer.available, false);
+  assert.equal(changedPair.hq.signer.restart_required, undefined);
+  assert.equal(options.length, beforePinChange, 'a replaced pin was refused before Machine received a probe');
+  writeFileSync(pin, originalPin);
+  deviceRefusal = 'MM_DAEMON_PEER_REFUSED';
+  const revokedPair = JSON.parse(await consoleStatus('--json'));
+  assert.equal(revokedPair.hq.signer.available, false);
+  assert.equal(revokedPair.hq.signer.restart_required, undefined);
+  assert.match(revokedPair.hq.signer.reason, /MM_DAEMON_PEER_REFUSED/);
+  deviceRefusal = undefined;
+  binding = undefined;
+  const unboundKey = JSON.parse(await consoleStatus('--json'));
+  assert.equal(unboundKey.hq.signer.available, true);
+  assert.equal(unboundKey.hq.signer.restart_required, undefined, 'a reachable key without the saved enrollment cannot activate admissions');
+  binding = originalBinding;
+  const recoveredMachine = JSON.parse(await consoleStatus('--json'));
+  assert.equal(recoveredMachine.hq.signer.available, true);
+  assert.equal(recoveredMachine.hq.signer.restart_required, true);
+  assert.equal(recoveredMachine.mode, 'safe');
+  assert.equal(recoveredMachine.admissions, false);
+  const recoveryText = await consoleStatus();
+  assert.match(recoveryText, /Machine custody recovered; restart HQ to reopen admissions/);
+  assert.doesNotMatch(recoveryText, /signer unavailable/);
+  const entry = await connectSocket(active.hq.paths.admission);
+  try {
+    assert.equal((await entry.request('Hello', {})).host_refusal.code, 'host.safe_mode');
+    assert.equal((await entry.request('launch', {})).host_refusal.code, 'host.safe_mode');
+  } finally { await entry.close(); }
+  assert.equal(service.state.requests.length, beforeRecovery, 'status uses the local Machine channel only');
+  assert.deepEqual(readFileSync(join(home, 'identity/device.json')), deviceRecord);
+  await active.close(); active = null;
   active = await open();
   assert.equal(active.status.mode, 'running');
   await checkNoFallback();

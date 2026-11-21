@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { isUtf8 } from 'node:buffer';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
 import { fail } from '../sdk/errors.mjs';
-import { machineRoleDevice } from './machine-channel.mjs';
+import { disconnectedMachinePair, machineRoleDevice } from './machine-channel.mjs';
 import { releaseServerKeys, signatureBytes } from './identity-service.mjs';
 import { jwkThumbprint, publicJwk, SIGNATURE_PREFIX } from './signer.mjs';
 
@@ -59,6 +59,7 @@ function checkLegacy(home) {
 export function createMachineSigner({ home, enrollment, request = machineRoleDevice, keysFor = releaseServerKeys, clock = { now: Date.now } }) {
   let current;
   let reason = 'Machine device identity has not been verified';
+  let disconnectedPair;
   let revision = 0;
   function checkReply(response, state) {
     const b = response.body;
@@ -80,15 +81,17 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
   function unavailableIdentity(error) {
     current = undefined;
     reason = error.message;
+    disconnectedPair = disconnectedMachinePair(error);
     revision++;
   }
-  async function refresh() {
+  async function refresh(expectedPair) {
     const started = revision;
     try {
       checkLegacy(home);
-      const identity = checkReply(await request('identity'), 'identity');
+      const identity = checkReply(await request('identity', undefined, expectedPair), 'identity');
       if (started !== revision) throw new Error('Machine custody changed during the identity check');
       current = identity;
+      disconnectedPair = undefined;
     } catch (error) {
       if (started === revision) unavailableIdentity(error);
       throw error;
@@ -121,6 +124,11 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
   }
   const signer = {
     source: 'paired Machine/keyd', report,
+    disconnectedPair: () => disconnectedPair,
+    async recheckPair(pair) {
+      await refresh(pair);
+      return enrollment.deviceStatus();
+    },
     async deviceStatus() {
       await refresh();
       const state = await enrollment.deviceStatus();

@@ -116,6 +116,12 @@ enrollment after restart, the device line reports `enrolled`. Use
 `status --owner-control` for a dedicated HQ service. Use `status --json` to
 check which signer HQ can reach before retrying an operation.
 
+If HQ started in safe mode because it could not connect to its paired
+Machine, owner status rechecks the original local pairing and saved device
+enrollment. When both verify, status asks the owner to restart HQ. The JSON
+report includes `hq.signer.restart_required` in this case. Admissions stay
+closed until HQ completes its normal startup checks after the restart.
+
 If an HQ is compromised, the Homebrew administrator can run `managed-machine daemon revoke-hq` to stop new local signing for that pairing. The deny record persists across restart. To withdraw the enrolled device's service access as well, the owner can revoke that device on the Identity service's [Devices page](https://agents.true-line.ai/devices). The service rejects subsequent device requests and retries upstream revocation for tracked GitHub installation tokens. Legacy installation tokens expire within one hour. Issuer details are in the [Identity API guide](https://github.com/true-line/agent-bot/blob/e001bf270d2cd45cd0c1919e5f4caae40e22fe66/docs/api.md).
 
 `notices` opts the agent-comms broker plugin into explicit identity-service
