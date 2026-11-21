@@ -587,6 +587,51 @@ test('credentials: completing an operation drops its pending resolution and pres
   assert.equal(credentials.release({ reference, ...done }), false);
 });
 
+test('credentials: opaque scope fields keep their exact boundaries', async (t) => {
+  const p = probe('agent-comms', ['credentials']);
+  const host = createTestHost({ plugins: [p.plugin] });
+  await host.start();
+  t.after(() => host.stop());
+  const { credentials } = p.ctx.services;
+  const reference = credentials.issue('fixture');
+  const scopes = [
+    { task: 'part\0two', operation: 'three' },
+    { task: 'part', operation: 'two\0three' },
+  ];
+  const pending = scopes.map(scope => credentials.resolve(reference, scope));
+  assert.equal(credentials.release({ reference, ...scopes[0] }), true);
+  await assert.rejects(pending[0], code('host.context_revoked'));
+  const active = await pending[1];
+  assert.equal(await credentials.resolve(reference, scopes[1]), active);
+  assert.equal(host.identity.mints.length, 2);
+  assert.equal(host.tokensHeld(), 1);
+});
+
+test('credentials: cleanup of a released mint preserves its pending replacement', async (t) => {
+  const p = probe('agent-comms', ['credentials']);
+  const host = createTestHost({ plugins: [p.plugin] });
+  await host.start();
+  t.after(() => host.stop());
+  const { credentials } = p.ctx.services;
+  const reference = 'fixture';
+  const scope = { task: 'task', operation: 'operation' };
+  const finish = [];
+  host.identity.mint = () => new Promise(resolve => finish.push(resolve));
+  const previous = credentials.resolve(reference, scope);
+  const previousPeer = credentials.resolve(reference, scope);
+  assert.equal(credentials.release({ reference, ...scope }), true);
+  const replacement = credentials.resolve(reference, scope);
+  assert.equal(finish.length, 2);
+  finish[0]({ token: 'old-fixture', expiresAt: host.clock.now() + 1000 });
+  await Promise.all([previous, previousPeer].map(pending => assert.rejects(pending, code('host.context_revoked'))));
+  const replacementPeer = credentials.resolve(reference, scope);
+  assert.equal(finish.length, 2);
+  finish[1]({ token: 'new-fixture', expiresAt: host.clock.now() + 1000 });
+  assert.deepEqual(await Promise.all([replacement, replacementPeer]), ['new-fixture', 'new-fixture']);
+  assert.equal(await credentials.resolve(reference, scope), 'new-fixture');
+  assert.equal(host.tokensHeld(), 1);
+});
+
 test('a live token used as an object key is redacted from receipts and logs', async () => {
   const p = probe('agent-comms', ['credentials', 'receipts', 'log']);
   const host = createTestHost({ plugins: [p.plugin] });

@@ -134,7 +134,7 @@ export function createCore({ clock = testClock(), random = testRandom(), profile
     receipts: [],
     logs: [],
     subscriptions: new Map(),   // type → Set({ plugin, phase, handler })
-    tokens: new Map(),          // `${reference}\0${task}\0${operation}` → { token, expiresAt }
+    tokens: new Map(),          // JSON-encoded [reference, task, operation] → { token, expiresAt }
     minting: new Map(),         // same key → in-flight mint, shared by concurrent callers
     references: new Map(),      // opaque member reference → underlying reference
     approvals: new Map(),       // id → record
@@ -293,7 +293,7 @@ function storeService(core, plugin) {
 }
 
 function credentialsService(core, plugin) {
-  const tokenKey = (reference, task, operation) => `${reference}\0${task}\0${operation}`;
+  const tokenKey = (reference, task, operation) => JSON.stringify([reference, task, operation]);
   return Object.freeze({
     // One token per (task, operation), held in HQ memory only and never
     // reused for another operation (§4.7). Callers use it for that one
@@ -330,6 +330,7 @@ function credentialsService(core, plugin) {
     },
     // The operation reached a terminal state: drop its token.
     release({ reference, task, operation } = {}) {
+      if (![reference, task, operation].every((field) => typeof field === 'string' && field.length > 0)) return false;
       const underlying = core.references.get(reference) ?? reference;
       const key = tokenKey(underlying, task, operation);
       const pending = core.minting.delete(key);
