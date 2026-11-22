@@ -81,12 +81,15 @@ export function checkSocketPath(path, platform = process.platform) {
 // `mode` is the socket file's mode: 0600 for HQ's own sockets, 0660 for a
 // harness endpoint whose directory gives it the account's group (hq/harness-accounts.mjs).
 // `takeover` enables the hook above for this listener.
-export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false, activated, authenticatePeer, connectionContext, connectionClosed }) {
+export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false, activated, authenticatePeer, connectionContext, connectionClosed, replaceStale = true }) {
   if (process.platform === 'win32') throw new Error('HQ on Windows needs a named pipe with an owner DACL, which is not built yet (#89)');
   const authenticate = activated ? activated.authenticate : authenticatePeer;
   if (activated && typeof authenticate !== 'function') throw new Error('an activated listener requires peer authentication');
   checkSocketPath(path);
-  if (!activated && existsSync(path)) {
+  if (!activated && !replaceStale && lstatSync(path, { throwIfNoEntry: false })) {
+    throw new Error(`socket path ${path} is occupied`);
+  }
+  if (!activated && replaceStale && existsSync(path)) {
     if (!lstatSync(path).isSocket()) throw new Error(`${path} exists and is not a socket; refusing to replace it`);
     if (await live(path)) throw new Error(`another HQ is listening on ${path}`);
     unlinkSync(path);
@@ -183,7 +186,7 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
       }
       if (trustedContext) trustedContext = Object.freeze({ ...trustedContext });
     }
-    const session = newSession();
+    const session = newSession(socket);
     // Bytes, not text: a takeover hands the rest of the stream on unchanged.
     // Lines split on 0x0a, which never occurs inside a UTF-8 sequence.
     let buf = Buffer.alloc(0);
@@ -271,17 +274,18 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     server.listen(activated ? { fd: activated.fd } : path, () => { server.off('error', reject); resolve(); });
   });
   activated?.listener?.adopt(onConnection);
-  if (!activated) chmodSync(path, mode);
+  const close = () => new Promise((resolve) => {
+    for (const s of conns) s.destroy();
+    // libuv clears the bound pathname at close. No-replace listeners need no
+    // additional unlink and require a directory where peers cannot replace
+    // the path. A privileged replacement would require an activated fd to
+    // avoid libuv's pathname cleanup.
+    server.close(() => { if (!activated && replaceStale) { try { unlinkSync(path); } catch { /* already gone */ } } resolve(); });
+  });
+  try { if (!activated) chmodSync(path, mode); }
+  catch (error) { await close(); throw error; }
 
-  return {
-    path,
-    auth,
-    connections: () => conns.size,
-    close: () => new Promise((resolve) => {
-      for (const s of conns) s.destroy();
-      server.close(() => { if (!activated) { try { unlinkSync(path); } catch { /* already gone */ } } resolve(); });
-    }),
-  };
+  return { path, auth, connections: () => conns.size, close };
 }
 
 // A minimal client for the CLI and the tests: request(op, payload) resolves

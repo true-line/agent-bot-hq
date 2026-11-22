@@ -49,6 +49,7 @@ import { createStandaloneSigner } from './standalone-signer.mjs';
 import { createEnrollment, DEFAULT_IDENTITY_SERVICE, validateEnrollmentConfig } from './enrollment.mjs';
 import { createLauncher, LAUNCH_OPERATIONS } from './launch.mjs';
 import { createSoulStarter } from './soul-start.mjs';
+import { bindBridgeAuthority, listenBridgeEndpoint, memberBrokerDispatch, planBridgeEndpoints } from './bridge-endpoints.mjs';
 import { loadPlugins } from './plugins.mjs';
 import { authenticatePeerUid, checkOwnerControlSupport, OWNER_CONTROL_PATH, OWNER_PEER_CHECK } from './owner-control.mjs';
 import { checkSocketPath, listenSocket } from './socket.mjs';
@@ -153,7 +154,8 @@ export function createHQ({
   soulLaunch,                    // Machine-authorized launcher under a distinct per-installation UID; never owner config
   soulVerifier,                  // independent Machine reservation signature verifier pinned by trusted HQ entry point
   soulCompletionVerifier,        // independent Machine containment signature verifier
-  bridgeAuthority,               // future authenticated Machine live-start/B proof client; never config or owner input
+  bridgeAuthority,               // authenticated Machine live-start/B proof client; never config or owner input
+  bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
   protectedAdmission,            // future pinned Machine verifier; absent in production until signed contracts ship
   plugins = [],                  // plugin objects (tests); installed ones come from pluginsDir
   pluginsDir,                    // installed plugins, each checked against `pins` (§4.5)
@@ -180,6 +182,7 @@ export function createHQ({
   // connection on the shared broker socket has no entry.
   let harnessPlan = { endpoints: [], accountOf: () => undefined };
   const brokerCallers = new Map();
+  const bridgePeers = new Map();
   // Agent launch (§9 row 16b) and what the profile reasons say about it.
   let launcher;
   let soulStarter;
@@ -255,7 +258,11 @@ export function createHQ({
     harnessPlan = cfg.harnesses
       ? planHarnessEndpoints(cfg.harnesses, { hqUid: uid, hqAccount: account, platform, ...(accounts ? { resolve: accounts } : {}), ...(harnessLstat ? { lstat: harnessLstat } : {}) })
       : { endpoints: [], accountOf: () => undefined };
-    if (platform === 'darwin' && harnessPlan.endpoints.length) checkOwnerControlSupport();
+    const bridgeEndpoints = planBridgeEndpoints(bridgeAssignments, { platform, account, hqUid: uid,
+      harnessUids: harnessPlan.endpoints.map((endpoint) => endpoint.uid) });
+    if (bridgeEndpoints.length && (typeof bridgeAuthority?.verifyLiveStart !== 'function'
+      || typeof bridgeAuthority?.onDisconnect !== 'function')) throw new Error('Machine bridge endpoints need live start and containment authority');
+    if (platform === 'darwin' && (harnessPlan.endpoints.length || bridgeEndpoints.length)) checkOwnerControlSupport();
     if (platform !== 'win32') for (const p of [paths.control, paths.admission, paths.broker, ...harnessPlan.endpoints.map((e) => e.path)]) checkSocketPath(p, platform);
     store = openStore(home, { uid });
     core = createCore({
@@ -331,7 +338,7 @@ export function createHQ({
       profileReasons: (pending, unbound) => profileReasons(pending, unbound),
       harnessAccount: (adapterId) => harnessPlan.accountOf(adapterId),
       callerOf: (connection) => brokerCallers.get(connection),
-      bridgeAuthority,
+      bridgeAuthority: bridgeEndpoints.length ? bindBridgeAuthority(bridgeAuthority, bridgePeers) : bridgeAuthority,
       protectedAdmission,
     });
     const builtIn = [admission, tasksPlugin({ schemas }), noticesPlugin({ schemas }), ...plugins];
@@ -414,7 +421,7 @@ export function createHQ({
         // Each frame goes to the plugin serving the broker; `op` is the kind.
         await listenSocket({
           path: paths.broker, auth: 'member', core,
-          dispatch: (kind, { payload, session }) => host.brokerAccept(kind, payload, { connection: session }),
+          dispatch: (kind, { payload, session }) => memberBrokerDispatch(host, kind, payload, session),
           newSession: () => `bc_${random.hex(12)}`,
           endSession: (connection) => { host.brokerClosed(connection); },
         }),
@@ -431,7 +438,7 @@ export function createHQ({
         sockets.push(await listenSocket({
           path: endpoint.path, auth: 'member', core, mode: 0o660,
           authenticatePeer: platform === 'darwin' ? (socket) => authenticatePeerUid(socket, endpoint.uid) : undefined,
-          dispatch: (kind, { payload, session }) => host.brokerAccept(kind, payload, { connection: session }),
+          dispatch: (kind, { payload, session }) => memberBrokerDispatch(host, kind, payload, session),
           newSession: () => {
             const connection = `bc_${random.hex(12)}`;
             brokerCallers.set(connection, Object.freeze({ account: endpoint.account, uid: endpoint.uid }));
@@ -440,6 +447,9 @@ export function createHQ({
           endSession: (connection) => { brokerCallers.delete(connection); host.brokerClosed(connection); },
         }));
         checkHarnessSocket(endpoint, { darwinHqUid: platform === 'darwin' ? uid : undefined });
+      }
+      for (const endpoint of bridgeEndpoints) {
+        sockets.push(await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers }));
       }
     } catch (e) {
       for (const s of sockets) await s.close();
