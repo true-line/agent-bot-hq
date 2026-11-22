@@ -178,6 +178,17 @@ when 'peer'
   exit(socket.local_address.unix? && socket.getsockopt(Socket::SOL_SOCKET, Socket::SO_TYPE).int == Socket::SOCK_STREAM &&
        socket.remote_address.unix? &&
        socket.getpeereid.first == Integer(ARGV.first, 10))
+when 'peer-pid'
+  exit 1 unless ARGV.length == 1 && /\A[0-9]+\z/.match?(ARGV.first)
+  socket = UNIXSocket.for_fd(3)
+  exit 1 unless socket.local_address.unix? &&
+                socket.getsockopt(Socket::SOL_SOCKET, Socket::SO_TYPE).int == Socket::SOCK_STREAM &&
+                socket.remote_address.unix? && socket.getpeereid.first == Integer(ARGV.first, 10)
+  # Darwin sys/un.h defines SOL_LOCAL=0 and LOCAL_PEERPID=0x002. Ruby does
+  # not expose these constants, so use the SDK-pinned numeric sockopt pair.
+  pid = socket.getsockopt(0, 0x002).int
+  exit 1 unless pid > 1
+  STDOUT.write("#{pid}\n")
 else
   exit 1
 end
