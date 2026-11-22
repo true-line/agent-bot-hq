@@ -49,27 +49,28 @@ test('every negative pins the exact bytes of its base positive', () => {
 });
 
 test('every fixture gets its expected schema verdict from the SDK validator', () => {
+  const walk = (d) => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(join(d, e.name)) : e.name.endsWith('.schema.json') ? [join(d, e.name)] : []));
+  const files = walk(join(dir, 'schemas'));
+  const schemas = files.map((f) => JSON.parse(readFileSync(f, 'utf8')));
   const schemaFor = (rel) => JSON.parse(readFileSync(join(dir, 'schemas', rel), 'utf8'));
   let invalid = 0;
   for (const [f, x] of [...positives, ...negatives]) {
     if (x.expect.parse) continue;
-    const errors = validate(schemaFor(x.schema), x.input);
+    const errors = validate(schemaFor(x.schema), x.input, { schemas });
     assert.equal(errors.length ? 'invalid' : 'valid', x.expect.schema, `${f}: ${JSON.stringify(errors)}`);
     if (errors.length) invalid++;
   }
   assert.ok(invalid >= 20, 'the schema-refusal negatives are exercised');
   // Every pinned schema uses only keywords the validator checks.
-  const walk = (d) => readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(join(d, e.name)) : e.name.endsWith('.schema.json') ? [join(d, e.name)] : []));
-  const schemas = walk(join(dir, 'schemas'));
   assert.ok(schemas.length >= 19);
-  for (const f of schemas) checkSchemaSupported(JSON.parse(readFileSync(f, 'utf8')), f);
+  for (const schema of schemas) checkSchemaSupported(schema, '#', { schemas });
 });
 
 test('the validator fails closed on keywords it does not check, and checks what it claims', () => {
-  for (const kw of [{ $ref: '#/x' }, { oneOf: [] }, { anyOf: [] }, { patternProperties: {} }, { format: 'uri' }]) {
+  for (const kw of [{ $ref: '#/x' }, { oneOf: [] }, { anyOf: [] }, { patternProperties: {} }, { format: 'unknown' }]) {
     assert.throws(() => validate(kw, {}), TypeError, JSON.stringify(kw));
   }
-  assert.throws(() => validate({ properties: { a: { not: {} } } }, {}), /keyword not/);
+  assert.throws(() => validate({ properties: { a: { dependentSchemas: {} } } }, {}), /keyword dependentSchemas/);
   const ts = { type: 'string', format: 'date-time' };
   assert.deepEqual(validate(ts, '2026-11-07T10:00:00Z'), []);
   assert.deepEqual(validate(ts, '2026-11-07T10:00:00.123+05:30'), []);
@@ -83,6 +84,42 @@ test('the validator fails closed on keywords it does not check, and checks what 
   assert.equal(validate(cond, { kind: 'x' }).length, 1);
   assert.deepEqual(validate(cond, { kind: 'z' }), []);
   assert.equal(validate({ type: 'array', contains: { const: 1 }, minContains: 2 }, [1, 2]).length, 1);
+});
+
+test('offline references and composition validate every branch and fail closed', () => {
+  const external = {
+    $id: 'https://example.test/defs.json',
+    $defs: { 'a/b': { type: 'string', minLength: 2 }, nested: { $ref: '#/$defs/a~1b' } },
+  };
+  const root = {
+    $id: 'https://example.test/root.json',
+    type: 'object',
+    properties: { name: { $ref: 'defs.json#/$defs/nested', maxLength: 3 } },
+    required: ['name'],
+  };
+  const registry = { schemas: [root, external] };
+  assert.deepEqual(validate(root, { name: 'ab' }, registry), []);
+  assert.equal(validate(root, { name: 'a' }, registry)[0].keyword, 'minLength');
+  assert.equal(validate(root, { name: 'abcd' }, registry)[0].keyword, 'maxLength');
+  assert.throws(() => validate(root, { name: 'ab' }), /unresolved reference/);
+  assert.throws(() => validate(root, { name: 'ab' }, { schemas: [{ $id: root.$id, $defs: { x: true } }, external] }), /conflicting schema ID/);
+  assert.throws(() => validate({ $id: root.$id, $ref: '#/$defs/missing' }, {}), /unresolved reference/);
+  assert.throws(() => validate({ $id: root.$id, $ref: '#next' }, {}), /unsupported reference fragment/);
+  assert.throws(() => validate({ $schema: 'http://json-schema.org/draft-07/schema#', $ref: '#/$defs/x', $defs: { x: true } }, {}), /unsupported schema dialect/);
+  assert.throws(() => validate({ $id: root.$id, $defs: { unused: { dependentSchemas: {} } } }, {}), /keyword dependentSchemas/);
+  assert.throws(() => validate({ $id: root.$id, $defs: { loop: { $ref: '#/$defs/loop' } }, $ref: '#/$defs/loop' }, {}), /cyclic reference/);
+  assert.equal(validate({ allOf: [{ type: 'integer' }, { minimum: 2 }] }, 1)[0].keyword, 'minimum');
+  assert.equal(validate({ anyOf: [{ const: 1 }, { const: 2 }] }, 3)[0].keyword, 'anyOf');
+  assert.equal(validate({ oneOf: [{ type: 'integer' }, { minimum: 0 }] }, 1)[0].keyword, 'oneOf');
+  assert.equal(validate({ not: { const: 1 } }, 1)[0].keyword, 'not');
+  assert.equal(validate({ type: 'object', maxProperties: 1 }, { a: 1, b: 2 })[0].keyword, 'maxProperties');
+  assert.deepEqual(validate({ type: 'string', format: 'uri' }, 'https://example.test/a'), []);
+  assert.deepEqual(validate({ type: 'string', format: 'uri' }, 'https://example.test:99999/a?x=1#part'), []);
+  assert.deepEqual(validate({ type: 'string', format: 'uri' }, 'https://[::1]/a'), []);
+  assert.deepEqual(validate({ type: 'string', format: 'uri' }, 'urn:example:animal:ferret:nose'), []);
+  for (const bad of ['/relative', 'https://example.test/%ZZ', 'https://example.test/\\evil', 'https://example.test/é', 'https://example.test/#a#b', 'https://example.test/a[b]', 'https://example.test/?q=[x]', 'https://a@b@example.test/']) {
+    assert.equal(validate({ type: 'string', format: 'uri' }, bad)[0].keyword, 'format', bad);
+  }
 });
 
 test('the strict parser refuses every parse-refusal fixture and accepts every fixture file', () => {
