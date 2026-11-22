@@ -424,8 +424,6 @@ export function createHQ({
         // launch.attach takes its connection over, so only this listener allows it.
         await listenSocket({
           path: paths.admission, auth: 'entry-point', core, takeover: true,
-          connectionContext: protectedAdmission ? (socket) => protectedAdmission.acceptPeer(socket) : undefined,
-          connectionClosed: protectedAdmission ? (socket, context) => protectedAdmission.peerDisconnected(socket, context) : undefined,
           dispatch: (op, meta) => (LAUNCH_OPERATIONS.includes(op) ? launcher.dispatch(op, meta)
             : op === 'soul.start' || op === 'soul.starts' ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta)),
           newSession: () => `ep_${random.hex(12)}`, endSession: () => {},

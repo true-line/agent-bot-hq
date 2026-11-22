@@ -48,6 +48,7 @@ import { validate } from '../sdk/wire/schema.mjs';
 import { inspectStage2aReservationV2 } from './stage2a-reservation.mjs';
 import { createStage2aMachineBridgeAuthority } from './stage2a-machine-bridge-authority.mjs';
 import { createStage2aProtectedStarter } from './stage2a-protected-start.mjs';
+import { createStage2aProtectedAdmission } from './stage2a-protected-admission.mjs';
 import { createStage2aQualificationProvider } from './stage2a-qualification-provider.mjs';
 
 const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
@@ -232,14 +233,30 @@ async function main(argv) {
         machinePublicKey, verifyReservation }) : undefined;
       const providers = new Map();
       let hq;
+      const protectedAdmission = installed.length ? createStage2aProtectedAdmission({
+        machinePublicKey, authority,
+        stopReservation: (reservationSHA256) => protectedStart.stopReservation(reservationSHA256),
+      }) : undefined;
       const protectedStart = installed.length ? createStage2aProtectedStarter({
         installations: installed, authority, verifyReservation,
         getBrokerIdentity: (installationId) => hq.bridgeBrokerIdentity(installationId),
         verifyBoundBridge: (selectors, digest) => hq.boundBridgeV2(selectors, digest),
-        openProtectedAdmission: ({ installed: plan, assignment, selectors }) =>
-          hq.openProtectedAdmission({ installed: plan, assignment, selectors,
-            renewLive: (request) => protectedStart.renewLive(request),
-            onLost: () => protectedStart.stopReservation(selectors.reservation_sha256) }),
+        openProtectedAdmission: async ({ installed: plan, assignment, selectors,
+          getBindReceiptSHA256 }) => {
+          const registration = protectedAdmission.registerStart({ installed: plan,
+            assignment, selectors, getBindReceiptSHA256 });
+          try {
+            const listener = await hq.openProtectedAdmission({ installed: plan, assignment,
+              selectors, renewLive: (request) => protectedStart.renewLive(request),
+              onLost: () => protectedStart.stopReservation(selectors.reservation_sha256) });
+            return Object.freeze({ path: listener.path,
+              helloFinalization: () => protectedAdmission.finalizationFor(selectors),
+              close: async () => {
+              registration.close();
+              await listener.close();
+            } });
+          } catch (error) { registration.close(); throw error; }
+        },
         onFinalized: ({ installed: plan, assignment, selectors }) => {
           providers.set(selectors.reservation_sha256, createStage2aQualificationProvider({
             plan: { installation_id: plan.installation_id, start_id: assignment.start_id,
@@ -254,7 +271,7 @@ async function main(argv) {
       hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins,
         pluginsDir, devPlugins: args.devPlugins, bridgeAssignments: installed,
         bridgeAuthority: authority, machineHqEpoch: epochs.values().next().value,
-        protectedStart,
+        protectedStart, protectedAdmission,
         qualificationAuthorizer: installed.length ? ({ request, observation }) => {
           const provider = providers.get(observation?.reservation_digest);
           if (!provider) throw new Error('Machine protected provider start is unavailable');

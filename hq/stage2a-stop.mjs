@@ -27,7 +27,7 @@ function canonical(bytes) {
   return value;
 }
 
-function verifyEnvelope(envelopeBytes, machinePublicKey, purpose) {
+export function verifyStage2aMachineEnvelope(envelopeBytes, machinePublicKey, purpose) {
   if (!Buffer.isBuffer(envelopeBytes) || envelopeBytes.length < 1 || envelopeBytes.length > 8192
     || !Buffer.isBuffer(machinePublicKey) || machinePublicKey.length !== 32) refuse();
   const envelope = canonical(envelopeBytes);
@@ -48,10 +48,13 @@ function verifyEnvelope(envelopeBytes, machinePublicKey, purpose) {
 export function verifyStage2aStop(envelopeBytes, { machinePublicKey, expected } = {}) {
   if (!exact(expected, ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
     'plan_id', 'plan_digest', 'hq_epoch', 'runner_uid', 'bridge_uid', 'runner_pid', 'bridge_pid'])) refuse();
-  const { payload, envelope_sha256 } = verifyEnvelope(envelopeBytes, machinePublicKey, PURPOSE);
-  if (!exact(payload, ['schema', 'reservation_sha256', 'installation_id', 'start_id',
+  const { payload, envelope_sha256 } = verifyStage2aMachineEnvelope(envelopeBytes, machinePublicKey, PURPOSE);
+  const base = ['schema', 'reservation_sha256', 'installation_id', 'start_id',
     'launch_id', 'plan_id', 'plan_digest', 'hq_epoch', 'runner_uid', 'bridge_uid',
-    'runner_pid', 'bridge_pid', 'both_uids_idle', 'stopped_at'])
+    'runner_pid', 'bridge_pid', 'both_uids_idle', 'stopped_at'];
+  const child = ['child_launcher_pid', 'child_pid', 'child_receipt_sha256']
+    .filter((field) => Object.hasOwn(payload ?? {}, field));
+  if (!exact(payload, [...base, ...child])
     || payload.schema !== SCHEMA || payload.both_uids_idle !== true
     || !SHA.test(payload.reservation_sha256)
     || !Number.isSafeInteger(payload.runner_uid) || payload.runner_uid < 300 || payload.runner_uid > 399
@@ -59,17 +62,27 @@ export function verifyStage2aStop(envelopeBytes, { machinePublicKey, expected } 
     || payload.runner_uid === payload.bridge_uid
     || !Number.isSafeInteger(payload.runner_pid) || payload.runner_pid === 1 || payload.runner_pid < 0
     || !Number.isSafeInteger(payload.bridge_pid) || payload.bridge_pid === 1 || payload.bridge_pid < 0
+    || (child.includes('child_launcher_pid') && (!Number.isSafeInteger(payload.child_launcher_pid)
+      || payload.child_launcher_pid < 2))
+    || (child.includes('child_pid') && (!Number.isSafeInteger(payload.child_pid)
+      || payload.child_pid < 2 || payload.child_pid === payload.child_launcher_pid))
+    || (child.includes('child_receipt_sha256') && (!SHA.test(payload.child_receipt_sha256)
+      || !child.includes('child_launcher_pid') || !child.includes('child_pid')))
     || typeof payload.stopped_at !== 'string' || !Number.isFinite(Date.parse(payload.stopped_at))) refuse();
   for (const [field, value] of Object.entries(expected)) if (payload[field] !== value) refuse();
   return Object.freeze({ envelope_sha256, stopped_at: payload.stopped_at,
-    runner_pid: payload.runner_pid, bridge_pid: payload.bridge_pid, both_uids_idle: true });
+    runner_pid: payload.runner_pid, bridge_pid: payload.bridge_pid,
+    ...(child.includes('child_launcher_pid') ? { child_launcher_pid: payload.child_launcher_pid } : {}),
+    ...(child.includes('child_pid') ? { child_pid: payload.child_pid } : {}),
+    ...(child.includes('child_receipt_sha256') ? { child_receipt_sha256: payload.child_receipt_sha256 } : {}),
+    both_uids_idle: true });
 }
 
 export function verifyStage2aFinalization(envelopeBytes, { machinePublicKey, expected } = {}) {
   const fields = ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
     'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'relay_socket', 'bridge_pid'];
   if (!exact(expected, fields)) refuse();
-  const { payload, envelope_sha256 } = verifyEnvelope(envelopeBytes, machinePublicKey, FINAL_PURPOSE);
+  const { payload, envelope_sha256 } = verifyStage2aMachineEnvelope(envelopeBytes, machinePublicKey, FINAL_PURPOSE);
   if (!exact(payload, ['schema', ...fields, 'finalized_at']) || payload.schema !== FINAL_SCHEMA
     || !SHA.test(payload.reservation_sha256) || !SHA.test(payload.bind_receipt_sha256)
     || !Number.isSafeInteger(payload.bridge_pid) || payload.bridge_pid < 2
