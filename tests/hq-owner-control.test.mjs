@@ -3,11 +3,40 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
-import { once } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { authenticateOwner, checkOwnerControlSupport, OWNER_CONTROL_PATH } from '../hq/owner-control.mjs';
+import { authenticateOwner, checkOwnerControlSupport, OWNER_CONTROL_PATH, peerProbeOutcome } from '../hq/owner-control.mjs';
+
+test('peer helper error cannot settle authentication before fd closure', async () => {
+  const probe = new EventEmitter();
+  let kills = 0;
+  probe.kill = (signal) => { assert.equal(signal, 'SIGKILL'); kills++; return true; };
+  let settled = false;
+  const result = peerProbeOutcome(probe).then((value) => { settled = true; return value; });
+  probe.emit('error', new Error('helper failed with fd 3 still open'));
+  probe.emit('error', new Error('failed kill')); // Must not become unhandled.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(kills, 1);
+  assert.equal(settled, false, 'no close means no custody decision');
+  probe.emit('close', 0);
+  assert.equal(await result, false);
+  const clean = new EventEmitter();
+  const success = peerProbeOutcome(clean);
+  clean.emit('close', 0);
+  assert.equal(await success, true);
+});
+
+test('peer helper kill failure without close rejects with unconfirmed custody', async () => {
+  const probe = new EventEmitter();
+  let kills = 0;
+  probe.kill = () => { kills++; return false; };
+  const result = peerProbeOutcome(probe, 10);
+  probe.emit('error', new Error('helper failed'));
+  await assert.rejects(result, /custody unconfirmed/);
+  assert.equal(kills, 2);
+});
 
 test('owner control compares the connected peer UID with the configured owner', { skip: !['linux', 'darwin'].includes(process.platform) }, async (t) => {
   checkOwnerControlSupport();

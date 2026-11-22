@@ -62,8 +62,17 @@ export async function startClaudeQualificationHttp({ socketPath, peerUid, groupG
   try { lstatSync(socketPath); throw new Error('qualification HTTP socket already exists'); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
 
+  let custodyFailure;
   const handle = async (request, response) => {
-    if (!await authenticatePeerUid(request.socket, peerUid)) { response.writeHead(403); response.end(); return; }
+    if (custodyFailure) { response.writeHead(503); response.end(); return; }
+    let authenticated;
+    try { authenticated = await authenticatePeerUid(request.socket, peerUid); }
+    catch (error) {
+      custodyFailure = error;
+      response.writeHead(503); response.end(); return;
+    }
+    if (custodyFailure) { response.writeHead(503); response.end(); return; }
+    if (!authenticated) { response.writeHead(403); response.end(); return; }
     let path;
     try { path = new URL(request.url, 'http://unix.invalid').pathname; }
     catch { response.writeHead(400); response.end(); return; }
@@ -121,5 +130,6 @@ export async function startClaudeQualificationHttp({ socketPath, peerUid, groupG
   return Object.freeze({ socketPath, async close() {
     await new Promise((resolve) => server.close(resolve));
     try { if (lstatSync(socketPath).ino === inode) unlinkSync(socketPath); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (custodyFailure) throw new Error('qualification HTTP peer helper custody unconfirmed', { cause: custodyFailure });
   } });
 }

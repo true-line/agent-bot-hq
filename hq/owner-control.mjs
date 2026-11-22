@@ -125,9 +125,30 @@ export function authenticatePeerUid(socket, uid) {
 export { authenticatePeerUid as authenticateOwner };
 
 function socketCheck(args, socket) {
-  return new Promise((resolve) => {
-    const probe = spawn(interpreter, [...helper, ...args], { ...helperOptions, stdio: ['ignore', 'ignore', 'ignore', socket] });
-    probe.once('error', () => resolve(false));
-    probe.once('close', (code) => resolve(code === 0));
+  const probe = spawn(interpreter, [...helper, ...args], { ...helperOptions, stdio: ['ignore', 'ignore', 'ignore', socket] });
+  return peerProbeOutcome(probe);
+}
+
+// A helper error can precede `close` while its inherited fd 3 still exists.
+// Keep the request pending until the kernel has closed every helper-owned fd.
+export function peerProbeOutcome(probe, closeTimeoutMs = 3000) {
+  return new Promise((resolve, reject) => {
+    let failed = false;
+    const timeout = setTimeout(() => {
+      failed = true;
+      try { probe.kill('SIGKILL'); } catch {}
+      reject(new Error('peer helper did not close; inherited socket custody unconfirmed'));
+    }, closeTimeoutMs);
+    const onError = () => {
+      if (failed) return;
+      failed = true;
+      try { probe.kill('SIGKILL'); } catch {}
+    };
+    probe.on('error', onError);
+    probe.once('close', (code) => {
+      clearTimeout(timeout);
+      probe.off('error', onError);
+      resolve(!failed && code === 0);
+    });
   });
 }
