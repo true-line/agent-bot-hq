@@ -368,6 +368,7 @@ export function createHQ({
           },
           launch: launcher.report(),
           soulStarts: soulStarter.report(),
+          bridgeBinding: host.provided('hq-admission')?.bridgeStatus?.() ?? { state: 'unavailable' },
           ownerSessions: openOwnerSessions(),
           pluginLoad,
           ...(signerReport() ? { signer: signerReport() } : {}),
@@ -457,6 +458,10 @@ export function createHQ({
     if (!running) return [];
     running = false;
     clearInterval(timer);
+    // revokeBridges sets its fail-closed fence before its first await. Start
+    // it before any legacy probe, runner or socket shutdown can pause here.
+    const bridgeStop = Promise.resolve(host.provided('hq-admission')?.revokeBridges?.());
+    bridgeStop.catch(() => {}); // observed below after the other shutdown paths
     // Close the transport before awaiting the legacy probe, launch shutdown
     // or plugin callbacks. A retained context and late reply cannot extend
     // credentials while one of those callbacks is blocked.
@@ -470,6 +475,7 @@ export function createHQ({
     for (const s of sockets) await s.close();
     sockets = [];
     const report = await host.stop({ reason });
+    await bridgeStop; // uncertain B containment cannot produce hq.stopped
     for (const [id, s] of coreTable(core, 'sessions')) if (!s.closed_at) coreTable(core, 'sessions').set(id, { ...s, closed_at: clock.now() });
     await pushReceipt(core, { plugin: 'hq', kind: 'hq.stopped', reason });
     return report;

@@ -17,6 +17,7 @@ function fixture({ timers } = {}) {
   let sequence = 0;
   let current = context;
   const stops = [];
+  const alerts = [];
   const service = createBridgeBindAdmission({
     authority: {
       verifyLiveStart: async () => current,
@@ -24,6 +25,7 @@ function fixture({ timers } = {}) {
     },
     clock: { now: () => now },
     random: { hex: () => (++sequence).toString(16).padStart(64, '0') },
+    receipts: { append: async (record) => { alerts.push(record); } },
     ...(timers ? { timers } : {}),
   });
   const bind = async (s = selectors, peer = connection) => {
@@ -33,7 +35,7 @@ function fixture({ timers } = {}) {
     const digest = `sha256:${createHash('sha256').update(result.bind_receipt).digest('hex')}`;
     return { challenge, result, digest };
   };
-  return { service, bind, stops, setNow: (value) => { now = value; },
+  return { service, bind, stops, alerts, setNow: (value) => { now = value; },
     setContext: (value) => { current = value; } };
 }
 
@@ -180,6 +182,7 @@ test('close or HQ stop during expired-start cleanup cannot resurrect a new B cha
       },
       clock: { now: () => now },
       random: { hex: () => (++sequence).toString(16).padStart(64, '0') },
+      receipts: { append: async () => {} },
     });
     await service.bridgeBindChallenge(selectors, { connection: 'bc_old' });
     now = 31_000;
@@ -208,6 +211,7 @@ test('stop revokes live B receipts and requests containment once', async () => {
 
 test('uncertain Machine containment stays a failed HQ stop, never a successful cleanup', async () => {
   let calls = 0;
+  const alerts = [];
   const service = createBridgeBindAdmission({
     authority: {
       verifyLiveStart: async () => context,
@@ -215,9 +219,112 @@ test('uncertain Machine containment stays a failed HQ stop, never a successful c
     },
     clock: { now: () => 1000 },
     random: { hex: () => 'f'.repeat(64) },
+    receipts: { append: async (record) => { alerts.push(record); } },
   });
   await service.bridgeBindChallenge(selectors, connection);
   await assert.rejects(service.forgetBridgeConnection(connection.connection), /containment unconfirmed/);
+  assert.deepEqual(service.bridgeStatus(), { state: 'containment_unconfirmed' });
+  assert.equal(alerts[0].kind, 'hq.bridge.containment_unconfirmed');
+  assert.equal(alerts[0].start_id, selectors.start_id);
   await assert.rejects(service.revokeAll(), /containment unconfirmed/);
   assert.equal(calls, 1, 'uncertain cleanup is retained and cannot be retried as a fresh bind');
+});
+
+test('silent-B timer failure raises a live degraded signal and durable HQ alert', async () => {
+  const scheduled = [];
+  const alerts = [];
+  const service = createBridgeBindAdmission({
+    authority: {
+      verifyLiveStart: async () => context,
+      onDisconnect: async () => { throw new Error('Machine stop unavailable'); },
+    },
+    clock: { now: () => 1000 },
+    random: { hex: () => 'f'.repeat(64) },
+    receipts: { append: async (record) => { alerts.push(record); } },
+    timers: { setTimeout: (fn) => { scheduled.push(fn); return scheduled.length; }, clearTimeout: () => {} },
+  });
+  await service.bridgeBindChallenge(selectors, connection);
+  scheduled[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(service.bridgeStatus(), { state: 'containment_unconfirmed' });
+  assert.equal(alerts[0].kind, 'hq.bridge.containment_unconfirmed');
+  await assert.rejects(service.bridgeBindChallenge(selectors, { connection: 'bc_new' }), denied);
+  await assert.rejects(service.revokeAll(), /Machine stop unavailable/);
+});
+
+test('a hung Machine stop reaches a bounded degraded alert without a successful close', async () => {
+  const scheduled = [];
+  const alerts = [];
+  const service = createBridgeBindAdmission({
+    authority: {
+      verifyLiveStart: async () => context,
+      onDisconnect: () => new Promise(() => {}),
+    },
+    clock: { now: () => 1000 },
+    random: { hex: () => 'f'.repeat(64) },
+    receipts: { append: async (record) => { alerts.push(record); } },
+    timers: { setTimeout: (fn, delay) => { scheduled.push({ fn, delay }); return scheduled.length; },
+      clearTimeout: () => {} },
+  });
+  await service.bridgeBindChallenge(selectors, connection);
+  const close = service.forgetBridgeConnection(connection.connection);
+  assert.equal(scheduled.find((timer) => timer.delay === 5000) !== undefined, true);
+  scheduled.find((timer) => timer.delay === 5000).fn();
+  await assert.rejects(close, /containment deadline exceeded/);
+  assert.deepEqual(service.bridgeStatus(), { state: 'containment_unconfirmed' });
+  assert.equal(alerts[0].kind, 'hq.bridge.containment_unconfirmed');
+});
+
+test('a hung HQ alert write leaves bridge degraded and fails cleanup by deadline', async () => {
+  const scheduled = new Map();
+  let nextTimer = 0;
+  const service = createBridgeBindAdmission({
+    authority: { verifyLiveStart: async () => context,
+      onDisconnect: () => { throw new Error('Machine stop unavailable'); } },
+    clock: { now: () => 1000 }, random: { hex: () => 'f'.repeat(64) },
+    receipts: { append: () => new Promise(() => {}) },
+    timers: { setTimeout: (fn, delay) => { const id = ++nextTimer; scheduled.set(id, { fn, delay }); return id; },
+      clearTimeout: (id) => scheduled.delete(id) },
+  });
+  await service.bridgeBindChallenge(selectors, connection);
+  const closing = service.forgetBridgeConnection(connection.connection);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(service.bridgeStatus(), { state: 'containment_unconfirmed' });
+  const alertTimer = [...scheduled.values()].find((timer) => timer.delay === 5000);
+  assert.ok(alertTimer, 'alert persistence has its own deadline');
+  alertTimer.fn();
+  await assert.rejects(closing, /bridge containment and alert persistence failed/);
+  await assert.rejects(service.revokeAll(), /bridge containment and alert persistence failed/);
+});
+
+test('a hung live-start verifier and immediate containment failure both reach HQ shutdown', async () => {
+  const scheduled = new Map();
+  let nextTimer = 0;
+  const alerts = [];
+  let calls = 0;
+  const service = createBridgeBindAdmission({
+    authority: { verifyLiveStart: async () => {
+      if (++calls === 1) return context;
+      return new Promise(() => {});
+    }, onDisconnect: async () => { throw new Error('Machine stop unavailable'); } },
+    clock: { now: () => 1000 }, random: { hex: () => 'f'.repeat(64) },
+    receipts: { append: async (record) => { alerts.push(record); } },
+    timers: { setTimeout: (fn, delay) => { const id = ++nextTimer; scheduled.set(id, { fn, delay }); return id; },
+      clearTimeout: (id) => scheduled.delete(id) },
+  });
+  await service.bridgeBindChallenge(selectors, connection);
+  const newer = { ...selectors, start_id: `st_${'e'.repeat(24)}` };
+  void service.bridgeBindChallenge(newer, { connection: 'bc_new' });
+  await new Promise((resolve) => setImmediate(resolve));
+  const stopping = service.revokeAll();
+  const drainTimer = [...scheduled.values()].filter((timer) => timer.delay === 5000).at(-1);
+  assert.ok(drainTimer, 'active verifier drain has a deadline');
+  drainTimer.fn();
+  await assert.rejects(stopping, (error) => {
+    assert.match(error.message, /verifier drain deadline exceeded/);
+    assert.ok(error.errors.some((cause) => /Machine stop unavailable/.test(cause.message)));
+    return true;
+  });
+  assert.deepEqual(service.bridgeStatus(), { state: 'containment_unconfirmed' });
+  assert.ok(alerts.some((alert) => alert.reason === 'bridge-verifier-drain-timeout'));
 });

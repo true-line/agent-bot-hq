@@ -13,6 +13,7 @@ const LAUNCH = /^ln_[0-9a-f]{24}$/;
 const SHA = /^[0-9a-f]{64}$/;
 const PROOF = /^[0-9a-f]{64}$/;
 const MAX_PENDING = 4096;
+const CONTAINMENT_DEADLINE_MS = 5000;
 
 const refuse = () => fail('host.launch_unavailable', 'authenticated protected bridge bind is unavailable');
 const record = (value) => value && typeof value === 'object' && !Array.isArray(value);
@@ -57,7 +58,7 @@ export function bridgeBindProof(key, nonce, context) {
 // resolves, and reject on uncertain containment. The proof key is generated
 // by HQ and given only to B via its one-use inherited descriptor.
 // No owner, member, configuration file or ordinary plugin can provide it.
-export function createBridgeBindAdmission({ authority, clock, random, timers = { setTimeout, clearTimeout } } = {}) {
+export function createBridgeBindAdmission({ authority, clock, random, receipts, timers = { setTimeout, clearTimeout } } = {}) {
   const challenges = new Map();
   const verifying = new Map();
   const live = new Map();
@@ -67,15 +68,20 @@ export function createBridgeBindAdmission({ authority, clock, random, timers = {
   const quarantines = new Map();
   const active = new Set();
   let stopping = false;
+  let containmentUnconfirmed = false;
   const track = (promise) => {
     active.add(promise);
     promise.then(() => active.delete(promise), () => active.delete(promise));
     return promise;
   };
-  const available = () => !stopping && typeof authority?.verifyLiveStart === 'function'
+  const configured = () => typeof authority?.verifyLiveStart === 'function'
     && typeof authority?.onDisconnect === 'function'
     && typeof clock?.now === 'function' && typeof random?.hex === 'function'
+    && typeof receipts?.append === 'function'
     && typeof timers?.setTimeout === 'function' && typeof timers?.clearTimeout === 'function';
+  const available = () => !stopping && !containmentUnconfirmed && configured();
+  const bridgeStatus = () => ({ state: containmentUnconfirmed ? 'containment_unconfirmed'
+    : stopping ? 'stopping' : configured() ? 'bind-enabled' : 'unavailable' });
   const connectionOf = (meta) => typeof meta?.connection === 'string' && meta.connection ? meta.connection : refuse();
   const check = async (selectors, connection) => {
     const context = await authority.verifyLiveStart(selectors, connection);
@@ -93,13 +99,42 @@ export function createBridgeBindAdmission({ authority, clock, random, timers = {
     broker_socket: context.broker_socket,
     ...(receipt ? { bind_receipt_sha256: `sha256:${createHash('sha256').update(receipt).digest('hex')}` } : {}),
   });
+  const bounded = (operation, label) => {
+    let timeout;
+    return new Promise((resolve, reject) => {
+      timeout = timers.setTimeout(() => reject(new Error(label)), CONTAINMENT_DEADLINE_MS);
+      Promise.resolve(operation).then(resolve, reject);
+    }).finally(() => timers.clearTimeout(timeout));
+  };
+  const alertUnconfirmed = async (reason, fields = {}) => {
+    containmentUnconfirmed = true;
+    const alert = { kind: 'hq.bridge.containment_unconfirmed', reason, ...fields };
+    await bounded(receipts.append(alert), 'HQ bridge alert persistence deadline exceeded');
+  };
   const quarantine = (context, reason, receipt) => {
     const key = startKey(context);
     if (quarantines.has(key)) return quarantines.get(key);
-    let pending;
-    try { pending = Promise.resolve(authority.onDisconnect(observation(context, receipt), reason)); }
-    catch (error) { pending = Promise.reject(error); }
+    const stopped = observation(context, receipt);
+    let requested;
+    try { requested = authority.onDisconnect(stopped, reason); }
+    catch (error) { requested = Promise.reject(error); }
+    const pending = bounded(requested, 'Machine bridge containment deadline exceeded').catch(async (error) => {
+      // Socket-close and timer callers may have no waiter. Freeze all bridge
+      // authority immediately, and persist a visible HQ alert before the
+      // cleanup failure can be swallowed by the generic broker lifecycle.
+      const fields = {
+        installation_id: stopped.installation_id, start_id: stopped.start_id,
+        launch_id: stopped.launch_id, hq_epoch: stopped.hq_epoch,
+        ...(stopped.bind_receipt_sha256 ? { bind_receipt_sha256: stopped.bind_receipt_sha256 } : {}) };
+      try { await alertUnconfirmed(reason, fields); }
+      catch (auditError) { throw new AggregateError([error, auditError], 'bridge containment and alert persistence failed'); }
+      throw error;
+    });
     quarantines.set(key, pending); // even an uncertain stop cannot be replayed as a fresh bind
+    // A timer or generic broker callback may discard its caller Promise.
+    // Keep the failure observed here; revokeAll still reads the original
+    // rejected Promise and reports it to HQ shutdown.
+    pending.catch(() => {});
     return pending;
   };
 
@@ -161,8 +196,8 @@ export function createBridgeBindAdmission({ authority, clock, random, timers = {
       if (stopping || closed.has(connection) || !verifying.has(connection)) refuse();
       verifying.delete(connection);
       const timer = timers.setTimeout(() => {
-        // The rejected cleanup promise stays in quarantines for HQ stop to
-        // surface. Machine's durable stop/audit is required by the callback.
+        // Failure degrades the live bridge state and records an HQ alert in
+        // quarantine(); the rejected cleanup remains for HQ stop to surface.
         void forgetBridgeConnection(connection, undefined, 'bridge-challenge-expired').catch(() => {});
       }, expires - now);
       timer?.unref?.();
@@ -235,11 +270,27 @@ export function createBridgeBindAdmission({ authority, clock, random, timers = {
     const stops = [];
     for (const connection of new Set([...challenges.keys(), ...verifying.keys(), ...live.keys()]))
       stops.push(forgetBridgeConnection(connection, live.get(connection)?.receipt, 'bridge-hq-stopped'));
+    // Observe containment failures before waiting on potentially stuck
+    // Machine verification. Otherwise an immediate onDisconnect rejection
+    // can become an unhandled process-level failure during the drain.
+    const settledStops = Promise.allSettled(stops);
     for (const connection of inFlight) closed.add(connection);
-    await Promise.allSettled([...active]);
-    await Promise.all([...stops, ...quarantines.values()]);
+    let drainError;
+    try {
+      await bounded(Promise.allSettled([...active]), 'HQ bridge verifier drain deadline exceeded');
+    } catch (error) { drainError = error; }
+    const outcomes = [...await settledStops, ...await Promise.allSettled([...quarantines.values()])];
+    const failures = [...new Set(outcomes.filter((outcome) => outcome.status === 'rejected')
+      .map((outcome) => outcome.reason))];
+    if (drainError) {
+      try { await alertUnconfirmed('bridge-verifier-drain-timeout', { active_operations: active.size }); }
+      catch (auditError) { failures.push(auditError); }
+      throw new AggregateError([drainError, ...failures], 'HQ bridge verifier drain deadline exceeded');
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length) throw new AggregateError(failures, 'HQ bridge containment failed');
   }
-  return Object.freeze({
+  return Object.freeze({ bridgeStatus,
     bridgeBindChallenge: (...args) => track(bridgeBindChallenge(...args)),
     verifyBridgeBinding: (...args) => track(verifyBridgeBinding(...args)),
     forgetBridgeConnection, boundBridge: (...args) => track(boundBridge(...args)), revokeAll,

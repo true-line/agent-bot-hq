@@ -111,7 +111,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
     services: ['store', 'receipts', 'clock', 'random', 'config', 'profile', 'log'],
     async init(ctx) {
       const { store, receipts, clock, random, config, profile } = ctx.services;
-      const bridge = createBridgeBindAdmission({ authority: bridgeAuthority, clock, random });
+      const bridge = createBridgeBindAdmission({ authority: bridgeAuthority, clock, random, receipts });
       bridgeStates.set(ctx, bridge);
       const atomicAudit = typeof receipts.appendIn === 'function';
       const ttl = () => config.get('leaseTtlMs') ?? DEFAULT_LEASE_TTL_MS;
@@ -460,6 +460,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         verifyBridgeBinding: bridge.verifyBridgeBinding,
         forgetBridgeConnection: bridge.forgetBridgeConnection,
         boundBridge: bridge.boundBridge,
+        bridgeStatus: bridge.bridgeStatus,
+        revokeBridges: bridge.revokeAll,
         withBoundRuntime, withNoticeScope, unboundRuntimes } };
     },
     async start(ctx) { await normalizeScopes.get(ctx)(); },
