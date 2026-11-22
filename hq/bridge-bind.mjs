@@ -168,13 +168,14 @@ export function createBridgeBindAdmission({ authority, clock, random, receipts, 
     if (!available()) refuse();
     const selectors = selectorsOf(input);
     const connection = connectionOf(meta);
-    if (closed.has(connection) || live.has(connection) || inFlight.has(connection)
+    if (closed.has(connection) || challenges.has(connection) || verifying.has(connection)
+      || live.has(connection) || inFlight.has(connection)
       || inFlight.size >= MAX_PENDING) refuse();
     inFlight.add(connection);
     let context;
     try {
       context = await check(selectors, connection);
-      if (closed.has(connection)) refuse();
+      if (!available() || closed.has(connection)) refuse();
       const claim = startKey(context);
       if (claimedStarts.has(claim) || claimedStarts.size >= MAX_PENDING) refuse();
       claimedStarts.add(claim); // failed or abandoned challenge still spends this local start
@@ -193,7 +194,7 @@ export function createBridgeBindAdmission({ authority, clock, random, receipts, 
       const nonce = random.hex(32);
       if (!SHA.test(nonce)) refuse();
       const expires = now + 30_000;
-      if (stopping || closed.has(connection) || !verifying.has(connection)) refuse();
+      if (!available() || closed.has(connection) || !verifying.has(connection)) refuse();
       verifying.delete(connection);
       const timer = timers.setTimeout(() => {
         // Failure degrades the live bridge state and records an HQ alert in
@@ -230,7 +231,7 @@ export function createBridgeBindAdmission({ authority, clock, random, receipts, 
       let context;
       try { context = await check(selectors, connection); }
       finally { inFlight.delete(connection); }
-      if (closed.has(connection) || verifying.get(connection) !== pending
+      if (!available() || closed.has(connection) || verifying.get(connection) !== pending
         || !sameContext(context, pending.context)) refuse();
       const expected = bridgeBindProof(context.proof_key, pending.nonce, context);
       if (!timingSafeEqual(Buffer.from(input.proof, 'hex'), Buffer.from(expected, 'hex'))) refuse();
@@ -253,7 +254,7 @@ export function createBridgeBindAdmission({ authority, clock, random, receipts, 
         && binding.observation.bind_receipt_sha256 === receiptDigest) {
         try {
           const current = await check(selectors, connection);
-          if (closed.has(connection) || live.get(connection) !== binding
+          if (!available() || closed.has(connection) || live.get(connection) !== binding
             || !sameContext(current, binding.context)) refuse();
           return { ...binding.observation, connected: true, hmac_verified: true };
         } catch {

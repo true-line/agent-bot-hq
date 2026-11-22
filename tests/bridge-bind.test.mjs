@@ -11,6 +11,11 @@ const context = Object.freeze({ ...selectors, hq_epoch: 'd'.repeat(64), bridge_u
   broker_socket: '/private/var/run/agent-bot/bridge/broker.sock', proof_key: key });
 const connection = { connection: 'bc_1' };
 const denied = { code: 'host.launch_unavailable' };
+const deferred = () => {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+};
 
 function fixture({ timers } = {}) {
   let now = 1_000;
@@ -61,6 +66,121 @@ test('one exact Machine start and one-use HMAC bind yields a live receipt until 
   await assert.rejects(f.service.bridgeBindChallenge(selectors, connection), denied);
   await assert.rejects(f.service.bridgeBindChallenge(selectors, { connection: 'bc_2' }), denied,
     'the same start cannot bootstrap another B connection');
+});
+
+test('a second challenge on one B connection cannot replace its first authenticated start', async () => {
+  const other = { ...selectors, start_id: `st_${'e'.repeat(24)}` };
+  const stops = [];
+  const timers = new Map();
+  let sequence = 0;
+  const service = createBridgeBindAdmission({
+    authority: {
+      verifyLiveStart: async (input) => ({ ...context, ...input }),
+      onDisconnect: async (observation) => { stops.push(observation.start_id); },
+    },
+    clock: { now: () => 1000 },
+    random: { hex: () => (++sequence).toString(16).padStart(64, '0') },
+    receipts: { append: async () => {} },
+    timers: { setTimeout: (fn) => { const id = ++sequence; timers.set(id, fn); return id; },
+      clearTimeout: (id) => timers.delete(id) },
+  });
+  await service.bridgeBindChallenge(selectors, connection);
+  await assert.rejects(service.bridgeBindChallenge(other, connection), denied);
+  assert.equal(timers.size, 1, 'the original challenge deadline remains registered');
+  await service.forgetBridgeConnection(connection.connection);
+  assert.deepEqual(stops, [selectors.start_id], 'close contains the first authenticated start');
+});
+
+test('an uncertain Machine stop fences every in-flight B authority publication', async () => {
+  for (const phase of ['challenge', 'bind', 'lookup']) {
+    const other = { ...selectors, start_id: `st_${'e'.repeat(24)}` };
+    const contexts = new Map([[selectors.start_id, context], [other.start_id, { ...context, ...other }]]);
+    const stopped = [];
+    const entered = deferred();
+    const gate = deferred();
+    let gateArmed = false;
+    let sequence = 0;
+    const targetPeer = { connection: 'bc_target' };
+    const otherPeer = { connection: 'bc_other' };
+    const service = createBridgeBindAdmission({
+      authority: {
+        verifyLiveStart: async (input, peer) => {
+          if (gateArmed && peer === targetPeer.connection) { entered.resolve(); await gate.promise; }
+          return contexts.get(input.start_id);
+        },
+        onDisconnect: async (observation) => {
+          stopped.push(observation.start_id);
+          if (observation.start_id === other.start_id) throw new Error('Machine stop unavailable');
+        },
+      },
+      clock: { now: () => 1000 },
+      random: { hex: () => (++sequence).toString(16).padStart(64, '0') },
+      receipts: { append: async () => {} },
+    });
+    let challenge;
+    let digest;
+    if (phase !== 'challenge') {
+      challenge = await service.bridgeBindChallenge(selectors, targetPeer);
+      if (phase === 'lookup') {
+        const bound = await service.verifyBridgeBinding({ ...selectors,
+          proof: bridgeBindProof(key, challenge.nonce, context) }, targetPeer);
+        digest = `sha256:${createHash('sha256').update(bound.bind_receipt).digest('hex')}`;
+      }
+    }
+    await service.bridgeBindChallenge(other, otherPeer);
+    gateArmed = true;
+    const operation = phase === 'challenge' ? service.bridgeBindChallenge(selectors, targetPeer)
+      : phase === 'bind' ? service.verifyBridgeBinding({ ...selectors,
+        proof: bridgeBindProof(key, challenge.nonce, context) }, targetPeer)
+        : service.boundBridge(selectors, digest);
+    await entered.promise;
+    await assert.rejects(service.forgetBridgeConnection(otherPeer.connection), /Machine stop unavailable/);
+    assert.deepEqual(service.bridgeStatus(), { state: 'containment_unconfirmed' });
+    gate.resolve();
+    await assert.rejects(operation, denied, `${phase}: no authority after Machine uncertainty`);
+    assert.ok(stopped.includes(selectors.start_id), `${phase}: authenticated target is contained`);
+  }
+});
+
+test('close and HQ stop win over delayed B bind and live-receipt checks', async () => {
+  for (const phase of ['bind', 'lookup']) for (const ending of ['close', 'stop']) {
+    const entered = deferred();
+    const gate = deferred();
+    const stopped = [];
+    let gateArmed = false;
+    let sequence = 0;
+    const service = createBridgeBindAdmission({
+      authority: {
+        verifyLiveStart: async () => {
+          if (gateArmed) { entered.resolve(); await gate.promise; }
+          return context;
+        },
+        onDisconnect: async (observation) => { stopped.push(observation.start_id); },
+      },
+      clock: { now: () => 1000 },
+      random: { hex: () => (++sequence).toString(16).padStart(64, '0') },
+      receipts: { append: async () => {} },
+    });
+    const challenge = await service.bridgeBindChallenge(selectors, connection);
+    let digest;
+    if (phase === 'lookup') {
+      const bound = await service.verifyBridgeBinding({ ...selectors,
+        proof: bridgeBindProof(key, challenge.nonce, context) }, connection);
+      digest = `sha256:${createHash('sha256').update(bound.bind_receipt).digest('hex')}`;
+    }
+    gateArmed = true;
+    const operation = phase === 'bind'
+      ? service.verifyBridgeBinding({ ...selectors,
+        proof: bridgeBindProof(key, challenge.nonce, context) }, connection)
+      : service.boundBridge(selectors, digest);
+    await entered.promise;
+    const cleanup = ending === 'close'
+      ? service.forgetBridgeConnection(connection.connection) : service.revokeAll();
+    gate.resolve();
+    await cleanup;
+    await assert.rejects(operation, denied, `${ending} during ${phase} check`);
+    assert.deepEqual(stopped, [selectors.start_id], `${ending} contains the start once`);
+  }
 });
 
 test('changed plan, B UID, broker endpoint or key after challenge cannot bind', async () => {
