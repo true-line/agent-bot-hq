@@ -369,6 +369,17 @@ function validStage2aFinalizeB(request) {
     && decimal(socket.device) && decimal(socket.inode) && socket.mode === 0o660;
 }
 
+function validStage2aSignedLiveLease(body) {
+  const encoded = body?.lease_envelope_base64url;
+  if (typeof encoded !== 'string' || !/^[A-Za-z0-9_-]{1,16384}$/.test(encoded)
+    || !/^sha256:[0-9a-f]{64}$/.test(body.lease_sha256 ?? '')
+    || !Number.isSafeInteger(body.lease_sequence) || body.lease_sequence < 1) return false;
+  const raw = Buffer.from(encoded, 'base64url');
+  return raw.length > 0 && raw.length <= 12 * 1024
+    && raw.toString('base64url') === encoded
+    && 'sha256:' + fingerprint(raw) === body.lease_sha256;
+}
+
 // Also exercised with a temporary private home in the protocol tests. The CLI
 // always obtains its home and UID from the kernel-backed account lookup above.
 export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false, roleUid = uid, expectedPair) {
@@ -472,7 +483,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       'stage2a-finalize-b': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
         'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'relay_socket'],
       'stage2a-live': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
-        'plan_id', 'plan_digest', 'hq_epoch'],
+        'plan_id', 'plan_digest', 'hq_epoch', 'challenge'],
       'stage2a-provider': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
         'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'model', 'prompt_sha256'],
     };
@@ -491,7 +502,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || !id.test(deviceFields.installation_id) || !/^st_[0-9a-f]{24}$/.test(deviceFields.start_id)
         || !sha.test(deviceFields.hq_epoch) || !/^ln_[0-9a-f]{24}$/.test(deviceFields.launch_id)))
       || (verb === 'stage2a-exec' && (!reservation.test(deviceFields.reservation_sha256)
-        || !['runner', 'bridge'].includes(deviceFields.role)
+        || !['runner', 'bridge', 'child'].includes(deviceFields.role)
         || typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(nonce)
         || Buffer.from(nonce, 'base64url').length !== 32
         || Buffer.from(nonce, 'base64url').toString('base64url') !== nonce
@@ -508,6 +519,11 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || !/^ln_[0-9a-f]{24}$/.test(deviceFields.launch_id) || !id.test(deviceFields.plan_id)
         || !sha.test(deviceFields.plan_digest) || !sha.test(deviceFields.hq_epoch)))
       || (verb === 'stage2a-finalize-b' && !validStage2aFinalizeB(deviceFields))
+      || (verb === 'stage2a-live' && (typeof deviceFields.challenge !== 'string'
+        || !/^[A-Za-z0-9_-]{43}$/.test(deviceFields.challenge)
+        || Buffer.from(deviceFields.challenge, 'base64url').length !== 32
+        || Buffer.from(deviceFields.challenge, 'base64url').toString('base64url')
+          !== deviceFields.challenge))
       || (verb === 'stage2a-provider' && (!reservation.test(deviceFields.bind_receipt_sha256)
         || !id.test(deviceFields.model) || !reservation.test(deviceFields.prompt_sha256)))) {
       throw new Error('invalid Stage 2a Machine reservation selectors');
@@ -527,7 +543,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     'stage2a-finalize-b': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
       'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'relay_socket'],
     'stage2a-live': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
-      'plan_id', 'plan_digest', 'hq_epoch'],
+      'plan_id', 'plan_digest', 'hq_epoch', 'challenge'],
     'stage2a-provider': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
       'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'model', 'prompt_sha256'],
   }[verb];
@@ -584,7 +600,8 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     }
     if (verb === 'stage2a-live') {
       const base = ['reservation_sha256', 'phase', 'bridge_pid', 'runner_pid'];
-      const finalized = ['finalization_sha256', 'bind_receipt_sha256', 'finalized_live_expires_at'];
+      const finalized = ['finalization_sha256', 'bind_receipt_sha256', 'finalized_live_expires_at',
+        'lease_envelope_base64url', 'lease_sha256', 'lease_sequence'];
       if (!body || typeof body !== 'object' || Array.isArray(body)
         || !['prebind', 'finalized'].includes(body.phase)
         || Object.keys(body).sort().join(',') !== [...base, ...(body.phase === 'finalized' ? finalized : [])].sort().join(',')
@@ -594,7 +611,8 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || (body.phase === 'finalized' && (!/^sha256:[0-9a-f]{64}$/.test(body.finalization_sha256)
           || !/^sha256:[0-9a-f]{64}$/.test(body.bind_receipt_sha256)
           || !Number.isSafeInteger(body.finalized_live_expires_at)
-          || body.finalized_live_expires_at <= Date.now()))) {
+          || body.finalized_live_expires_at <= Date.now()
+          || !validStage2aSignedLiveLease(body)))) {
         throw new Error('invalid signed Machine live start');
       }
       return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });

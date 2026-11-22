@@ -88,7 +88,7 @@ function challengeFrom(line, role) {
   return c;
 }
 
-function firstLine(child, parse, timeoutMs, limit, resume = false) {
+function firstLine(child, parse, timeoutMs, limit, resume = false, rejectRemainder = false) {
   return new Promise((resolve, reject) => {
     let bytes = Buffer.alloc(0);
     const timer = setTimeout(() => finish(new Error('Soul launcher challenge timed out')), timeoutMs);
@@ -110,6 +110,9 @@ function firstLine(child, parse, timeoutMs, limit, resume = false) {
         return;
       }
       try {
+        if (rejectRemainder && bytes.length !== end + 1) {
+          throw new Error('Soul runner sent bytes before child readiness');
+        }
         child.stdout.pause();
         if (bytes.length > end + 1) child.stdout.unshift(bytes.subarray(end + 1));
         finish(null, parse(bytes.subarray(0, end)));
@@ -144,6 +147,25 @@ function bridgeReadyFrom(line) {
     relay_socket: Object.freeze({ ...socket }) });
 }
 
+function runnerActivationFrom(line) {
+  if (line.length > 512) throw new Error('Soul runner activation ack is too large');
+  const ack = parseStrict(line.toString('utf8'));
+  if (!ack || typeof ack !== 'object' || Array.isArray(ack)
+    || Object.keys(ack).sort().join(',') !== [
+      'schema', 'reservation_sha256', 'start_id', 'launch_id',
+      'lease_sha256', 'lease_sequence',
+    ].sort().join(',')
+    || ack.schema !== 'agent-bot-souls/protected-activation-ack/v1'
+    || !DIGEST.test(ack.reservation_sha256)
+    || !/^st_[0-9a-f]{24}$/.test(ack.start_id)
+    || !/^ln_[0-9a-f]{24}$/.test(ack.launch_id)
+    || !DIGEST.test(ack.lease_sha256)
+    || !Number.isSafeInteger(ack.lease_sequence) || ack.lease_sequence < 1) {
+    throw new Error('invalid Soul runner activation ack');
+  }
+  return Object.freeze(ack);
+}
+
 function writeGrant(child, bytes) {
   return new Promise((resolve, reject) => {
     if (!Buffer.isBuffer(bytes) || bytes.length < 2 || bytes.length > 65536
@@ -170,12 +192,14 @@ export async function startStage2aRole({ account, role, reservationSHA256,
   machineExec = machineRoleStage2aExec, spawnProcess = spawn, timeoutMs = 12000 } = {}) {
   if (typeof account !== 'string'
     || !(role === 'runner' && RUNNER_ACCOUNT.test(account)
-      || role === 'bridge' && BRIDGE_ACCOUNT.test(account))
+      || role === 'bridge' && BRIDGE_ACCOUNT.test(account)
+      || role === 'child' && RUNNER_ACCOUNT.test(account))
     || !DIGEST.test(reservationSHA256 ?? '')
     || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 14000) {
     throw new Error('invalid Soul launcher assignment');
   }
-  const command = role === 'runner' ? 'soul-run' : 'soul-bridge';
+  const command = role === 'runner' ? 'soul-run'
+    : role === 'bridge' ? 'soul-bridge' : 'soul-child';
   const child = spawnProcess('/usr/bin/sudo', ['-n', '-u', account, '--', STAGE2A_LAUNCHER, command], {
     stdio: ['pipe', 'pipe', 'ignore'], shell: false,
     env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C' },
@@ -191,8 +215,29 @@ export async function startStage2aRole({ account, role, reservationSHA256,
       role, nonce: challenge.nonce, pid: challenge.pid }), timeoutMs, 'Machine role grant');
     await writeGrant(child, grant?.grantLine);
     let readinessAttempted = false;
+    let activationAttempted = false;
     return Object.freeze({ pid: challenge.pid, role, stdin: child.stdin, stdout: child.stdout, done,
       resumeOutput: () => child.stdout.resume(),
+      waitRunnerActivation: async ({ reservationSHA256, startId, launchId } = {}) => {
+        if (role !== 'runner' || activationAttempted || !DIGEST.test(reservationSHA256 ?? '')
+          || !/^st_[0-9a-f]{24}$/.test(startId ?? '')
+          || !/^ln_[0-9a-f]{24}$/.test(launchId ?? '')) {
+          throw new Error('invalid Soul runner activation verifier');
+        }
+        activationAttempted = true;
+        try {
+          const ack = await firstLine(child, runnerActivationFrom, 5000, 512, true, true);
+          if (ack.reservation_sha256 !== reservationSHA256 || ack.start_id !== startId
+            || ack.launch_id !== launchId || child.exitCode !== null || child.signalCode !== null) {
+            throw new Error('Soul runner activation ack differs from signed start');
+          }
+          return ack;
+        } catch (error) {
+          child.stdin.destroy();
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+          throw error;
+        }
+      },
       waitBridgeReady: async (verify) => {
         if (role !== 'bridge' || readinessAttempted || typeof verify !== 'function') {
           throw new Error('invalid Soul bridge readiness verifier');

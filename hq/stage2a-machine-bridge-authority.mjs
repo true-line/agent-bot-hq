@@ -1,7 +1,7 @@
 // HQ's B connection authority. The paired Machine owns every durable claim;
 // HQ keeps the exact verified reservation and stops both role processes if
 // the authenticated B connection disappears.
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { canonicalize } from '../sdk/wire/canonical-json.mjs';
 import { machineRoleStage2aLive, machineRoleStage2aVerifyB, machineRoleStage2aStop } from './machine-channel.mjs';
@@ -111,8 +111,11 @@ export function createStage2aMachineBridgeAuthority({ machinePublicKey, verifyRe
     return checked;
   }
 
-  async function live(record) {
-    const result = await machineLive(record.selectors);
+  async function live(record, challenge = randomBytes(32).toString('base64url')) {
+    if (typeof challenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(challenge)
+      || Buffer.from(challenge, 'base64url').length !== 32
+      || Buffer.from(challenge, 'base64url').toString('base64url') !== challenge) refuse();
+    const result = await machineLive({ ...record.selectors, challenge });
     if (result?.reservation_sha256 !== record.selectors.reservation_sha256
       || result.bridge_pid !== record.bridgePid || result.runner_pid !== record.runnerPid
       || !['prebind', 'finalized'].includes(result.phase)) refuse();
@@ -125,10 +128,10 @@ export function createStage2aMachineBridgeAuthority({ machinePublicKey, verifyRe
     return result;
   }
 
-  async function currentLiveStart(reservationSHA256) {
+  async function currentLiveStart(reservationSHA256, challenge) {
     const record = starts.get(reservationSHA256);
     if (!record || record.stopPromise) refuse();
-    return live(record);
+    return live(record, challenge);
   }
 
   async function verifyLiveStartV2(selectors, connection, peer, phase) {
