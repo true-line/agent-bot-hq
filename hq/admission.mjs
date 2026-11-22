@@ -44,6 +44,7 @@ import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
 import { negotiateVersions, supportWindow } from '../sdk/wire/versions.mjs';
 import { profileWarning } from './profile.mjs';
+import { createBridgeBindAdmission } from './bridge-bind.mjs';
 import { resolveNoticeScope, validNoticeScope, validNoticeRepository } from './notices-config.mjs';
 
 export const CURRENT_VERSIONS = Object.freeze({ hq: 1, wire: 1, task: 1 });
@@ -90,7 +91,7 @@ const unboundOf = (tx) => tx.list('runtimes').map(([, rt]) => rt).filter((rt) =>
 // the account a broker connection arrived from ({ account, uid }), or
 // undefined on the shared socket. HQ core supplies all three; an agent never
 // does.
-export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false }) {
+export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority } = {}) {
   for (const n of SCHEMA_NAMES) if (!schemas?.[n]) throw new TypeError(`admission needs the pinned hq/v1 ${n} schema`);
 
   const check = (name, value, inbound) => {
@@ -102,6 +103,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
   };
 
   const normalizeScopes = new WeakMap();
+  const bridgeStates = new WeakMap();
   return definePlugin({
     name: 'hq-admission',
     version: '0.1.0',
@@ -109,6 +111,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
     services: ['store', 'receipts', 'clock', 'random', 'config', 'profile', 'log'],
     async init(ctx) {
       const { store, receipts, clock, random, config, profile } = ctx.services;
+      const bridge = createBridgeBindAdmission({ authority: bridgeAuthority, clock, random, receipts });
+      bridgeStates.set(ctx, bridge);
       const atomicAudit = typeof receipts.appendIn === 'function';
       const ttl = () => config.get('leaseTtlMs') ?? DEFAULT_LEASE_TTL_MS;
       const accepted = (soul, digest) => (config.get('acceptedDefinitions')?.[soul] ?? []).includes(digest);
@@ -451,8 +455,16 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         const now = clock.now();
         return unbound.filter((rt) => now <= rt.lease_expires_at).map(({ soul_id: soulId, member_id: memberId, adapter_id: adapterId }) => ({ soul_id: soulId, member_id: memberId, adapter_id: adapterId }));
       };
-      return { provides: { withLiveRuntime, withLeases, verifyBinding, bindChallenge, forgetConnection, withBoundRuntime, withNoticeScope, unboundRuntimes } };
+      return { provides: { withLiveRuntime, withLeases, verifyBinding, bindChallenge, forgetConnection,
+        bridgeBindChallenge: bridge.bridgeBindChallenge,
+        verifyBridgeBinding: bridge.verifyBridgeBinding,
+        forgetBridgeConnection: bridge.forgetBridgeConnection,
+        boundBridge: bridge.boundBridge,
+        bridgeStatus: bridge.bridgeStatus,
+        revokeBridges: bridge.revokeAll,
+        withBoundRuntime, withNoticeScope, unboundRuntimes } };
     },
     async start(ctx) { await normalizeScopes.get(ctx)(); },
+    async stop(ctx) { await bridgeStates.get(ctx)?.revokeAll(); },
   });
 }
