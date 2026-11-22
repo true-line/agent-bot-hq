@@ -121,8 +121,8 @@ upstream service.
 [Installed-process test](https://github.com/true-line/agent-bot-identity/blob/843b4433f397d5a3cc746fdc6f9110b6687d9444/tests/integration/hq-inbox-release-gate.test.mjs) ·
 [Passing Identity CI](https://github.com/true-line/agent-bot-identity/actions/runs/43808462724/job/133104594419)
 
-HQ #141 separately verified **default host construction**. HQ registers the
-consumer with the released v0.5.0 notice schemas. The real comms broker tests
+HQ #141 separately verified **default host construction** against the then-current
+v0.5.0 notice schemas. The real comms broker tests
 exercise durable custody before acknowledgment, scoped peek and consume, and
 restart with a consumed record.
 [Default-host tests](https://github.com/true-line/agent-bot-hq/blob/dd9480195881912c12c537f6ae49eb221ec18cbc/tests/hq-notices-comms.test.mjs) ·
