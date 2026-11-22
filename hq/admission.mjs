@@ -682,6 +682,9 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         bridgeBindChallengeV2: bridge.bridgeBindChallengeV2,
         verifyBridgeBindingV2: bridge.verifyBridgeBindingV2,
         boundBridgeV2: bridge.boundBridgeV2,
+        // The packaged broker opts in to the route, but a live HQ must also
+        // have the installed Machine-backed one-use provider injected here.
+        bridgeQualificationEnabledV2: () => typeof qualificationAuthorizer === 'function',
         qualifyBridgeMessagesV2: bridge.qualifyBridgeMessagesV2,
         forgetBridgeConnection: bridge.forgetBridgeConnection,
         boundBridge: bridge.boundBridge,
