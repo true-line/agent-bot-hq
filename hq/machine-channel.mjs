@@ -139,7 +139,7 @@ function responseFields(line) {
 function authenticatedResponse(line, nonce, pinned, verb) {
   const { value: r, body } = responseFields(line);
   if ((isServiceHandoff(verb) || verb === 'hq-device'
-    || ['stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b'].includes(verb)) && Object.keys(r).some((field) =>
+    || ['stage2a-lookup', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b'].includes(verb)) && Object.keys(r).some((field) =>
     !['ok', 'diagnostic', 'message', 'state', 'body', 'timestamp', 'nonce', 'request_nonce', 'signature'].includes(field))) {
     throw new Error('unexpected Machine ' + verb + ' response field');
   }
@@ -259,6 +259,7 @@ function machineRoleStage2a(verb, request) {
 export const machineRoleStage2aReserve = (request) => machineRoleStage2a('stage2a-reserve', request);
 export const machineRoleStage2aExec = (request) => machineRoleStage2a('stage2a-exec', request);
 export const machineRoleStage2aVerifyB = (request) => machineRoleStage2a('stage2a-verify-b', request);
+export const machineRoleStage2aLookup = (request) => machineRoleStage2a('stage2a-lookup', request);
 
 // Also exercised with a temporary private home in the protocol tests. The CLI
 // always obtains its home and UID from the kernel-backed account lookup above.
@@ -284,7 +285,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       planID = args[1];
       socket = args[3];
     }
-  } else if (['stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b'].includes(verb)
+  } else if (['stage2a-lookup', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b'].includes(verb)
     && args.length === 2 && args[0] === '--socket') {
     socket = args[1];
   }
@@ -348,8 +349,9 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     }
     if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))
       || Object.keys(deviceFields).length !== keys.length || !/^(legacy|[a-f0-9]{64})$/.test(deviceFields.hq_epoch)) throw new Error('invalid Machine device fields');
-  } else if (['stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b'].includes(verb)) {
+  } else if (['stage2a-lookup', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b'].includes(verb)) {
     const selectors = {
+      'stage2a-lookup': ['package_path'],
       'stage2a-reserve': ['plan_digest', 'installation_id', 'start_id', 'hq_epoch', 'launch_id'],
       'stage2a-exec': ['reservation_sha256', 'role', 'nonce', 'pid'],
       'stage2a-verify-b': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
@@ -363,6 +365,9 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     if (!deviceFields || typeof deviceFields !== 'object' || Array.isArray(deviceFields)
       || Object.keys(deviceFields).length !== expected.length
       || !expected.every((key) => Object.hasOwn(deviceFields, key))
+      || (verb === 'stage2a-lookup' && (typeof deviceFields.package_path !== 'string'
+        || !isAbsolute(deviceFields.package_path) || /[\x00\r\n]/.test(deviceFields.package_path)
+        || Buffer.byteLength(deviceFields.package_path) > 4096))
       || (verb === 'stage2a-reserve' && (!sha.test(deviceFields.plan_digest)
         || !id.test(deviceFields.installation_id) || !/^st_[0-9a-f]{24}$/.test(deviceFields.start_id)
         || !sha.test(deviceFields.hq_epoch) || !/^ln_[0-9a-f]{24}$/.test(deviceFields.launch_id)))
@@ -381,6 +386,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     }
   } else if (deviceFields !== undefined) throw new Error('unexpected Machine device fields');
   const stage2aFields = {
+    'stage2a-lookup': ['package_path'],
     'stage2a-reserve': ['plan_digest', 'installation_id', 'start_id', 'hq_epoch', 'launch_id'],
     'stage2a-exec': ['reservation_sha256', 'role', 'nonce', 'pid'],
     'stage2a-verify-b': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
@@ -402,10 +408,24 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   const result = { client: 'agent-daemon', channel: 'signed', state: r.state, daemon_fingerprint: fingerprint(daemon) };
   if (verb === 'hq-device') return r;
   if (stage2aFields) {
-    const expectedState = { 'stage2a-reserve': 'reserved', 'stage2a-exec': 'granted',
+    const expectedState = { 'stage2a-lookup': 'found', 'stage2a-reserve': 'reserved', 'stage2a-exec': 'granted',
       'stage2a-verify-b': 'verified' }[verb];
     if (r.state !== expectedState) throw new Error('unexpected signed Machine Stage 2a state');
     const body = r.body;
+    if (verb === 'stage2a-lookup') {
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).length !== 5
+        || !['installation_id', 'plan_id', 'plan_digest', 'runner_account', 'bridge_account']
+          .every((key) => Object.hasOwn(body, key))
+        || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(body.installation_id)
+        || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(body.plan_id)
+        || !/^[0-9a-f]{64}$/.test(body.plan_digest)
+        || body.runner_account !== `_abm-sr-${fingerprint(Buffer.from(body.installation_id)).slice(0, 20)}`
+        || body.bridge_account !== `_abm-br-${fingerprint(Buffer.from(`agent-bot-soul-bridge/v1\0${body.installation_id}`)).slice(0, 20)}`) {
+        throw new Error('invalid signed Machine Stage 2a lookup');
+      }
+      return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
+    }
     if (verb === 'stage2a-verify-b') {
       if (!body || typeof body !== 'object' || Array.isArray(body)
         || Object.keys(body).length !== 1 || body.verified !== true) throw new Error('invalid signed Machine bridge verification');
