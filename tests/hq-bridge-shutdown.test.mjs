@@ -53,3 +53,21 @@ test('a swallowed broker-close error still degrades live HQ status and records a
     await assert.rejects(t.hq.stop(), /Machine stop unconfirmed/);
   } finally { await t.done(); }
 });
+
+test('the shared HQ broker cannot submit protected v2 bridge bind frames to Comms', async () => {
+  const accepted = [];
+  const broker = definePlugin({ name: 'test-member-broker', version: '0.1.0', hostApi: 1,
+    async init(ctx) {
+      ctx.broker.serve({ accept: async (kind) => { accepted.push(kind); return null; } });
+    } });
+  const t = await startHQ({ plugins: [broker] });
+  try {
+    const socket = await t.member();
+    for (const kind of ['bridge.bind.v2.challenge', 'bridge.bind.v2']) {
+      const reply = await socket.request(kind, selectors);
+      assert.equal(reply.host_refusal.code, 'host.launch_unavailable');
+    }
+    assert.equal((await socket.request('bind', {})).ok, true);
+    assert.deepEqual(accepted, ['bind']);
+  } finally { await t.done(); }
+});
