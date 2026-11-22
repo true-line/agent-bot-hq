@@ -345,7 +345,7 @@ export function createHost({
     };
   }
 
-  async function dispatch(op, { auth, payload, session } = {}) {
+  async function dispatch(op, { auth, payload, session, protectedStart } = {}) {
     if (!(op in HQ_OPERATIONS)) fail('host.unknown_operation', `${op} is not an hq/v1 operation`, { op });
     if (!['running', 'safe', 'device_revoked'].includes(mode)) fail('host.not_running', `host is ${mode}`);
     if (auth !== HQ_OPERATIONS[op]) fail('host.auth_mismatch', `${op} needs auth ${HQ_OPERATIONS[op]}`, { op, auth, expected: HQ_OPERATIONS[op] });
@@ -360,7 +360,10 @@ export function createHost({
     const reg = registries.hq.get(op);
     if (!reg) fail('host.unknown_operation', `no plugin implements ${op}`, { op });
     if (states.get(reg.plugin)?.state !== 'running') fail('host.plugin_degraded', `${reg.plugin} is ${states.get(reg.plugin)?.state}`, { plugin: reg.plugin, ...states.get(reg.plugin) });
-    return reg.handler(structuredClone(payload), Object.freeze({ auth, session }));
+    // The admission listener alone supplies protectedStart from a trusted
+    // native-peer check. It is never parsed from the client's JSON payload.
+    return reg.handler(structuredClone(payload), Object.freeze({ auth, session,
+      ...(op === 'Hello' && protectedStart ? { protectedStart } : {}) }));
   }
 
   // Enrollment is core (PDR-0027). The test signer enrolls in place; the

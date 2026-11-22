@@ -41,6 +41,7 @@ import { parseStrict } from '../sdk/wire/strict-json.mjs';
 export const MAX_LINE_BYTES = 1 << 20;
 const REQUEST_KEYS = new Set(['id', 'op', 'payload']);
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const PROTECTED_PEER_DEADLINE_MS = 5_000;
 
 const clip = (s) => {
   const text = String(s ?? '').trim() || 'refused';
@@ -80,7 +81,7 @@ export function checkSocketPath(path, platform = process.platform) {
 // `mode` is the socket file's mode: 0600 for HQ's own sockets, 0660 for a
 // harness endpoint whose directory gives it the account's group (hq/harness-accounts.mjs).
 // `takeover` enables the hook above for this listener.
-export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false, activated, authenticatePeer }) {
+export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false, activated, authenticatePeer, connectionContext, connectionClosed }) {
   if (process.platform === 'win32') throw new Error('HQ on Windows needs a named pipe with an owner DACL, which is not built yet (#89)');
   const authenticate = activated ? activated.authenticate : authenticatePeer;
   if (activated && typeof authenticate !== 'function') throw new Error('an activated listener requires peer authentication');
@@ -111,7 +112,7 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
   }
 
   // `offer`: this request may take the connection over.
-  async function handle(line, session, offer = false) {
+  async function handle(line, session, offer = false, trustedContext) {
     let req;
     try {
       req = parseStrict(line);
@@ -124,7 +125,8 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     if (extra.length) return respondError(new HostError('host.invalid_request', `unknown request field ${extra[0]}`), id);
     if (typeof req.op !== 'string') return respondError(new HostError('host.invalid_request', 'a request names its op'), id);
     try {
-      const result = await dispatch(req.op, { auth, payload: req.payload, session, ...(offer ? { takeover: true } : {}) });
+      const result = await dispatch(req.op, { auth, payload: req.payload, session,
+        ...(trustedContext ? { protectedStart: trustedContext } : {}), ...(offer ? { takeover: true } : {}) });
       const t = takeoverOf(result);
       if (t) {
         if (offer) return { id, takeover: t };
@@ -153,6 +155,33 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
       try { accepted = await authenticate(socket); } catch { /* refuse */ }
       finally { pendingChecks--; }
       if (!accepted || socket.destroyed) { socket.destroy(); return; }
+    }
+    // Only HQ's trusted listener can supply protected-start context. A wire
+    // payload never reaches this hook, and a failed native peer check closes
+    // before any request is parsed. Null means an ordinary cooperative peer.
+    let trustedContext;
+    if (connectionContext) {
+      let timer;
+      try {
+        trustedContext = await Promise.race([
+          Promise.resolve().then(() => connectionContext(socket)),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('protected peer check timed out')), PROTECTED_PEER_DEADLINE_MS);
+            timer.unref?.();
+          }),
+        ]);
+      }
+      catch {
+        if (connectionClosed) void Promise.resolve().then(() => connectionClosed(socket, undefined)).catch(() => {});
+        socket.destroy(); return;
+      }
+      finally { clearTimeout(timer); }
+      if (socket.destroyed || (trustedContext !== null && trustedContext !== undefined
+        && (typeof trustedContext !== 'object' || Array.isArray(trustedContext)))) {
+        if (connectionClosed) void Promise.resolve().then(() => connectionClosed(socket, trustedContext)).catch(() => {});
+        socket.destroy(); return;
+      }
+      if (trustedContext) trustedContext = Object.freeze({ ...trustedContext });
     }
     const session = newSession();
     // Bytes, not text: a takeover hands the rest of the stream on unchanged.
@@ -212,14 +241,14 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
         if (canTakeOver && lines++ === 0) {
           // The first request runs alone; the rest of the buffer waits for it.
           first = true;
-          queue = queue.then(() => handle(line, session, true)).then((out) => {
+          queue = queue.then(() => handle(line, session, true, trustedContext)).then((out) => {
             first = false;
             if (out?.takeover) takeOver(out.id, out.takeover);
             else { send(out); pump(); }
           }, (e) => { first = false; send(respondError(e, null)); pump(); });
           return;
         }
-        queue = queue.then(() => handle(line, session)).then(send, (e) => send(respondError(e, null)));
+        queue = queue.then(() => handle(line, session, false, trustedContext)).then(send, (e) => send(respondError(e, null)));
       }
     }
     function onData(chunk) {
@@ -230,7 +259,10 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     if (authenticate) socket.resume();
     // The session ends after its queued requests finish, so a request still
     // in flight (a broker bind, say) cannot recreate state after the end.
-    socket.on('close', () => { queue = queue.then(() => endSession(session)).catch(() => {}); });
+    socket.on('close', () => {
+      if (connectionClosed) void Promise.resolve().then(() => connectionClosed(socket, trustedContext)).catch(() => {});
+      queue = queue.then(() => endSession(session)).catch(() => {});
+    });
   }
 
   const server = createServer({ pauseOnConnect: Boolean(authenticate) }, onConnection);
