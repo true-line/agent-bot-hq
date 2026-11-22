@@ -153,6 +153,7 @@ export function createHQ({
   soulLaunch,                    // Machine-authorized launcher under a distinct per-installation UID; never owner config
   soulVerifier,                  // independent Machine reservation signature verifier pinned by trusted HQ entry point
   soulCompletionVerifier,        // independent Machine containment signature verifier
+  bridgeAuthority,               // future authenticated Machine live-start/B proof client; never config or owner input
   plugins = [],                  // plugin objects (tests); installed ones come from pluginsDir
   pluginsDir,                    // installed plugins, each checked against `pins` (§4.5)
   pins = { plugins: [] },        // governance/plugins.json
@@ -329,6 +330,7 @@ export function createHQ({
       profileReasons: (pending, unbound) => profileReasons(pending, unbound),
       harnessAccount: (adapterId) => harnessPlan.accountOf(adapterId),
       callerOf: (connection) => brokerCallers.get(connection),
+      bridgeAuthority,
     });
     const builtIn = [admission, tasksPlugin({ schemas }), noticesPlugin({ schemas }), ...plugins];
     pluginLoad = [];
