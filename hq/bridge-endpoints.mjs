@@ -50,7 +50,8 @@ export function planBridgeEndpoints(assignments, { platform, account, hqUid, har
     }
     usedUids.add(bridge_uid);
     installations.add(installation_id);
-    return Object.freeze({ installationId: installation_id, uid: bridge_uid, gid: bridge_gid, directory, path });
+    return Object.freeze({ installationId: installation_id, runnerUid: entry.runner_uid,
+      uid: bridge_uid, gid: bridge_gid, directory, path });
   });
 }
 
@@ -69,6 +70,7 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
       throw new Error('invalid Machine bridge broker directory on disk');
     }
     checkACL(endpoint.directory);
+    return dir;
   }
   function checkSocket() {
     const socket = lstat(endpoint.path);
@@ -80,17 +82,23 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
 
   checkDirectory();
   let identity;
+  const matchesInode = (recorded, current) => recorded.dev === current.dev && recorded.ino === current.ino;
+  function checkCurrent() {
+    if (!identity) return false;
+    const dir = checkDirectory();
+    const socket = checkSocket();
+    checkACL(endpoint.path);
+    return matchesInode(identity.dir, dir) && matchesInode(identity.socket, socket);
+  }
   const listener = await listen({
     path: endpoint.path, auth: 'member', core, mode: 0o660, replaceStale: false,
     authenticatePeer: async (socket) => {
-      if (!identity || await authenticate(socket, endpoint.uid) !== true) return false;
-      const current = checkSocket();
-      return current.dev === identity.dev && current.ino === identity.ino;
+      return await authenticate(socket, endpoint.uid) === true && checkCurrent();
     },
     newSession(socket) {
       const connection = `bb_${core.random.hex(12)}`;
-      peers.set(connection, Object.freeze({ socket, endpoint,
-        dev: identity.dev, ino: identity.ino }));
+      peers.set(connection, Object.freeze({ socket, endpoint, checkCurrent,
+        dev: identity.socket.dev, ino: identity.socket.ino }));
       const end = () => {
         peers.delete(connection);
         // Revoke HQ's receipt before pending broker dispatch can finish.
@@ -107,10 +115,10 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
     },
   });
   try {
-    checkDirectory();
+    const dir = checkDirectory();
     const socket = checkSocket();
     checkACL(endpoint.path);
-    identity = { dev: socket.dev, ino: socket.ino };
+    identity = { dir, socket };
   } catch (error) {
     await listener.close();
     throw error;
@@ -118,13 +126,37 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
   return listener;
 }
 
-export function bindBridgeAuthority(authority, peers) {
-  return {
-    async verifyLiveStart(selectors, connection) {
-      const peer = peers.get(connection);
-      if (!peer || peer.socket.destroyed || peer.endpoint.installationId !== selectors.installation_id) refuse();
-      return authority.verifyLiveStart(selectors, connection, peer);
-    },
-    onDisconnect: (...args) => authority.onDisconnect(...args),
+function matchesMemberEndpoint(member, endpoint, startId) {
+  const installationId = endpoint.installationId;
+  const slot = (domain, ...values) => createHash('sha256').update([domain, ...values].join('\0')).digest('hex').slice(0, 20);
+  const directory = join(dirname(DARWIN_HARNESS_DIR), 'm', slot('agent-bot-soul-endpoint-installation/v1', installationId));
+  const basename = `${slot('agent-bot-soul-endpoint-start/v1', installationId, startId)}.sock`;
+  return member?.directory === directory && member.socket_path === join(directory, basename)
+    && member.owner_uid === endpoint.runnerUid && member.group_gid === endpoint.gid
+    && member.dir_mode === 0o2750 && member.socket_mode === 0o660
+    && Array.isArray(member.peer_uids) && member.peer_uids.length === 2
+    && member.peer_uids[0] === endpoint.runnerUid && member.peer_uids[1] === endpoint.uid;
+}
+
+export function bindBridgeAuthority(authority, peers, { hqEpoch } = {}) {
+  if (typeof authority?.verifyLiveStartV2 !== 'function' || typeof authority.onDisconnectV2 !== 'function'
+    || typeof hqEpoch !== 'string' || !/^[0-9a-f]{64}$/.test(hqEpoch)) return undefined;
+  const isCurrentPeerV2 = (connection) => {
+    const peer = peers.get(connection);
+    return Boolean(peer && !peer.socket.destroyed && peer.checkCurrent());
   };
+  return Object.freeze({
+    async verifyLiveStartV2(selectors, connection, phase) {
+      const peer = peers.get(connection);
+      if (!peer || peer.endpoint.installationId !== selectors.installation_id || !isCurrentPeerV2(connection)) refuse();
+      return authority.verifyLiveStartV2(selectors, connection, peer, phase);
+    },
+    matchesAssignmentV2(context, selectors, connection) {
+      const peer = peers.get(connection);
+      return Boolean(peer && context.hq_epoch === hqEpoch && context.bridge_uid === peer.endpoint.uid
+        && context.broker_socket === peer.endpoint.path && matchesMemberEndpoint(context.member, peer.endpoint, selectors.start_id));
+    },
+    isCurrentPeerV2,
+    onDisconnectV2: (...args) => authority.onDisconnectV2(...args),
+  });
 }
