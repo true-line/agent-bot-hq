@@ -82,6 +82,17 @@ test('stock Messages HTTP reaches only a bound, one-use HQ qualification consume
   assert.equal(ancillary.status, 422);
   const malformed = await http(bridge.socketPath, 'POST', '/v1/messages', { model: MODEL, stream: true, messages: { role: 'user', content: PROMPT } });
   assert.equal(malformed.status, 422);
+  const invalidTurns = [
+    [{ role: 'user', content: [{ type: 'text', text: PROMPT }, { type: 'text', text: 'extra' }] }],
+    [{ role: 'user', content: [{ type: 'text', text: PROMPT }, { type: 'image', source: { type: 'base64', data: 'AA==' } }] }],
+    [{ role: 'user', content: [{ type: 'text', text: PROMPT }, { type: 'text', text: PROMPT }] }],
+    [{ role: 'user', content: [{ type: 'text', text: PROMPT, cache_control: { type: 'ephemeral' } }] }],
+    [{ role: 'user', content: PROMPT, extra: 'unbound' }],
+    [{ role: 'user', content: 'unrelated' }, { role: 'user', content: PROMPT }],
+  ];
+  for (const messages of invalidTurns) {
+    assert.equal((await http(bridge.socketPath, 'POST', '/v1/messages', { model: MODEL, stream: true, messages })).status, 422);
+  }
   assert.equal(decisions.length, 0);
   const message = { model: MODEL, stream: true, max_tokens: 32000, system: 'x'.repeat(87_000), tools: [], messages: [{ role: 'user', content: [{ type: 'text', text: PROMPT }] }] };
   const turn = await http(bridge.socketPath, 'POST', '/v1/messages?beta=test', message);

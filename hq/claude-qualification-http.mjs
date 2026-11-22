@@ -11,11 +11,15 @@ const MAX_BODY = 256 * 1024;
 const POLICY = Buffer.from('{"policy_limits":{},"restrictions":{},"compliance_taints":[]}');
 
 function exactPrompt(request, prompt) {
-  if (!Array.isArray(request?.messages)) return false;
-  const message = request.messages.at(-1);
-  if (message?.role !== 'user') return false;
-  const blocks = Array.isArray(message.content) ? message.content : [{ type: 'text', text: message.content }];
-  return blocks.some((block) => block?.type === 'text' && block.text === prompt);
+  if (!Array.isArray(request?.messages) || request.messages.length !== 1) return false;
+  const message = request.messages[0];
+  if (message?.role !== 'user' || Object.keys(message).length !== 2
+    || !Object.hasOwn(message, 'content')) return false;
+  if (typeof message.content === 'string') return message.content === prompt;
+  if (!Array.isArray(message.content) || message.content.length !== 1) return false;
+  const block = message.content[0];
+  return block?.type === 'text' && block.text === prompt
+    && Object.keys(block).length === 2;
 }
 
 function sse(response, kind, fields = {}) {
