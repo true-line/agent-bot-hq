@@ -139,7 +139,7 @@ function responseFields(line) {
 function authenticatedResponse(line, nonce, pinned, verb) {
   const { value: r, body } = responseFields(line);
   if ((isServiceHandoff(verb) || verb === 'hq-device'
-    || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider'].includes(verb)) && Object.keys(r).some((field) =>
+    || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)) && Object.keys(r).some((field) =>
     !['ok', 'diagnostic', 'message', 'state', 'body', 'timestamp', 'nonce', 'request_nonce', 'signature'].includes(field))) {
     throw new Error('unexpected Machine ' + verb + ' response field');
   }
@@ -266,6 +266,11 @@ export const machineRoleStage2aStop = (request) => machineRoleStage2a('stage2a-s
 export const machineRoleStage2aFinalizeB = (request) => machineRoleStage2a('stage2a-finalize-b', request);
 export const machineRoleStage2aLive = (request) => machineRoleStage2a('stage2a-live', request);
 export const machineRoleStage2aProvider = (request) => machineRoleStage2a('stage2a-provider', request);
+export const machineRoleStage2aChildReady = (request) => machineRoleStage2a('stage2a-child-ready', request);
+export const machineRoleStage2aHelloStart = (request) => machineRoleStage2a('stage2a-hello-start', request);
+export const machineRoleStage2aHelloFinalize = (request) => machineRoleStage2a('stage2a-hello-finalize', request);
+export const machineRoleStage2aHelloAbort = (request) => machineRoleStage2a('stage2a-hello-abort', request);
+export const machineRoleStage2aPeerRole = (request) => machineRoleStage2a('stage2a-peer-role', request);
 
 function stage2aListResult(body, daemon, hqUid) {
   const id = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -404,7 +409,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       planID = args[1];
       socket = args[3];
     }
-  } else if (['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider'].includes(verb)
+  } else if (['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)
     && args.length === 2 && args[0] === '--socket') {
     socket = args[1];
   }
@@ -468,7 +473,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     }
     if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))
       || Object.keys(deviceFields).length !== keys.length || !/^(legacy|[a-f0-9]{64})$/.test(deviceFields.hq_epoch)) throw new Error('invalid Machine device fields');
-  } else if (['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider'].includes(verb)) {
+  } else if (['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role', 'stage2a-stop', 'stage2a-finalize-b'].includes(verb)) {
     const selectors = {
       'stage2a-lookup': ['package_path'],
       'stage2a-list': [],
@@ -484,6 +489,17 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'relay_socket'],
       'stage2a-live': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
         'plan_id', 'plan_digest', 'hq_epoch', 'challenge'],
+      'stage2a-child-ready': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+        'plan_id', 'plan_digest', 'hq_epoch', 'child_launcher_pid', 'child_pid', 'grant_sha256'],
+      'stage2a-hello-start': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+        'plan_id', 'plan_digest', 'hq_epoch', 'peer_uid', 'peer_pid',
+        'hello_payload_base64url', 'hello_payload_sha256', 'broker_bind_receipt_sha256'],
+      'stage2a-hello-finalize': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+        'plan_id', 'plan_digest', 'hq_epoch', 'start_envelope_sha256', 'expected'],
+      'stage2a-hello-abort': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+        'plan_id', 'plan_digest', 'hq_epoch'],
+      'stage2a-peer-role': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+        'plan_id', 'plan_digest', 'hq_epoch', 'peer_uid', 'peer_pid'],
       'stage2a-provider': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
         'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'model', 'prompt_sha256'],
     };
@@ -513,7 +529,9 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || !sha.test(deviceFields.plan_digest) || !sha.test(deviceFields.hq_epoch)
         || !sha.test(deviceFields.challenge) || !sha.test(deviceFields.proof)))
       || (verb === 'stage2a-prepare-b' && !validStage2aPrepareB(deviceFields))
-      || (['stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider'].includes(verb)
+      || (['stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider',
+        'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize',
+        'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)
         && (!reservation.test(deviceFields.reservation_sha256)
         || !id.test(deviceFields.installation_id) || !/^st_[0-9a-f]{24}$/.test(deviceFields.start_id)
         || !/^ln_[0-9a-f]{24}$/.test(deviceFields.launch_id) || !id.test(deviceFields.plan_id)
@@ -524,6 +542,27 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || Buffer.from(deviceFields.challenge, 'base64url').length !== 32
         || Buffer.from(deviceFields.challenge, 'base64url').toString('base64url')
           !== deviceFields.challenge))
+      || (verb === 'stage2a-child-ready' && (!Number.isSafeInteger(deviceFields.child_launcher_pid)
+        || deviceFields.child_launcher_pid < 2 || !Number.isSafeInteger(deviceFields.child_pid)
+        || deviceFields.child_pid < 2 || deviceFields.child_pid === deviceFields.child_launcher_pid
+        || !reservation.test(deviceFields.grant_sha256)))
+      || (verb === 'stage2a-hello-start' && (!Number.isSafeInteger(deviceFields.peer_uid)
+        || deviceFields.peer_uid < 1 || !Number.isSafeInteger(deviceFields.peer_pid)
+        || deviceFields.peer_pid < 2 || !reservation.test(deviceFields.hello_payload_sha256)
+        || !reservation.test(deviceFields.broker_bind_receipt_sha256)
+        || typeof deviceFields.hello_payload_base64url !== 'string'
+        || !/^[A-Za-z0-9_-]{1,5462}$/.test(deviceFields.hello_payload_base64url)
+        || Buffer.from(deviceFields.hello_payload_base64url, 'base64url').toString('base64url')
+          !== deviceFields.hello_payload_base64url
+        || `sha256:${fingerprint(Buffer.from(deviceFields.hello_payload_base64url, 'base64url'))}`
+          !== deviceFields.hello_payload_sha256))
+      || (verb === 'stage2a-peer-role' && (!Number.isSafeInteger(deviceFields.peer_uid)
+        || deviceFields.peer_uid < 1 || !Number.isSafeInteger(deviceFields.peer_pid)
+        || deviceFields.peer_pid < 2))
+      || (verb === 'stage2a-hello-finalize' && (!reservation.test(deviceFields.start_envelope_sha256)
+        || !deviceFields.expected || typeof deviceFields.expected !== 'object'
+        || Array.isArray(deviceFields.expected)
+        || Buffer.byteLength(JSON.stringify(deviceFields.expected)) > 4096))
       || (verb === 'stage2a-provider' && (!reservation.test(deviceFields.bind_receipt_sha256)
         || !id.test(deviceFields.model) || !reservation.test(deviceFields.prompt_sha256)))) {
       throw new Error('invalid Stage 2a Machine reservation selectors');
@@ -544,6 +583,17 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'relay_socket'],
     'stage2a-live': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
       'plan_id', 'plan_digest', 'hq_epoch', 'challenge'],
+    'stage2a-child-ready': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+      'plan_id', 'plan_digest', 'hq_epoch', 'child_launcher_pid', 'child_pid', 'grant_sha256'],
+    'stage2a-hello-start': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+      'plan_id', 'plan_digest', 'hq_epoch', 'peer_uid', 'peer_pid',
+      'hello_payload_base64url', 'hello_payload_sha256', 'broker_bind_receipt_sha256'],
+    'stage2a-hello-finalize': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+      'plan_id', 'plan_digest', 'hq_epoch', 'start_envelope_sha256', 'expected'],
+    'stage2a-hello-abort': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+      'plan_id', 'plan_digest', 'hq_epoch'],
+    'stage2a-peer-role': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+      'plan_id', 'plan_digest', 'hq_epoch', 'peer_uid', 'peer_pid'],
     'stage2a-provider': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
       'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'model', 'prompt_sha256'],
   }[verb];
@@ -567,7 +617,10 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       'stage2a-reserve': 'reserved', 'stage2a-exec': 'granted',
       'stage2a-verify-b': 'verified', 'stage2a-prepare-b': 'prepared',
       'stage2a-stop': 'stopped', 'stage2a-finalize-b': 'finalized',
-      'stage2a-live': 'live', 'stage2a-provider': 'provided' }[verb];
+      'stage2a-live': 'live', 'stage2a-provider': 'provided',
+      'stage2a-child-ready': 'child-ready', 'stage2a-hello-start': 'hello-started',
+      'stage2a-hello-finalize': 'hello-finalized', 'stage2a-hello-abort': 'hello-aborted',
+      'stage2a-peer-role': 'peer-verified' }[verb];
     if (r.state !== expectedState) throw new Error('unexpected signed Machine Stage 2a state');
     const body = r.body;
     if (verb === 'stage2a-list') return stage2aListResult(body, daemon, uid);
@@ -631,18 +684,31 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       }
       return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
     }
-    if (verb === 'stage2a-finalize-b') {
+    if (verb === 'stage2a-hello-abort') {
       if (!body || typeof body !== 'object' || Array.isArray(body)
-        || Object.keys(body).sort().join(',') !== 'envelope_base64url,finalized_live_expires_at,sha256'
-        || !Number.isSafeInteger(body.finalized_live_expires_at)
-        || body.finalized_live_expires_at <= Date.now()) {
-        throw new Error('invalid signed Machine B finalization');
+        || Object.keys(body).join(',') !== 'aborted' || body.aborted !== true) {
+        throw new Error('invalid signed Machine Hello abort');
+      }
+      return Object.freeze({ aborted: true, daemon_fingerprint: fingerprint(daemon) });
+    }
+    if (verb === 'stage2a-finalize-b' || verb === 'stage2a-child-ready') {
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).sort().join(',') !== (verb === 'stage2a-finalize-b'
+          ? 'envelope_base64url,finalized_live_expires_at,sha256'
+          : 'envelope_base64url,expires_at_ms,sha256')
+        || !Number.isSafeInteger(verb === 'stage2a-finalize-b'
+          ? body.finalized_live_expires_at : body.expires_at_ms)
+        || (verb === 'stage2a-finalize-b' ? body.finalized_live_expires_at
+          : body.expires_at_ms) <= Date.now()) {
+        throw new Error('invalid signed Machine Stage 2a finalization');
       }
     }
     const expected = verb === 'stage2a-exec'
       ? ['envelope_base64url', 'sha256', 'invocation_base64url']
       : verb === 'stage2a-finalize-b'
         ? ['envelope_base64url', 'sha256', 'finalized_live_expires_at']
+        : verb === 'stage2a-child-ready'
+          ? ['envelope_base64url', 'sha256', 'expires_at_ms']
         : ['envelope_base64url', 'sha256'];
     if (!body || typeof body !== 'object' || Array.isArray(body)
       || Object.keys(body).length !== expected.length
@@ -653,9 +719,13 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     const envelope = Buffer.from(body.envelope_base64url, 'base64url');
     if (envelope.length === 0 || envelope.toString('base64url') !== body.envelope_base64url
       || `sha256:${fingerprint(envelope)}` !== body.sha256) throw new Error('Machine reservation envelope digest mismatch');
-    if (verb === 'stage2a-reserve' || verb === 'stage2a-stop' || verb === 'stage2a-finalize-b') {
+    if (verb === 'stage2a-reserve' || verb === 'stage2a-stop'
+      || verb === 'stage2a-finalize-b' || verb === 'stage2a-child-ready'
+      || verb === 'stage2a-hello-start' || verb === 'stage2a-hello-finalize'
+      || verb === 'stage2a-peer-role') {
       return Object.freeze({ envelope, sha256: body.sha256,
         ...(verb === 'stage2a-finalize-b' ? { finalized_live_expires_at: body.finalized_live_expires_at } : {}),
+        ...(verb === 'stage2a-child-ready' ? { expires_at_ms: body.expires_at_ms } : {}),
         daemon_fingerprint: fingerprint(daemon) });
     }
     if (typeof body.invocation_base64url !== 'string' || !/^[A-Za-z0-9_-]+$/.test(body.invocation_base64url)) {

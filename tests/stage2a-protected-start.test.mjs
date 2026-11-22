@@ -12,9 +12,13 @@ const PLAN = 'c'.repeat(64);
 const EPOCH = 'd'.repeat(64);
 const FINAL_BYTES = Buffer.from('signed-finalization');
 const FINAL = 'sha256:' + createHash('sha256').update(FINAL_BYTES).digest('hex');
+const CHILD_BYTES = Buffer.from('signed-child-start');
+const CHILD = 'sha256:' + createHash('sha256').update(CHILD_BYTES).digest('hex');
+const CHILD_GRANT = 'sha256:' + 'e'.repeat(64);
 const CHALLENGE = Buffer.alloc(32, 7).toString('base64url');
+const CHALLENGE2 = Buffer.alloc(32, 8).toString('base64url');
 
-function fixture(packageRoot, { runnerFails = false, ackFails = false,
+function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckFails = false,
   ackIsPreviousLease = false } = {}) {
   const events = [];
   let providerAttempts = 0;
@@ -69,6 +73,13 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false,
     verifyBoundBridge: async () => ({ bind_receipt_sha256: BIND }),
     prepareBridge: async () => {},
     machineFinalize: async () => ({ envelope: FINAL_BYTES, sha256: FINAL }),
+    machineChildReady: async (request) => {
+      assert.equal(request.child_launcher_pid, 403);
+      assert.equal(request.child_pid, 404);
+      assert.equal(request.grant_sha256, CHILD_GRANT);
+      events.push('Machine-child-ready');
+      return { envelope: CHILD_BYTES, sha256: CHILD, expires_at_ms: Date.now() + 4500 };
+    },
     startRole: async ({ role }) => {
       if (role === 'runner') {
         if (runnerFails) throw new Error('R failed before launch');
@@ -99,6 +110,33 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false,
               start_id: startId, launch_id: launchId,
               lease_sha256: live.lease_sha256,
               lease_sequence: live.lease_sequence };
+          },
+          waitRunnerChildReady: async ({ reservationSHA256, startId, launchId,
+            childStartSHA256, childStartEnvelope }) => {
+            if (childAckFails) throw new Error('R rejected child receipt');
+            assert.equal(reservationSHA256, RESERVATION);
+            assert.equal(startId, assignment.start_id);
+            assert.equal(launchId, assignment.launch_id);
+            assert.equal(childStartSHA256, CHILD);
+            assert.deepEqual(childStartEnvelope, CHILD_BYTES);
+            events.push('R-child-ack');
+          } };
+      }
+      if (role === 'child') {
+        events.push('child-launched');
+        return { pid: 403, grantSHA256: CHILD_GRANT, stop: async () => {},
+          done: new Promise(() => {}),
+          waitChildStarted: async () => {
+            events.push('child-started');
+            return { child_launcher_pid: 403, child_pid: 404, grant_sha256: CHILD_GRANT };
+          },
+          sendChildReceipt: async (receipt) => {
+            assert.equal(receipt.sha256, CHILD);
+            events.push('child-receipt-sent');
+          },
+          waitChildAccepted: async (sha256) => {
+            assert.equal(sha256, CHILD);
+            events.push('child-accepted');
           } };
       }
       return { pid: 401, stop: async () => {},
@@ -121,16 +159,18 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false,
     get activation() { return activation; } };
 }
 
-test('B finalization cannot publish one-use qualification before live R', async () => {
+test('one-use provider opens only after B, R and stock child are ready', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-start-'));
   try {
     const root = realpathSync(dir);
     const f = fixture(root);
     await f.starter.start({ package_path: root, requested_profile: 'managed-protected' });
     assert.equal(f.providerAttempts, 1);
-    assert.deepEqual(f.events.slice(-9), ['B-finalized', 'runner-started',
+    assert.deepEqual(f.events.slice(-15), ['B-finalized', 'runner-started',
       'runner:402', 'Machine-live', 'R-activated',
-      'Machine-live', 'R-live', 'R-ack', 'provider-registered']);
+      'Machine-live', 'R-live', 'R-ack', 'child-launched', 'child-started',
+      'Machine-child-ready', 'child-receipt-sent', 'child-accepted', 'R-child-ack',
+      'provider-registered']);
     assert.deepEqual(Object.keys(f.activation).sort(), [
       'schema', 'reservation_sha256', 'start_id', 'launch_id',
       'runner_wrapper_pid',
@@ -142,6 +182,18 @@ test('B finalization cannot publish one-use qualification before live R', async 
     assert.equal(f.activation.runner_wrapper_pid, 402);
     assert.equal(Buffer.from(f.activation.finalization_envelope_base64url, 'base64url').toString(),
       FINAL_BYTES.toString());
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('R refusal of child receipt leaves the one-use provider closed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-start-'));
+  try {
+    const root = realpathSync(dir);
+    const f = fixture(root, { childAckFails: true });
+    await assert.rejects(f.starter.start({ package_path: root,
+      requested_profile: 'managed-protected' }), /R rejected child receipt/);
+    assert.equal(f.providerAttempts, 0);
+    assert.ok(f.events.includes('Machine-stop'));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -184,6 +236,24 @@ test('paired Machine Live renews the exact occupied R start', async () => {
     assert.equal(reply.lease_sequence, 3);
     assert.ok(reply.live_expires_at_ms > Date.now());
     assert.equal(f.events.filter((event) => event === 'Machine-live').length, 3);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('R and child concurrent Live renewals keep distinct signed challenges', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-start-'));
+  try {
+    const root = realpathSync(dir);
+    const f = fixture(root);
+    await f.starter.start({ package_path: root, requested_profile: 'managed-protected' });
+    const selectors = { installation_id: 'install-1', reservation_sha256: RESERVATION,
+      start_id: f.activation.start_id, launch_id: f.activation.launch_id };
+    const [runner, child] = await Promise.all([
+      f.starter.renewLive({ ...selectors, challenge: CHALLENGE }),
+      f.starter.renewLive({ ...selectors, challenge: CHALLENGE2 }),
+    ]);
+    assert.equal(runner.challenge, CHALLENGE);
+    assert.equal(child.challenge, CHALLENGE2);
+    assert.equal(child.lease_sequence, runner.lease_sequence + 1);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

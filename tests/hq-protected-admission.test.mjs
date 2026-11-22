@@ -40,11 +40,43 @@ function machine({ finalized, entered, aborts, cooperativePeers = 0 }) {
   };
 }
 
+// These tests exercise admission state transitions with a synthetic trusted
+// listener context. Production receives that context only on the per-start
+// R socket; the shared C socket never attaches one.
+async function startProtectedHQ(options) {
+  const t = await startHQ(options);
+  let nextSession = 0;
+  const verifier = options.protectedAdmission;
+  t.entry = async () => {
+    const context = await verifier.acceptPeer();
+    const session = `rp_fixture_${++nextSession}`;
+    let closed = false;
+    return {
+      request: async (op, payload) => {
+        if (closed) throw new Error('synthetic R entry is closed');
+        try {
+          const result = await t.hq.host.dispatch(op, { auth: 'entry-point',
+            session, payload, protectedStart: context });
+          return { ok: true, result };
+        } catch (error) {
+          return { ok: false, host_refusal: { code: error.code ?? 'host.internal' } };
+        }
+      },
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        if (context) await verifier.peerDisconnected(null, context);
+      },
+    };
+  };
+  return t;
+}
+
 test('protected Hello keeps all runtimes unusable until distinct Machine finalization', async () => {
   const finalized = next();
   const entered = next();
   const aborts = [];
-  const t = await startHQ({ protectedAdmission: machine({ finalized, entered, aborts }) });
+  const t = await startProtectedHQ({ protectedAdmission: machine({ finalized, entered, aborts }) });
   try {
     const entry = await t.entry();
     const pending = entry.request('Hello', hello());
@@ -77,7 +109,7 @@ test('wrong finalization spends the protected start and revokes every runtime', 
   const finalized = next();
   const entered = next();
   const aborts = [];
-  const t = await startHQ({ protectedAdmission: machine({ finalized, entered, aborts }) });
+  const t = await startProtectedHQ({ protectedAdmission: machine({ finalized, entered, aborts }) });
   try {
     const entry = await t.entry();
     const pending = entry.request('Hello', hello());
@@ -98,7 +130,7 @@ test('failed protected finalization leaves an earlier cooperative admission live
   const finalized = next();
   const entered = next();
   const aborts = [];
-  const t = await startHQ({ protectedAdmission: machine({ finalized, entered, aborts, cooperativePeers: 1 }) });
+  const t = await startProtectedHQ({ protectedAdmission: machine({ finalized, entered, aborts, cooperativePeers: 1 }) });
   try {
     const oldEntry = await t.entry();
     const old = (await oldEntry.request('Hello', hello())).result;
@@ -121,7 +153,7 @@ test('a Machine finalization timeout refuses and spends the protected Hello', { 
   const finalized = next(); // deliberately never resolved
   const entered = next();
   const aborts = [];
-  const t = await startHQ({ protectedAdmission: machine({ finalized, entered, aborts }) });
+  const t = await startProtectedHQ({ protectedAdmission: machine({ finalized, entered, aborts }) });
   try {
     const entry = await t.entry();
     const pending = entry.request('Hello', hello());
@@ -168,7 +200,7 @@ test('restart revokes a persisted provisional Hello before serving admission', a
 test('restart revokes even a finalized protected runtime until Machine reauthenticates it', async () => {
   const finalized = next();
   const entered = next();
-  const t = await startHQ({ protectedAdmission: machine({ finalized, entered, aborts: [] }) });
+  const t = await startProtectedHQ({ protectedAdmission: machine({ finalized, entered, aborts: [] }) });
   const home = t.home;
   let runtimeId;
   try {
@@ -194,7 +226,7 @@ test('mapping throw and accepted-definition refusal abort verified starts', asyn
     const finalized = next(), entered = next(), aborts = [];
     const verifier = machine({ finalized, entered, aborts });
     if (kind === 'mapping') verifier.verifyDefinitionMapping = async () => { throw new Error('Machine mapping failed'); };
-    const t = await startHQ({ protectedAdmission: verifier,
+    const t = await startProtectedHQ({ protectedAdmission: verifier,
       ...(kind === 'acceptance' ? { config: { acceptedDefinitions: {} } } : {}) });
     try {
       const entry = await t.entry();
@@ -208,7 +240,7 @@ test('mapping throw and accepted-definition refusal abort verified starts', asyn
 test('distinct verified start cannot reuse an active cooperative Hello', async () => {
   const finalized = next(), entered = next(), aborts = [];
   const verifier = machine({ finalized, entered, aborts, cooperativePeers: 1 });
-  const t = await startHQ({ protectedAdmission: verifier });
+  const t = await startProtectedHQ({ protectedAdmission: verifier });
   try {
     const cooperative = await t.entry();
     const old = (await cooperative.request('Hello', hello())).result;
@@ -230,7 +262,7 @@ test('R/B loss before finalization refuses and aborts, including late finalize',
     if (terminal) throw new Error('Machine rejected late finalize after terminal abort');
     return expected;
   };
-  const t = await startHQ({ protectedAdmission: verifier });
+  const t = await startProtectedHQ({ protectedAdmission: verifier });
   try {
     const entry = await t.entry();
     const pending = entry.request('Hello', hello());
@@ -247,7 +279,7 @@ test('R/B loss before finalization refuses and aborts, including late finalize',
 test('R/B loss after finalization revokes active runtimes and Admit', async () => {
   const finalized = next(), entered = next(), aborts = [];
   const verifier = machine({ finalized, entered, aborts });
-  const t = await startHQ({ protectedAdmission: verifier });
+  const t = await startProtectedHQ({ protectedAdmission: verifier });
   try {
     const entry = await t.entry();
     const pending = entry.request('Hello', hello());
@@ -271,7 +303,7 @@ test('verification failure aborts by authenticated peer token before a binding e
   const verifier = machine({ finalized, entered, aborts });
   verifier.verifyHelloStart = async () => { throw new Error('Machine verification failed'); };
   verifier.abort = async (target) => { aborts.push(target.connection.machine_peer); };
-  const t = await startHQ({ protectedAdmission: verifier });
+  const t = await startProtectedHQ({ protectedAdmission: verifier });
   try {
     const entry = await t.entry();
     assert.equal((await entry.request('Hello', hello())).host_refusal.code, 'host.launch_unavailable');
@@ -285,7 +317,7 @@ test('pending or final admission snapshot failure aborts the verified start', as
     const finalized = next(), entered = next(), aborts = [];
     const verifier = machine({ finalized, entered, aborts });
     if (stage === 'final') verifier.finalize = async (expected) => expected;
-    const t = await startHQ({ protectedAdmission: verifier });
+    const t = await startProtectedHQ({ protectedAdmission: verifier });
     const original = fs.renameSync;
     let injected = false;
     fs.renameSync = function (from, to) {
@@ -320,7 +352,7 @@ test('closing the authenticated R entry socket revokes its finalized runtime', a
   const verifier = machine({ finalized, entered, aborts });
   const closed = next();
   verifier.peerDisconnected = async (_socket, context) => { if (context) { verifier.onLoss?.(); closed.resolve(); } };
-  const t = await startHQ({ protectedAdmission: verifier });
+  const t = await startProtectedHQ({ protectedAdmission: verifier });
   try {
     const entry = await t.entry();
     const pending = entry.request('Hello', hello());
@@ -344,7 +376,7 @@ test('lost R/B with rejected or timed-out abort records containment uncertainty'
       if (outcome === 'rejected') throw new Error('Machine abort refused');
       return new Promise(() => {});
     };
-    const t = await startHQ({ protectedAdmission: verifier });
+    const t = await startProtectedHQ({ protectedAdmission: verifier });
     try {
       const entry = await t.entry();
       const pending = entry.request('Hello', hello());
@@ -368,7 +400,7 @@ test('lost R/B with rejected or timed-out abort records containment uncertainty'
 test('failed Machine watcher transport closes active runtime and lease authority', async () => {
   const finalized = next(), entered = next(), aborts = [];
   const verifier = machine({ finalized, entered, aborts });
-  const t = await startHQ({ protectedAdmission: verifier });
+  const t = await startProtectedHQ({ protectedAdmission: verifier });
   try {
     const entry = await t.entry();
     const pending = entry.request('Hello', hello());

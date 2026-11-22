@@ -6,7 +6,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { pipeline } from 'node:stream';
 import { takeover } from './socket.mjs';
 import { machineRoleStage2aLookup, machineRoleStage2aReserve,
-  machineRoleStage2aFinalizeB } from './machine-channel.mjs';
+  machineRoleStage2aFinalizeB, machineRoleStage2aChildReady } from './machine-channel.mjs';
 import { prepareStage2aBridge, stage2aRelayClaim, startStage2aRole } from './stage2a-role-launch.mjs';
 
 const exact = (value, fields) => value && typeof value === 'object' && !Array.isArray(value)
@@ -77,6 +77,7 @@ function activateRunner(runner, assignment, reservationSHA256, live, finalizatio
 export function createStage2aProtectedStarter({ installations, authority, verifyReservation,
   getBrokerIdentity, verifyBoundBridge, machineLookup = machineRoleStage2aLookup,
   machineReserve = machineRoleStage2aReserve, machineFinalize = machineRoleStage2aFinalizeB,
+  machineChildReady = machineRoleStage2aChildReady,
   openProtectedAdmission,
   prepareBridge = prepareStage2aBridge, startRole = startStage2aRole,
   onFinalized, onStopped, random = (bytes) => randomBytes(bytes).toString('hex') } = {}) {
@@ -86,6 +87,7 @@ export function createStage2aProtectedStarter({ installations, authority, verify
     || typeof getBrokerIdentity !== 'function' || typeof verifyBoundBridge !== 'function'
     || typeof machineLookup !== 'function'
     || typeof machineReserve !== 'function' || typeof machineFinalize !== 'function'
+    || typeof machineChildReady !== 'function'
     || typeof prepareBridge !== 'function' || typeof startRole !== 'function'
     || typeof random !== 'function') refuse();
   const byId = new Map(installations.map((i) => [i.installation_id, i]));
@@ -137,9 +139,9 @@ export function createStage2aProtectedStarter({ installations, authority, verify
       || lookup.bridge_account !== installed.bridge_account
       || slots.has(installed.installation_id)) refuse();
     const slot = { installed, reservationSHA256: null, assignment: null,
-      runner: null, bridge: null, admission: null, finalizationEnvelope: null,
+      runner: null, bridge: null, child: null, admission: null, finalizationEnvelope: null,
       bindReceiptSHA256: null, activationSent: false, activated: false,
-      rLeaseReady: false, renewing: false,
+      rLeaseReady: false, livePending: 0, liveQueue: Promise.resolve(),
       lastLeaseSequence: 0,
       issuedRLeases: new Map(),
       leaseTimer: null, stopPromise: null };
@@ -162,11 +164,12 @@ export function createStage2aProtectedStarter({ installations, authority, verify
       slot.assignment = assignment;
       const selectors = await authority.register({ envelope: reserved.envelope,
         sha256: reserved.sha256, installed, killRoles: async () => {
-          const roles = [slot.runner, slot.bridge].filter(Boolean);
+          const roles = [slot.child, slot.runner, slot.bridge].filter(Boolean);
           await Promise.allSettled(roles.map((role) => role.stop()));
         } });
       registered = true;
-      slot.admission = await openProtectedAdmission({ installed, assignment, selectors });
+      slot.admission = await openProtectedAdmission({ installed, assignment, selectors,
+        getBindReceiptSHA256: () => slot.bindReceiptSHA256 });
       if (typeof slot.admission?.close !== 'function') refuse();
       if (slot.stopPromise) {
         await slot.admission.close();
@@ -220,25 +223,47 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         || slot.issuedRLeases.get(ack.lease_sequence)?.expiresAt <= Date.now()
         || !slot.rLeaseReady || slot.stopPromise) refuse();
       slot.activated = true;
-      // Do not expose the one-use provider before the protected R admission
-      // has completed and R has acknowledged an A-signed live lease.
+      // The stock ACP child has its own one-use Machine grant and process
+      // group. R remains an admission supervisor and never carries ACP bytes.
+      slot.child = await startRole({ account: installed.runner_account, role: 'child',
+        reservationSHA256: reserved.sha256 });
+      slot.child.done?.then(() => { void stop(slot).catch(() => {}); });
+      const childStarted = await slot.child.waitChildStarted();
+      if (childStarted.child_launcher_pid !== slot.child.pid
+        || childStarted.grant_sha256 !== slot.child.grantSHA256) refuse();
+      const childReceipt = await machineChildReady({ ...selectors,
+        child_launcher_pid: childStarted.child_launcher_pid,
+        child_pid: childStarted.child_pid,
+        grant_sha256: childStarted.grant_sha256 });
+      if (!Buffer.isBuffer(childReceipt?.envelope)
+        || !DIGEST.test(childReceipt?.sha256 ?? '')
+        || !Number.isSafeInteger(childReceipt?.expires_at_ms)
+        || childReceipt.expires_at_ms <= Date.now()) refuse();
+      await slot.child.sendChildReceipt(childReceipt);
+      await slot.child.waitChildAccepted(childReceipt.sha256);
+      await slot.runner.waitRunnerChildReady({ reservationSHA256: reserved.sha256,
+        startId, launchId, childStartSHA256: childReceipt.sha256,
+        childStartEnvelope: childReceipt.envelope });
+      if (slot.stopPromise) refuse();
+      // Do not expose the one-use provider before R and the stock child have
+      // both acknowledged A's signed current start and child receipts.
       await onFinalized?.({ installed, assignment, selectors,
         bindReceiptSHA256: live.bind_receipt_sha256 });
       const result = { start_id: startId, launch_id: launchId, installation_id: installed.installation_id,
-        soul_id: installed.soul_id, package_path: source, pid: slot.runner.pid,
+        soul_id: installed.soul_id, package_path: source, pid: childStarted.child_pid,
         runner_uid: installed.runner_uid, runner_gid: installed.runner_gid,
         hq_epoch: installed.hq_epoch, profile: 'managed-protected', protected: true };
       return takeover(result, { open: () => (socket) => {
         if (stopping || slot.stopPromise) { socket.destroy(); return; }
         const cut = () => { socket.destroy(); void stop(slot); };
         socket.once('error', cut);
-        slot.runner.stdin.once?.('error', cut);
-        slot.runner.stdout.once?.('error', cut);
-        socket.pipe(slot.runner.stdin);
-        pipeline(slot.runner.stdout, socket, (error) => { if (error) cut(); });
-        slot.runner.resumeOutput();
+        slot.child.stdin.once?.('error', cut);
+        slot.child.stdout.once?.('error', cut);
+        socket.pipe(slot.child.stdin);
+        pipeline(slot.child.stdout, socket, (error) => { if (error) cut(); });
+        slot.child.resumeOutput();
         socket.once('close', () => { void stop(slot); });
-        slot.runner.done.then(() => { socket.end(); void stop(slot); });
+        slot.child.done.then(() => { socket.end(); void stop(slot); });
       }, cancel: () => { void stop(slot); } });
     } catch (error) {
       if (registered) {
@@ -257,15 +282,22 @@ export function createStage2aProtectedStarter({ installations, authority, verify
       || Buffer.from(request.challenge, 'base64url').toString('base64url') !== request.challenge) refuse();
     const slot = byId.has(request.installation_id)
       ? slots.get(request.installation_id) : undefined;
-    if (!slot || !slot.activationSent || slot.stopPromise || slot.renewing) refuse();
+    if (!slot || !slot.activationSent || slot.stopPromise || slot.livePending >= 2) refuse();
     if (request.reservation_sha256 !== slot.reservationSHA256
       || request.start_id !== slot.assignment?.start_id
       || request.launch_id !== slot.assignment?.launch_id) {
       await stop(slot).catch(() => {});
       refuse();
     }
-    slot.renewing = true;
+    // R and the separate child each renew their five-second A lease. Serialize
+    // the two paired calls, preserving each distinct challenge and sequence.
+    const prior = slot.liveQueue;
+    let release;
+    slot.liveQueue = new Promise((resolve) => { release = resolve; });
+    slot.livePending += 1;
     try {
+      await prior;
+      if (slot.stopPromise) refuse();
       const live = await authority.currentLiveStart(slot.reservationSHA256, request.challenge);
       const finalizationSHA256 = 'sha256:' + createHash('sha256')
         .update(slot.finalizationEnvelope).digest('hex');
@@ -297,7 +329,10 @@ export function createStage2aProtectedStarter({ installations, authority, verify
     } catch (error) {
       await stop(slot).catch(() => {});
       throw error;
-    } finally { slot.renewing = false; }
+    } finally {
+      slot.livePending -= 1;
+      release();
+    }
   }
 
   async function stopReservation(reservationSHA256) {

@@ -166,6 +166,23 @@ function runnerActivationFrom(line) {
   return Object.freeze(ack);
 }
 
+function runnerChildReadyFrom(line) {
+  if (line.length > 512) throw new Error('Soul runner child ack is too large');
+  const ack = parseStrict(line.toString('utf8'));
+  if (!ack || typeof ack !== 'object' || Array.isArray(ack)
+    || Object.keys(ack).sort().join(',') !== [
+      'schema', 'reservation_sha256', 'start_id', 'launch_id', 'child_start_sha256',
+    ].sort().join(',')
+    || ack.schema !== 'agent-bot-souls/protected-child-ready/v1'
+    || !DIGEST.test(ack.reservation_sha256)
+    || !/^st_[0-9a-f]{24}$/.test(ack.start_id)
+    || !/^ln_[0-9a-f]{24}$/.test(ack.launch_id)
+    || !DIGEST.test(ack.child_start_sha256)) {
+    throw new Error('invalid Soul runner child ack');
+  }
+  return Object.freeze(ack);
+}
+
 function writeGrant(child, bytes) {
   return new Promise((resolve, reject) => {
     if (!Buffer.isBuffer(bytes) || bytes.length < 2 || bytes.length > 65536
@@ -185,6 +202,71 @@ function bounded(promise, timeoutMs, label) {
   ]).finally(() => clearTimeout(timer));
 }
 
+// Machine writes child lifecycle receipts to the fixed wrapper's stderr.
+// ACP stdout remains reserved for the stock protocol stream.
+function childProgress(child) {
+  if (!child.stderr || typeof child.stderr.on !== 'function') {
+    throw new Error('protected child status pipe is unavailable');
+  }
+  const kinds = ['child-started', 'child-accepted', 'started'];
+  const queue = [];
+  let buffer = Buffer.alloc(0);
+  let phase = 0;
+  let failure;
+  let waiter;
+  const fail = (error) => {
+    if (failure) return;
+    failure = error;
+    if (waiter) { const pending = waiter; waiter = undefined; pending.reject(error); }
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+  };
+  const deliver = (value) => {
+    if (waiter) { const pending = waiter; waiter = undefined; pending.resolve(value); }
+    else queue.push(value);
+  };
+  child.stderr.on('data', (chunk) => {
+    if (failure || phase === kinds.length) return;
+    buffer = Buffer.concat([buffer, chunk]);
+    while (phase < kinds.length) {
+      const end = buffer.indexOf(0x0a);
+      if (end < 0) {
+        if (buffer.length > 1024) fail(new Error('protected child status is too large'));
+        break;
+      }
+      if (end > 1024) { fail(new Error('protected child status is too large')); return; }
+      let event;
+      try { event = parseStrict(buffer.subarray(0, end).toString('utf8')); }
+      catch { fail(new Error('invalid protected child status')); return; }
+      if (!event || typeof event !== 'object' || Array.isArray(event)
+        || event.kind !== kinds[phase]) {
+        fail(new Error('unexpected protected child status')); return;
+      }
+      const fields = phase === 0
+        ? ['kind', 'child_pid', 'child_launcher_pid', 'grant_sha256']
+        : phase === 1 ? ['kind', 'receipt_sha256', 'lease_sequence'] : ['kind'];
+      if (Object.keys(event).sort().join(',') !== fields.sort().join(',')) {
+        fail(new Error('unexpected protected child status fields')); return;
+      }
+      buffer = buffer.subarray(end + 1);
+      phase += 1;
+      deliver(Object.freeze(event));
+    }
+    if (phase === kinds.length) buffer = Buffer.alloc(0);
+  });
+  child.stderr.once('error', () => fail(new Error('protected child status pipe failed')));
+  child.once('close', () => {
+    if (phase !== kinds.length) fail(new Error('protected child exited before readiness'));
+  });
+  return Object.freeze({ next: async (expected, timeoutMs) => {
+    if (failure) throw failure;
+    const value = queue.length ? queue.shift() : await bounded(new Promise((resolve, reject) => {
+      waiter = { resolve, reject };
+    }), timeoutMs, 'protected child status').catch((error) => { fail(error); throw error; });
+    if (value.kind !== expected) throw new Error('protected child status out of order');
+    return value;
+  } });
+}
+
 // A returned role is *started*, not contained or protected. The caller must
 // bind the reservation to an authenticated live start and obtain Machine's
 // signed stop/completion before releasing any installation occupancy.
@@ -201,9 +283,10 @@ export async function startStage2aRole({ account, role, reservationSHA256,
   const command = role === 'runner' ? 'soul-run'
     : role === 'bridge' ? 'soul-bridge' : 'soul-child';
   const child = spawnProcess('/usr/bin/sudo', ['-n', '-u', account, '--', STAGE2A_LAUNCHER, command], {
-    stdio: ['pipe', 'pipe', 'ignore'], shell: false,
+    stdio: ['pipe', 'pipe', role === 'child' ? 'pipe' : 'ignore'], shell: false,
     env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C' },
   });
+  const progress = role === 'child' ? childProgress(child) : undefined;
   const done = new Promise((resolve) => {
     child.once('close', (exit_code, signal) => resolve({ exit_code, signal, contained: false }));
   });
@@ -216,8 +299,40 @@ export async function startStage2aRole({ account, role, reservationSHA256,
     await writeGrant(child, grant?.grantLine);
     let readinessAttempted = false;
     let activationAttempted = false;
-    return Object.freeze({ pid: challenge.pid, role, stdin: child.stdin, stdout: child.stdout, done,
+    let childReadyAttempted = false;
+    return Object.freeze({ pid: challenge.pid, role, stdin: child.stdin, stdout: child.stdout,
+      grantSHA256: grant?.sha256, done,
       resumeOutput: () => child.stdout.resume(),
+      waitChildStarted: async () => {
+        if (role !== 'child' || !DIGEST.test(grant?.sha256 ?? '')) throw new Error('invalid protected child grant');
+        const started = await progress.next('child-started', 5000);
+        if (!Number.isSafeInteger(started.child_pid) || started.child_pid < 2
+          || started.child_pid === challenge.pid || started.child_launcher_pid !== challenge.pid
+          || started.grant_sha256 !== grant.sha256) throw new Error('protected child start differs from grant');
+        return started;
+      },
+      sendChildReceipt: async (receipt) => {
+        if (role !== 'child' || !Buffer.isBuffer(receipt?.envelope)
+          || !DIGEST.test(receipt?.sha256 ?? '')
+          || !Number.isSafeInteger(receipt?.expires_at_ms)
+          || receipt.expires_at_ms <= Date.now()) throw new Error('invalid protected child receipt');
+        const line = Buffer.from(JSON.stringify({
+          envelope_base64url: receipt.envelope.toString('base64url'),
+          sha256: receipt.sha256, expires_at_ms: receipt.expires_at_ms,
+        }) + '\n');
+        await writeGrant(child, line);
+      },
+      waitChildAccepted: async (receiptSHA256) => {
+        if (role !== 'child' || !DIGEST.test(receiptSHA256 ?? '')) {
+          throw new Error('invalid protected child receipt selector');
+        }
+        const accepted = await progress.next('child-accepted', 5000);
+        if (accepted.receipt_sha256 !== receiptSHA256
+          || !Number.isSafeInteger(accepted.lease_sequence)
+          || accepted.lease_sequence < 1) throw new Error('protected child receipt was not accepted');
+        await progress.next('started', 5000);
+        return accepted;
+      },
       waitRunnerActivation: async ({ reservationSHA256, startId, launchId } = {}) => {
         if (role !== 'runner' || activationAttempted || !DIGEST.test(reservationSHA256 ?? '')
           || !/^st_[0-9a-f]{24}$/.test(startId ?? '')
@@ -226,10 +341,45 @@ export async function startStage2aRole({ account, role, reservationSHA256,
         }
         activationAttempted = true;
         try {
-          const ack = await firstLine(child, runnerActivationFrom, 5000, 512, true, true);
+          // Protected Hello/Equip can cross several paired Machine calls.
+          // The starter independently enforces each five-second signed Live
+          // lease while this bounded admission handshake remains open.
+          const ack = await firstLine(child, runnerActivationFrom, 30000, 512, true, true);
           if (ack.reservation_sha256 !== reservationSHA256 || ack.start_id !== startId
             || ack.launch_id !== launchId || child.exitCode !== null || child.signalCode !== null) {
             throw new Error('Soul runner activation ack differs from signed start');
+          }
+          return ack;
+        } catch (error) {
+          child.stdin.destroy();
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+          throw error;
+        }
+      },
+      waitRunnerChildReady: async ({ reservationSHA256, startId, launchId,
+        childStartSHA256, childStartEnvelope } = {}) => {
+        if (role !== 'runner' || !activationAttempted || childReadyAttempted
+          || !DIGEST.test(reservationSHA256 ?? '')
+          || !/^st_[0-9a-f]{24}$/.test(startId ?? '')
+          || !/^ln_[0-9a-f]{24}$/.test(launchId ?? '')
+          || !DIGEST.test(childStartSHA256 ?? '')
+          || !Buffer.isBuffer(childStartEnvelope) || childStartEnvelope.length === 0
+          || 'sha256:' + createHash('sha256').update(childStartEnvelope).digest('hex')
+            !== childStartSHA256) throw new Error('invalid Soul runner child confirmation');
+        childReadyAttempted = true;
+        const line = Buffer.from(JSON.stringify({
+          schema: 'agent-bot-souls/protected-child-start/v1',
+          reservation_sha256: reservationSHA256, start_id: startId, launch_id: launchId,
+          child_start_sha256: childStartSHA256,
+          child_start_envelope_base64url: childStartEnvelope.toString('base64url'),
+        }) + '\n');
+        try {
+          await writeGrant(child, line);
+          const ack = await firstLine(child, runnerChildReadyFrom, 5000, 512, true, true);
+          if (ack.reservation_sha256 !== reservationSHA256 || ack.start_id !== startId
+            || ack.launch_id !== launchId || ack.child_start_sha256 !== childStartSHA256
+            || child.exitCode !== null || child.signalCode !== null) {
+            throw new Error('Soul runner child ack differs from Machine receipt');
           }
           return ack;
         } catch (error) {
