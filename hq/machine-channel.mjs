@@ -138,7 +138,8 @@ function responseFields(line) {
 
 function authenticatedResponse(line, nonce, pinned, verb) {
   const { value: r, body } = responseFields(line);
-  if ((isServiceHandoff(verb) || verb === 'hq-device') && Object.keys(r).some((field) =>
+  if ((isServiceHandoff(verb) || verb === 'hq-device'
+    || ['stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b'].includes(verb)) && Object.keys(r).some((field) =>
     !['ok', 'diagnostic', 'message', 'state', 'body', 'timestamp', 'nonce', 'request_nonce', 'signature'].includes(field))) {
     throw new Error('unexpected Machine ' + verb + ' response field');
   }
@@ -242,6 +243,23 @@ export function machineRoleCommand(argv) {
   return machineCommandInHome(argv, account.homedir, account.uid, undefined, ordinary);
 }
 
+// The protected start request is sent only by the dedicated HQ service over
+// its existing pinned, signed local Machine channel. No path, command, UID or
+// socket is accepted from the owner-facing Soul request.
+function machineRoleStage2a(verb, request) {
+  const { account } = roleAccount(true);
+  const prefix = process.platform === 'darwin' && process.arch === 'arm64' ? '/opt/homebrew' : null;
+  if (!prefix) throw new Error('Stage 2a Machine reservation requires dedicated macOS HQ');
+  return machineCommandInHome(
+    [verb, '--socket', join(prefix, 'var/agent-machine/daemon.sock')],
+    account.homedir, account.uid, request,
+  );
+}
+
+export const machineRoleStage2aReserve = (request) => machineRoleStage2a('stage2a-reserve', request);
+export const machineRoleStage2aExec = (request) => machineRoleStage2a('stage2a-exec', request);
+export const machineRoleStage2aVerifyB = (request) => machineRoleStage2a('stage2a-verify-b', request);
+
 // Also exercised with a temporary private home in the protocol tests. The CLI
 // always obtains its home and UID from the kernel-backed account lookup above.
 export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false, roleUid = uid, expectedPair) {
@@ -266,6 +284,9 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       planID = args[1];
       socket = args[3];
     }
+  } else if (['stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b'].includes(verb)
+    && args.length === 2 && args[0] === '--socket') {
+    socket = args[1];
   }
   if (!identity && (!socket || !isAbsolute(socket))) {
     throw new Error('usage: machine identity | status --socket PATH [--daemon-key HEX] | members-plans list --socket PATH [--after PLAN_ID] | members-plans get PLAN_ID --socket PATH');
@@ -306,7 +327,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     const timestamp = Math.floor(Date.now() / 1000);
     const nonce = randomBytes(16).toString('base64url');
     const parts = [fields.verb, '', fields.option ?? '', '', fields.plan_id ?? '', '', '', '', timestamp, nonce];
-    for (const field of ['plan_digest', 'challenge_nonce', 'owner_signature', 'hq_epoch', 'session', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature']) {
+    for (const field of ['plan_digest', 'challenge_nonce', 'owner_signature', 'hq_epoch', 'session', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature', 'stage2a_request']) {
       if (fields[field] !== undefined) parts.push(field, fields[field]);
     }
     const request = { ...fields, timestamp, nonce, public_key: pub.toString('base64'),
@@ -327,8 +348,50 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     }
     if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))
       || Object.keys(deviceFields).length !== keys.length || !/^(legacy|[a-f0-9]{64})$/.test(deviceFields.hq_epoch)) throw new Error('invalid Machine device fields');
+  } else if (['stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b'].includes(verb)) {
+    const selectors = {
+      'stage2a-reserve': ['plan_digest', 'installation_id', 'start_id', 'hq_epoch', 'launch_id'],
+      'stage2a-exec': ['reservation_sha256', 'role', 'nonce', 'pid'],
+      'stage2a-verify-b': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+        'plan_id', 'plan_digest', 'hq_epoch', 'challenge', 'proof'],
+    };
+    const expected = selectors[verb];
+    const id = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+    const sha = /^[0-9a-f]{64}$/;
+    const reservation = /^sha256:[0-9a-f]{64}$/;
+    const nonce = deviceFields?.nonce;
+    if (!deviceFields || typeof deviceFields !== 'object' || Array.isArray(deviceFields)
+      || Object.keys(deviceFields).length !== expected.length
+      || !expected.every((key) => Object.hasOwn(deviceFields, key))
+      || (verb === 'stage2a-reserve' && (!sha.test(deviceFields.plan_digest)
+        || !id.test(deviceFields.installation_id) || !/^st_[0-9a-f]{24}$/.test(deviceFields.start_id)
+        || !sha.test(deviceFields.hq_epoch) || !/^ln_[0-9a-f]{24}$/.test(deviceFields.launch_id)))
+      || (verb === 'stage2a-exec' && (!reservation.test(deviceFields.reservation_sha256)
+        || !['runner', 'bridge'].includes(deviceFields.role)
+        || typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(nonce)
+        || Buffer.from(nonce, 'base64url').length !== 32
+        || Buffer.from(nonce, 'base64url').toString('base64url') !== nonce
+        || !Number.isSafeInteger(deviceFields.pid) || deviceFields.pid < 2))
+      || (verb === 'stage2a-verify-b' && (!reservation.test(deviceFields.reservation_sha256)
+        || !id.test(deviceFields.installation_id) || !/^st_[0-9a-f]{24}$/.test(deviceFields.start_id)
+        || !/^ln_[0-9a-f]{24}$/.test(deviceFields.launch_id) || !id.test(deviceFields.plan_id)
+        || !sha.test(deviceFields.plan_digest) || !sha.test(deviceFields.hq_epoch)
+        || !sha.test(deviceFields.challenge) || !sha.test(deviceFields.proof)))) {
+      throw new Error('invalid Stage 2a Machine reservation selectors');
+    }
   } else if (deviceFields !== undefined) throw new Error('unexpected Machine device fields');
-  const fields = { verb, ...deviceFields, ...(option && { option }), ...(planID && { plan_id: planID }) };
+  const stage2aFields = {
+    'stage2a-reserve': ['plan_digest', 'installation_id', 'start_id', 'hq_epoch', 'launch_id'],
+    'stage2a-exec': ['reservation_sha256', 'role', 'nonce', 'pid'],
+    'stage2a-verify-b': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+      'plan_id', 'plan_digest', 'hq_epoch', 'challenge', 'proof'],
+  }[verb];
+  const stage2aRequest = stage2aFields
+    ? Buffer.from(JSON.stringify(Object.fromEntries(stage2aFields.map((key) => [key, deviceFields[key]])))).toString('base64url')
+    : undefined;
+  const fields = { verb, ...(verb === 'hq-device' ? deviceFields : {}),
+    ...(stage2aRequest && { stage2a_request: stage2aRequest }),
+    ...(option && { option }), ...(planID && { plan_id: planID }) };
   const { response: r } = await send(fields).catch(error => {
     if (pair && disconnectedPairs.has(error)) disconnectedPairs.set(error, pair);
     // keyd binds this exact signed receipt idempotently. Reconnect once with
@@ -338,6 +401,41 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   });
   const result = { client: 'agent-daemon', channel: 'signed', state: r.state, daemon_fingerprint: fingerprint(daemon) };
   if (verb === 'hq-device') return r;
+  if (stage2aFields) {
+    const expectedState = { 'stage2a-reserve': 'reserved', 'stage2a-exec': 'granted',
+      'stage2a-verify-b': 'verified' }[verb];
+    if (r.state !== expectedState) throw new Error('unexpected signed Machine Stage 2a state');
+    const body = r.body;
+    if (verb === 'stage2a-verify-b') {
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).length !== 1 || body.verified !== true) throw new Error('invalid signed Machine bridge verification');
+      return Object.freeze({ verified: true, daemon_fingerprint: fingerprint(daemon) });
+    }
+    const expected = verb === 'stage2a-exec'
+      ? ['envelope_base64url', 'sha256', 'invocation_base64url']
+      : ['envelope_base64url', 'sha256'];
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+      || Object.keys(body).length !== expected.length
+      || !expected.every((key) => Object.hasOwn(body, key))
+      || typeof body.envelope_base64url !== 'string'
+      || !/^[A-Za-z0-9_-]+$/.test(body.envelope_base64url)
+      || !/^sha256:[0-9a-f]{64}$/.test(body.sha256)) throw new Error('invalid signed Machine Stage 2a body');
+    const envelope = Buffer.from(body.envelope_base64url, 'base64url');
+    if (envelope.length === 0 || envelope.toString('base64url') !== body.envelope_base64url
+      || `sha256:${fingerprint(envelope)}` !== body.sha256) throw new Error('Machine reservation envelope digest mismatch');
+    if (verb === 'stage2a-reserve') return Object.freeze({ envelope, sha256: body.sha256, daemon_fingerprint: fingerprint(daemon) });
+    if (typeof body.invocation_base64url !== 'string' || !/^[A-Za-z0-9_-]+$/.test(body.invocation_base64url)) {
+      throw new Error('invalid Machine role invocation');
+    }
+    const invocation = Buffer.from(body.invocation_base64url, 'base64url');
+    if (invocation.length === 0 || invocation.toString('base64url') !== body.invocation_base64url) {
+      throw new Error('invalid Machine role invocation');
+    }
+    const grantLine = Buffer.from(JSON.stringify({ envelope_base64url: body.envelope_base64url,
+      sha256: body.sha256, invocation_base64url: body.invocation_base64url }) + '\n', 'utf8');
+    return Object.freeze({ envelope, sha256: body.sha256, invocation, grantLine,
+      daemon_fingerprint: fingerprint(daemon) });
+  }
   if (verb === 'members-plans') return { ...result, ...membersPlanResult(option, planID, r) };
   if (!existing && !publish(dir, 'daemon.pub', daemon, uid).equals(daemon)) throw new Error('a different daemon key was pinned concurrently');
   return result;

@@ -10,7 +10,7 @@ const selectors = Object.freeze({ installation_id: 'soul-a', start_id: `st_${'a'
   launch_id: `ln_${'b'.repeat(24)}`, plan_id: 'plan-1', plan_digest: 'c'.repeat(64),
   reservation_digest: 'sha256:eff7c53524a3d30873e2046ed2d42c48dd7a0c87a69c2c7d3bad998e7f68079e' });
 const context = Object.freeze({ ...selectors, hq_epoch: 'd'.repeat(64), bridge_uid: 322,
-  broker_socket: '/private/tmp/hq-broker.sock', proof_key: key, reservation_bytes: bytes,
+  broker_socket: '/private/tmp/hq-broker.sock', reservation_bytes: bytes,
   reservation_expires_at: 20_000, member: { socket_path: '/private/tmp/machine-assigned-member.sock' },
   soul_artifact_sha256: `sha256:${'f'.repeat(64)}` });
 const connection = { connection: 'bb_1' };
@@ -20,9 +20,11 @@ function fixture({ timers, qualificationAuthorizer } = {}) {
   let now = 1_000;
   let sequence = 0;
   let verified = context;
+  let machineKey = key;
   let peerCurrent = true;
   let assignmentMatches = true;
   let recheck;
+  let proofCheck;
   let contain;
   const scopes = [];
   const stops = [];
@@ -34,6 +36,15 @@ function fixture({ timers, qualificationAuthorizer } = {}) {
         scopes.push([scope, peer]);
         await recheck?.(scope, peer, phase);
         return verified;
+      },
+      async verifyProofV2(proof, peer) {
+        assert.equal(peer, connection.connection);
+        assert.equal(Object.hasOwn(proof, 'proof_key'), false);
+        assert.equal(proof.hq_epoch, context.hq_epoch);
+        assert.equal(proof.bridge_uid, context.bridge_uid);
+        assert.equal(proof.broker_socket, context.broker_socket);
+        await proofCheck?.();
+        return proof.proof === bridgeBindProofV2(machineKey, proof.challenge, context);
       },
       verifyLiveStart() { throw new Error('v2 cannot fall back to a v1 verifier'); },
       isCurrentPeerV2: () => peerCurrent,
@@ -55,9 +66,11 @@ function fixture({ timers, qualificationAuthorizer } = {}) {
     bind: async () => service.verifyBridgeBindingV2(withProof(await challenge()), connection),
     setNow: (value) => { now = value; },
     setVerified: (value) => { verified = value; },
+    setMachineKey: (value) => { machineKey = value; },
     rejectAssignment: () => { assignmentMatches = false; },
     losePeer: () => { peerCurrent = false; },
     onVerify: (call) => { recheck = call; },
+    onProof: (call) => { proofCheck = call; },
     onContain: (call) => { contain = call; },
   };
 }
@@ -186,12 +199,30 @@ test('v2 wrong proof, changed context and late verification spend or expire the 
       challenge.context, challenge.nonce, challenge.hq_epoch, ...Object.values(selectors),
       context.bridge_uid, context.broker_socket,
     ].join('\n')).digest('hex');
-    if (scenario === 'changed key') f.setVerified({ ...context, proof_key: Buffer.alloc(32) });
+    if (scenario === 'changed key') f.setMachineKey(Buffer.alloc(32));
     if (scenario === 'changed peer') f.onVerify(f.losePeer);
     if (scenario === 'late verification') f.onVerify(() => f.setNow(context.reservation_expires_at));
     await assert.rejects(f.service.verifyBridgeBindingV2(proof, connection), denied, scenario);
     await assert.rejects(f.service.verifyBridgeBindingV2(f.withProof(challenge), connection), denied, scenario);
     assert.equal(f.stops.length, 1, scenario);
+  }
+});
+
+test('a late Machine proof cannot publish a B receipt after disconnect or expiry', async () => {
+  for (const ending of ['disconnect', 'expiry']) {
+    const f = fixture();
+    const challenge = await f.challenge();
+    const entered = Promise.withResolvers();
+    const release = Promise.withResolvers();
+    f.onProof(async () => { entered.resolve(); await release.promise; });
+    const pending = assert.rejects(f.service.verifyBridgeBindingV2(f.withProof(challenge), connection), denied);
+    await entered.promise;
+    if (ending === 'disconnect') await f.service.forgetBridgeConnection(connection.connection);
+    else f.setNow(context.reservation_expires_at);
+    release.resolve();
+    await pending;
+    assert.equal(await f.service.boundBridgeV2(selectors, digest('late-receipt')), null);
+    assert.equal(f.stops.length, 1);
   }
 });
 

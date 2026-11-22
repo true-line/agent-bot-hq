@@ -91,6 +91,7 @@ async function checkBridgeTransport(enabled) {
     owner_uid: 321, group_gid: 322, dir_mode: 0o2750, socket_mode: 0o660, peer_uids: [321, 322] };
   const context = { hq_epoch: epoch, bridge_uid: endpoint.uid, broker_socket: endpoint.path, member };
   let observed = context;
+  let observedProof;
   const authority = bindBridgeAuthority({
     verifyLiveStartV2(_selectors, connection, peer) {
       assert.equal(connection, session);
@@ -98,11 +99,27 @@ async function checkBridgeTransport(enabled) {
       assert.equal(peer.ino, 42);
       return observed;
     },
+    verifyProofV2(request, connection, peer) {
+      assert.equal(connection, session);
+      assert.equal(peer.socket, socket);
+      observedProof = request;
+      return true;
+    },
     onDisconnectV2() {},
   }, peers, { hqEpoch: epoch });
   assert.equal(await authority.verifyLiveStartV2(selectors, session), context);
   assert.equal(authority.matchesAssignmentV2(context, selectors, session), true);
+  const proof = { ...selectors, launch_id: `ln_${'b'.repeat(24)}`, plan_id: 'plan-a',
+    plan_digest: 'c'.repeat(64), reservation_digest: `sha256:${'d'.repeat(64)}`,
+    hq_epoch: epoch, bridge_uid: endpoint.uid, broker_socket: endpoint.path,
+    challenge: 'e'.repeat(64), proof: 'f'.repeat(64) };
+  assert.equal(await authority.verifyProofV2(proof, session), true);
+  assert.deepEqual(observedProof, { reservation_sha256: proof.reservation_digest,
+    installation_id: proof.installation_id, start_id: proof.start_id, launch_id: proof.launch_id,
+    plan_id: proof.plan_id, plan_digest: proof.plan_digest, hq_epoch: proof.hq_epoch,
+    challenge: proof.challenge, proof: proof.proof });
   const denied = { code: 'host.launch_unavailable' };
+  await assert.rejects(authority.verifyProofV2({ ...proof, bridge_uid: 321 }, session), denied);
   await assert.rejects(authority.verifyLiveStartV2({ ...selectors, installation_id: 'soul-b' }, session), denied);
   assert.equal(authority.matchesAssignmentV2(context, { ...selectors, start_id: `st_${'b'.repeat(24)}` }, session), false);
   for (const change of [{ hq_epoch: 'b'.repeat(64) }, { bridge_uid: 321 }, { broker_socket: '/tmp/broker.sock' },

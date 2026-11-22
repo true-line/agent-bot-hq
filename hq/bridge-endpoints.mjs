@@ -143,7 +143,8 @@ function matchesMemberEndpoint(member, endpoint, startId) {
 }
 
 export function bindBridgeAuthority(authority, peers, { hqEpoch } = {}) {
-  if (typeof authority?.verifyLiveStartV2 !== 'function' || typeof authority.onDisconnectV2 !== 'function'
+  if (typeof authority?.verifyLiveStartV2 !== 'function' || typeof authority.verifyProofV2 !== 'function'
+    || typeof authority.onDisconnectV2 !== 'function'
     || typeof hqEpoch !== 'string' || !/^[0-9a-f]{64}$/.test(hqEpoch)) return undefined;
   const isCurrentPeerV2 = (connection) => {
     const peer = peers.get(connection);
@@ -159,6 +160,20 @@ export function bindBridgeAuthority(authority, peers, { hqEpoch } = {}) {
       const peer = peers.get(connection);
       return Boolean(peer && context.hq_epoch === hqEpoch && context.bridge_uid === peer.endpoint.uid
         && context.broker_socket === peer.endpoint.path && matchesMemberEndpoint(context.member, peer.endpoint, selectors.start_id));
+    },
+    async verifyProofV2(proof, connection) {
+      const peer = peers.get(connection);
+      if (!peer || !isCurrentPeerV2(connection)
+        || peer.endpoint.installationId !== proof?.installation_id
+        || proof.hq_epoch !== hqEpoch || proof.bridge_uid !== peer.endpoint.uid
+        || proof.broker_socket !== peer.endpoint.path) refuse();
+      return await authority.verifyProofV2({
+        reservation_sha256: proof.reservation_digest,
+        installation_id: proof.installation_id, start_id: proof.start_id,
+        launch_id: proof.launch_id, plan_id: proof.plan_id,
+        plan_digest: proof.plan_digest, hq_epoch: proof.hq_epoch,
+        challenge: proof.challenge, proof: proof.proof,
+      }, connection, peer) === true;
     },
     isCurrentPeerV2,
     onDisconnectV2: (...args) => authority.onDisconnectV2(...args),
