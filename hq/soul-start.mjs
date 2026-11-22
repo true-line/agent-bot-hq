@@ -60,6 +60,12 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
     if (auth !== 'owner') fail('host.auth_mismatch', 'Soul start is owner-only');
     if (!canTakeOver) fail('host.invalid_request', 'soul.start must be the first request on a new owner connection');
     if (shuttingDown || mode() !== 'running') fail('host.launch_unavailable', 'HQ is not running admissions');
+    // A protected request must never be silently served by the cooperative
+    // runner. The signed R/B start, B-only bind and live Machine checks have
+    // no production implementation yet.
+    if (payload?.requested_profile === 'managed-protected') {
+      fail('host.launch_unavailable', 'Machine protected R/B bridge start is not installed');
+    }
     if (!machineLaunch || typeof machineLaunch.reserve !== 'function'
       || typeof verifyMachineReservation !== 'function' || typeof verifyMachineCompletion !== 'function'
       || typeof machineLaunch.start !== 'function') {
@@ -239,8 +245,8 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       fail('host.launch_unavailable', 'Soul runner stopped before ACP takeover');
     }
     item.state = 'running';
-    launch.stdin.on?.('error', () => {});
-    launch.stdout.on?.('error', () => {});
+    launch.stdin.on?.('error', () => { void stop(item); });
+    launch.stdout.on?.('error', () => { void stop(item); });
     try {
       await pushReceipt(core, { plugin: 'hq', kind: 'hq.soul.started', start_id: id, package_path: path,
         soul_id: item.soulId, installation_id: item.installationId, definition_digest: item.definitionDigest,
@@ -258,6 +264,12 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
     return takeover(result, {
       open: () => (socket) => {
         if (item.terminal || !starts.has(id) || shuttingDown) { socket.destroy(); return; }
+        const stopOnStreamError = () => { socket.destroy(); void stop(item); };
+        // pipe() only unpipes on a source error. It does not stop the Machine
+        // runner, so every ACP transport error must revoke this start.
+        socket.once('error', stopOnStreamError);
+        launch.stdin.once?.('error', stopOnStreamError);
+        launch.stdout.once?.('error', stopOnStreamError);
         socket.pipe(launch.stdin);
         launch.stdout.pipe(socket);
         socket.once('close', () => { stop(item); });

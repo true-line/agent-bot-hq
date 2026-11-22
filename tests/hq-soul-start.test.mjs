@@ -89,6 +89,43 @@ test('the owner cannot configure arbitrary code to run in HQ account', () => {
   assert.throws(() => validateConfig({ soulRunner: { command: ['/bin/sh'] } }), /unknown key soulRunner/);
 });
 
+test('an explicit protected Soul start never falls back to the cooperative Machine runner', async () => {
+  const home = tempHome();
+  const launches = [];
+  const machine = fakeMachineLaunch(launches);
+  await assert.rejects(starter(home, machine).dispatch('soul.start', {
+    ...startRequest(home), payload: { package_path: home, requested_profile: 'managed-protected' },
+  }), (error) => error.code === 'host.launch_unavailable');
+  assert.deepEqual(launches, []);
+});
+
+test('an ACP runner stream error stops the Machine process and releases only after containment', { timeout: 10000 }, async () => {
+  for (const side of ['stdin', 'stdout']) {
+    const home = tempHome();
+    const machine = fakeMachineLaunch([]);
+    const originalStart = machine.start.bind(machine);
+    let launch;
+    let stops = 0;
+    machine.start = async (reservation) => {
+      launch = await originalStart(reservation);
+      const originalStop = launch.stop;
+      launch.stop = async () => { stops += 1; return originalStop(); };
+      return launch;
+    };
+    const t = await startHQ({ home, ...machineOptions(machine) });
+    let stream;
+    try {
+      const started = await rawStart(t, home);
+      stream = started.stream;
+      assert.equal(started.response.ok, true);
+      launch[side].emit('error', new Error('fixture transport error'));
+      await waitFor(() => stops === 1);
+      await waitFor(() => t.hq.status().hq.soulStarts.length === 0);
+      assert.equal(t.hq.core.receipts.some((r) => r.kind === 'hq.soul.exited' && r.contained === true), true);
+    } finally { stream?.destroy(); await t.done(); }
+  }
+});
+
 test('only the owner can request a separate Machine runner; the ACP stream stops with its owner connection', { timeout: 10000 }, async () => {
   const home = tempHome();
   const launches = [];

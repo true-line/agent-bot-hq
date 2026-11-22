@@ -42,6 +42,7 @@ import { productionPluginsDir, readPins } from './plugins.mjs';
 import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { connectSocket } from './socket.mjs';
 import { machineRoleCommand } from './machine-channel.mjs';
+import { relaySoulAcp } from './soul-acp-relay.mjs';
 
 const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
@@ -111,9 +112,7 @@ async function startSoul(controlPath, path) {
     if (!response.answer.ok) throw new Error(JSON.stringify(response.answer.refusal ?? response.answer.host_refusal ?? response.answer));
     process.stderr.write(`HQ started Soul runner ${response.answer.result.start_id} (pid ${response.answer.result.pid}); protected qualification remains unavailable\n`);
     if (response.rest.length) process.stdout.write(response.rest);
-    process.stdin.pipe(socket);
-    socket.pipe(process.stdout);
-    await new Promise((resolve) => socket.once('close', resolve));
+    await relaySoulAcp(process.stdin, process.stdout, socket);
   } finally { socket.destroy(); }
 }
 
