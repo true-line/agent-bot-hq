@@ -98,8 +98,6 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         authority.markFinalized(reserved.sha256, { envelope: finalized.envelope,
           sha256: finalized.sha256, bindReceiptSHA256: observation.bind_receipt_sha256,
           relaySocket: relay_socket });
-        await onFinalized?.({ installed, assignment, selectors,
-          bindReceiptSHA256: observation.bind_receipt_sha256 });
         return true;
       });
       if (!ready || !slot.bridge) refuse();
@@ -108,7 +106,13 @@ export function createStage2aProtectedStarter({ installations, authority, verify
       authority.setRolePid(reserved.sha256, 'runner', slot.runner.pid);
       // A signed current Machine lease is needed after both PIDs are present.
       const live = await authority.currentLiveStart(reserved.sha256);
-      if (!live || !Number.isSafeInteger(live.finalized_live_expires_at)) refuse();
+      if (!live || live.phase !== 'finalized' || live.runner_pid !== slot.runner.pid
+        || live.bridge_pid !== slot.bridge.pid
+        || !Number.isSafeInteger(live.finalized_live_expires_at)) refuse();
+      // B may finish its bind before the Soul runner exists. Publish the
+      // one-use provider only after Machine confirms both launched PIDs.
+      await onFinalized?.({ installed, assignment, selectors,
+        bindReceiptSHA256: live.bind_receipt_sha256 });
       const result = { start_id: startId, launch_id: launchId, installation_id: installed.installation_id,
         soul_id: installed.soul_id, package_path: source, pid: slot.runner.pid,
         runner_uid: installed.runner_uid, runner_gid: installed.runner_gid,
