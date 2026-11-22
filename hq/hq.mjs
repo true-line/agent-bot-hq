@@ -154,8 +154,11 @@ export function createHQ({
   soulLaunch,                    // Machine-authorized launcher under a distinct per-installation UID; never owner config
   soulVerifier,                  // independent Machine reservation signature verifier pinned by trusted HQ entry point
   soulCompletionVerifier,        // independent Machine containment signature verifier
+  machineHqEpoch,                // signed current paired epoch from Machine list; never owner config
+  protectedStart,                // HQ-started Machine-authorized R/B lifecycle from trusted entry point
   bridgeAuthority,               // authenticated Machine live-start/B proof client; never config or owner input
   bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
+  qualificationAuthorizer,       // trusted one-use installed test-provider operation; never owner config
   protectedAdmission,            // future pinned Machine verifier; absent in production until signed contracts ship
   plugins = [],                  // plugin objects (tests); installed ones come from pluginsDir
   pluginsDir,                    // installed plugins, each checked against `pins` (§4.5)
@@ -183,6 +186,7 @@ export function createHQ({
   let harnessPlan = { endpoints: [], accountOf: () => undefined };
   const brokerCallers = new Map();
   const bridgePeers = new Map();
+  const bridgeListeners = new Map();
   // Agent launch (§9 row 16b) and what the profile reasons say about it.
   let launcher;
   let soulStarter;
@@ -298,8 +302,9 @@ export function createHQ({
     });
     soulStarter = createSoulStarter({ core, home, machineLaunch: soulLaunch,
       verifyMachineReservation: soulVerifier, verifyMachineCompletion: soulCompletionVerifier,
+      protectedStart,
       mode: () => host?.mode ?? 'starting', hqUid: uid,
-      harnessUids: harnessPlan.endpoints.map((endpoint) => endpoint.uid) });
+      harnessUids: harnessPlan.endpoints.map((endpoint) => endpoint.uid), machineHqEpoch });
     // Whether the provisioner's rule lets HQ start each harness account;
     // bounded, and a missing rule leaves HQ serving row 16a.
     await launcher.probe();
@@ -342,6 +347,7 @@ export function createHQ({
         ? bindBridgeAuthority(bridgeAuthority, bridgePeers, { hqEpoch: soulStarter.hqEpoch })
         : { verifyLiveStart: bridgeAuthority?.verifyLiveStart?.bind(bridgeAuthority),
           onDisconnect: bridgeAuthority?.onDisconnect?.bind(bridgeAuthority) },
+      qualificationAuthorizer,
       protectedAdmission,
     });
     const builtIn = [admission, tasksPlugin({ schemas }), noticesPlugin({ schemas }), ...plugins];
@@ -452,11 +458,15 @@ export function createHQ({
         checkHarnessSocket(endpoint, { darwinHqUid: platform === 'darwin' ? uid : undefined });
       }
       for (const endpoint of bridgeEndpoints) {
-        sockets.push(await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers }));
+        const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
+          enableBridgeQualification: typeof qualificationAuthorizer === 'function' });
+        bridgeListeners.set(endpoint.installationId, listener);
+        sockets.push(listener);
       }
     } catch (e) {
       for (const s of sockets) await s.close();
       sockets = [];
+      bridgeListeners.clear();
       await host.stop({ reason: 'socket failed' }).catch(() => {});
       throw e;
     }
@@ -491,6 +501,7 @@ export function createHQ({
     await launcher.stopAll();
     for (const s of sockets) await s.close();
     sockets = [];
+    bridgeListeners.clear();
     const report = await host.stop({ reason });
     await bridgeStop; // uncertain B containment cannot produce hq.stopped
     for (const [id, s] of coreTable(core, 'sessions')) if (!s.closed_at) coreTable(core, 'sessions').set(id, { ...s, closed_at: clock.now() });
@@ -503,6 +514,18 @@ export function createHQ({
     stop,
     paths,
     status: () => host.status(),
+    bridgeBrokerIdentity: (installationId) => {
+      if (!running || typeof installationId !== 'string') fail('host.launch_unavailable', 'HQ bridge broker is unavailable');
+      const listener = bridgeListeners.get(installationId);
+      if (!listener) fail('host.launch_unavailable', 'Soul installation has no Machine-assigned B broker');
+      return listener.brokerIdentity();
+    },
+    boundBridgeV2: (selectors, receiptDigest) => {
+      if (!running) fail('host.launch_unavailable', 'HQ bridge admission is unavailable');
+      const admission = host.provided('hq-admission');
+      if (!admission) fail('host.launch_unavailable', 'HQ bridge admission is unavailable');
+      return admission.boundBridgeV2(selectors, receiptDigest);
+    },
     legacyTick,
     sweepTasks,
     // Resolves when the first legacy pass after start has finished.

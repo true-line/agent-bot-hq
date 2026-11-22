@@ -128,7 +128,7 @@ const unboundOf = (tx) => tx.list('runtimes').map(([, rt]) => rt).filter((rt) =>
 // the account a broker connection arrived from ({ account, uid }), or
 // undefined on the shared socket. HQ core supplies all three; an agent never
 // does.
-export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, protectedAdmission } = {}) {
+export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, qualificationAuthorizer, protectedAdmission } = {}) {
   for (const n of SCHEMA_NAMES) if (!schemas?.[n]) throw new TypeError(`admission needs the pinned hq/v1 ${n} schema`);
   if (protectedAdmission && (typeof protectedAdmission.acceptPeer !== 'function'
     || typeof protectedAdmission.verifyHelloStart !== 'function'
@@ -158,7 +158,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
     services: ['store', 'receipts', 'clock', 'random', 'config', 'profile', 'log'],
     async init(ctx) {
       const { store, receipts, clock, random, config, profile } = ctx.services;
-      const bridge = createBridgeBindAdmission({ authority: bridgeAuthority, clock, random, receipts });
+      const bridge = createBridgeBindAdmission({ authority: bridgeAuthority, qualificationAuthorizer, clock, random, receipts });
       bridgeStates.set(ctx, bridge);
       const atomicAudit = typeof receipts.appendIn === 'function';
       const ttl = () => config.get('leaseTtlMs') ?? DEFAULT_LEASE_TTL_MS;
@@ -682,6 +682,10 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         bridgeBindChallengeV2: bridge.bridgeBindChallengeV2,
         verifyBridgeBindingV2: bridge.verifyBridgeBindingV2,
         boundBridgeV2: bridge.boundBridgeV2,
+        // The packaged broker opts in to the route, but a live HQ must also
+        // have the installed Machine-backed one-use provider injected here.
+        bridgeQualificationEnabledV2: () => typeof qualificationAuthorizer === 'function',
+        qualifyBridgeMessagesV2: bridge.qualifyBridgeMessagesV2,
         forgetBridgeConnection: bridge.forgetBridgeConnection,
         boundBridge: bridge.boundBridge,
         bridgeStatus: bridge.bridgeStatus,

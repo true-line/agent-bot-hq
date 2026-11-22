@@ -10,11 +10,12 @@ import { listenSocket } from './socket.mjs';
 
 const ROLE_UID = (uid) => Number.isInteger(uid) && uid >= 300 && uid <= 399;
 const INSTALLATION = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const BRIDGE_QUALIFICATION_MESSAGES = 'bridge.qualification.messages.v1';
 const protectedBridgeKind = (kind) => kind === 'bridge.bind.v2.challenge' || kind === 'bridge.bind.v2';
 const refuse = () => fail('host.launch_unavailable', 'bridge bind requires the dedicated Machine-assigned B broker');
 
 export function memberBrokerDispatch(host, kind, payload, connection) {
-  if (protectedBridgeKind(kind)) refuse();
+  if (protectedBridgeKind(kind) || kind === BRIDGE_QUALIFICATION_MESSAGES) refuse();
   return host.brokerAccept(kind, payload, { connection });
 }
 
@@ -56,17 +57,19 @@ export function planBridgeEndpoints(assignments, { platform, account, hqUid, har
 }
 
 export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
-  lstat = lstatSync, checkACL = checkDarwinACL, authenticate = authenticatePeerUid, listen = listenSocket } = {}) {
+  enableBridgeQualification = false, lstat = (path) => lstatSync(path, { bigint: true }),
+  checkACL = checkDarwinACL, authenticate = authenticatePeerUid, listen = listenSocket } = {}) {
   function checkDirectory() {
     for (const path of ['/', '/Library', '/Library/Application Support', dirname(DARWIN_HARNESS_DIR), DARWIN_HARNESS_DIR]) {
       const st = lstat(path);
-      if (!st.isDirectory() || st.uid !== 0 || (st.mode & 0o022) || !(st.mode & 0o001)) {
+      if (!st.isDirectory() || Number(st.uid) !== 0 || (Number(st.mode) & 0o022) || !(Number(st.mode) & 0o001)) {
         throw new Error(`untrusted Darwin bridge broker parent ${path}`);
       }
       checkACL(path);
     }
     const dir = lstat(endpoint.directory);
-    if (!dir.isDirectory() || dir.uid !== hqUid || dir.gid !== endpoint.gid || (dir.mode & 0o7777) !== 0o2750) {
+    if (!dir.isDirectory() || Number(dir.uid) !== hqUid || Number(dir.gid) !== endpoint.gid
+      || (Number(dir.mode) & 0o7777) !== 0o2750) {
       throw new Error('invalid Machine bridge broker directory on disk');
     }
     checkACL(endpoint.directory);
@@ -74,7 +77,8 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
   }
   function checkSocket() {
     const socket = lstat(endpoint.path);
-    if (!socket.isSocket() || socket.uid !== hqUid || socket.gid !== endpoint.gid || (socket.mode & 0o7777) !== 0o660) {
+    if (!socket.isSocket() || Number(socket.uid) !== hqUid || Number(socket.gid) !== endpoint.gid
+      || (Number(socket.mode) & 0o7777) !== 0o660) {
       throw new Error('invalid HQ bridge broker socket on disk');
     }
     return socket;
@@ -82,7 +86,8 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
 
   checkDirectory();
   let identity;
-  const matchesInode = (recorded, current) => recorded.dev === current.dev && recorded.ino === current.ino;
+  const matchesInode = (recorded, current) => BigInt(recorded.dev) === BigInt(current.dev)
+    && BigInt(recorded.ino) === BigInt(current.ino);
   function checkCurrent() {
     if (!identity) return false;
     const dir = checkDirectory();
@@ -110,7 +115,10 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
     },
     endSession: () => {},
     dispatch(kind, { payload, session }) {
-      if (!protectedBridgeKind(kind) || !peers.has(session)) refuse();
+      const qualification = kind === BRIDGE_QUALIFICATION_MESSAGES;
+      const peer = peers.get(session);
+      if (!peer || (!protectedBridgeKind(kind) && !(qualification && enableBridgeQualification === true))) refuse();
+      if (qualification && (peer.socket.destroyed || !peer.checkCurrent())) refuse();
       return host.brokerAccept(kind, payload, { connection: session });
     },
   });
@@ -123,7 +131,21 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
     await listener.close();
     throw error;
   }
-  return listener;
+  // The paired Machine prepare-B request can bind the identity HQ actually
+  // observed. A cannot traverse H:B. B independently reopens and compares
+  // these identities before it uses the broker, so H's claim is not enough.
+  const brokerIdentity = () => {
+    if (!checkCurrent()) refuse();
+    const dir = checkDirectory();
+    const socket = checkSocket();
+    if (!matchesInode(identity.dir, dir) || !matchesInode(identity.socket, socket)) refuse();
+    const projection = (st) => Object.freeze({ device: BigInt(st.dev).toString(),
+      inode: BigInt(st.ino).toString(), owner_uid: Number(st.uid), group_gid: Number(st.gid),
+      mode: Number(st.mode) & 0o7777 });
+    return Object.freeze({ directory: endpoint.directory, socket_path: endpoint.path,
+      directory_identity: projection(dir), socket_identity: projection(socket) });
+  };
+  return Object.freeze({ ...listener, brokerIdentity });
 }
 
 function matchesMemberEndpoint(member, endpoint, startId) {
@@ -139,7 +161,8 @@ function matchesMemberEndpoint(member, endpoint, startId) {
 }
 
 export function bindBridgeAuthority(authority, peers, { hqEpoch } = {}) {
-  if (typeof authority?.verifyLiveStartV2 !== 'function' || typeof authority.onDisconnectV2 !== 'function'
+  if (typeof authority?.verifyLiveStartV2 !== 'function' || typeof authority.verifyProofV2 !== 'function'
+    || typeof authority.onDisconnectV2 !== 'function'
     || typeof hqEpoch !== 'string' || !/^[0-9a-f]{64}$/.test(hqEpoch)) return undefined;
   const isCurrentPeerV2 = (connection) => {
     const peer = peers.get(connection);
@@ -155,6 +178,20 @@ export function bindBridgeAuthority(authority, peers, { hqEpoch } = {}) {
       const peer = peers.get(connection);
       return Boolean(peer && context.hq_epoch === hqEpoch && context.bridge_uid === peer.endpoint.uid
         && context.broker_socket === peer.endpoint.path && matchesMemberEndpoint(context.member, peer.endpoint, selectors.start_id));
+    },
+    async verifyProofV2(proof, connection) {
+      const peer = peers.get(connection);
+      if (!peer || !isCurrentPeerV2(connection)
+        || peer.endpoint.installationId !== proof?.installation_id
+        || proof.hq_epoch !== hqEpoch || proof.bridge_uid !== peer.endpoint.uid
+        || proof.broker_socket !== peer.endpoint.path) refuse();
+      return await authority.verifyProofV2({
+        reservation_sha256: proof.reservation_digest,
+        installation_id: proof.installation_id, start_id: proof.start_id,
+        launch_id: proof.launch_id, plan_id: proof.plan_id,
+        plan_digest: proof.plan_digest, hq_epoch: proof.hq_epoch,
+        challenge: proof.challenge, proof: proof.proof,
+      }, connection, peer) === true;
     },
     isCurrentPeerV2,
     onDisconnectV2: (...args) => authority.onDisconnectV2(...args),

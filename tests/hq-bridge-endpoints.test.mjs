@@ -37,7 +37,11 @@ test('B endpoint plans refuse shared C and R identities, widened peer sets and c
   assert.throws(() => planBridgeEndpoints([bad], options), /broker endpoint/);
 });
 
-test('B transport checks native UID and inode, restricts dispatch, and revokes on socket close', async () => {
+test('B transport checks UID and inode, refuses qualification by default, and revokes on close', () => checkBridgeTransport(false));
+
+test('B transport forwards qualification only from the current dedicated peer when enabled', () => checkBridgeTransport(true));
+
+async function checkBridgeTransport(enabled) {
   const [endpoint] = planBridgeEndpoints([assignment('soul-a')], options);
   const peers = new Map();
   const calls = [];
@@ -49,7 +53,7 @@ test('B transport checks native UID and inode, restricts dispatch, and revokes o
   let handler;
   let inode = 42;
   const checks = [];
-  await listenBridgeEndpoint(endpoint, { hqUid, host, peers, core: { random: { hex: () => 'test' } },
+  const listener = await listenBridgeEndpoint(endpoint, { hqUid, host, peers, ...(enabled ? { enableBridgeQualification: true } : {}), core: { random: { hex: () => 'test' } },
     checkACL() {},
     lstat(path) {
       return { isDirectory: () => path !== endpoint.path, isSocket: () => path === endpoint.path,
@@ -60,16 +64,27 @@ test('B transport checks native UID and inode, restricts dispatch, and revokes o
     listen: async (config) => { handler = config; return {}; },
   });
   const socket = Object.assign(new EventEmitter(), { uid: 321, destroyed: false });
+  assert.deepEqual(listener.brokerIdentity(), {
+    directory: endpoint.directory, socket_path: endpoint.path,
+    directory_identity: { device: '8', inode: '42', owner_uid: hqUid, group_gid: endpoint.gid, mode: 0o2750 },
+    socket_identity: { device: '8', inode: '42', owner_uid: hqUid, group_gid: endpoint.gid, mode: 0o660 },
+  });
   assert.equal(await handler.authenticatePeer(socket), false);
   socket.uid = 322;
   assert.equal(await handler.authenticatePeer(socket), true);
   assert.deepEqual(checks, [322, 322]);
   inode++;
+  assert.throws(() => listener.brokerIdentity(), { code: 'host.launch_unavailable' });
   assert.equal(await handler.authenticatePeer(socket), false);
   inode--;
   const session = handler.newSession(socket);
   assert.throws(() => memberBrokerDispatch(host, 'bridge.bind.v2', {}, 'shared'), { code: 'host.launch_unavailable' });
   assert.throws(() => memberBrokerDispatch(host, 'bridge.bind.v2.challenge', {}, 'harness'), { code: 'host.launch_unavailable' });
+  const qualification = 'bridge.qualification.messages.v1';
+  assert.throws(() => memberBrokerDispatch(host, qualification, {}, 'harness'), { code: 'host.launch_unavailable' });
+  assert.throws(() => handler.dispatch(qualification, { payload: {}, session: 'unknown' }), { code: 'host.launch_unavailable' });
+  if (enabled) handler.dispatch(qualification, { payload: {}, session });
+  else assert.throws(() => handler.dispatch(qualification, { payload: {}, session }), { code: 'host.launch_unavailable' });
   memberBrokerDispatch(host, 'bind', {}, 'member');
   assert.throws(() => handler.dispatch('bind', { payload: {}, session }), { code: 'host.launch_unavailable' });
   assert.throws(() => handler.dispatch('bridge.bind.challenge', { payload: {}, session }), { code: 'host.launch_unavailable' });
@@ -82,6 +97,7 @@ test('B transport checks native UID and inode, restricts dispatch, and revokes o
     owner_uid: 321, group_gid: 322, dir_mode: 0o2750, socket_mode: 0o660, peer_uids: [321, 322] };
   const context = { hq_epoch: epoch, bridge_uid: endpoint.uid, broker_socket: endpoint.path, member };
   let observed = context;
+  let observedProof;
   const authority = bindBridgeAuthority({
     verifyLiveStartV2(_selectors, connection, peer) {
       assert.equal(connection, session);
@@ -89,11 +105,27 @@ test('B transport checks native UID and inode, restricts dispatch, and revokes o
       assert.equal(peer.ino, 42);
       return observed;
     },
+    verifyProofV2(request, connection, peer) {
+      assert.equal(connection, session);
+      assert.equal(peer.socket, socket);
+      observedProof = request;
+      return true;
+    },
     onDisconnectV2() {},
   }, peers, { hqEpoch: epoch });
   assert.equal(await authority.verifyLiveStartV2(selectors, session), context);
   assert.equal(authority.matchesAssignmentV2(context, selectors, session), true);
+  const proof = { ...selectors, launch_id: `ln_${'b'.repeat(24)}`, plan_id: 'plan-a',
+    plan_digest: 'c'.repeat(64), reservation_digest: `sha256:${'d'.repeat(64)}`,
+    hq_epoch: epoch, bridge_uid: endpoint.uid, broker_socket: endpoint.path,
+    challenge: 'e'.repeat(64), proof: 'f'.repeat(64) };
+  assert.equal(await authority.verifyProofV2(proof, session), true);
+  assert.deepEqual(observedProof, { reservation_sha256: proof.reservation_digest,
+    installation_id: proof.installation_id, start_id: proof.start_id, launch_id: proof.launch_id,
+    plan_id: proof.plan_id, plan_digest: proof.plan_digest, hq_epoch: proof.hq_epoch,
+    challenge: proof.challenge, proof: proof.proof });
   const denied = { code: 'host.launch_unavailable' };
+  await assert.rejects(authority.verifyProofV2({ ...proof, bridge_uid: 321 }, session), denied);
   await assert.rejects(authority.verifyLiveStartV2({ ...selectors, installation_id: 'soul-b' }, session), denied);
   assert.equal(authority.matchesAssignmentV2(context, { ...selectors, start_id: `st_${'b'.repeat(24)}` }, session), false);
   for (const change of [{ hq_epoch: 'b'.repeat(64) }, { bridge_uid: 321 }, { broker_socket: '/tmp/broker.sock' },
@@ -106,16 +138,19 @@ test('B transport checks native UID and inode, restricts dispatch, and revokes o
   observed = context;
   inode++;
   assert.equal(authority.isCurrentPeerV2(session), false);
+  assert.throws(() => handler.dispatch(qualification, { payload: {}, session }), denied);
   await assert.rejects(authority.verifyLiveStartV2(selectors, session), denied);
   inode--;
   socket.emit('close');
   await assert.rejects(authority.verifyLiveStartV2(selectors, session), denied);
+  assert.throws(() => handler.dispatch(qualification, { payload: {}, session }), denied);
   assert.deepEqual(calls, [
+    ...(enabled ? [['accepted', qualification, {}, { connection: session }]] : []),
     ['accepted', 'bind', {}, { connection: 'member' }],
     ['accepted', 'bridge.bind.v2.challenge', {}, { connection: session }],
     ['revoked', session], ['closed', session],
   ]);
-});
+}
 
 test('a B listener refuses an occupied path including a dangling symlink', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'b-'));
