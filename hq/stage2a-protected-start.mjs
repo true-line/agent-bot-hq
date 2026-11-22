@@ -3,6 +3,7 @@
 // owner connection carries the runner ACP stream only after B is finalized.
 import { lstatSync, realpathSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import { pipeline } from 'node:stream';
 import { takeover } from './socket.mjs';
 import { machineRoleStage2aLookup, machineRoleStage2aReserve,
   machineRoleStage2aFinalizeB } from './machine-channel.mjs';
@@ -124,7 +125,7 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         slot.runner.stdin.once?.('error', cut);
         slot.runner.stdout.once?.('error', cut);
         socket.pipe(slot.runner.stdin);
-        slot.runner.stdout.pipe(socket);
+        pipeline(slot.runner.stdout, socket, (error) => { if (error) cut(); });
         slot.runner.resumeOutput();
         socket.once('close', () => { void stop(slot); });
         slot.runner.done.then(() => { socket.end(); void stop(slot); });
