@@ -48,6 +48,7 @@ import { createMachineSigner } from './machine-device.mjs';
 import { createStandaloneSigner } from './standalone-signer.mjs';
 import { createEnrollment, DEFAULT_IDENTITY_SERVICE, validateEnrollmentConfig } from './enrollment.mjs';
 import { createLauncher, LAUNCH_OPERATIONS } from './launch.mjs';
+import { createSoulStarter } from './soul-start.mjs';
 import { loadPlugins } from './plugins.mjs';
 import { authenticatePeerUid, checkOwnerControlSupport, OWNER_CONTROL_PATH, OWNER_PEER_CHECK } from './owner-control.mjs';
 import { checkSocketPath, listenSocket } from './socket.mjs';
@@ -149,6 +150,9 @@ export function createHQ({
   harnessLstat,                  // how harness account paths are inspected (lstatSync by default; tests
                                  // stand in another owner for an account's home)
   launch = {},                   // the agent launcher's spawn, timers and graceMs (hq/launch.mjs defaults)
+  soulLaunch,                    // Machine-authorized launcher under a distinct per-installation UID; never owner config
+  soulVerifier,                  // independent Machine reservation signature verifier pinned by trusted HQ entry point
+  soulCompletionVerifier,        // independent Machine containment signature verifier
   plugins = [],                  // plugin objects (tests); installed ones come from pluginsDir
   pluginsDir,                    // installed plugins, each checked against `pins` (§4.5)
   pins = { plugins: [] },        // governance/plugins.json
@@ -176,6 +180,7 @@ export function createHQ({
   const brokerCallers = new Map();
   // Agent launch (§9 row 16b) and what the profile reasons say about it.
   let launcher;
+  let soulStarter;
   let profileReasons = () => [];
 
   const paths = { home, control: join(home, 'control.sock'), admission: join(home, 'admission.sock'), broker: join(home, 'broker.sock') };
@@ -236,7 +241,8 @@ export function createHQ({
       return detectProfile({
         platform, account, standalone: cfg.standalone === true, harnessAccounts,
         // This host-wide profile is shared by external admission requests.
-        // HQ has no Soul-start operation yet; agent launch is not Soul start.
+        // The owner Soul-start path has no per-Soul authenticated admission
+        // proof yet; agent launch is not Soul start.
         startedByHQ: false,
         keyStorage: report?.available ? report.key_storage : undefined, keyFiles: report?.key_files,
       });
@@ -281,6 +287,10 @@ export function createHQ({
         return admission.withLiveRuntime(runtimeId, caller, fn);
       },
     });
+    soulStarter = createSoulStarter({ core, home, machineLaunch: soulLaunch,
+      verifyMachineReservation: soulVerifier, verifyMachineCompletion: soulCompletionVerifier,
+      mode: () => host?.mode ?? 'starting', hqUid: uid,
+      harnessUids: harnessPlan.endpoints.map((endpoint) => endpoint.uid) });
     // Whether the provisioner's rule lets HQ start each harness account;
     // bounded, and a missing rule leaves HQ serving row 16a.
     await launcher.probe();
@@ -355,6 +365,7 @@ export function createHQ({
             ...(harnessPlan.endpoints.length ? { harnesses: harnessPlan.endpoints.map((e) => ({ account: e.account, adapters: e.adapters, path: e.path })), harnessAccess: 'one endpoint per harness account, mode 0660 in a 2750 directory of the account\'s private group; it identifies the account, not one agent in it' } : {}),
           },
           launch: launcher.report(),
+          soulStarts: soulStarter.report(),
           ownerSessions: openOwnerSessions(),
           pluginLoad,
           ...(signerReport() ? { signer: signerReport() } : {}),
@@ -379,17 +390,18 @@ export function createHQ({
         ).finally(() => { checkingPair = undefined; });
         await checkingPair;
       }
-      return host.dispatch(op, meta);
+      return op === 'soul.start' || op === 'soul.starts' ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta);
     }
 
     try {
       sockets = [
-        await listenSocket({ path: paths.control, auth: 'owner', dispatch: ownerDispatch, core, newSession: openSession, endSession: closeSession }),
+        await listenSocket({ path: paths.control, auth: 'owner', dispatch: ownerDispatch, core, takeover: true, newSession: openSession, endSession: closeSession }),
         // Agent launch is HQ core's own framing on this socket (hq/launch.mjs);
         // launch.attach takes its connection over, so only this listener allows it.
         await listenSocket({
           path: paths.admission, auth: 'entry-point', core, takeover: true,
-          dispatch: (op, meta) => (LAUNCH_OPERATIONS.includes(op) ? launcher.dispatch(op, meta) : host.dispatch(op, meta)),
+          dispatch: (op, meta) => (LAUNCH_OPERATIONS.includes(op) ? launcher.dispatch(op, meta)
+            : op === 'soul.start' || op === 'soul.starts' ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta)),
           newSession: () => `ep_${random.hex(12)}`, endSession: () => {},
         }),
         // Each frame goes to the plugin serving the broker; `op` is the kind.
@@ -402,7 +414,7 @@ export function createHQ({
       ];
       if (ownerControl) {
         sockets.push(await listenSocket({
-          path: OWNER_CONTROL_PATH, activated: ownerControl, auth: 'owner', core, dispatch: ownerDispatch,
+          path: OWNER_CONTROL_PATH, activated: ownerControl, auth: 'owner', core, dispatch: ownerDispatch, takeover: true,
           newSession: () => openSession(ownerControl.account, ownerControl.uid), endSession: closeSession,
         }));
       }
@@ -451,6 +463,7 @@ export function createHQ({
     await firstTick;
     // Agents first, while their connections are still open: each launch's
     // process group is stopped (hq/launch.mjs).
+    await soulStarter.stopAll();
     await launcher.stopAll();
     for (const s of sockets) await s.close();
     sockets = [];
