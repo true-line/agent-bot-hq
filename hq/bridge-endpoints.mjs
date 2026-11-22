@@ -10,11 +10,12 @@ import { listenSocket } from './socket.mjs';
 
 const ROLE_UID = (uid) => Number.isInteger(uid) && uid >= 300 && uid <= 399;
 const INSTALLATION = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const BRIDGE_QUALIFICATION_MESSAGES = 'bridge.qualification.messages.v1';
 const protectedBridgeKind = (kind) => kind === 'bridge.bind.v2.challenge' || kind === 'bridge.bind.v2';
 const refuse = () => fail('host.launch_unavailable', 'bridge bind requires the dedicated Machine-assigned B broker');
 
 export function memberBrokerDispatch(host, kind, payload, connection) {
-  if (protectedBridgeKind(kind)) refuse();
+  if (protectedBridgeKind(kind) || kind === BRIDGE_QUALIFICATION_MESSAGES) refuse();
   return host.brokerAccept(kind, payload, { connection });
 }
 
@@ -56,7 +57,7 @@ export function planBridgeEndpoints(assignments, { platform, account, hqUid, har
 }
 
 export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
-  lstat = lstatSync, checkACL = checkDarwinACL, authenticate = authenticatePeerUid, listen = listenSocket } = {}) {
+  enableBridgeQualification = false, lstat = lstatSync, checkACL = checkDarwinACL, authenticate = authenticatePeerUid, listen = listenSocket } = {}) {
   function checkDirectory() {
     for (const path of ['/', '/Library', '/Library/Application Support', dirname(DARWIN_HARNESS_DIR), DARWIN_HARNESS_DIR]) {
       const st = lstat(path);
@@ -110,7 +111,10 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
     },
     endSession: () => {},
     dispatch(kind, { payload, session }) {
-      if (!protectedBridgeKind(kind) || !peers.has(session)) refuse();
+      const qualification = kind === BRIDGE_QUALIFICATION_MESSAGES;
+      const peer = peers.get(session);
+      if (!peer || (!protectedBridgeKind(kind) && !(qualification && enableBridgeQualification === true))) refuse();
+      if (qualification && (peer.socket.destroyed || !peer.checkCurrent())) refuse();
       return host.brokerAccept(kind, payload, { connection: session });
     },
   });
