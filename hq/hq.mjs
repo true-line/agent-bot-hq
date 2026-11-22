@@ -53,6 +53,7 @@ import { bindBridgeAuthority, listenBridgeEndpoint, memberBrokerDispatch, planBr
 import { loadPlugins } from './plugins.mjs';
 import { authenticatePeerUid, checkOwnerControlSupport, OWNER_CONTROL_PATH, OWNER_PEER_CHECK } from './owner-control.mjs';
 import { checkSocketPath, listenSocket } from './socket.mjs';
+import { listenStage2aRunnerAdmission } from './stage2a-r-admission.mjs';
 import { checkHarnessSocket, planHarnessEndpoints, validateHarnessesConfig } from './harness-accounts.mjs';
 import { coreTable, CORE_PLUGIN, ensurePrivateDir, openStore } from './store.mjs';
 import { validateNoticesConfig, noticeIngestionConfig } from './notices-config.mjs';
@@ -187,6 +188,8 @@ export function createHQ({
   const brokerCallers = new Map();
   const bridgePeers = new Map();
   const bridgeListeners = new Map();
+  const runnerAdmissions = new Map();
+  const openingRunnerAdmissions = new Set();
   // Agent launch (§9 row 16b) and what the profile reasons say about it.
   let launcher;
   let soulStarter;
@@ -499,6 +502,9 @@ export function createHQ({
     // process group is stopped (hq/launch.mjs).
     await soulStarter.stopAll();
     await launcher.stopAll();
+    const admissionsToClose = [...runnerAdmissions.values()];
+    runnerAdmissions.clear();
+    await Promise.all(admissionsToClose.map((listener) => listener.close()));
     for (const s of sockets) await s.close();
     sockets = [];
     bridgeListeners.clear();
@@ -514,6 +520,24 @@ export function createHQ({
     stop,
     paths,
     status: () => host.status(),
+    openProtectedAdmission: async ({ installed, assignment, selectors, renewLive, onLost }) => {
+      const key = selectors?.reservation_sha256;
+      if (!running || !key || runnerAdmissions.has(key) || openingRunnerAdmissions.has(key))
+        fail('host.launch_unavailable', 'protected R admission is unavailable');
+      openingRunnerAdmissions.add(key);
+      try {
+        const listener = await listenStage2aRunnerAdmission({ installed, assignment, selectors,
+          hqUid: uid, core, renewLive, onLost, protectedAdmission,
+          admissionDispatch: (op, meta) => host.dispatch(op, meta) });
+        if (!running) { await listener.close(); fail('host.launch_unavailable', 'HQ stopped during protected R admission'); }
+        runnerAdmissions.set(key, listener);
+        return Object.freeze({ path: listener.path, close: async () => {
+          if (runnerAdmissions.get(key) !== listener) return;
+          runnerAdmissions.delete(key);
+          await listener.close();
+        } });
+      } finally { openingRunnerAdmissions.delete(key); }
+    },
     bridgeBrokerIdentity: (installationId) => {
       if (!running || typeof installationId !== 'string') fail('host.launch_unavailable', 'HQ bridge broker is unavailable');
       const listener = bridgeListeners.get(installationId);

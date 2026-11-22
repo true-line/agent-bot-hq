@@ -236,6 +236,10 @@ async function main(argv) {
         installations: installed, authority, verifyReservation,
         getBrokerIdentity: (installationId) => hq.bridgeBrokerIdentity(installationId),
         verifyBoundBridge: (selectors, digest) => hq.boundBridgeV2(selectors, digest),
+        openProtectedAdmission: ({ installed: plan, assignment, selectors }) =>
+          hq.openProtectedAdmission({ installed: plan, assignment, selectors,
+            renewLive: (request) => protectedStart.renewLive(request),
+            onLost: () => protectedStart.stopReservation(selectors.reservation_sha256) }),
         onFinalized: ({ installed: plan, assignment, selectors }) => {
           providers.set(selectors.reservation_sha256, createStage2aQualificationProvider({
             plan: { installation_id: plan.installation_id, start_id: assignment.start_id,
