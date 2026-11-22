@@ -16,7 +16,7 @@ const context = Object.freeze({ ...selectors, hq_epoch: 'd'.repeat(64), bridge_u
 const connection = { connection: 'bb_1' };
 const denied = { code: 'host.launch_unavailable' };
 
-function fixture({ timers } = {}) {
+function fixture({ timers, qualificationAuthorizer } = {}) {
   let now = 1_000;
   let sequence = 0;
   let verified = context;
@@ -28,6 +28,7 @@ function fixture({ timers } = {}) {
   const stops = [];
   const alerts = [];
   const service = createBridgeBindAdmission({
+    qualificationAuthorizer,
     authority: {
       async verifyLiveStartV2(scope, peer, phase) {
         scopes.push([scope, peer]);
@@ -251,4 +252,59 @@ test('a finalized receipt refuses if Machine subsequently loses finalized live a
   f.setVerified(context);
   await assert.rejects(f.service.boundBridgeV2(selectors, receiptDigest), denied);
   assert.equal(f.stops[0].reason, 'bridge-live-recheck-failed');
+});
+
+const qualificationRequest = { model: 'fixture-model', prompt_sha256: `sha256:${'a'.repeat(64)}` };
+const qualificationResult = { model: qualificationRequest.model, text: 'fixture', stop_reason: 'end_turn',
+  usage: { input_tokens: 1, output_tokens: 1 } };
+
+test('qualification requires the same finalized v2 connection and spends one attempt', async () => {
+  const authorizations = [];
+  const f = fixture({ qualificationAuthorizer: async (input) => {
+    authorizations.push(input);
+    return qualificationResult;
+  } });
+  const { bind_receipt } = await f.bind();
+  f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
+  const qualify = (input = qualificationRequest, peer = connection, receipt = bind_receipt) =>
+    f.service.qualifyBridgeMessagesV2(input, peer, receipt);
+  await assert.rejects(qualify(qualificationRequest, { connection: 'another' }), denied);
+  await assert.rejects(qualify(qualificationRequest, connection, '0'.repeat(64)), denied);
+  for (const key of ['runtime_id', 'path', 'credential', 'destination']) {
+    await assert.rejects(qualify({ ...qualificationRequest, [key]: 'extra' }), denied);
+  }
+  assert.deepEqual(authorizations, []);
+  assert.deepEqual(await qualify(), qualificationResult);
+  await assert.rejects(qualify(), denied);
+  assert.equal(authorizations.length, 1);
+  assert.deepEqual(authorizations[0].request, qualificationRequest);
+  assert.equal(authorizations[0].observation.reservation_digest, selectors.reservation_digest);
+  assert.equal(authorizations[0].observation.bind_receipt_sha256, digest(bind_receipt));
+  assert.equal(Object.hasOwn(authorizations[0].observation, 'proof_key'), false);
+  await f.service.revokeAll();
+});
+
+test('qualification refuses unfinalized binds without calling the authorizer', async () => {
+  const f = fixture({ qualificationAuthorizer: async () => assert.fail('unfinalized bind was dispatched') });
+  const { bind_receipt } = await f.bind();
+  await assert.rejects(f.service.qualifyBridgeMessagesV2(qualificationRequest, connection, bind_receipt), denied);
+  assert.equal(f.stops.length, 1);
+});
+
+test('qualification discards a result after the peer disconnects during authorization', async () => {
+  const entered = Promise.withResolvers();
+  const authorization = Promise.withResolvers();
+  const f = fixture({ qualificationAuthorizer: () => {
+    entered.resolve();
+    return authorization.promise;
+  } });
+  const { bind_receipt } = await f.bind();
+  f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
+  const pending = assert.rejects(f.service.qualifyBridgeMessagesV2(qualificationRequest, connection, bind_receipt), denied);
+  await entered.promise;
+  await assert.rejects(f.service.qualifyBridgeMessagesV2(qualificationRequest, connection, bind_receipt), denied);
+  await f.service.forgetBridgeConnection(connection.connection, bind_receipt);
+  authorization.resolve(qualificationResult);
+  await pending;
+  assert.equal(f.stops.length, 1);
 });

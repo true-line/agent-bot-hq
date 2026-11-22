@@ -76,7 +76,7 @@ export const bridgeBindProofV2 = (key, nonce, context) => proofFor(V2, key, nonc
 // onDisconnectV2 uses that retained target even if HQ cannot validate the
 // projection. It returns true only after independently confirming the durable
 // containment request, and rejects on uncertainty.
-export function createBridgeBindAdmission({ authority, clock, random, receipts, timers = { setTimeout, clearTimeout } } = {}) {
+export function createBridgeBindAdmission({ authority, qualificationAuthorizer, clock, random, receipts, timers = { setTimeout, clearTimeout } } = {}) {
   const challenges = new Map();
   const verifying = new Map();
   const live = new Map();
@@ -374,6 +374,39 @@ export function createBridgeBindAdmission({ authority, clock, random, receipts, 
     return null;
   }
 
+  // Source-only qualification fixture. This injected host boundary must verify
+  // the exact pinned provider plan and atomically consume its durable one-use
+  // operation before returning the fixture result. There is no default authorizer.
+  async function qualifyBridgeMessagesV2(input, { connection }, receipt) {
+    const binding = live.get(connection);
+    if (typeof qualificationAuthorizer !== 'function' || !available(V2)
+      || binding?.context.protocol !== V2 || binding.receipt !== receipt
+      || !record(input) || Object.keys(input).length !== 2
+      || !Object.hasOwn(input, 'model') || !Object.hasOwn(input, 'prompt_sha256')
+      || !matches(ID, input.model) || !matches(DIGEST, input.prompt_sha256)) refuse();
+    if (binding.qualificationAttempted) refuse();
+    binding.qualificationAttempted = true;
+    const request = Object.freeze({ model: input.model, prompt_sha256: input.prompt_sha256 });
+    try {
+      const observation = await recheckBridge(connection, binding);
+      if (!binding.finalized) refuse();
+      const result = await bounded(Promise.resolve().then(() => qualificationAuthorizer({
+        request, observation: Object.freeze(observation),
+      })), 'Machine qualification authorization deadline exceeded');
+      if (!record(result) || result.model !== request.model || result.stop_reason !== 'end_turn'
+        || typeof result.text !== 'string' || !result.text || result.text.length > 4096
+        || !Number.isSafeInteger(result.usage?.input_tokens) || result.usage.input_tokens < 0
+        || !Number.isSafeInteger(result.usage?.output_tokens) || result.usage.output_tokens < 0) refuse();
+      const response = { model: result.model, stop_reason: result.stop_reason, text: result.text,
+        usage: { input_tokens: result.usage.input_tokens, output_tokens: result.usage.output_tokens } };
+      await recheckBridge(connection, binding);
+      return response;
+    } catch {
+      await forgetBridgeConnection(connection, binding.receipt, 'bridge-qualification-failed');
+      refuse();
+    }
+  }
+
   async function revokeAll() {
     stopping = true;
     const stops = [];
@@ -406,6 +439,7 @@ export function createBridgeBindAdmission({ authority, clock, random, receipts, 
     bridgeBindChallengeV2: (...args) => track(bridgeBindChallenge(V2, ...args)),
     verifyBridgeBindingV2: (...args) => track(verifyBridgeBinding(V2, ...args)),
     boundBridgeV2: (...args) => track(boundBridge(V2, ...args)),
+    qualifyBridgeMessagesV2: (...args) => track(qualifyBridgeMessagesV2(...args)),
     forgetBridgeConnection, revokeAll,
   });
 }
