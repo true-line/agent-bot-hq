@@ -1,13 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
 import { createStage2aProtectedAdmission } from '../hq/stage2a-protected-admission.mjs';
+import { connectSocket, listenSocket } from '../hq/socket.mjs';
 
 const sha = (bytes) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 const digest = (char) => `sha256:${char.repeat(64)}`;
 
-test('signed Machine role and Hello finalize the copied HQ admission binding', async () => {
+test('signed Machine role and Hello survive the actual socket context copy', async (t) => {
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const machinePublicKey = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
   const now = Date.now();
@@ -97,11 +100,36 @@ test('signed Machine role and Hello finalize the copied HQ admission binding', a
     getBindReceiptSHA256: () => bind });
   const context = await verifier.acceptPeer({}, { installed, assignment, selectors,
     peer_uid: 311, peer_pid: peerProcess.pid });
-  // listenSocket freezes this shallow copy before dispatch and close.
-  const copiedContext = Object.freeze({ ...context });
+  const directory = mkdtempSync('/private/tmp/stage2a-peer-');
+  const path = join(directory, 'admission.sock');
+  let copiedContext;
+  let finishClose;
+  const closed = new Promise((resolve) => { finishClose = resolve; });
+  const listener = await listenSocket({ path, auth: 'entry-point',
+    core: { logs: [], clock: { now: () => now }, random: { hex: () => 'a'.repeat(16) } },
+    newSession: () => 'rp-1', endSession: () => {},
+    connectionContext: async () => context,
+    connectionClosed: async (socket, connection) => {
+      await verifier.peerDisconnected(socket, connection);
+      finishClose();
+    },
+    dispatch: async (op, meta) => {
+      assert.equal(op, 'Hello');
+      copiedContext = meta.protectedStart;
+      return verifier.verifyHelloStart({ connection: copiedContext, caller: meta.session,
+        payload: meta.payload, hello_payload_sha256: sha(canonicalBytes(meta.payload)) });
+    } });
+  let client;
+  t.after(async () => {
+    await client?.close();
+    await listener.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  client = await connectSocket(path);
+  const response = await client.request('Hello', payload);
+  assert.equal(response.ok, true);
   assert.notEqual(copiedContext, context);
-  const original = await verifier.verifyHelloStart({ connection: copiedContext, caller: 'rp-1',
-    payload, hello_payload_sha256: helloPayloadSHA256 });
+  const original = response.result;
   const copied = Object.freeze({ ...original });
   assert.equal(await verifier.verifyDefinitionMapping(copied, payload), true);
   const unwatch = verifier.watchLiveness(copied, () => {});
@@ -127,7 +155,8 @@ test('signed Machine role and Hello finalize the copied HQ admission binding', a
   await assert.rejects(verifier.assertLive(copied),
     /Machine protected Hello authority is unavailable/);
   unwatch();
-  await verifier.peerDisconnected({}, copiedContext);
+  await client.close();
+  await closed;
   assert.deepEqual(calls.slice(-2), ['abort', 'stop']);
   registration.close();
 });
