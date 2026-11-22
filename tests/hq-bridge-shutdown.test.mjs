@@ -71,3 +71,21 @@ test('the shared HQ broker cannot submit protected v2 bridge bind frames to Comm
     assert.deepEqual(accepted, ['bind']);
   } finally { await t.done(); }
 });
+
+test('HQ offers no protected v2 authority without a dedicated B listener', async () => {
+  const t = await startHQ({ bridgeAuthority: {
+    verifyLiveStartV2() { assert.fail('HQ called a verifier without a dedicated listener'); },
+    isCurrentPeerV2: () => true,
+    matchesAssignmentV2: () => true,
+    onDisconnectV2() { assert.fail('HQ selected a stop target without a dedicated listener'); },
+  } });
+  try {
+    const v2 = { installation_id: selectors.installation_id, start_id: selectors.start_id,
+      launch_id: selectors.launch_id, plan_id: selectors.plan_id, plan_digest: selectors.plan_digest,
+      reservation_digest: `sha256:${'a'.repeat(64)}` };
+    const admission = t.hq.host.provided('hq-admission');
+    assert.deepEqual(admission.bridgeStatus(), { state: 'unavailable' });
+    await assert.rejects(admission.bridgeBindChallengeV2(v2, { connection: 'bb_untrusted' }),
+      { code: 'host.launch_unavailable' });
+  } finally { await t.done(); }
+});

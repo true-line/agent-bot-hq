@@ -279,7 +279,7 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
     });
   }
 
-  return { dispatch, report, stopAll: async () => {
+  return { dispatch, report, hqEpoch, stopAll: async () => {
     shuttingDown = true;
     await Promise.all([...starts.values()].map(stop));
   } };

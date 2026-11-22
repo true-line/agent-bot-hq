@@ -73,19 +73,43 @@ test('B transport checks native UID and inode, restricts dispatch, and revokes o
   memberBrokerDispatch(host, 'bind', {}, 'member');
   assert.throws(() => handler.dispatch('bind', { payload: {}, session }), { code: 'host.launch_unavailable' });
   assert.throws(() => handler.dispatch('bridge.bind.challenge', { payload: {}, session }), { code: 'host.launch_unavailable' });
+  assert.throws(() => handler.dispatch('bridge.bind', { payload: {}, session }), { code: 'host.launch_unavailable' });
   handler.dispatch('bridge.bind.v2.challenge', { payload: {}, session });
+  const selectors = { installation_id: 'soul-a', start_id: `st_${'a'.repeat(24)}` };
+  const epoch = 'a'.repeat(64);
+  const directory = '/Library/Application Support/ai.true-line.agent-bot-hq/m/5d2de78b58134f80521f';
+  const member = { directory, socket_path: `${directory}/7da4d062fa49525ad2c6.sock`,
+    owner_uid: 321, group_gid: 322, dir_mode: 0o2750, socket_mode: 0o660, peer_uids: [321, 322] };
+  const context = { hq_epoch: epoch, bridge_uid: endpoint.uid, broker_socket: endpoint.path, member };
+  let observed = context;
   const authority = bindBridgeAuthority({
-    verifyLiveStart(_selectors, connection, peer) {
+    verifyLiveStartV2(_selectors, connection, peer) {
       assert.equal(connection, session);
       assert.equal(peer.socket, socket);
       assert.equal(peer.ino, 42);
-      return peer.endpoint;
+      return observed;
     },
-  }, peers);
-  assert.equal(await authority.verifyLiveStart({ installation_id: 'soul-a' }, session), endpoint);
-  await assert.rejects(authority.verifyLiveStart({ installation_id: 'soul-b' }, session), { code: 'host.launch_unavailable' });
+    onDisconnectV2() {},
+  }, peers, { hqEpoch: epoch });
+  assert.equal(await authority.verifyLiveStartV2(selectors, session), context);
+  assert.equal(authority.matchesAssignmentV2(context, selectors, session), true);
+  const denied = { code: 'host.launch_unavailable' };
+  await assert.rejects(authority.verifyLiveStartV2({ ...selectors, installation_id: 'soul-b' }, session), denied);
+  assert.equal(authority.matchesAssignmentV2(context, { ...selectors, start_id: `st_${'b'.repeat(24)}` }, session), false);
+  for (const change of [{ hq_epoch: 'b'.repeat(64) }, { bridge_uid: 321 }, { broker_socket: '/tmp/broker.sock' },
+    { member: undefined }, { member: { ...member, socket_path: '/tmp/legacy.sock' } },
+    { member: { ...member, owner_uid: 322 } }, { member: { ...member, dir_mode: 0o750 } },
+    { member: { ...member, peer_uids: [321] } }]) {
+    observed = { ...context, ...change };
+    assert.equal(authority.matchesAssignmentV2(observed, selectors, session), false);
+  }
+  observed = context;
+  inode++;
+  assert.equal(authority.isCurrentPeerV2(session), false);
+  await assert.rejects(authority.verifyLiveStartV2(selectors, session), denied);
+  inode--;
   socket.emit('close');
-  await assert.rejects(authority.verifyLiveStart({ installation_id: 'soul-a' }, session), { code: 'host.launch_unavailable' });
+  await assert.rejects(authority.verifyLiveStartV2(selectors, session), denied);
   assert.deepEqual(calls, [
     ['accepted', 'bind', {}, { connection: 'member' }],
     ['accepted', 'bridge.bind.v2.challenge', {}, { connection: session }],

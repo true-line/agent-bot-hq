@@ -260,8 +260,8 @@ export function createHQ({
       : { endpoints: [], accountOf: () => undefined };
     const bridgeEndpoints = planBridgeEndpoints(bridgeAssignments, { platform, account, hqUid: uid,
       harnessUids: harnessPlan.endpoints.map((endpoint) => endpoint.uid) });
-    if (bridgeEndpoints.length && (typeof bridgeAuthority?.verifyLiveStart !== 'function'
-      || typeof bridgeAuthority?.onDisconnect !== 'function')) throw new Error('Machine bridge endpoints need live start and containment authority');
+    if (bridgeEndpoints.length && (typeof bridgeAuthority?.verifyLiveStartV2 !== 'function'
+      || typeof bridgeAuthority?.onDisconnectV2 !== 'function')) throw new Error('Machine bridge endpoints need live start and containment authority');
     if (platform === 'darwin' && (harnessPlan.endpoints.length || bridgeEndpoints.length)) checkOwnerControlSupport();
     if (platform !== 'win32') for (const p of [paths.control, paths.admission, paths.broker, ...harnessPlan.endpoints.map((e) => e.path)]) checkSocketPath(p, platform);
     store = openStore(home, { uid });
@@ -338,7 +338,10 @@ export function createHQ({
       profileReasons: (pending, unbound) => profileReasons(pending, unbound),
       harnessAccount: (adapterId) => harnessPlan.accountOf(adapterId),
       callerOf: (connection) => brokerCallers.get(connection),
-      bridgeAuthority: bridgeEndpoints.length ? bindBridgeAuthority(bridgeAuthority, bridgePeers) : bridgeAuthority,
+      bridgeAuthority: bridgeEndpoints.length
+        ? bindBridgeAuthority(bridgeAuthority, bridgePeers, { hqEpoch: soulStarter.hqEpoch })
+        : { verifyLiveStart: bridgeAuthority?.verifyLiveStart?.bind(bridgeAuthority),
+          onDisconnect: bridgeAuthority?.onDisconnect?.bind(bridgeAuthority) },
       protectedAdmission,
     });
     const builtIn = [admission, tasksPlugin({ schemas }), noticesPlugin({ schemas }), ...plugins];
