@@ -14,6 +14,8 @@ const FINAL_BYTES = Buffer.from('signed-finalization');
 const FINAL = 'sha256:' + createHash('sha256').update(FINAL_BYTES).digest('hex');
 const CHILD_BYTES = Buffer.from('signed-child-start');
 const CHILD = 'sha256:' + createHash('sha256').update(CHILD_BYTES).digest('hex');
+const HELLO_BYTES = Buffer.from('signed-hello-finalization');
+const HELLO = 'sha256:' + createHash('sha256').update(HELLO_BYTES).digest('hex');
 const CHILD_GRANT = 'sha256:' + 'e'.repeat(64);
 const CHALLENGE = Buffer.alloc(32, 7).toString('base64url');
 const CHALLENGE2 = Buffer.alloc(32, 8).toString('base64url');
@@ -67,7 +69,8 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckF
       payload: { assignment } }),
     openProtectedAdmission: async () => {
       events.push('R-admission-open');
-      return { close: async () => { events.push('R-admission-closed'); } };
+      return { helloFinalization: () => ({ envelope: HELLO_BYTES, sha256: HELLO }),
+        close: async () => { events.push('R-admission-closed'); } };
     },
     getBrokerIdentity: () => ({}),
     verifyBoundBridge: async () => ({ bind_receipt_sha256: BIND }),
@@ -112,13 +115,16 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckF
               lease_sequence: live.lease_sequence };
           },
           waitRunnerChildReady: async ({ reservationSHA256, startId, launchId,
-            childStartSHA256, childStartEnvelope }) => {
+            childStartSHA256, childStartEnvelope,
+            helloFinalizationSHA256, helloFinalizationEnvelope }) => {
             if (childAckFails) throw new Error('R rejected child receipt');
             assert.equal(reservationSHA256, RESERVATION);
             assert.equal(startId, assignment.start_id);
             assert.equal(launchId, assignment.launch_id);
             assert.equal(childStartSHA256, CHILD);
             assert.deepEqual(childStartEnvelope, CHILD_BYTES);
+            assert.equal(helloFinalizationSHA256, HELLO);
+            assert.deepEqual(helloFinalizationEnvelope, HELLO_BYTES);
             events.push('R-child-ack');
           } };
       }

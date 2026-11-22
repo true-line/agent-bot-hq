@@ -203,6 +203,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
       || !same(signed.expected, expected)
       || !Number.isFinite(Date.parse(signed.finalized_at))) refuse();
     record.finalSHA256 = reply.sha256;
+    record.finalEnvelope = Buffer.from(reply.envelope);
     return Object.freeze({ ...reply, expected });
   }
 
@@ -215,6 +216,14 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
       'agent-bot-machine/stage2a-hello-finalization/v1', record.selectors);
     record.finalized = true;
     return true;
+  }
+
+  function finalizationFor(selectors) {
+    const record = recordFor(selectors);
+    if (!record.finalized || !Buffer.isBuffer(record.finalEnvelope)
+      || sha(record.finalEnvelope) !== record.finalSHA256) refuse();
+    return Object.freeze({ envelope: Buffer.from(record.finalEnvelope),
+      sha256: record.finalSHA256 });
   }
 
   async function abort(binding) {
@@ -293,5 +302,5 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
 
   return Object.freeze({ registerStart, acceptPeer, verifyHelloStart,
     verifyDefinitionMapping, finalize, verifyFinalization, abort,
-    watchLiveness, assertLive, peerDisconnected, watchHealthy });
+    finalizationFor, watchLiveness, assertLive, peerDisconnected, watchHealthy });
 }

@@ -357,7 +357,8 @@ export async function startStage2aRole({ account, role, reservationSHA256,
         }
       },
       waitRunnerChildReady: async ({ reservationSHA256, startId, launchId,
-        childStartSHA256, childStartEnvelope } = {}) => {
+        childStartSHA256, childStartEnvelope,
+        helloFinalizationSHA256, helloFinalizationEnvelope } = {}) => {
         if (role !== 'runner' || !activationAttempted || childReadyAttempted
           || !DIGEST.test(reservationSHA256 ?? '')
           || !/^st_[0-9a-f]{24}$/.test(startId ?? '')
@@ -365,13 +366,20 @@ export async function startStage2aRole({ account, role, reservationSHA256,
           || !DIGEST.test(childStartSHA256 ?? '')
           || !Buffer.isBuffer(childStartEnvelope) || childStartEnvelope.length === 0
           || 'sha256:' + createHash('sha256').update(childStartEnvelope).digest('hex')
-            !== childStartSHA256) throw new Error('invalid Soul runner child confirmation');
+            !== childStartSHA256
+          || !DIGEST.test(helloFinalizationSHA256 ?? '')
+          || !Buffer.isBuffer(helloFinalizationEnvelope)
+          || helloFinalizationEnvelope.length === 0
+          || 'sha256:' + createHash('sha256').update(helloFinalizationEnvelope).digest('hex')
+            !== helloFinalizationSHA256) throw new Error('invalid Soul runner child confirmation');
         childReadyAttempted = true;
         const line = Buffer.from(JSON.stringify({
           schema: 'agent-bot-souls/protected-child-start/v1',
           reservation_sha256: reservationSHA256, start_id: startId, launch_id: launchId,
           child_start_sha256: childStartSHA256,
           child_start_envelope_base64url: childStartEnvelope.toString('base64url'),
+          hello_finalization_sha256: helloFinalizationSHA256,
+          hello_finalization_envelope_base64url: helloFinalizationEnvelope.toString('base64url'),
         }) + '\n');
         try {
           await writeGrant(child, line);

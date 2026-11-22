@@ -249,7 +249,9 @@ async function main(argv) {
             const listener = await hq.openProtectedAdmission({ installed: plan, assignment,
               selectors, renewLive: (request) => protectedStart.renewLive(request),
               onLost: () => protectedStart.stopReservation(selectors.reservation_sha256) });
-            return Object.freeze({ path: listener.path, close: async () => {
+            return Object.freeze({ path: listener.path,
+              helloFinalization: () => protectedAdmission.finalizationFor(selectors),
+              close: async () => {
               registration.close();
               await listener.close();
             } });

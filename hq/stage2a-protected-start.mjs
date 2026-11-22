@@ -222,6 +222,11 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         || slot.issuedRLeases.get(ack.lease_sequence)?.sha256 !== ack.lease_sha256
         || slot.issuedRLeases.get(ack.lease_sequence)?.expiresAt <= Date.now()
         || !slot.rLeaseReady || slot.stopPromise) refuse();
+      const helloFinalization = slot.admission.helloFinalization?.();
+      if (!Buffer.isBuffer(helloFinalization?.envelope)
+        || !DIGEST.test(helloFinalization?.sha256 ?? '')
+        || 'sha256:' + createHash('sha256').update(helloFinalization.envelope).digest('hex')
+          !== helloFinalization.sha256) refuse();
       slot.activated = true;
       // The stock ACP child has its own one-use Machine grant and process
       // group. R remains an admission supervisor and never carries ACP bytes.
@@ -243,7 +248,9 @@ export function createStage2aProtectedStarter({ installations, authority, verify
       await slot.child.waitChildAccepted(childReceipt.sha256);
       await slot.runner.waitRunnerChildReady({ reservationSHA256: reserved.sha256,
         startId, launchId, childStartSHA256: childReceipt.sha256,
-        childStartEnvelope: childReceipt.envelope });
+        childStartEnvelope: childReceipt.envelope,
+        helloFinalizationSHA256: helloFinalization.sha256,
+        helloFinalizationEnvelope: helloFinalization.envelope });
       if (slot.stopPromise) refuse();
       // Do not expose the one-use provider before R and the stock child have
       // both acknowledged A's signed current start and child receipts.

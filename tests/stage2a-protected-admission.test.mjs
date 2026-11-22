@@ -117,6 +117,8 @@ test('signed Machine role and Hello finalize the copied HQ admission binding', a
       profile_in_force: 'managed-protected' }] };
   const final = await verifier.finalize(expected);
   assert.equal(await verifier.verifyFinalization(final, expected), true);
+  assert.deepEqual(verifier.finalizationFor(selectors),
+    { envelope: final.envelope, sha256: final.sha256 });
   assert.deepEqual(calls, ['peer', 'hello', 'peer', 'finalize']);
   peerChanged = true;
   await assert.rejects(verifier.assertLive(copied),
