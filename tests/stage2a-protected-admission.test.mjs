@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
 import { createStage2aProtectedAdmission } from '../hq/stage2a-protected-admission.mjs';
@@ -11,6 +12,7 @@ const sha = (bytes) => `sha256:${createHash('sha256').update(bytes).digest('hex'
 const digest = (char) => `sha256:${char.repeat(64)}`;
 
 test('signed Machine role and Hello survive the actual socket context copy', async (t) => {
+  if (process.platform === 'win32') { t.skip('Unix socket'); return; }
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const machinePublicKey = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
   const now = Date.now();
@@ -100,7 +102,8 @@ test('signed Machine role and Hello survive the actual socket context copy', asy
     getBindReceiptSHA256: () => bind });
   const context = await verifier.acceptPeer({}, { installed, assignment, selectors,
     peer_uid: 311, peer_pid: peerProcess.pid });
-  const directory = mkdtempSync('/private/tmp/stage2a-peer-');
+  const directory = mkdtempSync(join(process.platform === 'darwin' ? '/private/tmp' : tmpdir(),
+    'stage2a-peer-'));
   const path = join(directory, 'admission.sock');
   let copiedContext;
   let finishClose;
