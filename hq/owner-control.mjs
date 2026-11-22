@@ -122,6 +122,33 @@ export function authenticatePeerUid(socket, uid) {
   return socketCheck(['peer', String(uid)], socket);
 }
 
+// Observe the connecting PID from the accepted descriptor, with the same
+// kernel UID check. This is an HQ-local role gate; Machine must authenticate
+// a protected Hello independently before publishing managed provenance.
+export function observePeerPid(socket, uid) {
+  return new Promise((resolve) => {
+    if (!Number.isSafeInteger(uid) || uid < 1) { resolve(null); return; }
+    let probe;
+    try {
+      probe = spawn(interpreter, [...helper, 'peer-pid', String(uid)], {
+        ...helperOptions, stdio: ['ignore', 'pipe', 'ignore', socket],
+      });
+    } catch { resolve(null); return; }
+    let output = '';
+    let overflow = false;
+    probe.stdout.on('data', (chunk) => {
+      output += chunk.toString('ascii');
+      if (output.length > 32) { overflow = true; probe.kill('SIGKILL'); }
+    });
+    probe.once('error', () => resolve(null));
+    probe.once('close', (code) => {
+      if (code !== 0 || overflow || !/^[1-9][0-9]{0,9}\n$/.test(output)) { resolve(null); return; }
+      const pid = Number(output.trim());
+      resolve(Number.isSafeInteger(pid) && pid > 1 ? pid : null);
+    });
+  });
+}
+
 export { authenticatePeerUid as authenticateOwner };
 
 function socketCheck(args, socket) {

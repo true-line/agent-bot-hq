@@ -8,7 +8,7 @@ const ROOT = '/Library/Application Support/ai.true-line.agent-bot-hq';
 const hash = (...parts) => createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 20);
 const sha = (raw) => `sha256:${createHash('sha256').update(raw).digest('hex')}`;
 
-function fixture({ invalidLease = false, protectedPeer = false } = {}) {
+function fixture({ invalidLease = false, protectedPeer = true } = {}) {
   const installation_id = 'install-1', start_id = 'st_' + 'a'.repeat(24);
   const directory = join(ROOT, 'r', hash('agent-bot-soul-endpoint-installation/v1', installation_id));
   const socket_path = join(directory, hash('agent-bot-soul-endpoint-start/v1', installation_id, start_id) + '.sock');
@@ -43,16 +43,22 @@ function fixture({ invalidLease = false, protectedPeer = false } = {}) {
     hqUid: 309, core: { random: { hex: () => 'a'.repeat(24) } }, renewLive,
     onLost: () => { lost++; }, lstat, checkACL: () => {},
     protectedAdmission: protectedPeer ? {
-      acceptPeer: async () => ({ ...selectors }),
+      acceptPeer: async (socket, { peer_uid, peer_pid }) => ({ ...selectors,
+        peer_uid, peer_pid, role: socket.role ?? 'runner' }),
       peerDisconnected: async () => { disconnected++; },
     } : undefined,
     admissionDispatch: protectedPeer ? async (op, meta) => {
       admitted.push({ op, context: meta.protectedStart });
       return { admitted: true };
     } : undefined,
-    authenticate: async (_, uid) => uid === 311,
+    observePeer: async (socket, uid) => uid === 311 ? (socket.pid ?? 402) : null,
     listen: async (options) => { listening = options; return { close: async () => { closed++; } }; } });
-  return { open, admission, assignment, selectors, replaceSocket: () => { socketInode++; },
+  const peer = async (role = 'runner', pid = 402) => {
+    const socket = { role, pid };
+    assert.equal(await listening.authenticatePeer(socket), true);
+    return { socket, context: await listening.connectionContext(socket) };
+  };
+  return { open, peer, admission, assignment, selectors, replaceSocket: () => { socketInode++; },
     get listening() { return listening; },
     get closed() { return closed; }, get lost() { return lost; }, get calls() { return calls; },
     get disconnected() { return disconnected; }, admitted };
@@ -64,18 +70,18 @@ test('signed per-start R listener accepts only the assigned peer and relays A le
   assert.equal(listener.path, f.admission.socket_path);
   assert.equal(f.listening.mode, 0o660);
   assert.equal(f.listening.replaceStale, false);
-  assert.equal(await f.listening.authenticatePeer({}), true);
+  const { context } = await f.peer();
   const challenge = randomBytes(32).toString('base64url');
   const payload = { installation_id: f.selectors.installation_id,
     start_id: f.selectors.start_id, launch_id: f.selectors.launch_id,
     reservation_sha256: f.selectors.reservation_sha256, challenge };
-  const reply = await f.listening.dispatch('launch.live', { payload });
+  const reply = await f.listening.dispatch('launch.live', { payload, protectedStart: context });
   assert.equal(JSON.parse(Buffer.from(reply.lease_envelope_base64url, 'base64url')).challenge, challenge);
   assert.equal(reply.lease_sequence, 1);
   assert.equal(f.calls, 1);
   await assert.rejects(f.listening.dispatch('launch', { payload }), /protected R admission/);
   await assert.rejects(f.listening.dispatch('Hello', { payload }), /protected R admission/);
-  await assert.rejects(f.listening.dispatch('launch.live', { payload: { ...payload, start_id: 'st_' + 'f'.repeat(24) } }), /protected R admission/);
+  await assert.rejects(f.listening.dispatch('launch.live', { payload: { ...payload, start_id: 'st_' + 'f'.repeat(24) }, protectedStart: context }), /protected R admission/);
   assert.equal(f.calls, 1);
   await listener.close();
   assert.equal(listener.checkCurrent(), false);
@@ -104,35 +110,54 @@ test('a changed signed plan binding is refused before listen', async () => {
 });
 
 test('protected Hello and later admission ops route only with the trusted R peer context', async () => {
-  const f = fixture({ protectedPeer: true });
+  const f = fixture();
   await f.open();
-  const context = await f.listening.connectionContext({});
+  const { socket, context } = await f.peer();
   assert.equal(context.reservation_sha256, f.selectors.reservation_sha256);
+  assert.equal(context.peer_pid, 402);
+  assert.equal(context.peer_uid, 311);
   assert.deepEqual(await f.listening.dispatch('Hello', { payload: {}, protectedStart: context }), { admitted: true });
   for (const op of ['Admit', 'Equip', 'Ready', 'Lease'])
     assert.deepEqual(await f.listening.dispatch(op, { payload: {}, protectedStart: context }), { admitted: true });
   assert.deepEqual(f.admitted.map(({ op }) => op), ['Hello', 'Admit', 'Equip', 'Ready', 'Lease']);
   await assert.rejects(f.listening.dispatch('Hello', { payload: {} }), /protected R admission/);
   await assert.rejects(f.listening.dispatch('launch', { payload: {} }), /protected R admission/);
-  await f.listening.connectionClosed({}, context);
+  await f.listening.connectionClosed(socket, context);
   assert.equal(f.disconnected, 1);
-  const liveOnly = await f.listening.connectionContext({});
-  await f.listening.connectionClosed({}, liveOnly);
+  const liveOnly = await f.peer('child', 403);
+  await assert.rejects(f.listening.dispatch('Hello', { payload: {}, protectedStart: liveOnly.context }), /protected R admission/);
+  const challenge = randomBytes(32).toString('base64url');
+  const lease = await f.listening.dispatch('launch.live', { protectedStart: liveOnly.context,
+    payload: { installation_id: f.selectors.installation_id, start_id: f.selectors.start_id,
+      launch_id: f.selectors.launch_id, reservation_sha256: f.selectors.reservation_sha256,
+      challenge } });
+  assert.equal(lease.lease_sequence, 1);
+  await f.listening.connectionClosed(liveOnly.socket, liveOnly.context);
   assert.equal(f.disconnected, 1, 'a separate Live renewal close does not revoke Hello');
+});
+
+test('no Machine-authenticated role context means no Live or Hello', async () => {
+  const f = fixture({ protectedPeer: false });
+  await f.open();
+  const socket = {};
+  assert.equal(await f.listening.authenticatePeer(socket), true);
+  await assert.rejects(f.listening.dispatch('Hello', { payload: {} }), /protected R admission/);
+  await assert.rejects(f.listening.dispatch('launch.live', { payload: {} }), /protected R admission/);
 });
 
 test('unsigned or changed lease cannot reach R and requests containment', async () => {
   const f = fixture({ invalidLease: true });
   await f.open();
+  const { context } = await f.peer();
   const payload = { installation_id: f.selectors.installation_id,
     start_id: f.selectors.start_id, launch_id: f.selectors.launch_id,
     reservation_sha256: f.selectors.reservation_sha256,
     challenge: randomBytes(32).toString('base64url') };
-  await assert.rejects(f.listening.dispatch('launch.live', { payload }), /protected R admission/);
+  await assert.rejects(f.listening.dispatch('launch.live', { payload, protectedStart: context }), /protected R admission/);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(f.lost, 1);
   assert.equal(f.calls, 1);
-  await assert.rejects(f.listening.dispatch('launch.live', { payload }), /protected R admission/);
+  await assert.rejects(f.listening.dispatch('launch.live', { payload, protectedStart: context }), /protected R admission/);
   assert.equal(f.calls, 1);
 });
 

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { createConnection, createServer } from 'node:net';
@@ -7,7 +7,7 @@ import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { authenticateOwner, checkOwnerControlSupport, OWNER_CONTROL_PATH } from '../hq/owner-control.mjs';
+import { authenticateOwner, checkOwnerControlSupport, observePeerPid, OWNER_CONTROL_PATH } from '../hq/owner-control.mjs';
 
 test('owner control compares the connected peer UID with the configured owner', { skip: !['linux', 'darwin'].includes(process.platform) }, async (t) => {
   checkOwnerControlSupport();
@@ -23,11 +23,36 @@ test('owner control compares the connected peer UID with the configured owner', 
     try {
       assert.equal(await authenticateOwner(peer, process.getuid()), true);
       assert.equal(await authenticateOwner(peer, process.getuid() + 1), false);
+      assert.equal(await observePeerPid(peer, process.getuid()), process.pid);
+      assert.equal(await observePeerPid(peer, process.getuid() + 1), null);
     } finally {
       peer.destroy();
       client.destroy();
     }
   } finally { await new Promise((resolve) => server.close(resolve)); }
+});
+
+test('peer PID comes from the connecting process, not the HQ listener', { skip: !['linux', 'darwin'].includes(process.platform), timeout: 10000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'hq-peer-pid-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'peer.sock');
+  const server = createServer().listen(path);
+  await once(server, 'listening');
+  const accepted = once(server, 'connection');
+  const child = spawn(process.execPath, ['-e',
+    'require("node:net").connect(process.argv[1]); setInterval(() => {}, 1000);', path],
+  { stdio: 'ignore' });
+  try {
+    const [peer] = await accepted;
+    try {
+      assert.notEqual(child.pid, process.pid);
+      assert.equal(await observePeerPid(peer, process.getuid()), child.pid);
+    } finally { peer.destroy(); }
+  } finally {
+    child.kill('SIGKILL');
+    await new Promise((resolve) => child.once('close', resolve));
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test('Darwin matches a renamed listener to the published socket with a bounded probe', { skip: process.platform !== 'darwin' }, () => {

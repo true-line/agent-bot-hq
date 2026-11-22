@@ -5,7 +5,7 @@ import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { fail } from '../sdk/errors.mjs';
 import { checkDarwinACL } from './darwin-harness-accounts.mjs';
-import { authenticatePeerUid } from './owner-control.mjs';
+import { observePeerPid } from './owner-control.mjs';
 import { listenSocket } from './socket.mjs';
 
 const ROOT = '/Library/Application Support/ai.true-line.agent-bot-hq';
@@ -57,16 +57,17 @@ function checkedEndpoint(installed, assignment, selectors, hqUid) {
 export async function listenStage2aRunnerAdmission({ installed, assignment, selectors,
   hqUid, core, renewLive, onLost, protectedAdmission, admissionDispatch,
   lstat = (path) => lstatSync(path, { bigint: true }),
-  checkACL = checkDarwinACL, authenticate = authenticatePeerUid,
+  checkACL = checkDarwinACL, observePeer = observePeerPid,
   listen = listenSocket } = {}) {
   if (typeof renewLive !== 'function' || typeof onLost !== 'function'
-    || typeof authenticate !== 'function' || typeof listen !== 'function') refuse();
+    || typeof observePeer !== 'function' || typeof listen !== 'function') refuse();
   const ep = checkedEndpoint(installed, assignment, selectors, hqUid);
   let identity;
   let closed = false;
   let closePromise;
   let lost = false;
   const helloConnections = new WeakSet();
+  const peerPids = new WeakMap();
   const lose = () => {
     if (lost || closed) return;
     lost = true;
@@ -106,10 +107,18 @@ export async function listenStage2aRunnerAdmission({ installed, assignment, sele
   checkDirectory();
   const listener = await listen({
     path: ep.socket_path, auth: 'entry-point', core, mode: 0o660, replaceStale: false,
-    authenticatePeer: async (socket) => await authenticate(socket, installed.runner_uid) === true && current(),
+    authenticatePeer: async (socket) => {
+      const pid = await observePeer(socket, installed.runner_uid);
+      if (!Number.isSafeInteger(pid) || pid < 2 || !current()) return false;
+      peerPids.set(socket, pid);
+      return true;
+    },
     connectionContext: protectedAdmission ? async (socket) => {
       if (!current()) refuse();
-      const context = await protectedAdmission.acceptPeer(socket, { installed, assignment, selectors });
+      const peer_pid = peerPids.get(socket);
+      if (!Number.isSafeInteger(peer_pid) || peer_pid < 2) refuse();
+      const context = await protectedAdmission.acceptPeer(socket, { installed, assignment,
+        selectors, peer_uid: installed.runner_uid, peer_pid });
       if (!context || typeof context !== 'object' || Array.isArray(context)
         || context.reservation_sha256 !== selectors.reservation_sha256
         || context.installation_id !== selectors.installation_id
@@ -117,7 +126,10 @@ export async function listenStage2aRunnerAdmission({ installed, assignment, sele
         || context.launch_id !== selectors.launch_id
         || context.plan_id !== selectors.plan_id
         || context.plan_digest !== selectors.plan_digest
-        || context.hq_epoch !== selectors.hq_epoch) refuse();
+        || context.hq_epoch !== selectors.hq_epoch
+        || context.peer_uid !== installed.runner_uid
+        || context.peer_pid !== peer_pid
+        || !['runner', 'child'].includes(context.role)) refuse();
       return context;
     } : undefined,
     connectionClosed: protectedAdmission ? (socket, context) => {
@@ -126,14 +138,15 @@ export async function listenStage2aRunnerAdmission({ installed, assignment, sele
     } : undefined,
     newSession: () => `rp_${core.random.hex(12)}`, endSession: () => {},
     async dispatch(op, meta) {
-      if (!current()) refuse();
+      if (!current() || !protectedAdmission || !meta.protectedStart) refuse();
       if (ADMISSION_OPERATIONS.has(op)) {
-        if (!protectedAdmission || typeof admissionDispatch !== 'function'
-          || !meta.protectedStart) refuse();
+        if (typeof admissionDispatch !== 'function'
+          || meta.protectedStart.role !== 'runner') refuse();
         if (op === 'Hello') helloConnections.add(meta.protectedStart);
         return admissionDispatch(op, meta);
       }
       if (op !== 'launch.live') refuse();
+      if (!['runner', 'child'].includes(meta.protectedStart.role)) refuse();
       const { payload } = meta;
       if (!payload || typeof payload !== 'object' || Array.isArray(payload)
         || Object.keys(payload).sort().join(',') !== 'challenge,installation_id,launch_id,reservation_sha256,start_id'
