@@ -1,4 +1,5 @@
-// Provisional: not wired to launch or admission; replace with pinned contract.
+// Signed Machine reservation verification. The envelope check can be repeated
+// during admission; only the first start consumes the one-use claim.
 import { createHash, createPublicKey, verify } from 'node:crypto';
 import { canonicalize } from '../sdk/wire/canonical-json.mjs';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
@@ -29,13 +30,15 @@ const keysEqual = (o, keys) => o && typeof o === 'object' && !Array.isArray(o) &
 // pinned contract schema; it must return true only for valid payloads.
 // clock must read trusted current time on every call. A reservation consumed
 // before expiry but expired while consuming is refused and remains consumed.
-async function verifyReservation(raw, { enrolledMachineKey, expected, clock, consume, validatePayload }, format) {
+async function verifyReservation(raw, { enrolledMachineKey, expected, clock, consume, validatePayload }, format,
+  { consumeClaim = true } = {}) {
   if (!Buffer.isBuffer(raw) || raw.length > 65536 || !Buffer.isBuffer(enrolledMachineKey) || enrolledMachineKey.length !== 32 ||
-      !expected || typeof consume !== 'function' || typeof clock !== 'function' || typeof validatePayload !== 'function') fail();
+      (consumeClaim && (!expected || typeof consume !== 'function' || typeof clock !== 'function'))
+      || typeof validatePayload !== 'function') fail();
   const time = () => { const now = clock(); if (!(now instanceof Date) || !Number.isFinite(now.getTime())) fail(); return now.getTime(); };
   const e = parseCanonical(raw);
   if (!keysEqual(e, ['schema_version','purpose','issuer_public_key_base64url','payload_sha256','payload_base64url','signature_base64url']) ||
-      e.schema_version !== 1 || e.purpose !== format.purpose) fail();
+      e.schema_version !== format.schemaVersion || e.purpose !== format.purpose) fail();
   const issuer = decode(e.issuer_public_key_base64url, 32);
   if (!issuer.equals(enrolledMachineKey)) fail();
   const payloadBytes = decode(e.payload_base64url);
@@ -49,8 +52,10 @@ async function verifyReservation(raw, { enrolledMachineKey, expected, clock, con
       p.contract !== format.contract || p.kind !== 'stage2a-reservation' || p.schema_version !== format.schemaVersion ||
       typeof p.host_id !== 'string' || !p.host_id || !p.assignment || !p.member_endpoint || !p.measurement_binding) fail();
   // Compare complete nested structures, not caller-selected subsets.
-  for (const field of ['host_id','assignment','member_endpoint','measurement_binding','installed_plan_receipt_sha256','admission_challenge_sha256']) {
-    if (!Object.hasOwn(expected, field) || !same(p[field], expected[field])) fail();
+  if (expected) {
+    for (const field of ['host_id','assignment','member_endpoint','measurement_binding','installed_plan_receipt_sha256','admission_challenge_sha256']) {
+      if (!Object.hasOwn(expected, field) || !same(p[field], expected[field])) fail();
+    }
   }
   for (const field of ['start_id','launch_id','hq_epoch','plan_id','plan_digest','installation_id']) {
     if (typeof p.assignment[field] !== 'string' || !p.assignment[field]) fail();
@@ -74,10 +79,22 @@ async function verifyReservation(raw, { enrolledMachineKey, expected, clock, con
     || !Number.isSafeInteger(a.machine_uid) || a.machine_uid <= 399
     || m.snapshots.definition.owner_uid !== a.machine_uid
     || m.snapshots.launch_inputs.owner_uid !== a.machine_uid)) fail();
+  if (format === V2) {
+    const slot = createHash('sha256').update(`agent-bot-soul-endpoint-installation/v1\0${a.installation_id}`)
+      .digest('hex').slice(0, 20);
+    const namespace = `/private/var/db/managed-machine/soul-snapshots/${slot}/snap_`;
+    const roots = [m.snapshots.definition.root_path, m.snapshots.launch_inputs.root_path];
+    if (roots[0] === roots[1] || roots.includes(a.package_root)
+      || roots.some((root) => typeof root !== 'string' || !root.startsWith(namespace)
+        || root.length !== namespace.length + 24)) fail();
+  }
   const issued = Date.parse(p.issued_at), expires = Date.parse(p.expires_at);
   if (typeof p.issued_at !== 'string' || typeof p.expires_at !== 'string' || !Number.isFinite(issued) || !Number.isFinite(expires) ||
-      issued > time() || expires <= time() || expires <= issued || p.assignment.expires_at !== p.expires_at) fail();
+      expires <= issued || (format === V2 && expires - issued > 30000)
+      || p.assignment.expires_at !== p.expires_at) fail();
   const reservationSHA256 = sha(raw);
+  if (!consumeClaim) return { payload: p, reservationSHA256 };
+  if (issued > time() || expires <= time()) fail();
   if (await consume({ issuer: e.issuer_public_key_base64url, installationId: p.assignment.installation_id,
     startId: p.assignment.start_id, reservationSHA256, expiresAt: p.expires_at }) !== true) fail();
   const afterConsume = time();
@@ -87,3 +104,9 @@ async function verifyReservation(raw, { enrolledMachineKey, expected, clock, con
 
 export const verifyStage2aReservation = (raw, options) => verifyReservation(raw, options, V1);
 export const verifyStage2aReservationV2 = (raw, options) => verifyReservation(raw, options, V2);
+// This never marks a claim used. Callers must compare the complete signed
+// projection with installed Machine state and require a fresh signed Machine
+// live response at every bind phase. An expired reservation is still
+// authenticated so that Machine can renew the finalized live lease.
+export const inspectStage2aReservationV2 = (raw, options) =>
+  verifyReservation(raw, options, V2, { consumeClaim: false });

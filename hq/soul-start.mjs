@@ -20,9 +20,14 @@ const PACKAGE_SHA256 = /^[0-9a-f]{64}$/;
 // must authenticate Machine's one-use binding independently of that client.
 // Production passes no client until Machine #629/#630 implement that proof.
 export function createSoulStarter({ core, home, machineLaunch, verifyMachineReservation, verifyMachineCompletion,
-  mode, hqUid = process.getuid?.(), harnessUids = [] } = {}) {
-  // Machine's fixed SoulRunRequest header uses exactly 64 lowercase hex.
-  const hqEpoch = core.random.hex(32);
+  protectedStart, mode, hqUid = process.getuid?.(), harnessUids = [], machineHqEpoch } = {}) {
+  // Protected starts use Machine's current paired HQ epoch, not a local
+  // process nonce. A pairing rotation invalidates every installed policy.
+  // Cooperative starts retain their local epoch when no Machine is wired.
+  if (machineHqEpoch !== undefined && !/^[0-9a-f]{64}$/.test(machineHqEpoch)) {
+    throw new Error('invalid signed Machine HQ pairing epoch');
+  }
+  const hqEpoch = machineHqEpoch ?? core.random.hex(32);
   const excludedUids = new Set(harnessUids);
   const starts = new Map();
   const byPath = new Map();
@@ -60,11 +65,11 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
     if (auth !== 'owner') fail('host.auth_mismatch', 'Soul start is owner-only');
     if (!canTakeOver) fail('host.invalid_request', 'soul.start must be the first request on a new owner connection');
     if (shuttingDown || mode() !== 'running') fail('host.launch_unavailable', 'HQ is not running admissions');
-    // A protected request must never be silently served by the cooperative
-    // runner. The signed R/B start, B-only bind and live Machine checks have
-    // no production implementation yet.
     if (payload?.requested_profile === 'managed-protected') {
-      fail('host.launch_unavailable', 'Machine protected R/B bridge start is not installed');
+      if (typeof protectedStart?.start !== 'function') {
+        fail('host.launch_unavailable', 'Machine protected R/B bridge start is not installed');
+      }
+      return protectedStart.start(payload);
     }
     if (!machineLaunch || typeof machineLaunch.reserve !== 'function'
       || typeof verifyMachineReservation !== 'function' || typeof verifyMachineCompletion !== 'function'
@@ -281,6 +286,7 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
 
   return { dispatch, report, hqEpoch, stopAll: async () => {
     shuttingDown = true;
+    await protectedStart?.stopAll?.();
     await Promise.all([...starts.values()].map(stop));
   } };
 }

@@ -67,7 +67,7 @@ test('every fixture gets its expected schema verdict from the SDK validator', ()
 });
 
 test('the validator fails closed on keywords it does not check, and checks what it claims', () => {
-  for (const kw of [{ $ref: '#/x' }, { oneOf: [] }, { anyOf: [] }, { patternProperties: {} }, { format: 'unknown' }]) {
+  for (const kw of [{ $ref: '#/x' }, { oneOf: [] }, { anyOf: [] }, { format: 'unknown' }]) {
     assert.throws(() => validate(kw, {}), TypeError, JSON.stringify(kw));
   }
   assert.throws(() => validate({ properties: { a: { dependentSchemas: {} } } }, {}), /keyword dependentSchemas/);
@@ -80,6 +80,10 @@ test('the validator fails closed on keywords it does not check, and checks what 
   assert.deepEqual(validate({ type: 'number' }, 2), []);
   assert.equal(validate({ type: 'array', uniqueItems: true }, [{ a: 1, b: 2 }, { b: 2, a: 1 }]).length, 1);
   assert.equal(validate({ type: 'object', additionalProperties: false, properties: { a: true } }, { a: 1, b: 2 })[0].message, 'unknown field b');
+  const namedValues = { type: 'object', patternProperties: { '^x': { type: 'integer' } }, additionalProperties: false };
+  assert.deepEqual(validate(namedValues, { x1: 1 }), []);
+  assert.equal(validate(namedValues, { x1: 'bad' })[0].keyword, 'type');
+  assert.equal(validate(namedValues, { y1: 1 })[0].keyword, 'additionalProperties');
   const cond = { if: { properties: { kind: { const: 'x' } }, required: ['kind'] }, then: { required: ['y'] } };
   assert.equal(validate(cond, { kind: 'x' }).length, 1);
   assert.deepEqual(validate(cond, { kind: 'z' }), []);

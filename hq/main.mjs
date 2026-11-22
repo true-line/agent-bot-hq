@@ -28,6 +28,7 @@
 // fetches it into .cache/ on first use). A release will vendor the pinned
 // tree with the plugins (§4.5) instead.
 import { readFileSync } from 'node:fs';
+import { userInfo } from 'node:os';
 import { connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -41,10 +42,15 @@ import { createHQ } from './hq.mjs';
 import { productionPluginsDir, readPins } from './plugins.mjs';
 import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { connectSocket } from './socket.mjs';
-import { machineRoleCommand } from './machine-channel.mjs';
+import { machineRoleCommand, machineRoleStage2aList } from './machine-channel.mjs';
 import { relaySoulAcp } from './soul-acp-relay.mjs';
+import { validate } from '../sdk/wire/schema.mjs';
+import { inspectStage2aReservationV2 } from './stage2a-reservation.mjs';
+import { createStage2aMachineBridgeAuthority } from './stage2a-machine-bridge-authority.mjs';
+import { createStage2aProtectedStarter } from './stage2a-protected-start.mjs';
+import { createStage2aQualificationProvider } from './stage2a-qualification-provider.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
@@ -61,6 +67,11 @@ function parse(argv) {
     } else if (argv[i] === '--soul') {
       args.soul = argv[++i];
       if (!args.soul || args.cmd !== 'soul' || args.sub !== 'start') throw new Error('--soul DIR is only for soul start');
+    } else if (argv[i] === '--profile') {
+      args.profile = argv[++i];
+      if (args.cmd !== 'soul' || args.sub !== 'start' || args.profile !== 'managed-protected') {
+        throw new Error('--profile supports managed-protected only');
+      }
     } else if (argv[i] === '--json') args.json = true;
     else if (argv[i] === '--harness') (args.harnesses ??= []).push(argv[++i]);
     else if (argv[i] === '--force') args.force = true;
@@ -83,17 +94,26 @@ function loadSchemas() {
   return Object.fromEntries([...load('hq/v1', [...SCHEMA_NAMES, ...NOTICE_SCHEMA_NAMES]), ...load('task/v1', TASK_SCHEMA_NAMES), ...load('wire/v1', TASK_WIRE_SCHEMA_NAMES)]);
 }
 
+function loadStage2aSchemas() {
+  const { dir } = verify();
+  const paths = ['machine/v2/snapshot-identity', 'machine/v2/measurement-binding',
+    'machine/v2/stage2a-reservation-payload'];
+  const schemas = paths.map((path) => JSON.parse(readFileSync(join(dir, 'schemas', `${path}.schema.json`), 'utf8')));
+  return (payload) => validate(schemas[2], payload, { schemas: schemas.slice(0, 2) }).length === 0;
+}
+
 async function ask(controlPath, op) {
   const client = await connectSocket(controlPath);
   try { return await client.request(op); } finally { await client.close(); }
 }
 
-async function startSoul(controlPath, path) {
+async function startSoul(controlPath, path, profile) {
   if (!path) throw new Error('soul start needs --soul DIR');
   const socket = netConnect(controlPath);
   await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
   try {
-    socket.write(`${JSON.stringify({ id: 1, op: 'soul.start', payload: { package_path: path } })}\n`);
+    socket.write(`${JSON.stringify({ id: 1, op: 'soul.start', payload: { package_path: path,
+      ...(profile ? { requested_profile: profile } : {}) } })}\n`);
     let buf = Buffer.alloc(0);
     const response = await new Promise((resolve, reject) => {
       const onData = (chunk) => {
@@ -110,7 +130,9 @@ async function startSoul(controlPath, path) {
       socket.once('close', onClose);
     });
     if (!response.answer.ok) throw new Error(JSON.stringify(response.answer.refusal ?? response.answer.host_refusal ?? response.answer));
-    process.stderr.write(`HQ started Soul runner ${response.answer.result.start_id} (pid ${response.answer.result.pid}); protected qualification remains unavailable\n`);
+    process.stderr.write(response.answer.result.profile === 'managed-protected'
+      ? `HQ started protected Soul runner ${response.answer.result.start_id} (pid ${response.answer.result.pid})\n`
+      : `HQ started Soul runner ${response.answer.result.start_id} (pid ${response.answer.result.pid}); protected qualification remains unavailable\n`);
     if (response.rest.length) process.stdout.write(response.rest);
     await relaySoulAcp(process.stdin, process.stdout, socket);
   } finally { socket.destroy(); }
@@ -188,7 +210,52 @@ async function main(argv) {
     try {
       const pins = readPins(PINS);
       const pluginsDir = productionPluginsDir(args, fileURLToPath(import.meta.url), pins);
-      const hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins, pluginsDir, devPlugins: args.devPlugins });
+      let installed = [];
+      let machinePublicKey;
+      if (process.platform === 'darwin' && process.arch === 'arm64'
+        && userInfo().username === '_agent-bot-hq') {
+        try {
+          const list = await machineRoleStage2aList();
+          installed = list.installations;
+          machinePublicKey = Buffer.from(list.machine_public_key, 'hex');
+        } catch (error) {
+          console.error(`Machine protected Soul plans unavailable: ${error.message}`);
+        }
+      }
+      const epochs = new Set(installed.map((entry) => entry.hq_epoch));
+      if (epochs.size > 1) throw new Error('Machine installed Soul plans disagree on HQ pairing epoch');
+      const validatePayload = installed.length ? loadStage2aSchemas() : undefined;
+      const verifyReservation = installed.length ? (envelope) =>
+        inspectStage2aReservationV2(envelope, { enrolledMachineKey: machinePublicKey,
+          validatePayload }) : undefined;
+      const authority = installed.length ? createStage2aMachineBridgeAuthority({
+        machinePublicKey, verifyReservation }) : undefined;
+      const providers = new Map();
+      let hq;
+      const protectedStart = installed.length ? createStage2aProtectedStarter({
+        installations: installed, authority, verifyReservation,
+        getBrokerIdentity: (installationId) => hq.bridgeBrokerIdentity(installationId),
+        verifyBoundBridge: (selectors, digest) => hq.boundBridgeV2(selectors, digest),
+        onFinalized: ({ installed: plan, assignment, selectors }) => {
+          providers.set(selectors.reservation_sha256, createStage2aQualificationProvider({
+            plan: { installation_id: plan.installation_id, start_id: assignment.start_id,
+              launch_id: assignment.launch_id, hq_epoch: plan.hq_epoch, plan_id: plan.plan_id,
+              plan_digest: plan.plan_digest, reservation_sha256: selectors.reservation_sha256,
+              soul_artifact_sha256: `sha256:${plan.soul_artifact_sha256}`,
+              provider_config_sha256: plan.provider_config_sha256 },
+          }));
+        },
+        onStopped: (reservationSHA256) => { providers.delete(reservationSHA256); },
+      }) : undefined;
+      hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins,
+        pluginsDir, devPlugins: args.devPlugins, bridgeAssignments: installed,
+        bridgeAuthority: authority, machineHqEpoch: epochs.values().next().value,
+        protectedStart,
+        qualificationAuthorizer: installed.length ? ({ request, observation }) => {
+          const provider = providers.get(observation?.reservation_digest);
+          if (!provider) throw new Error('Machine protected provider start is unavailable');
+          return provider({ request, observation });
+        } : undefined });
       // Handlers first, so a signal during start still shuts down cleanly.
       let starting = true;
       const shutdown = (signal) => {
@@ -232,7 +299,7 @@ async function main(argv) {
   }
   if (args.cmd === 'soul') {
     if (args.sub !== 'start') throw new Error(USAGE);
-    await startSoul(controlPath, args.soul);
+    await startSoul(controlPath, args.soul, args.profile);
     return;
   }
   if (args.cmd === 'signer') {

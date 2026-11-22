@@ -57,17 +57,19 @@ export function planBridgeEndpoints(assignments, { platform, account, hqUid, har
 }
 
 export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
-  enableBridgeQualification = false, lstat = lstatSync, checkACL = checkDarwinACL, authenticate = authenticatePeerUid, listen = listenSocket } = {}) {
+  enableBridgeQualification = false, lstat = (path) => lstatSync(path, { bigint: true }),
+  checkACL = checkDarwinACL, authenticate = authenticatePeerUid, listen = listenSocket } = {}) {
   function checkDirectory() {
     for (const path of ['/', '/Library', '/Library/Application Support', dirname(DARWIN_HARNESS_DIR), DARWIN_HARNESS_DIR]) {
       const st = lstat(path);
-      if (!st.isDirectory() || st.uid !== 0 || (st.mode & 0o022) || !(st.mode & 0o001)) {
+      if (!st.isDirectory() || Number(st.uid) !== 0 || (Number(st.mode) & 0o022) || !(Number(st.mode) & 0o001)) {
         throw new Error(`untrusted Darwin bridge broker parent ${path}`);
       }
       checkACL(path);
     }
     const dir = lstat(endpoint.directory);
-    if (!dir.isDirectory() || dir.uid !== hqUid || dir.gid !== endpoint.gid || (dir.mode & 0o7777) !== 0o2750) {
+    if (!dir.isDirectory() || Number(dir.uid) !== hqUid || Number(dir.gid) !== endpoint.gid
+      || (Number(dir.mode) & 0o7777) !== 0o2750) {
       throw new Error('invalid Machine bridge broker directory on disk');
     }
     checkACL(endpoint.directory);
@@ -75,7 +77,8 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
   }
   function checkSocket() {
     const socket = lstat(endpoint.path);
-    if (!socket.isSocket() || socket.uid !== hqUid || socket.gid !== endpoint.gid || (socket.mode & 0o7777) !== 0o660) {
+    if (!socket.isSocket() || Number(socket.uid) !== hqUid || Number(socket.gid) !== endpoint.gid
+      || (Number(socket.mode) & 0o7777) !== 0o660) {
       throw new Error('invalid HQ bridge broker socket on disk');
     }
     return socket;
@@ -83,7 +86,8 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
 
   checkDirectory();
   let identity;
-  const matchesInode = (recorded, current) => recorded.dev === current.dev && recorded.ino === current.ino;
+  const matchesInode = (recorded, current) => BigInt(recorded.dev) === BigInt(current.dev)
+    && BigInt(recorded.ino) === BigInt(current.ino);
   function checkCurrent() {
     if (!identity) return false;
     const dir = checkDirectory();
@@ -127,7 +131,21 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
     await listener.close();
     throw error;
   }
-  return listener;
+  // The paired Machine prepare-B request can bind the identity HQ actually
+  // observed. A cannot traverse H:B. B independently reopens and compares
+  // these identities before it uses the broker, so H's claim is not enough.
+  const brokerIdentity = () => {
+    if (!checkCurrent()) refuse();
+    const dir = checkDirectory();
+    const socket = checkSocket();
+    if (!matchesInode(identity.dir, dir) || !matchesInode(identity.socket, socket)) refuse();
+    const projection = (st) => Object.freeze({ device: BigInt(st.dev).toString(),
+      inode: BigInt(st.ino).toString(), owner_uid: Number(st.uid), group_gid: Number(st.gid),
+      mode: Number(st.mode) & 0o7777 });
+    return Object.freeze({ directory: endpoint.directory, socket_path: endpoint.path,
+      directory_identity: projection(dir), socket_identity: projection(socket) });
+  };
+  return Object.freeze({ ...listener, brokerIdentity });
 }
 
 function matchesMemberEndpoint(member, endpoint, startId) {

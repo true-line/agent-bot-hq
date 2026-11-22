@@ -53,7 +53,7 @@ async function checkBridgeTransport(enabled) {
   let handler;
   let inode = 42;
   const checks = [];
-  await listenBridgeEndpoint(endpoint, { hqUid, host, peers, ...(enabled ? { enableBridgeQualification: true } : {}), core: { random: { hex: () => 'test' } },
+  const listener = await listenBridgeEndpoint(endpoint, { hqUid, host, peers, ...(enabled ? { enableBridgeQualification: true } : {}), core: { random: { hex: () => 'test' } },
     checkACL() {},
     lstat(path) {
       return { isDirectory: () => path !== endpoint.path, isSocket: () => path === endpoint.path,
@@ -64,11 +64,17 @@ async function checkBridgeTransport(enabled) {
     listen: async (config) => { handler = config; return {}; },
   });
   const socket = Object.assign(new EventEmitter(), { uid: 321, destroyed: false });
+  assert.deepEqual(listener.brokerIdentity(), {
+    directory: endpoint.directory, socket_path: endpoint.path,
+    directory_identity: { device: '8', inode: '42', owner_uid: hqUid, group_gid: endpoint.gid, mode: 0o2750 },
+    socket_identity: { device: '8', inode: '42', owner_uid: hqUid, group_gid: endpoint.gid, mode: 0o660 },
+  });
   assert.equal(await handler.authenticatePeer(socket), false);
   socket.uid = 322;
   assert.equal(await handler.authenticatePeer(socket), true);
   assert.deepEqual(checks, [322, 322]);
   inode++;
+  assert.throws(() => listener.brokerIdentity(), { code: 'host.launch_unavailable' });
   assert.equal(await handler.authenticatePeer(socket), false);
   inode--;
   const session = handler.newSession(socket);

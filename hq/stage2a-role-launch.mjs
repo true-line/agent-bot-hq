@@ -1,0 +1,228 @@
+// HQ starts only the installed, sudoers-pinned Soul launcher under Machine's
+// assigned R or B account. Machine authorizes the observed process over the
+// paired local channel; HQ relays its signed grant over this private pipe.
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { parseStrict } from '../sdk/wire/strict-json.mjs';
+import { machineRoleStage2aExec, machineRoleStage2aPrepareB } from './machine-channel.mjs';
+import { join } from 'node:path';
+
+export const STAGE2A_LAUNCHER = '/Library/Application Support/ai.true-line.agent-bot-hq/soul-launch';
+const RUNNER_ACCOUNT = /^_abm-sr-[0-9a-f]{20}$/;
+const BRIDGE_ACCOUNT = /^_abm-br-[0-9a-f]{20}$/;
+const DIGEST = /^sha256:[0-9a-f]{64}$/;
+const NONCE = /^[A-Za-z0-9_-]{43}$/;
+
+// Translate HQ's bigint-safe lstat observation into Machine's signed
+// prepare-B request. The directory and socket must be the installed H:B
+// endpoint; no owner-selected path or rounded inode enters the claim.
+export function stage2aBrokerClaim(installed, observed) {
+  const ep = installed?.broker;
+  const exact = (value, fields) => value && typeof value === 'object' && !Array.isArray(value)
+    && Object.keys(value).sort().join(',') === [...fields].sort().join(',');
+  const decimal = (value) => typeof value === 'string' && /^[1-9][0-9]*$/.test(value)
+    && value.length <= 20 && BigInt(value) <= 18446744073709551615n;
+  const node = (value, mode) => exact(value, ['owner_uid', 'group_gid', 'device', 'inode', 'mode'])
+    && value.owner_uid === installed.hq_uid && value.group_gid === installed.bridge_gid
+    && decimal(value.device) && decimal(value.inode) && value.mode === mode;
+  if (!ep || !observed || observed.directory !== ep.directory
+    || observed.socket_path !== ep.socket_path
+    || !node(observed.directory_identity, 0o2750)
+    || !node(observed.socket_identity, 0o660)) {
+    throw new Error('HQ broker identity differs from installed Machine assignment');
+  }
+  const project = (value) => Object.freeze({ uid: value.owner_uid, gid: value.group_gid,
+    device: value.device, inode: value.inode, mode: value.mode });
+  return Object.freeze({ path: ep.socket_path,
+    parent: project(observed.directory_identity), socket: project(observed.socket_identity) });
+}
+
+export async function prepareStage2aBridge({ installed, observed, selectors,
+  machinePrepare = machineRoleStage2aPrepareB } = {}) {
+  if (!selectors || typeof selectors !== 'object' || Array.isArray(selectors)
+    || Object.keys(selectors).sort().join(',') !== [
+      'reservation_sha256', 'installation_id', 'start_id', 'launch_id', 'plan_id', 'plan_digest', 'hq_epoch',
+    ].sort().join(',') || selectors.installation_id !== installed?.installation_id
+    || selectors.plan_id !== installed.plan_id || selectors.plan_digest !== installed.plan_digest
+    || selectors.hq_epoch !== installed.hq_epoch) {
+    throw new Error('B preparation differs from signed installed assignment');
+  }
+  const reply = await machinePrepare({ ...selectors, broker: stage2aBrokerClaim(installed, observed) });
+  if (!DIGEST.test(reply?.assignment_sha256 ?? '')) {
+    throw new Error('Machine did not prepare the signed B assignment');
+  }
+  return reply;
+}
+
+export function stage2aRelayClaim(installed, startId, ready) {
+  if (!installed || !/^st_[0-9a-f]{24}$/.test(startId ?? '')
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(installed.installation_id ?? '')
+    || !DIGEST.test(ready?.bind_receipt_sha256 ?? '')) {
+    throw new Error('invalid signed B readiness selectors');
+  }
+  const socket = ready.relay_socket;
+  if (!socket || socket.uid !== installed.bridge_uid || socket.gid !== installed.runner_gid
+    || socket.mode !== 0o660 || !Number.isSafeInteger(socket.device) || socket.device <= 0
+    || !Number.isSafeInteger(socket.inode) || socket.inode <= 0) {
+    throw new Error('B readiness differs from installed relay account');
+  }
+  const basename = createHash('sha256').update([
+    'agent-bot-soul-endpoint-start/v1', installed.installation_id, startId,
+  ].join('\0')).digest('hex').slice(0, 20) + '.sock';
+  return Object.freeze({ path: join(installed.relay.directory, basename),
+    socket: Object.freeze({ uid: socket.uid, gid: socket.gid,
+      device: String(socket.device), inode: String(socket.inode), mode: socket.mode }) });
+}
+
+function challengeFrom(line, role) {
+  if (line.length > 512) throw new Error('Soul launcher challenge is too large');
+  const c = parseStrict(line.toString('utf8'));
+  if (!c || typeof c !== 'object' || Array.isArray(c)
+    || Object.keys(c).length !== 3 || !['role', 'nonce', 'pid'].every((k) => Object.hasOwn(c, k))
+    || c.role !== role || typeof c.nonce !== 'string' || !NONCE.test(c.nonce)
+    || Buffer.from(c.nonce, 'base64url').length !== 32
+    || Buffer.from(c.nonce, 'base64url').toString('base64url') !== c.nonce
+    || !Number.isSafeInteger(c.pid) || c.pid < 2) {
+    throw new Error('invalid Soul launcher challenge');
+  }
+  return c;
+}
+
+function firstLine(child, parse, timeoutMs, limit, resume = false) {
+  return new Promise((resolve, reject) => {
+    let bytes = Buffer.alloc(0);
+    const timer = setTimeout(() => finish(new Error('Soul launcher challenge timed out')), timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.stdout.off('data', onData);
+      child.stdout.off('error', onError);
+      child.off('error', onError);
+      child.off('close', onClose);
+    };
+    const finish = (error, value) => { cleanup(); if (error) reject(error); else resolve(value); };
+    const onError = (error) => finish(error);
+    const onClose = () => finish(new Error('Soul launcher exited before its response'));
+    const onData = (chunk) => {
+      bytes = Buffer.concat([bytes, chunk]);
+      const end = bytes.indexOf(0x0a);
+      if (end < 0) {
+        if (bytes.length > limit) finish(new Error('Soul launcher response is too large'));
+        return;
+      }
+      try {
+        child.stdout.pause();
+        if (bytes.length > end + 1) child.stdout.unshift(bytes.subarray(end + 1));
+        finish(null, parse(bytes.subarray(0, end)));
+      }
+      catch (error) { finish(error); }
+    };
+    child.stdout.on('data', onData);
+    child.stdout.once('error', onError);
+    child.once('error', onError);
+    child.once('close', onClose);
+    if (resume) child.stdout.resume();
+  });
+}
+
+function bridgeReadyFrom(line) {
+  if (line.length > 1024) throw new Error('Soul bridge readiness is too large');
+  const ready = parseStrict(line.toString('utf8'));
+  const socket = ready?.relay_socket;
+  if (!ready || typeof ready !== 'object' || Array.isArray(ready)
+    || Object.keys(ready).length !== 2
+    || !Object.hasOwn(ready, 'bind_receipt_sha256') || !Object.hasOwn(ready, 'relay_socket')
+    || !DIGEST.test(ready.bind_receipt_sha256)
+    || !socket || typeof socket !== 'object' || Array.isArray(socket)
+    || Object.keys(socket).length !== 5
+    || !['uid', 'gid', 'device', 'inode', 'mode'].every((key) => Object.hasOwn(socket, key)
+      && Number.isSafeInteger(socket[key]) && socket[key] >= 0)
+    || socket.uid < 300 || socket.uid > 399 || socket.gid < 300 || socket.gid > 399
+    || socket.inode === 0 || socket.mode !== 0o660) {
+    throw new Error('invalid Soul bridge readiness');
+  }
+  return Object.freeze({ bind_receipt_sha256: ready.bind_receipt_sha256,
+    relay_socket: Object.freeze({ ...socket }) });
+}
+
+function writeGrant(child, bytes) {
+  return new Promise((resolve, reject) => {
+    if (!Buffer.isBuffer(bytes) || bytes.length < 2 || bytes.length > 65536
+      || bytes.at(-1) !== 0x0a || child.exitCode !== null || child.signalCode !== null) {
+      reject(new Error('invalid or late Soul launcher grant'));
+      return;
+    }
+    child.stdin.write(bytes, (error) => error ? reject(error) : resolve());
+  });
+}
+
+function bounded(promise, timeoutMs, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+// A returned role is *started*, not contained or protected. The caller must
+// bind the reservation to an authenticated live start and obtain Machine's
+// signed stop/completion before releasing any installation occupancy.
+export async function startStage2aRole({ account, role, reservationSHA256,
+  machineExec = machineRoleStage2aExec, spawnProcess = spawn, timeoutMs = 12000 } = {}) {
+  if (typeof account !== 'string'
+    || !(role === 'runner' && RUNNER_ACCOUNT.test(account)
+      || role === 'bridge' && BRIDGE_ACCOUNT.test(account))
+    || !DIGEST.test(reservationSHA256 ?? '')
+    || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 14000) {
+    throw new Error('invalid Soul launcher assignment');
+  }
+  const command = role === 'runner' ? 'soul-run' : 'soul-bridge';
+  const child = spawnProcess('/usr/bin/sudo', ['-n', '-u', account, '--', STAGE2A_LAUNCHER, command], {
+    stdio: ['pipe', 'pipe', 'ignore'], shell: false,
+    env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C' },
+  });
+  const done = new Promise((resolve) => {
+    child.once('close', (exit_code, signal) => resolve({ exit_code, signal, contained: false }));
+  });
+  child.stdin.on('error', () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); });
+  child.stdout.on('error', () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); });
+  try {
+    const challenge = await firstLine(child, (line) => challengeFrom(line, role), timeoutMs, 512);
+    const grant = await bounded(machineExec({ reservation_sha256: reservationSHA256,
+      role, nonce: challenge.nonce, pid: challenge.pid }), timeoutMs, 'Machine role grant');
+    await writeGrant(child, grant?.grantLine);
+    let readinessAttempted = false;
+    return Object.freeze({ pid: challenge.pid, role, stdin: child.stdin, stdout: child.stdout, done,
+      resumeOutput: () => child.stdout.resume(),
+      waitBridgeReady: async (verify) => {
+        if (role !== 'bridge' || readinessAttempted || typeof verify !== 'function') {
+          throw new Error('invalid Soul bridge readiness verifier');
+        }
+        readinessAttempted = true;
+        try {
+          const ready = await firstLine(child, bridgeReadyFrom, 5000, 1024, true);
+          const verified = await bounded(Promise.resolve().then(() => verify(ready)), 5000,
+            'Soul bridge readiness verification');
+          if (verified !== true || child.exitCode !== null || child.signalCode !== null) {
+            throw new Error('Soul bridge readiness was not authenticated');
+          }
+          return ready;
+        } catch (error) {
+          child.stdin.destroy();
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+          throw error;
+        }
+      },
+      stop: async () => {
+        child.stdin.destroy();
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+        const killer = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        }, 3000);
+        try { return await done; } finally { clearTimeout(killer); }
+      } });
+  } catch (error) {
+    child.stdin.destroy();
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+    throw error;
+  }
+}
