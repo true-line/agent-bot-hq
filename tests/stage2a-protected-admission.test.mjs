@@ -97,7 +97,10 @@ test('signed Machine role and Hello finalize the copied HQ admission binding', a
     getBindReceiptSHA256: () => bind });
   const context = await verifier.acceptPeer({}, { installed, assignment, selectors,
     peer_uid: 311, peer_pid: peerProcess.pid });
-  const original = await verifier.verifyHelloStart({ connection: context, caller: 'rp-1',
+  // listenSocket freezes this shallow copy before dispatch and close.
+  const copiedContext = Object.freeze({ ...context });
+  assert.notEqual(copiedContext, context);
+  const original = await verifier.verifyHelloStart({ connection: copiedContext, caller: 'rp-1',
     payload, hello_payload_sha256: helloPayloadSHA256 });
   const copied = Object.freeze({ ...original });
   assert.equal(await verifier.verifyDefinitionMapping(copied, payload), true);
@@ -124,5 +127,7 @@ test('signed Machine role and Hello finalize the copied HQ admission binding', a
   await assert.rejects(verifier.assertLive(copied),
     /Machine protected Hello authority is unavailable/);
   unwatch();
+  await verifier.peerDisconnected({}, copiedContext);
+  assert.deepEqual(calls.slice(-2), ['abort', 'stop']);
   registration.close();
 });

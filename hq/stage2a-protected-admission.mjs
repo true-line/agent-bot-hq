@@ -13,6 +13,7 @@ const STOP_FIELDS = ['reservation_sha256', 'installation_id', 'start_id', 'launc
 const PEER_PURPOSE = 'agent-bot/stage2a-peer-role/v1';
 const START_PURPOSE = 'agent-bot/stage2a-hello-start/v1';
 const FINAL_PURPOSE = 'agent-bot/stage2a-hello-finalization/v1';
+const PEER_TOKEN = Symbol('stage2a-authenticated-peer');
 const refuse = () => { throw new Error('Machine protected Hello authority is unavailable'); };
 const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
@@ -45,6 +46,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
   const starts = new Map();
   const contexts = new WeakMap();
   const bindings = new WeakMap();
+  const peerFor = (connection) => contexts.get(connection?.[PEER_TOKEN]);
 
   function recordFor(selectors) {
     const record = starts.get(selectors?.reservation_sha256);
@@ -113,14 +115,19 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
       || (signed.role === 'child' && (!record.finalized
         || signed.hello_finalization_sha256 !== record.finalSHA256
         || !DIGEST.test(signed.child_start_receipt_sha256 ?? '')))) refuse();
-    const context = Object.freeze({ ...selectors, peer_uid, peer_pid, role: signed.role });
-    contexts.set(context, { record, expiresAt: signed.expires_at_ms,
+    // listenSocket freezes a shallow copy of this context before dispatch.
+    // The opaque token survives that copy while an untrusted wire value
+    // cannot manufacture an entry in this WeakMap.
+    const token = Object.freeze({});
+    const context = Object.freeze({ ...selectors, peer_uid, peer_pid,
+      role: signed.role, [PEER_TOKEN]: token });
+    contexts.set(token, { record, expiresAt: signed.expires_at_ms,
       role: signed.role, peerProcess: signed.peer_process });
     return context;
   }
 
   async function verifyHelloStart({ connection, caller, payload, hello_payload_sha256 } = {}) {
-    const peer = contexts.get(connection);
+    const peer = peerFor(connection);
     if (!peer || peer.role !== 'runner' || peer.record.lost || peer.record.hello
       || peer.expiresAt <= now() || typeof caller !== 'string' || !caller) refuse();
     const record = peer.record;
@@ -228,7 +235,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
 
   async function abort(binding) {
     const record = bindings.get(binding)
-      ?? contexts.get(binding?.connection)?.record
+      ?? peerFor(binding?.connection)?.record
       ?? starts.get(binding?.reservation_sha256);
     if (!record) refuse();
     if (record.abortPromise) return record.abortPromise;
@@ -266,7 +273,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
   async function assertLive(binding) {
     const record = recordForBinding(binding);
     const connection = record.hello.connection;
-    const peer = contexts.get(connection);
+    const peer = peerFor(connection);
     if (!peer || peer.record !== record || peer.role !== 'runner') refuse();
     const [live, roleReply] = await Promise.all([
       authority.currentLiveStart(record.selectors.reservation_sha256),
@@ -294,7 +301,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
   }
 
   async function peerDisconnected(_socket, context) {
-    const peer = contexts.get(context);
+    const peer = peerFor(context);
     if (!peer || peer.record.lost) return;
     peer.record.watch?.();
     await abort(context);
