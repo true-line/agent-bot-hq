@@ -53,7 +53,8 @@ import { bindBridgeAuthority, listenBridgeEndpoint, memberBrokerDispatch, planBr
 import { loadPlugins } from './plugins.mjs';
 import { authenticatePeerUid, checkOwnerControlSupport, OWNER_CONTROL_PATH, OWNER_PEER_CHECK } from './owner-control.mjs';
 import { checkSocketPath, listenSocket } from './socket.mjs';
-import { listenStage2aRunnerAdmission } from './stage2a-r-admission.mjs';
+import { listenStage2aRunnerAdmission, listenStage2aCooperativeAdmission,
+  listenStage2aCooperativeBroker } from './stage2a-r-admission.mjs';
 import { checkHarnessSocket, planHarnessEndpoints, validateHarnessesConfig } from './harness-accounts.mjs';
 import { coreTable, CORE_PLUGIN, ensurePrivateDir, openStore } from './store.mjs';
 import { validateNoticesConfig, noticeIngestionConfig } from './notices-config.mjs';
@@ -161,6 +162,7 @@ export function createHQ({
   bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
   qualificationAuthorizer,       // trusted one-use installed test-provider operation; never owner config
   protectedAdmission,            // future pinned Machine verifier; absent in production until signed contracts ship
+  cooperativeAdmission,          // paired A reservation/attach/watch client; never owner config
   plugins = [],                  // plugin objects (tests); installed ones come from pluginsDir
   pluginsDir,                    // installed plugins, each checked against `pins` (§4.5)
   pins = { plugins: [] },        // governance/plugins.json
@@ -190,6 +192,8 @@ export function createHQ({
   const bridgeListeners = new Map();
   const runnerAdmissions = new Map();
   const openingRunnerAdmissions = new Set();
+  const cooperativeListeners = new Map();
+  const openingCooperativeListeners = new Set();
   // Agent launch (§9 row 16b) and what the profile reasons say about it.
   let launcher;
   let soulStarter;
@@ -352,6 +356,7 @@ export function createHQ({
           onDisconnect: bridgeAuthority?.onDisconnect?.bind(bridgeAuthority) },
       qualificationAuthorizer,
       protectedAdmission,
+      cooperativeAdmission,
     });
     const builtIn = [admission, tasksPlugin({ schemas }), noticesPlugin({ schemas }), ...plugins];
     pluginLoad = [];
@@ -503,6 +508,9 @@ export function createHQ({
     const admissionsToClose = [...runnerAdmissions.values()];
     runnerAdmissions.clear();
     await Promise.all(admissionsToClose.map((listener) => listener.close()));
+    const cooperativeToClose = [...cooperativeListeners.values()];
+    cooperativeListeners.clear();
+    await Promise.all(cooperativeToClose.map((listener) => listener.close()));
     for (const s of sockets) await s.close();
     sockets = [];
     bridgeListeners.clear();
@@ -535,6 +543,49 @@ export function createHQ({
           await listener.close();
         } });
       } finally { openingRunnerAdmissions.delete(key); }
+    },
+    openCooperativeAdmission: async ({ reservation, openAcpStream, onLost }) => {
+      const key = reservation?.sha256;
+      if (!running || !key || cooperativeListeners.has(key) || openingCooperativeListeners.has(key)
+        || typeof cooperativeAdmission?.verifyReservation !== 'function'
+        || typeof cooperativeAdmission?.attach !== 'function'
+        || typeof cooperativeAdmission?.verifyAttachReceipt !== 'function'
+        || typeof cooperativeAdmission?.watchHealthy !== 'function'
+        || typeof onLost !== 'function')
+        fail('host.launch_unavailable', 'cooperative H admission is unavailable');
+      openingCooperativeListeners.add(key);
+      let admission;
+      let broker;
+      try {
+        admission = await listenStage2aCooperativeAdmission({ reservation,
+          verifyReservation: (value) => cooperativeAdmission.verifyReservation(value),
+          hqUid: uid, core, machineAttach: (value) => cooperativeAdmission.attach(value),
+          verifyAttachReceipt: (receipt, expected) => cooperativeAdmission.verifyAttachReceipt(receipt, expected),
+          isLive: (value) => cooperativeAdmission.watchHealthy(value), openAcpStream, onLost,
+          admissionDispatch: (op, meta) => host.dispatch(op, meta) });
+        if (admission.brokerPin.reservation_sha256 !== key)
+          fail('host.launch_unavailable', 'cooperative reservation digest changed after verification');
+        broker = await listenStage2aCooperativeBroker({ admission, hqUid: uid, core,
+          callers: brokerCallers, onLost,
+          brokerDispatch: (kind, payload, session) => memberBrokerDispatch(host, kind, payload, session),
+          brokerClosed: (session) => host.brokerClosed(session) });
+        if (!running) fail('host.launch_unavailable', 'HQ stopped during cooperative admission');
+        let closing;
+        const close = () => {
+          if (!closing) {
+            if (cooperativeListeners.get(key)?.close === close) cooperativeListeners.delete(key);
+            closing = Promise.all([broker.close(), admission.close()]).then(() => {});
+          }
+          return closing;
+        };
+        const listener = Object.freeze({ path: admission.path, brokerPath: broker.path, close });
+        cooperativeListeners.set(key, listener);
+        return listener;
+      } catch (error) {
+        await broker?.close().catch(() => {});
+        await admission?.close().catch(() => {});
+        throw error;
+      } finally { openingCooperativeListeners.delete(key); }
     },
     bridgeBrokerIdentity: (installationId) => {
       if (!running || typeof installationId !== 'string') fail('host.launch_unavailable', 'HQ bridge broker is unavailable');
