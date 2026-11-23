@@ -318,6 +318,10 @@ function protectedInstallPlan(machineKey, roleUid = 300, change = () => {}) {
   const runnerAccount = '_abm-sr-' + sha(installation);
   const bridgeAccount = '_abm-br-' + sha('agent-bot-soul-bridge/v1\0' + installation);
   const artifact = root + '/soul-artifacts/' + sha('agent-bot-soul-endpoint-installation/v1\0' + installation) + '.soul';
+  const snapshotRoot = '/private/var/db/managed-machine/soul-snapshots/' + sha('agent-bot-soul-endpoint-installation/v1\0' + installation);
+  const snapshot = kind => ({ root_path: snapshotRoot + '/snap_' + createHash('sha256')
+    .update('agent-bot-machine/stage2a-install-snapshot/v1\0' + kind + '\0' + installation).digest('hex').slice(0, 24),
+  device: '', inode: '', generation: '', birthtime_ns: '', owner_uid: 450, owner_gid: 301, mode: '0555' });
   const soul = 'agent_11111111-1111-1111-1111-111111111111';
   const emptyDirectory = { path: '', device: 0, inode: '', birth_seconds: 0, birth_nanoseconds: 0 };
   const policy = {
@@ -336,15 +340,25 @@ function protectedInstallPlan(machineKey, roleUid = 300, change = () => {}) {
       soul_artifact_sha256: 'd'.repeat(64), profile_in_force: 'managed-protected',
       claimed_definition_digest: 'sha256:' + 'e'.repeat(64), definition_measurement: 'sha256:' + 'f'.repeat(64),
       launch_input_measurement: 'sha256:' + '1'.repeat(64), snapshots: {
-        definition: { root_path: '/reviewed/definition', device: '1', inode: '2', generation: '3', birthtime_ns: '4', owner_uid: 450, owner_gid: 301, mode: '0555' },
-        launch_inputs: { root_path: '/reviewed/inputs', device: '1', inode: '5', generation: '3', birthtime_ns: '4', owner_uid: 450, owner_gid: 301, mode: '0555' },
-      },
+        definition: snapshot('definition'), launch_inputs: snapshot('inputs') },
     },
-    definition: [{ path: 'SOUL.md', kind: 'regular', sha256: 'e'.repeat(64), size: 1 }],
-    launch_inputs: { files: [], host_projection: {}, selected_command: '/reviewed/node', argv: [],
-      environment: {}, effective_config: {}, system_images: {}, sandbox_policy_digest: 'sha256:' + '2'.repeat(64), component_digests: {} },
+    definition: [
+      { path: 'Contents', kind: 'directory', mode: '0555' },
+      { path: 'Contents/SoulInfo.json', kind: 'regular', mode: '0444', size: 1, sha256: 'e'.repeat(64) },
+      { path: 'Contents/SoulLock.json', kind: 'regular', mode: '0444', size: 1, sha256: 'e'.repeat(64) },
+      { path: 'Contents/opt', kind: 'directory', mode: '0555' },
+      { path: 'Contents/primitives', kind: 'directory', mode: '0555' },
+    ],
+    launch_inputs: { files: ['bin/agent-bot-souls.mjs', 'bin/node', 'host/adapters.json', 'host/installation.json']
+      .map(path => ({ path, kind: 'regular', mode: '0444', size: 1, sha256: 'f'.repeat(64) })),
+      host_projection: { adapters: {}, installation: {} }, selected_command: '/reviewed/node', argv: [],
+      environment: {}, effective_config: {}, system_images: { product_version: 'test', build_version: 'test',
+        darwin_kernel: 'test', selected: [{ path: '/usr/bin/sandbox-exec', signing_requirement: 'test', cdhash: 'a'.repeat(40) }] },
+      sandbox_policy_digest: 'sha256:' + '2'.repeat(64), component_digests: { bridge: 'sha256:' + '3'.repeat(64) } },
     node: '/reviewed/node', entry: '/reviewed/entry', bridge_executable: { path: '/reviewed/bridge', sha256: '3'.repeat(64) },
-    bridge_qualification: { model: 'test-model', request_sha256: 'sha256:' + '4'.repeat(64) },
+    bridge_qualification: { model: 'test-model', request_sha256: 'sha256:' + '4'.repeat(64),
+      headers_sha256: 'sha256:' + '5'.repeat(64), client_key_sha256: 'sha256:' + '6'.repeat(64),
+      http_host: 'localhost', messages_query: '?fixture=1', response_text: 'pilot response' },
   };
   const plan = {
     version: 3, hq_account: role, dir: 'none', members: [bridgeAccount, runnerAccount].sort(),
@@ -393,6 +407,11 @@ test('paired protected Soul install rejects altered scope before issuing a chall
     p => { p.soul_protected_launch.policy.claims.inode = '1'; },
     p => { p.soul_protected_launch.policy.runner.uid = p.soul_protected_launch.policy.bridge.uid; },
     p => { p.soul_protected_launch.policy.measurement_binding.soul_artifact_sha256 = ''; },
+    p => { p.soul_protected_launch.policy.definition = [null]; },
+    p => { p.soul_protected_launch.policy.launch_inputs = []; },
+    p => { p.soul_protected_launch.policy.bridge_executable = {}; },
+    p => { p.soul_protected_launch.policy.bridge_qualification = {}; },
+    p => { delete p.soul_protected_launch.policy.measurement_binding.snapshots; },
     p => { p.steps[0].detail = 'install a different policy'; },
     p => { p.steps.push({ kind: 'file', target: '/tmp/extra', action: 'write' }); },
     p => { p.soul_protected_launch.launch_inputs_source = '/tmp/../other'; },
