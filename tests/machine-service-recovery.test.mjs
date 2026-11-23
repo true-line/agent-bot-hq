@@ -707,3 +707,40 @@ test('paired qualification keeps legacy previews readable and refuses them for a
   await assert.rejects(f.approve(), /outside the paired HQ qualification plan scope/);
   assert.equal(f.requests.length, before);
 });
+
+
+test('runner account owner handoff binds purpose and HQ role without a harness', arm, async (t) => {
+  const installation = 'inst_existing';
+  const runner = '_abm-sr-' + createHash('sha256').update(installation).digest('hex').slice(0, 20);
+  const plan = { version: 3, hq_account: role, dir: 'none', members: [runner], steps: [
+    { kind: 'hq-account', target: role, action: 'none', group: role, mode: '0700',
+      detail: 'exists; dedicated; home /var/agent-bot-hq; its password is checked at apply', uid: 300, gid: 300 },
+    { kind: 'account', target: runner, action: 'create', group: runner, mode: '0700',
+      detail: `Soul runner home /var/agent-bot-soul-runner-${runner}, shell /usr/bin/false, private group, no password, no other groups`,
+      uid: 301, gid: 301 },
+  ], purpose: 'soul-runner-provision', soul_runners: [
+    { soul_id: 'agent_01234567-0123-4567-0123-456789abcdef', installation_id: installation, account: runner },
+  ] };
+  const plan_canonical = JSON.stringify(plan) + '\n';
+  const saved = { plan_id: id, plan_digest: createHash('sha256').update(plan_canonical).digest('hex'), plan_canonical };
+  const f = await fixture(t, 'soul-runner-provision', 300);
+  f.state.saved = saved;
+  await f.pin();
+  const line = await f.issue();
+  writeFileSync(f.challengeFile, line);
+  const challenge = JSON.parse(line).body;
+  writeFileSync(f.proofFile, JSON.stringify(proof(challenge, f.owner)));
+  assert.equal((await f.approve()).state, 'approved');
+
+  const wrongRole = await fixture(t, 'soul-runner-provision', 302);
+  wrongRole.state.saved = saved;
+  await wrongRole.pin();
+  await assert.rejects(wrongRole.issue(), /outside the paired HQ Soul runner account scope/);
+  assert.deepEqual(wrongRole.requests.map(r => r.verb), ['status', 'members-plans']);
+
+  const wrongPurpose = await fixture(t, protectedInstallPurpose, 300);
+  wrongPurpose.state.saved = saved;
+  await wrongPurpose.pin();
+  await assert.rejects(wrongPurpose.issue(), /outside the paired protected Soul launch install plan scope/);
+  assert.deepEqual(wrongPurpose.requests.map(r => r.verb), ['status', 'members-plans']);
+});
