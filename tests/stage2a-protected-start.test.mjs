@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
+import { once } from 'node:events';
+import { Duplex, PassThrough } from 'node:stream';
+import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
 import { createStage2aProtectedStarter } from '../hq/stage2a-protected-start.mjs';
 
 const RESERVATION = 'sha256:' + 'a'.repeat(64);
@@ -20,11 +23,24 @@ const CHILD_GRANT = 'sha256:' + 'e'.repeat(64);
 const CHALLENGE = Buffer.alloc(32, 7).toString('base64url');
 const CHALLENGE2 = Buffer.alloc(32, 8).toString('base64url');
 
+const CAPTURE_SCHEMA = 'agent-bot-machine/stage2a-inner-acp-capture-selector/v1';
+const captureKeys = generateKeyPairSync('ed25519');
+const captureMachinePublicKey = captureKeys.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
+function signedCapture(selectors, register, changes = {}) {
+  const selector = { ...selectors, schema: CAPTURE_SCHEMA, session_id: 'a'.repeat(32), sequence: 1,
+    test_plan_sha256: CHILD_GRANT, challenge_base64url: CHALLENGE, expires_at_ms: Date.now() + 30000, ...changes };
+  const raw = Buffer.concat([Buffer.from(CAPTURE_SCHEMA + '\0'), canonicalBytes(selector)]);
+  return { selector, register, signature_base64url: sign(null, raw, captureKeys.privateKey).toString('base64url') };
+}
+
 function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckFails = false,
-  ackIsPreviousLease = false, hqCodeReady = true, reservationVerifier } = {}) {
+  ackIsPreviousLease = false, hqCodeReady = true, reservationVerifier, recordLaunch, selectAcpCapture } = {}) {
   const events = [];
   let providerAttempts = 0;
   let activation;
+  let launchReceipt;
+  const childStdin = new PassThrough();
+  const childStdout = new PassThrough();
   let leaseSequence = 0;
   const installed = {
     installation_id: 'install-1', package_root: packageRoot, plan_id: 'plan-1',
@@ -59,7 +75,7 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckF
     stopStart: async () => { events.push('Machine-stop'); },
   };
   const starter = createStage2aProtectedStarter({
-    installations: [installed], authority,
+    installations: [installed], authority, selectAcpCapture, captureMachinePublicKey,
     ...(hqCodeReady ? { verifyHQCodeReady: () => true } : {}),
     machineLookup: async () => { events.push('lookup'); return installed; },
     machineReserve: async ({ start_id, launch_id }) => {
@@ -133,6 +149,7 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckF
       if (role === 'child') {
         events.push('child-launched');
         return { pid: 403, grantSHA256: CHILD_GRANT, stop: async () => {},
+          stdin: childStdin, stdout: childStdout, resumeOutput: () => childStdout.resume(),
           done: new Promise(() => {}),
           waitChildStarted: async () => {
             events.push('child-started');
@@ -156,6 +173,12 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckF
           return true;
         } };
     },
+    recordLaunch: async (record) => {
+      assert.ok(events.includes('R-child-ack'));
+      events.push('launch-receipt');
+      launchReceipt = record;
+      return recordLaunch ? recordLaunch(record) : { ...record, seq: 1 };
+    },
     onFinalized: async () => {
       assert.ok(events.includes('Machine-live'), 'provider needs Machine-confirmed live R');
       providerAttempts++;
@@ -163,8 +186,8 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckF
     },
     random: () => 'a'.repeat(24),
   });
-  return { starter, events, get providerAttempts() { return providerAttempts; },
-    get activation() { return activation; } };
+  return { starter, events, childStdin, childStdout, get providerAttempts() { return providerAttempts; },
+    get activation() { return activation; }, get launchReceipt() { return launchReceipt; } };
 }
 
 test('machine/v2 policy refuses protected start before Machine lookup without H code proof', async () => {
@@ -203,11 +226,23 @@ test('one-use provider opens only after B, R and stock child are ready', async (
     const f = fixture(root);
     await f.starter.start({ package_path: root, requested_profile: 'managed-protected' });
     assert.equal(f.providerAttempts, 1);
-    assert.deepEqual(f.events.slice(-15), ['B-finalized', 'runner-started',
+    assert.deepEqual(f.events.slice(-16), ['B-finalized', 'runner-started',
       'runner:402', 'Machine-live', 'R-activated',
       'Machine-live', 'R-live', 'R-ack', 'child-launched', 'child-started',
       'Machine-child-ready', 'child-receipt-sent', 'child-accepted', 'R-child-ack',
-      'provider-registered']);
+      'launch-receipt', 'provider-registered']);
+    assert.deepEqual(f.launchReceipt, {
+      start_id: 'st_' + 'a'.repeat(24), launch_id: 'ln_' + 'a'.repeat(24), installation_id: 'install-1',
+      soul_id: 'soul-1', package_path: root, pid: 404, runner_uid: 311, runner_gid: 312, hq_epoch: EPOCH,
+      protected: true, plan_id: 'plan-1', plan_digest: PLAN, profile_in_force: 'managed-protected',
+      reservation_sha256: RESERVATION, child_start_receipt_sha256: CHILD,
+      bind_receipt_sha256: BIND, b_finalization_sha256: FINAL,
+      relay_socket: { path: '/private/tmp/relay/' + createHash('sha256')
+        .update(['agent-bot-soul-endpoint-start/v1', 'install-1', 'st_' + 'a'.repeat(24)].join('\0'))
+        .digest('hex').slice(0, 20) + '.sock',
+      socket: { uid: 310, gid: 312, mode: 0o660, device: '1', inode: '2' } },
+      child_launcher_pid: 403, child_pid: 404, runner_pid: 402, bridge_pid: 401,
+    });
     assert.deepEqual(Object.keys(f.activation).sort(), [
       'schema', 'reservation_sha256', 'start_id', 'launch_id',
       'runner_wrapper_pid',
@@ -304,4 +339,108 @@ test('R launch failure leaves the Machine provider claim unspent', async () => {
     assert.equal(f.providerAttempts, 0);
     assert.ok(f.events.includes('Machine-stop'));
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test('protected start contains roles and withholds takeover if launch receipt persistence fails', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-start-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const root = realpathSync(dir);
+  const f = fixture(root, { recordLaunch: async () => { throw new Error('launch receipt disk failure'); } });
+  await assert.rejects(f.starter.start({ package_path: root, requested_profile: 'managed-protected' }), /launch receipt disk failure/);
+  assert.equal(f.providerAttempts, 0);
+  assert.deepEqual(f.events.slice(-4), ['R-child-ack', 'launch-receipt', 'R-admission-closed', 'Machine-stop']);
+});
+
+
+test('only a trusted selected challenge joins exact inner ACP bytes to the durable receipt', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-capture-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  let control;
+  const f = fixture(realpathSync(dir), {
+    selectAcpCapture: (selectors) => signedCapture(selectors, (value) => { control = value; }),
+  });
+  const response = await f.starter.start({ package_path: realpathSync(dir), requested_profile: 'managed-protected' });
+  const token = response[Object.getOwnPropertySymbols(response)[0]];
+  assert.equal(control.selector.reservation_sha256, RESERVATION);
+  assert.equal(JSON.parse(control.receiptRaw).seq, 1);
+  assert.equal(control.receiptSHA256, 'sha256:' + createHash('sha256').update(control.receiptRaw).digest('hex'));
+  assert.equal(control.selectorSHA256, 'sha256:' + createHash('sha256').update(canonicalBytes(control.selector)).digest('hex'));
+  assert.equal(f.launchReceipt.qualification_capture_selector_sha256, control.selectorSHA256);
+  assert.throws(() => control.seal(CHALLENGE), /unavailable/);
+  const writes = new PassThrough();
+  const reads = new PassThrough();
+  const owner = Duplex.from({ readable: reads, writable: writes });
+  const outbound = Buffer.from([1, 2, 3, 0, 255]);
+  const inbound = Buffer.from([9, 0, 8]);
+  const seenByChild = once(f.childStdin, 'data');
+  const seenByOwner = once(writes, 'data');
+  token.open()(owner);
+  reads.write(outbound);
+  f.childStdout.write(inbound);
+  assert.deepEqual((await seenByChild)[0], outbound);
+  assert.deepEqual((await seenByOwner)[0], inbound);
+  assert.throws(() => control.seal(CHALLENGE2), /unavailable/);
+  const observed = control.seal(CHALLENGE);
+  assert.deepEqual(observed.acpIn, outbound);
+  assert.deepEqual(observed.acpOut, inbound);
+  assert.equal(observed.acpOutSHA256, 'sha256:' + createHash('sha256').update(inbound).digest('hex'));
+  assert.throws(() => control.seal(CHALLENGE), /unavailable/);
+  owner.destroy();
+  await f.starter.stopAll();
+});
+
+
+test('inner ACP capture overflow discards evidence and contains the protected launch', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-capture-limit-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  let control;
+  const f = fixture(realpathSync(dir), {
+    selectAcpCapture: (selectors) => signedCapture(selectors, (value) => { control = value; }),
+  });
+  const response = await f.starter.start({ package_path: realpathSync(dir), requested_profile: 'managed-protected' });
+  const token = response[Object.getOwnPropertySymbols(response)[0]];
+  const reads = new PassThrough();
+  const owner = Duplex.from({ readable: reads, writable: new PassThrough() });
+  const closed = new Promise((resolve) => owner.once('close', resolve));
+  let forwarded = 0;
+  f.childStdin.on('data', (chunk) => { forwarded += chunk.length; });
+  token.open()(owner);
+  reads.write(Buffer.alloc(4 * 1024 * 1024 + 1, 1));
+  await closed;
+  await f.starter.stopAll();
+  assert.equal(forwarded, 0);
+  assert.throws(() => control.seal(CHALLENGE), /unavailable/);
+  assert.ok(f.events.includes('Machine-stop'));
+});
+
+
+test('protected capture rejects stale, forged and mismatched A selectors before opening roles', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-capture-auth-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const register = () => assert.fail('untrusted selector must not expose capture control');
+  const expired = (selectors) => signedCapture(selectors, register, { expires_at_ms: Date.now() - 1 });
+  const changed = (selectors) => signedCapture(selectors, register, { hq_epoch: '0'.repeat(64) });
+  const forged = (selectors) => ({ ...signedCapture(selectors, register),
+    signature_base64url: Buffer.alloc(64, 1).toString('base64url') });
+  for (const selectAcpCapture of [expired, changed, forged]) {
+    const f = fixture(realpathSync(dir), { selectAcpCapture });
+    await assert.rejects(f.starter.start({ package_path: realpathSync(dir),
+      requested_profile: 'managed-protected' }), /unavailable/);
+    assert.deepEqual(f.events, ['lookup', 'reserved', 'registered', 'Machine-stop']);
+  }
+});
+
+test('HQ will not rearm a capture command after its original launch stops', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-capture-replay-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  let registrations = 0;
+  const f = fixture(realpathSync(dir), {
+    selectAcpCapture: (selectors) => signedCapture(selectors, () => { registrations++; }),
+  });
+  const payload = { package_path: realpathSync(dir), requested_profile: 'managed-protected' };
+  await f.starter.start(payload);
+  await f.starter.stopReservation(RESERVATION);
+  await assert.rejects(f.starter.start(payload), /unavailable/);
+  assert.equal(registrations, 1);
 });
