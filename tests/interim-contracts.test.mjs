@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { copyFileSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync, rmSync, chmodSync, truncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { H_V0102_EXCLUDED, hRuntimeSelection, manifestDigest, readPin, verify,
+import { H_PRIVATE_CONTRACTS_PIN, H_V0102_EXCLUDED, hRuntimeSelection, manifestDigest, readPin, verify,
   verifySelectedVendoredTree, verifyVendored } from '../scripts/soul-contracts.mjs';
 
 test('vendored contracts verify exact content and refuse tampering and symlinks', () => {
@@ -89,6 +89,27 @@ test('interim mode verifies offline and missing payload never falls back to git'
       assert.doesNotMatch(refused.stderr, /spawnSync git/);
     }
   } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+
+test('private H pin requires the exact candidate and a Machine-authenticated selected runtime', (t) => {
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), 'hq-private-pin-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'pin.json');
+  const write = (pin) => writeFileSync(path, JSON.stringify(pin));
+  write(H_PRIVATE_CONTRACTS_PIN);
+  assert.deepEqual(readPin(path), H_PRIVATE_CONTRACTS_PIN);
+  for (const changes of [{ tag: 'v0.10.2' }, { files: 583 }, { paths: ['errors,fixtures', 'schemas'] }]) {
+    write({ ...H_PRIVATE_CONTRACTS_PIN, ...changes });
+    assert.throws(() => readPin(path), /reviewed Contracts tuple/);
+  }
+  const entry = new URL('../scripts/soul-contracts.mjs', import.meta.url).href;
+  for (const offline of ['0', '1']) {
+    const result = spawnSync(process.execPath, ['--input-type=module', '-e',
+      `import {verify,H_PRIVATE_CONTRACTS_PIN} from ${JSON.stringify(entry)}; verify(H_PRIVATE_CONTRACTS_PIN);`],
+    { encoding: 'utf8', env: { ...process.env, PATH: '/nonexistent', HQ_INTERIM_OFFLINE: offline } });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /private H candidate requires (?:a sealed offline runtime|an authenticated selection)/);
+  }
 });
 
 test('selected H Contracts verifies exactly the A-bound v0.10.2 runtime subset', () => {
