@@ -194,3 +194,53 @@ test('closing the B listener frees its socket path for a clean HQ restart', asyn
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+test('cooperative B challenge, proof and policy dispatch stay on one dedicated stream', async () => {
+  const [endpoint] = planBridgeEndpoints([assignment('soul-coop')], options);
+  const receipt = 'a'.repeat(64), digest = 'sha256:' + 'b'.repeat(64);
+  let handler;
+  let sequence = 0;
+  let challengedSession;
+  const isolation = { code: 'host.launch_unavailable' };
+  const methods = {
+    stage2aCooperativeBBindChallengeV3: async (_request, { connection }) => {
+      challengedSession = connection;
+      return { nonce: 'c'.repeat(64) };
+    },
+    stage2aCooperativeBBindV3: async (_request, { connection }) => {
+      assert.equal(connection, challengedSession);
+      return { bind_receipt: receipt, bind_receipt_sha256: digest };
+    },
+    stage2aCooperativeBPolicyV3: async (_request, { connection }, presented) => {
+      assert.equal(connection, challengedSession);
+      assert.equal(presented, receipt);
+      return { policy: 'accepted' };
+    },
+  };
+  await listenBridgeEndpoint(endpoint, { hqUid, peers: new Map(),
+    enableCooperativeBBind: true, enableCooperativeBPolicy: true,
+    host: { provided: () => methods, brokerClosed: async () => {},
+      brokerAccept: () => assert.fail('cooperative operations route only through dedicated HQ dispatch') },
+    core: { random: { hex: () => String(++sequence) } },
+    checkACL() {}, authenticate: () => true,
+    lstat(path) {
+      return { isDirectory: () => path !== endpoint.path, isSocket: () => path === endpoint.path,
+        uid: [endpoint.path, endpoint.directory].includes(path) ? hqUid : 0, gid: endpoint.gid,
+        mode: path === endpoint.path ? 0o660 : path === endpoint.directory ? 0o2750 : 0o755, dev: 8, ino: 42 };
+    },
+    listen: async (config) => { handler = config; return {}; },
+  });
+  const socket = new EventEmitter();
+  const session = handler.newSession(socket);
+  const other = handler.newSession(new EventEmitter());
+  const bind = 'bridge.bind.cooperative.v3', policy = 'bridge.member-policy.v3';
+  await assert.rejects(handler.dispatch(policy, { session, payload: {} }), isolation);
+  assert.ok((await handler.dispatch(bind, { session, payload: {} })).nonce);
+  await assert.rejects(handler.dispatch(bind, { session: other, payload: { proof_hex: 'd'.repeat(64) } }), isolation);
+  const proof = { session, payload: { proof_hex: 'd'.repeat(64) } };
+  assert.deepEqual(await handler.dispatch(bind, proof), { bind_receipt_sha256: digest });
+  assert.deepEqual(await handler.dispatch(policy, { session, payload: {} }), { policy: 'accepted' });
+  await assert.rejects(handler.dispatch(policy, { session, payload: {} }), isolation);
+  socket.emit('close');
+  assert.throws(() => handler.dispatch(policy, { session, payload: {} }), isolation);
+});

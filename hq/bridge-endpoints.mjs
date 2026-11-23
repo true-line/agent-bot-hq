@@ -70,6 +70,45 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
   enableRelayPeerChallenge = false, enableMemberArmExchange = false, enableCooperativeBPolicy = false, enableCooperativeBBind = false,
   lstat = (path) => lstatSync(path, { bigint: true }),
   checkACL = checkDarwinACL, authenticate = authenticatePeerUid, listen = listenSocket } = {}) {
+  const cooperative = new Map();
+  async function cooperativeDispatch(kind, payload, connection, peer) {
+    const methods = host.provided('hq-admission');
+    const meta = Object.freeze({ connection });
+    const current = () => peers.get(connection) === peer && !peer.socket.destroyed && peer.checkCurrent();
+    const state = cooperative.get(connection);
+    if (kind === COOPERATIVE_B_BIND) {
+      if (!state) {
+        if (!payload || Array.isArray(payload) || Object.keys(payload).length !== 0
+          || typeof methods?.stage2aCooperativeBBindChallengeV3 !== 'function') refuse();
+        const pending = { phase: 'challenge-pending' };
+        cooperative.set(connection, pending);
+        const result = await methods.stage2aCooperativeBBindChallengeV3(payload, meta);
+        if (!current() || cooperative.get(connection) !== pending) refuse();
+        pending.phase = 'challenge';
+        return result;
+      }
+      if (state.phase !== 'challenge' || typeof methods?.stage2aCooperativeBBindV3 !== 'function') refuse();
+      state.phase = 'proof-pending';
+      const result = await methods.stage2aCooperativeBBindV3(payload, meta);
+      if (!current() || cooperative.get(connection) !== state
+        || !/^[0-9a-f]{64}$/.test(result?.bind_receipt ?? '')
+        || !/^sha256:[0-9a-f]{64}$/.test(result?.bind_receipt_sha256 ?? '')) refuse();
+      state.phase = 'bound';
+      state.receipt = result.bind_receipt;
+      return Object.freeze({ bind_receipt_sha256: result.bind_receipt_sha256 });
+    }
+    if (state?.phase !== 'bound' || typeof methods?.stage2aCooperativeBPolicyV3 !== 'function') refuse();
+    state.phase = 'policy-pending';
+    try {
+      const result = await methods.stage2aCooperativeBPolicyV3(payload, meta, state.receipt);
+      if (!current() || cooperative.get(connection) !== state) refuse();
+      state.phase = 'policy-delivered';
+      return result;
+    } finally {
+      if (state.phase === 'policy-pending') state.phase = 'bound';
+    }
+  }
+
   function checkDirectory() {
     for (const path of ['/', '/Library', '/Library/Application Support', dirname(DARWIN_HARNESS_DIR), DARWIN_HARNESS_DIR]) {
       const st = lstat(path);
@@ -122,6 +161,7 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
         dev: identity.socket.dev, ino: identity.socket.ino }));
       const end = () => {
         peers.delete(connection);
+        cooperative.delete(connection);
         // Revoke HQ's receipt before pending broker dispatch can finish.
         void host.provided('hq-admission')?.forgetBridgeConnection?.(connection)?.catch(() => {});
         void host.brokerClosed(connection).catch(() => {});
@@ -146,6 +186,7 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
         && !(cooperativeBind && enableCooperativeBBind === true))) refuse();
       if ((qualification || relayIngress || livePeer || memberArm || policy || cooperativeBind || endpoint.parentIdentity)
         && (peer.socket.destroyed || !peer.checkCurrent())) refuse();
+      if (cooperativeBind || policy) return cooperativeDispatch(kind, payload, session, peer);
       return host.brokerAccept(kind, payload, { connection: session });
     },
   });
