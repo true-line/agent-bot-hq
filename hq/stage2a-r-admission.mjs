@@ -1,12 +1,16 @@
 // The Machine reservation assigns this H-owned, R-group endpoint to one
 // protected start. It is never the shared C admission/launch socket.
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { fail } from '../sdk/errors.mjs';
 import { checkDarwinACL } from './darwin-harness-accounts.mjs';
 import { observePeerPid } from './owner-control.mjs';
 import { listenSocket, takeover } from './socket.mjs';
+import { canonicalBytes, canonicalDigest } from '../sdk/wire/canonical-json.mjs';
+import { validate } from '../sdk/wire/schema.mjs';
+import { verifyStage2aBridgeMemberAuthority } from './stage2a-relay-peer.mjs';
+import { verifyStage2aMachineEnvelope } from './stage2a-stop.mjs';
 
 const ROOT = '/Library/Application Support/ai.true-line.agent-bot-hq';
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
@@ -15,6 +19,162 @@ const LIVE_DEADLINE_MS = 5_000;
 const ADMISSION_OPERATIONS = new Set(['Hello', 'Admit', 'Equip', 'Ready', 'Lease']);
 const refuse = () => fail('host.launch_unavailable', 'protected R admission is unavailable');
 const sameInode = (a, b) => BigInt(a.dev) === BigInt(b.dev) && BigInt(a.ino) === BigInt(b.ino);
+
+const MEMBER_ATTACH_PREPARE = 'stage2a.member.attach.prepare';
+const MEMBER_ATTACH = 'stage2a.member.attach';
+const ATTACH_TOKEN = /^[0-9a-f]{64}$/;
+const ATTACH_CAP = 128 * 1024;
+const ATTACH_TTL_MS = 30_000;
+const ATTACH_ENVELOPE_CAP = 16 * 1024;
+
+export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors, runnerEndpoint,
+  core, current, onLost, refreshRunnerPeer } = {}) {
+  if (!provider?.resultSchema || !provider.childObservationSchema || !provider.readySchema
+    || typeof provider.select !== 'function'
+    || typeof withLiveRuntime !== 'function' || typeof refreshRunnerPeer !== 'function') throw new TypeError('prestarted attach needs a pinned schema and live providers');
+  const slots = new Map();
+  const spent = new Set();
+  const bridgeTokens = new Set();
+  const bridgeNonces = new Set();
+  const now = () => core.clock.now();
+  const checkSchema = (schema, payload) => {
+    const references = [provider.assignmentSchema, ...(provider.schemaReferences ?? [])].filter((entry) =>
+      entry?.$id && entry.$id !== schema.$id);
+    if (validate(schema, payload, { schemas: references }).length) refuse();
+  };
+  const matches = (a, b, fields) => fields.every((field) => a?.[field] === b?.[field]);
+  const usable = (slot) => current() && slot.expires > now() && slot.isCurrent() === true;
+
+  async function prepare(payload, { session, protectedStart }) {
+    if (!payload || Object.keys(payload).join(',') !== 'runtime_id' || typeof payload.runtime_id !== 'string'
+      || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(payload.runtime_id)
+      || protectedStart?.role !== 'runner' || !current()) refuse();
+    const peer = await refreshRunnerPeer(protectedStart);
+    if (!DIGEST.test(peer?.processSHA256 ?? '') || peer.isCurrent() !== true) refuse();
+    const runtimeId = payload.runtime_id;
+    const runtime = await withLiveRuntime(runtimeId, session, (rt) => rt);
+    if (runtime.protected_state !== 'active' || runtime.protected_start_id !== selectors.start_id
+      || runtime.installation_id !== selectors.installation_id) refuse();
+    const input = await provider.select({ runtimeId, runtime, selectors, protectedStart });
+    if (!input || !current() || typeof input.isCurrent !== 'function' || input.isCurrent() !== true
+      || typeof input.connect !== 'function' || !DIGEST.test(input.boundAuthoritySHA256 ?? '')) refuse();
+    const { machinePublicKey, assignmentBytes, childObservationBytes, readyBytes, authorityBytes } = input;
+    const signed = (bytes, kind) => verifyStage2aMachineEnvelope(bytes, machinePublicKey,
+      `agent-bot/stage2a-member-set-${kind}/v1`, { maxBytes: ATTACH_ENVELOPE_CAP });
+    const assignment = signed(assignmentBytes, 'assignment');
+    const child = signed(childObservationBytes, 'child-observation');
+    const ready = signed(readyBytes, 'ready');
+    const authority = verifyStage2aBridgeMemberAuthority(authorityBytes, { machinePublicKey,
+      schema: provider.authoritySchema, assignmentSchema: provider.assignmentSchema,
+      schemas: provider.schemaReferences, assignmentBytes,
+      expected: { ...input.expected, ...selectors, soul_id: runtime.soul_id,
+        profile_in_force: 'managed-protected' }, now: now() });
+    const a = assignment.payload, c = child.payload, r = ready.payload;
+    checkSchema(provider.childObservationSchema, c);
+    checkSchema(provider.readySchema, r);
+    const bridge = authority.payload.bridge;
+    const ids = ['profile_in_force', 'host_id', 'installation_id', 'soul_id', 'start_id', 'hq_epoch',
+      'reservation_sha256'];
+    if (authority.envelope_sha256 !== input.boundAuthoritySHA256
+      || !matches(c, a, ids) || !matches(r, a, ids)
+      || c.assignment_envelope_sha256 !== assignment.envelope_sha256
+      || r.assignment_envelope_sha256 !== assignment.envelope_sha256
+      || r.child_observation_envelope_sha256 !== child.envelope_sha256
+      || r.member_b_authority_envelope_sha256 !== authority.envelope_sha256
+      || r.b_authority_sha256 !== a.b_authority.envelope_sha256
+      || c.provisional_hq_mapping?.runtime_state !== 'provisional'
+      || c.provisional_hq_mapping?.acp_authority !== 'withheld'
+      || c.provisional_hq_mapping?.assignment_envelope_sha256 !== assignment.envelope_sha256
+      || c.provisional_hq_mapping_sha256 !== canonicalDigest(c.provisional_hq_mapping)
+      || r.provisional_hq_mapping_sha256 !== c.provisional_hq_mapping_sha256
+      || !matches(r.bridge_process, bridge, ['uid', 'gid'])
+      || !input.boundBridgeProcess || canonicalDigest(r.bridge_process) !== canonicalDigest(input.boundBridgeProcess)
+      || [a, c, r].some((p) => !Array.isArray(p.members) || p.members.length !== 2)
+      || c.provisional_hq_mapping.members?.length !== 2) refuse();
+    const member = a.members.find((row) => row.member_id === runtime.member_id);
+    const memberIndex = a.members.indexOf(member);
+    if (!member || spent.has(member.launch_id)) refuse();
+    for (const [i, row] of a.members.entries()) {
+      const mapped = c.provisional_hq_mapping.members[i];
+      const observed = c.members[i], armed = r.members[i];
+      if (!matches(row, mapped, ['member_id', 'member_selector'])
+        || !matches(row, observed, ['member_id', 'member_selector', 'launch_id'])
+        || !matches(observed, armed, ['member_id', 'member_selector', 'launch_id', 'runtime_id'])
+        || observed.runtime_id !== mapped.runtime_id || (i === memberIndex && observed.runtime_id !== runtimeId)
+        || observed.child_process?.executable_sha256 !== row.command_sha256
+        || observed.child_process?.uid !== a.runner_uid || observed.child_process?.gid !== a.runner_gid
+        || armed.bridge_arm?.state !== 'armed' || armed.bridge_arm?.adapter_pid !== observed.child_process.pid
+        || armed.bridge_arm?.child_observation_envelope_sha256 !== child.envelope_sha256
+        || armed.bridge_arm_receipt_sha256 !== canonicalDigest(armed.bridge_arm)) refuse();
+    }
+    if (!(Date.parse(a.issued_at) <= Date.parse(c.provisional_hq_mapping.issued_at)
+      && Date.parse(c.provisional_hq_mapping.issued_at) <= Date.parse(c.issued_at)
+      && Date.parse(c.issued_at) <= Date.parse(r.issued_at) && Date.parse(r.issued_at) <= now())
+      || c.members[0].child_process.pid === c.members[1].child_process.pid
+      || c.members[0].runtime_id === c.members[1].runtime_id
+      || a.members[0].launch_id === a.members[1].launch_id) refuse();
+    const expires = Math.min(now() + ATTACH_TTL_MS, runtime.lease_expires_at,
+      ...[a, c, r, authority.payload].map((p) => Date.parse(p.expires_at)));
+    if (!Number.isFinite(expires) || expires <= now()) refuse();
+    const attach = core.random.hex(32);
+    const ep = bridge.endpoints.member;
+    const { socket_path: memberSocket, ...memberEndpoint } = ep;
+    const reply = Object.freeze({ version: 'stage2a-member-attach/v1', installation_id: selectors.installation_id,
+      start_id: selectors.start_id, member_id: member.member_id, member_selector: member.member_selector,
+      runtime_id: runtimeId, launch_id: member.launch_id, attach, expires_at: new Date(expires).toISOString(),
+      cwd: input.cwd, member_socket: memberSocket, member_endpoint: memberEndpoint,
+      member_bridge_token: input.memberBridgeToken, bridge_ready_nonce: input.bridgeReadyNonce,
+      runner_endpoint: runnerEndpoint,
+      child_observation_envelope_base64url: childObservationBytes.toString('base64url'),
+      child_observation_envelope_sha256: child.envelope_sha256,
+      member_b_authority_envelope_base64url: authorityBytes.toString('base64url'),
+      member_b_authority_envelope_sha256: authority.envelope_sha256,
+      ready_envelope_base64url: readyBytes.toString('base64url'), ready_envelope_sha256: ready.envelope_sha256 });
+    if (!ATTACH_TOKEN.test(attach) || canonicalBytes(reply).length > ATTACH_CAP) refuse();
+    checkSchema(provider.resultSchema, reply);
+    await withLiveRuntime(runtimeId, session, (rt) => {
+      if (!matches(rt, runtime, ['epoch', 'lease_generation', 'member_id', 'protected_start_id'])
+        || !current() || peer.isCurrent() !== true || input.isCurrent() !== true || spent.has(member.launch_id)
+        || bridgeTokens.has(reply.member_bridge_token) || bridgeNonces.has(reply.bridge_ready_nonce)) refuse();
+      bridgeTokens.add(reply.member_bridge_token);
+      bridgeNonces.add(reply.bridge_ready_nonce);
+      spent.add(member.launch_id);
+      slots.set(member.launch_id, { attach, runtimeId, session, expires, processSHA256: peer.processSHA256,
+        isCurrent: input.isCurrent, connect: input.connect });
+    });
+    return reply;
+  }
+
+  async function attach(payload, { takeover: offer, protectedStart }) {
+    if (!offer || protectedStart?.role !== 'runner' || !payload
+      || Object.keys(payload).sort().join(',') !== 'attach,launch_id'
+      || typeof payload.launch_id !== 'string' || typeof payload.attach !== 'string'
+      || !ATTACH_TOKEN.test(payload.attach)) refuse();
+    const slot = slots.get(payload.launch_id);
+    if (!slot || !usable(slot)
+      || !timingSafeEqual(Buffer.from(slot.attach, 'hex'), Buffer.from(payload.attach, 'hex'))) refuse();
+    const peer = await refreshRunnerPeer(protectedStart);
+    if (peer?.processSHA256 !== slot.processSHA256 || peer.isCurrent() !== true
+      || slots.get(payload.launch_id) !== slot || !usable(slot)) refuse();
+    slots.delete(payload.launch_id);
+    try {
+      await withLiveRuntime(slot.runtimeId, slot.session, () => {
+        if (peer.isCurrent() !== true || !usable(slot)) refuse();
+      });
+    } catch (error) { onLost(); throw error; }
+    return takeover({ launch_id: payload.launch_id }, {
+      open: () => {
+        if (peer.isCurrent() !== true || !usable(slot)) { onLost(); refuse(); }
+        return (socket) => {
+          try { slot.connect(socket); }
+          catch { socket.destroy(); onLost(); }
+        };
+      },
+      cancel: onLost,
+    });
+  }
+  return Object.freeze({ prepare, attach });
+}
 
 function checkedEndpoint(installed, assignment, selectors, hqUid) {
   const ep = assignment?.admission;
@@ -55,7 +215,7 @@ function checkedEndpoint(installed, assignment, selectors, hqUid) {
 // `renewLive` is HQ's paired Machine channel. It must return the exact
 // A-signed lease envelope; an HQ-generated expiry never reaches R.
 export async function listenStage2aRunnerAdmission({ installed, assignment, selectors,
-  hqUid, core, renewLive, onLost, protectedAdmission, admissionDispatch,
+  hqUid, core, renewLive, onLost, protectedAdmission, admissionDispatch, memberAttachProvider, withLiveRuntime,
   lstat = (path) => lstatSync(path, { bigint: true }),
   checkACL = checkDarwinACL, observePeer = observePeerPid,
   listen = listenSocket } = {}) {
@@ -104,9 +264,15 @@ export async function listenStage2aRunnerAdmission({ installed, assignment, sele
       return intact;
     } catch { lose(); return false; }
   }
+  const memberAttach = memberAttachProvider ? createStage2aMemberAttach({
+    provider: memberAttachProvider, withLiveRuntime, selectors, core, current, onLost: lose,
+    refreshRunnerPeer: protectedAdmission?.refreshRunnerPeer,
+    runnerEndpoint: Object.freeze({ socketPath: ep.socket_path, peerUid: hqUid, directory: ep.directory }),
+  }) : undefined;
   checkDirectory();
   const listener = await listen({
     path: ep.socket_path, auth: 'entry-point', core, mode: 0o660, replaceStale: false,
+    takeover: !!memberAttach,
     authenticatePeer: async (socket) => {
       const pid = await observePeer(socket, installed.runner_uid);
       if (!Number.isSafeInteger(pid) || pid < 2 || !current()) return false;
@@ -139,6 +305,11 @@ export async function listenStage2aRunnerAdmission({ installed, assignment, sele
     newSession: () => `rp_${core.random.hex(12)}`, endSession: () => {},
     async dispatch(op, meta) {
       if (!current() || !protectedAdmission || !meta.protectedStart) refuse();
+      if (memberAttach && op === MEMBER_ATTACH_PREPARE) {
+        if (!helloConnections.has(meta.protectedStart)) refuse();
+        return memberAttach.prepare(meta.payload, meta);
+      }
+      if (memberAttach && op === MEMBER_ATTACH) return memberAttach.attach(meta.payload, meta);
       if (ADMISSION_OPERATIONS.has(op)) {
         if (typeof admissionDispatch !== 'function'
           || meta.protectedStart.role !== 'runner') refuse();

@@ -571,14 +571,15 @@ export function createHQ({
     stop,
     paths,
     status: () => host.status(),
-    openProtectedAdmission: async ({ installed, assignment, selectors, renewLive, onLost }) => {
+    openProtectedAdmission: async ({ installed, assignment, selectors, renewLive, onLost, memberAttachProvider }) => {
       const key = selectors?.reservation_sha256;
       if (!running || !key || runnerAdmissions.has(key) || openingRunnerAdmissions.has(key))
         fail('host.launch_unavailable', 'protected R admission is unavailable');
       openingRunnerAdmissions.add(key);
       try {
         const listener = await listenStage2aRunnerAdmission({ installed, assignment, selectors,
-          hqUid: uid, core, renewLive, onLost, protectedAdmission,
+          hqUid: uid, core, renewLive, onLost, protectedAdmission, memberAttachProvider,
+          withLiveRuntime: host.provided('hq-admission')?.withLiveRuntime,
           admissionDispatch: (op, meta) => host.dispatch(op, meta) });
         if (!running) { await listener.close(); fail('host.launch_unavailable', 'HQ stopped during protected R admission'); }
         runnerAdmissions.set(key, listener);

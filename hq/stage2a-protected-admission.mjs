@@ -122,8 +122,28 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
     const context = Object.freeze({ ...selectors, peer_uid, peer_pid,
       role: signed.role, [PEER_TOKEN]: token });
     contexts.set(token, { record, expiresAt: signed.expires_at_ms,
-      role: signed.role, peerProcess: signed.peer_process });
+      role: signed.role, peerProcess: signed.peer_process, socket: _socket });
     return context;
+  }
+
+  async function refreshRunnerPeer(connection) {
+    const peer = peerFor(connection);
+    if (!peer || peer.role !== 'runner' || peer.record.lost || peer.socket?.destroyed
+      || !peer.record.finalized) refuse();
+    const helloPeer = peerFor(peer.record.hello?.connection);
+    if (!helloPeer || !same(peer.peerProcess, helloPeer.peerProcess)) refuse();
+    const { installed, assignment, selectors } = peer.record;
+    const refreshed = await acceptPeer(peer.socket, { installed, assignment, selectors,
+      peer_uid: connection.peer_uid, peer_pid: connection.peer_pid });
+    const live = peerFor(refreshed);
+    const process = live?.peerProcess;
+    if (live?.role !== 'runner' || !same(process, peer.peerProcess)
+      || !Number.isSafeInteger(process.start_seconds) || process.start_seconds <= 0
+      || !Number.isSafeInteger(process.start_micros) || process.start_micros < 0
+      || process.start_micros >= 1e6) refuse();
+    const processSHA256 = sha(canonicalBytes(process));
+    return Object.freeze({ processSHA256, isCurrent: () => !peer.record.lost
+      && !peer.socket?.destroyed && live.expiresAt > now() });
   }
 
   async function verifyHelloStart({ connection, caller, payload, hello_payload_sha256 } = {}) {
@@ -307,7 +327,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
     await abort(context);
   }
 
-  return Object.freeze({ registerStart, acceptPeer, verifyHelloStart,
+  return Object.freeze({ registerStart, acceptPeer, refreshRunnerPeer, verifyHelloStart,
     verifyDefinitionMapping, finalize, verifyFinalization, abort,
     finalizationFor, watchLiveness, assertLive, peerDisconnected, watchHealthy });
 }
