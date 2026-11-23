@@ -45,7 +45,7 @@ import { connectSocket } from './socket.mjs';
 import { machineRoleCommand, machineRoleStage2aCooperative, machineRoleStage2aList } from './machine-channel.mjs';
 import { relaySoulAcp } from './soul-acp-relay.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
-import { inspectStage2aReservationV2 } from './stage2a-reservation.mjs';
+import { verifyStage2aProtectedCandidateReservationV3 } from './stage2a-reservation.mjs';
 import { createStage2aMachineBridgeAuthority } from './stage2a-machine-bridge-authority.mjs';
 import { createStage2aProtectedStarter } from './stage2a-protected-start.mjs';
 import { createStage2aProtectedAdmission } from './stage2a-protected-admission.mjs';
@@ -109,9 +109,10 @@ function loadSchemas() {
 function loadStage2aSchemas() {
   const { dir } = verify();
   const paths = ['machine/v2/snapshot-identity', 'machine/v2/measurement-binding',
-    'machine/v2/stage2a-reservation-payload'];
+    'machine/v3/inventory-ref', 'machine/v3/measurement-binding', 'machine/v3/stage2a-reservation-payload',
+    'machine/v3/stage2a-qualification-candidate-binding', 'machine/v3/stage2a-qualification-candidate-reservation-payload'];
   const schemas = paths.map((path) => JSON.parse(readFileSync(join(dir, 'schemas', `${path}.schema.json`), 'utf8')));
-  return (payload) => validate(schemas[2], payload, { schemas: schemas.slice(0, 2) }).length === 0;
+  return (payload) => validate(schemas.at(-1), payload, { schemas: schemas.slice(0, -1) }).length === 0;
 }
 
 async function ask(controlPath, op, payload) {
@@ -241,15 +242,18 @@ async function main(argv) {
       }
       const epochs = new Set(installed.map((entry) => entry.hq_epoch));
       if (epochs.size > 1) throw new Error('Machine installed Soul plans disagree on HQ pairing epoch');
-      const validatePayload = installed.length ? loadStage2aSchemas() : undefined;
-      const verifyReservation = installed.length ? (envelope) =>
-        inspectStage2aReservationV2(envelope, { enrolledMachineKey: machinePublicKey,
-          validatePayload }) : undefined;
+      const selectedH = authenticatedSelectedH();
+      const verifyHQCodeReady = () => Boolean(managedHq && selectedH && machinePublicKey
+        && selectedH.machinePublicKey === machinePublicKey.toString('hex')
+        && installed.length && installed.every((entry) => entry.host_id === selectedH.hostId));
+      const validatePayload = verifyHQCodeReady() ? loadStage2aSchemas() : undefined;
+      const verifyReservation = installed.length ? (envelope, plan, reservationSHA256) =>
+        verifyStage2aProtectedCandidateReservationV3(envelope, { enrolledMachineKey: machinePublicKey,
+          installed: plan, reservationSHA256, validatePayload }) : undefined;
       const authority = installed.length ? createStage2aMachineBridgeAuthority({
         machinePublicKey, verifyReservation }) : undefined;
       const providers = new Map();
       let hq;
-      const selectedH = authenticatedSelectedH();
       const cooperativeMachine = managedHq && selectedH ? createStage2aCooperativeMachine({
         exchange: machineRoleStage2aCooperative, hDescriptorDigest: selectedH.descriptorDigest,
         machinePublicKey: selectedH.machinePublicKey,
@@ -262,7 +266,7 @@ async function main(argv) {
         stopReservation: (reservationSHA256) => protectedStart.stopReservation(reservationSHA256),
       }) : undefined;
       const protectedStart = installed.length ? createStage2aProtectedStarter({
-        installations: installed, authority, verifyReservation,
+        installations: installed, authority, verifyReservation, verifyHQCodeReady,
         getBrokerIdentity: (installationId) => hq.bridgeBrokerIdentity(installationId),
         verifyBoundBridge: (selectors, digest) => hq.boundBridgeV2(selectors, digest),
         openProtectedAdmission: async ({ installed: plan, assignment, selectors,

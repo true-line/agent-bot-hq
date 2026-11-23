@@ -232,7 +232,7 @@ export async function preloadSelectedHQCode() {
   const vendorRows = inventory.files.filter((row) => row.path.startsWith('vendor/soul-contracts/'))
     .map((row) => Object.freeze({ path: row.path, sha256: row.sha256,
       size_bytes: row.size_bytes, mode: row.mode }));
-  completedSelection = Object.freeze({ root: ref.snapshot.path, descriptorDigest,
+  completedSelection = Object.freeze({ root: ref.snapshot.path, descriptorDigest, hostId: payload.host_id,
     machinePublicKey: pin.toString('hex'),
     metadataSha256: releaseMetadata.sha256, metadataSize: releaseMetadata.size_bytes,
     vendorRows: Object.freeze(vendorRows) });

@@ -8,6 +8,8 @@ import { authenticatedSelectedH } from './stage2a-h-preloader.mjs';
 const V1 = Object.freeze({ purpose: 'agent-bot/stage2a-reservation/v1', contract: 'machine/v1', schemaVersion: 1 });
 const V2 = Object.freeze({ purpose: 'agent-bot/stage2a-reservation/v2', contract: 'machine/v2', schemaVersion: 2 });
 const V3 = Object.freeze({ purpose: 'agent-bot/stage2a-reservation/v3', contract: 'machine/v3', schemaVersion: 3 });
+const CANDIDATE_V3 = Object.freeze({ purpose: 'agent-bot/stage2a-qualification-candidate-reservation/v3',
+  contract: 'machine/v3', schemaVersion: 3, kind: 'stage2a-qualification-candidate-reservation' });
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const sha = bytes => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 const fail = () => { throw new Error('invalid Stage 2a reservation'); };
@@ -51,8 +53,9 @@ async function verifyReservation(raw, { enrolledMachineKey, expected, clock, con
   if (!verify(null, Buffer.concat([Buffer.from(format.purpose + '\0'), payloadBytes]), key, sig)) fail();
   const p = parseCanonical(payloadBytes);
   if (validatePayload(structuredClone(p)) !== true) fail();
-  if (!keysEqual(p, ['contract','kind','schema_version','host_id','issued_at','expires_at','installed_plan_receipt_sha256','assignment','member_endpoint','measurement_binding','admission_challenge_sha256']) ||
-      p.contract !== format.contract || p.kind !== 'stage2a-reservation' || p.schema_version !== format.schemaVersion ||
+  if (!keysEqual(p, ['contract','kind','schema_version','host_id','issued_at','expires_at','installed_plan_receipt_sha256','assignment','member_endpoint','measurement_binding','admission_challenge_sha256',
+      ...(format === CANDIDATE_V3 ? ['qualification_attempt'] : [])]) ||
+      p.contract !== format.contract || p.kind !== (format.kind ?? 'stage2a-reservation') || p.schema_version !== format.schemaVersion ||
       typeof p.host_id !== 'string' || !p.host_id || !p.assignment || !p.member_endpoint || !p.measurement_binding) fail();
   // Compare complete nested structures, not caller-selected subsets.
   if (expected) {
@@ -77,7 +80,7 @@ async function verifyReservation(raw, { enrolledMachineKey, expected, clock, con
   const { socket_path, ...endpoint } = ep;
   if (typeof socket_path !== 'string' || !socket_path || member.member_socket !== socket_path ||
       !same(member.member_endpoint, endpoint)) fail();
-  const protectedFormat = format === V2 || format === V3;
+  const protectedFormat = format !== V1;
   if (protectedFormat && (m.contract !== format.contract || m.schema_version !== format.schemaVersion
     || m.profile_in_force !== 'managed-protected'
     || !Number.isSafeInteger(a.machine_uid) || a.machine_uid <= 399
@@ -140,3 +143,34 @@ export async function verifyStage2aReservationV3(raw, { enrolledMachineKey, sele
 // The protected-start caller gets H only from the authenticated preloader.
 export const verifyStage2aProtectedReservationV3 = (raw, options) =>
   verifyStage2aReservationV3(raw, { ...options, selectedH: authenticatedSelectedH() });
+
+
+// The first-run candidate has its own released purpose and complete payload
+// schema. It cannot enter the certified V3 route or a legacy V2 route.
+export async function verifyStage2aCandidateReservationV3(raw, { enrolledMachineKey, selectedH,
+  installed, validatePayload, reservationSHA256, now = Date.now } = {}) {
+  if (!Buffer.isBuffer(enrolledMachineKey) || enrolledMachineKey.length !== 32
+    || !DIGEST.test(selectedH?.descriptorDigest ?? '')
+    || selectedH.machinePublicKey !== enrolledMachineKey.toString('hex')
+    || !installed || selectedH.hostId !== installed.host_id || typeof now !== 'function') fail();
+  const checked = await verifyReservation(raw, { enrolledMachineKey, validatePayload },
+    CANDIDATE_V3, { consumeClaim: false });
+  const { payload } = checked;
+  const { assignment, measurement_binding: binding } = payload;
+  if (payload.host_id !== installed.host_id || payload.installed_plan_receipt_sha256 !== installed.root_receipt_sha256
+    || ['installation_id', 'plan_id', 'plan_digest', 'hq_epoch'].some(field => assignment[field] !== installed[field])
+    || assignment.h_service_descriptor_digest !== selectedH.descriptorDigest
+    || binding.h_service_descriptor_digest !== selectedH.descriptorDigest
+    || assignment.r_inventory_digest !== binding.r_inventory.inventory_digest) fail();
+  // Initial starts supply the digest returned by Machine Reserve. Live B
+  // reinspection instead uses A's renewed signed live proof.
+  if (reservationSHA256 !== undefined) {
+    const current = now();
+    if (checked.reservationSHA256 !== reservationSHA256 || !Number.isSafeInteger(current)
+      || current < Date.parse(payload.issued_at) || current >= Date.parse(payload.expires_at)) fail();
+  }
+  return checked;
+}
+
+export const verifyStage2aProtectedCandidateReservationV3 = (raw, options) =>
+  verifyStage2aCandidateReservationV3(raw, { ...options, selectedH: authenticatedSelectedH() });
