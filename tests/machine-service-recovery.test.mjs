@@ -351,8 +351,9 @@ function protectedInstallPlan(machineKey, roleUid = 300, change = () => {}) {
       { path: 'Contents/opt', kind: 'directory', mode: '0555' },
       { path: 'Contents/primitives', kind: 'directory', mode: '0555' },
     ],
-    launch_inputs: { files: ['host/adapters.json', 'host/installation.json', 'runtime/bin/agent-bot-souls.mjs', 'runtime/bin/node']
-      .map(path => ({ path, kind: 'regular', mode: path === 'runtime/bin/node' ? '0555' : '0444', size: 1, sha256: 'f'.repeat(64) })),
+    launch_inputs: { files: ['host/adapters.json', 'host/installation.json', 'runtime/bin/agent-bot-souls.mjs', 'runtime/bin/node', 'runtime/lib/claude']
+      .map(path => ({ path, kind: 'regular', mode: path === 'runtime/bin/node' ? '0555' : '0444',
+        size: path === 'runtime/lib/claude' ? 354630016 : 1, sha256: 'f'.repeat(64) })),
       host_projection: { adapters: {}, installation: {} }, selected_command: node, argv: [],
       environment: {}, effective_config: {}, system_images: { product_version: 'test', build_version: 'test',
         darwin_kernel: 'test', selected: [{ path: '/usr/bin/sandbox-exec', signing_requirement: 'test', cdhash: 'a'.repeat(40) }] },
@@ -414,6 +415,8 @@ test('paired protected Soul install rejects altered scope before issuing a chall
     p => { p.soul_protected_launch.policy.bridge_executable = {}; },
     p => { p.soul_protected_launch.policy.bridge_qualification = {}; },
     p => { delete p.soul_protected_launch.policy.measurement_binding.snapshots; },
+    p => { p.soul_protected_launch.policy.launch_inputs.files.at(-1).size = 512 * 1024 * 1024 + 1; },
+    p => { for (const file of p.soul_protected_launch.policy.launch_inputs.files.slice(0, 3)) file.size = 400 * 1024 * 1024; },
     p => { p.steps[0].detail = 'install a different policy'; },
     p => { p.steps.push({ kind: 'file', target: '/tmp/extra', action: 'write' }); },
     p => { p.soul_protected_launch.launch_inputs_source = '/tmp/../other'; },

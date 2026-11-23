@@ -11,6 +11,8 @@ const account = /^[a-z_][a-z0-9_-]{0,31}$/;
 const hex = /^[0-9a-f]{64}$/;
 const digest = /^sha256:[0-9a-f]{64}$/;
 const soul = /^agent_[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const maxFileBytes = 512 * 1024 * 1024;
+const maxTotalBytes = 1024 * 1024 * 1024;
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).join(',') === names;
 const absolute = (value) => typeof value === 'string' && value.length <= 4096
@@ -31,12 +33,17 @@ function record(value) {
   if (mode & 0o222) return false;
   return value.kind === 'directory' ? fields(value, 'path,kind,mode')
     : value.kind === 'regular' && fields(value, 'path,kind,mode,size,sha256')
-      && Number.isSafeInteger(value.size) && value.size >= 0 && value.size <= 256 * 1024 * 1024
+      && Number.isSafeInteger(value.size) && value.size >= 0 && value.size <= maxFileBytes
       && hex.test(value.sha256);
 }
-function records(value, minimum) {
-  return Array.isArray(value) && value.length >= minimum && value.length <= 512
-    && value.every((r, i) => record(r) && (i === 0 || r.path > value[i - 1].path));
+function records(value, minimum, maximum = 512) {
+  let total = 0;
+  return Array.isArray(value) && value.length >= minimum && value.length <= maximum
+    && value.every((r, i) => {
+      if (!record(r) || (i !== 0 && r.path <= value[i - 1].path)) return false;
+      total += r.kind === 'regular' ? r.size : 0;
+      return total <= maxTotalBytes;
+    });
 }
 function snapshot(value, expectedPath, machineUid, runnerGid) {
   return fields(value, 'root_path,device,inode,generation,birthtime_ns,owner_uid,owner_gid,mode')
@@ -53,7 +60,7 @@ function validNested(policy, request) {
   if (!records(definition, 5) || !Object.entries(requiredDefinition).every(([path, kind]) =>
     definition.some(r => r.path === path && r.kind === kind))
     || !fields(inputs, 'files,host_projection,selected_command,argv,environment,effective_config,system_images,sandbox_policy_digest,component_digests')
-    || !records(inputs.files, 4) || !inputs.files.every(r => r.kind === 'regular')
+    || !records(inputs.files, 4, 64) || !inputs.files.every(r => r.kind === 'regular')
     || !['host/adapters.json', 'host/installation.json']
       .every(path => inputs.files.some(r => r.path === path))
     || !fields(inputs.host_projection, 'adapters,installation')
