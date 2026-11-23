@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { copyFileSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync, rmSync, chmodSync, truncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { H_V09_EXCLUDED, hRuntimeSelection, manifestDigest, readPin, verify,
+import { H_V0102_EXCLUDED, hRuntimeSelection, manifestDigest, readPin, verify,
   verifySelectedVendoredTree, verifyVendored } from '../scripts/soul-contracts.mjs';
 
 test('vendored contracts verify exact content and refuse tampering and symlinks', () => {
@@ -91,14 +91,14 @@ test('interim mode verifies offline and missing payload never falls back to git'
   } finally { rmSync(dir,{recursive:true,force:true}); }
 });
 
-test('selected H Contracts verifies exactly the A-bound v0.9 runtime subset', () => {
+test('selected H Contracts verifies exactly the A-bound v0.10.2 runtime subset', () => {
   const pin = readPin();
   const full = verify(pin);
   const runtime = hRuntimeSelection(pin, full.manifest);
-  assert.equal(runtime.files, 420);
-  assert.equal(runtime.digest, 'sha256:25486824df6e2fc2df87c8cfa0721384f9e5650a6519dc87c53ece8377d7447e');
+  assert.equal(runtime.files, 418);
+  assert.equal(runtime.digest, 'sha256:54be96221e034b0878bee9aaaa42595c5d81d452162db84ff15f1a0354850012');
   const changedFull = { ...full.manifest,
-    [H_V09_EXCLUDED[0]]: { ...full.manifest[H_V09_EXCLUDED[0]], size: 1 } };
+    [H_V0102_EXCLUDED[0]]: { ...full.manifest[H_V0102_EXCLUDED[0]], size: 1 } };
   assert.throws(() => hRuntimeSelection(pin, changedFull), /full source/);
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'hq-selected-contracts-'));
   const dir = join(root, 'vendor/soul-contracts');
@@ -109,9 +109,9 @@ test('selected H Contracts verifies exactly the A-bound v0.9 runtime subset', ()
       mkdirSync(dirname(dest), { recursive: true });
       copyFileSync(join(full.dir, path), dest);
     }
-    for (const path of H_V09_EXCLUDED) rmSync(join(dir, path));
+    for (const path of H_V0102_EXCLUDED) rmSync(join(dir, path));
     const rows = Object.entries(full.manifest)
-      .filter(([path]) => !H_V09_EXCLUDED.includes(path))
+      .filter(([path]) => !H_V0102_EXCLUDED.includes(path))
       .map(([path, item]) => ({ path: `vendor/soul-contracts/${path}`,
         sha256: `sha256:${item.sha256}`, size_bytes: item.size, mode: '0440' }));
     const metadata = { schema_version: 1, target_platform: 'darwin',
@@ -144,7 +144,7 @@ test('selected H Contracts verifies exactly the A-bound v0.9 runtime subset', ()
     const changedRows = rows.map((row) => ({ ...row }));
     changedRows[0].sha256 = 'sha256:' + '0'.repeat(64);
     assert.throws(() => check(metadata, changedRows), /row/);
-    const omitted = H_V09_EXCLUDED[0];
+    const omitted = H_V0102_EXCLUDED[0];
     copyFileSync(join(full.dir, omitted), join(dir, omitted));
     assert.throws(() => check(), /subset/);
     rmSync(join(dir, omitted));
