@@ -3,7 +3,8 @@ import { createHash, createPrivateKey, sign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
-import { verifyStage2aProtectedReservationV3, verifyStage2aReservationV3 } from '../hq/stage2a-reservation.mjs';
+import { verifyStage2aCandidateReservationV3, verifyStage2aProtectedCandidateReservationV3,
+  verifyStage2aProtectedReservationV3, verifyStage2aReservationV3 } from '../hq/stage2a-reservation.mjs';
 import { verify } from '../scripts/soul-contracts.mjs';
 import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
@@ -89,4 +90,40 @@ test('protected v3 requires enrolled A, exact response bytes, pinned schema and 
     await assert.rejects(verifyStage2aReservationV3(bytes, { ...options(bytes), ...overrides }),
       /invalid Stage 2a reservation/);
   }
+});
+
+
+test('protected candidate uses the released candidate purpose and authenticated H and plan receipt', async () => {
+  const payload = read('fixtures/positive/stage2a-qualification-candidate-reservation-payload.v3-synthetic.json').input;
+  const schema = read('schemas/machine/v3/stage2a-qualification-candidate-reservation-payload.schema.json');
+  const bindingSchema = read('schemas/machine/v3/stage2a-qualification-candidate-binding.schema.json');
+  const candidateValidation = (value) => validate(schema, value, {
+    schemas: [payloadSchema, bindingSchema, ...schemas],
+  }).length === 0;
+  assert.equal(candidateValidation(payload), true);
+  const purpose = 'agent-bot/stage2a-qualification-candidate-reservation/v3';
+  const make = (value) => {
+    const bytes = canonicalBytes(value);
+    const preimage = Buffer.concat([Buffer.from(purpose + '\0'), bytes]);
+    return canonicalBytes({ schema_version: 3, purpose, issuer_public_key_base64url: enrolledMachineKey.toString('base64url'),
+      payload_sha256: sha(bytes), payload_base64url: bytes.toString('base64url'),
+      signature_base64url: sign(null, preimage, privateKey).toString('base64url') });
+  };
+  const bytes = make(payload);
+  const selected = { ...selectedH, hostId: payload.host_id, descriptorDigest: payload.assignment.h_service_descriptor_digest };
+  const installed = { ...payload.assignment, host_id: payload.host_id, root_receipt_sha256: payload.installed_plan_receipt_sha256 };
+  const candidateOptions = { enrolledMachineKey, selectedH: selected, installed, validatePayload: candidateValidation,
+    reservationSHA256: sha(bytes), now: () => Date.parse(payload.issued_at) };
+  assert.equal((await verifyStage2aCandidateReservationV3(bytes, candidateOptions)).reservationSHA256, sha(bytes));
+  await assert.rejects(verifyStage2aProtectedCandidateReservationV3(bytes, candidateOptions), /invalid Stage 2a reservation/);
+  await assert.rejects(verifyStage2aCandidateReservationV3(raw, { ...candidateOptions, validatePayload }), /invalid Stage 2a reservation/);
+  await assert.rejects(verifyStage2aCandidateReservationV3(bytes, {
+    ...candidateOptions, installed: { ...installed, root_receipt_sha256: sha(Buffer.from('other installed plan')) },
+  }), /invalid Stage 2a reservation/);
+  await assert.rejects(verifyStage2aCandidateReservationV3(bytes, {
+    ...candidateOptions, selectedH: { ...selected, descriptorDigest: sha(Buffer.from('other H')) },
+  }), /invalid Stage 2a reservation/);
+  await assert.rejects(verifyStage2aCandidateReservationV3(bytes, {
+    ...candidateOptions, now: () => Date.parse(payload.expires_at),
+  }), /invalid Stage 2a reservation/);
 });
