@@ -9,9 +9,10 @@ import { accountsPurpose } from './machine-harness-accounts.mjs';
 import { qualificationApprovalDetail, qualificationPurpose } from './machine-harness-qualification.mjs';
 import { checkUpgradeRecords } from './machine-service-upgrade.mjs';
 import { checkHarnessLaunchPlan, isHarnessLaunchHandoff } from './machine-harness-launch.mjs';
+import { checkProtectedInstallPlan, protectedInstallPurpose } from './machine-soul-protected-launch.mjs';
 
 export const isServiceHandoff = (verb) => verb === 'hq-service-recovery' || verb === 'hq-service-upgrade' ||
-  isHarnessLaunchHandoff(verb) || verb === accountsPurpose || verb === qualificationPurpose;
+  isHarnessLaunchHandoff(verb) || verb === accountsPurpose || verb === qualificationPurpose || verb === protectedInstallPurpose;
 const role = '_agent-bot-hq';
 const maxFrame = 64 * 1024;
 const fieldsAre = (o, names) => o && typeof o === 'object' && !Array.isArray(o) &&
@@ -56,7 +57,11 @@ function ownerPublicKey(encoded) {
     x: point.subarray(1, 33).toString('base64url'), y: point.subarray(33).toString('base64url') } });
 }
 
-function checkPlanScope(plan, action, id, roleUid) {
+function checkPlanScope(plan, action, id, roleUid, machineKey) {
+  if (action === protectedInstallPurpose || plan.purpose === protectedInstallPurpose) {
+    if (action !== plan.purpose) throw new Error('outside the paired protected Soul launch install plan scope');
+    return checkProtectedInstallPlan(plan, roleUid, machineKey);
+  }
   if (action === qualificationPurpose || plan.purpose === qualificationPurpose) {
     if (action !== plan.purpose || plan.steps[0].detail !== qualificationApprovalDetail) {
       throw new Error('outside the paired HQ qualification plan scope');
@@ -91,7 +96,7 @@ function validatedChallenge(r, machine, hq, action, roleUid) {
     throw new Error('invalid, expired or misdirected Machine service challenge');
   }
   const body = { plan_id: c.plan_id, plan_digest: c.plan_digest, plan_canonical: c.plan_canonical };
-  checkPlanScope(validatedMembersPlan(c.plan_id, { state: 'found', body }), action, c.plan_id, roleUid);
+  checkPlanScope(validatedMembersPlan(c.plan_id, { state: 'found', body }), action, c.plan_id, roleUid, machine);
   ownerPublicKey(c.owner_key);
   return c;
 }
@@ -120,7 +125,7 @@ function utcSecond(value) {
 export async function serviceHandoff(action, args, machine, hq, send, authenticateStored, roleUid) {
   if (args.operation === 'export') {
     const { response } = await send({ verb: 'members-plans', option: 'get', plan_id: args.id });
-    checkPlanScope(validatedMembersPlan(args.id, response), action, args.id, roleUid);
+    checkPlanScope(validatedMembersPlan(args.id, response), action, args.id, roleUid, machine);
     const saved = response.body;
     const issued = await send({ verb: action, option: 'challenge', plan_id: saved.plan_id, plan_digest: saved.plan_digest });
     const c = validatedChallenge(issued.response, machine, hq, action, roleUid);

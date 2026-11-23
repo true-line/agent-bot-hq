@@ -51,7 +51,7 @@ import { createStage2aProtectedStarter } from './stage2a-protected-start.mjs';
 import { createStage2aProtectedAdmission } from './stage2a-protected-admission.mjs';
 import { createStage2aQualificationProvider } from './stage2a-qualification-provider.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {

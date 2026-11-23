@@ -330,3 +330,28 @@ An approved response records owner consent for this exact single-use plan.
 Execution and evidence are separate. This command does not certify the adapter
 or install a launch rule. To abandon a challenge, use
 `cancel --challenge-file FILE --socket PATH` for the same operation.
+
+### Review one protected Soul installation
+
+Machine builds and saves the `soul-protected-launch-install` plan from the
+reviewed local request. From the paired dedicated HQ account, first establish
+the Machine pin with signed `machine status`, then export the saved plan's
+signed owner challenge:
+
+```sh
+node hq/main.mjs machine soul-protected-launch-install export "$plan_id" --socket "$socket" > "$challenge_file"
+```
+
+The owner reviews the exact plan and digest in the signed challenge, including
+the frozen `.soul` digest, runner and bridge accounts, installation and host
+identity, source paths, measured definition and launch inputs, and Machine
+public key. Return the purpose-bound owner proof to the same paired HQ account:
+
+```sh
+node hq/main.mjs machine soul-protected-launch-install approve --challenge-file "$challenge_file" --proof-file "$proof_file" --socket "$socket"
+```
+
+Use `cancel --challenge-file FILE --socket PATH` with the same verb to abandon
+the challenge. Approval authorizes only the saved plan named in the proof.
+Machine's root apply and installed receipt are separate steps; this handoff
+does not establish physical acceptance or open protected launch.
