@@ -10,7 +10,7 @@ const FINAL_PURPOSE = 'agent-bot/stage2a-finalization/v1';
 const FINAL_SCHEMA = 'agent-bot-machine/stage2a-finalization/v1';
 const SHA = /^sha256:[0-9a-f]{64}$/;
 const exact = (value, fields) => value && typeof value === 'object' && !Array.isArray(value)
-  && Object.keys(value).sort().join(',') === [...fields].sort().join(',');
+  && Object.keys(value).length === fields.length && fields.every((field) => Object.hasOwn(value, field));
 const digest = (bytes) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 const refuse = () => { throw new Error('invalid signed Machine Stage 2a stop'); };
 
@@ -27,13 +27,14 @@ function canonical(bytes) {
   return value;
 }
 
-export function verifyStage2aMachineEnvelope(envelopeBytes, machinePublicKey, purpose) {
-  if (!Buffer.isBuffer(envelopeBytes) || envelopeBytes.length < 1 || envelopeBytes.length > 8192
+export function verifyStage2aMachineEnvelope(envelopeBytes, machinePublicKey, purpose,
+  { schemaVersion = 1, maxBytes = 8192 } = {}) {
+  if (!Buffer.isBuffer(envelopeBytes) || envelopeBytes.length < 1 || envelopeBytes.length > maxBytes
     || !Buffer.isBuffer(machinePublicKey) || machinePublicKey.length !== 32) refuse();
   const envelope = canonical(envelopeBytes);
   if (!exact(envelope, ['schema_version', 'purpose', 'issuer_public_key_base64url',
     'payload_sha256', 'payload_base64url', 'signature_base64url'])
-    || envelope.schema_version !== 1 || envelope.purpose !== purpose
+    || envelope.schema_version !== schemaVersion || envelope.purpose !== purpose
     || !base64url(envelope.issuer_public_key_base64url, 32).equals(machinePublicKey)) refuse();
   const payloadBytes = base64url(envelope.payload_base64url);
   if (!SHA.test(envelope.payload_sha256) || digest(payloadBytes) !== envelope.payload_sha256) refuse();

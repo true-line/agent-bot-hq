@@ -218,7 +218,8 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     verifying.delete(connection);
     live.delete(connection);
     const context = bound?.context ?? pending?.context;
-    if (!context) return Promise.resolve();
+    if (!context) return authority?.retainsChallengeStopV2?.(connection) === true
+      ? quarantine(V2, connection, undefined, reason) : Promise.resolve();
     const containment = quarantine(context.protocol, connection, context, reason, bound?.receipt);
     // Comms may close while the bind reply is in flight, before it knows the
     // receipt. A wrong supplied receipt still requests containment first.
@@ -285,6 +286,10 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
         if (challenges.has(connection) || verifying.has(connection) || live.has(connection))
           await forgetBridgeConnection(connection, undefined, 'bridge-challenge-failed');
         else await quarantine(protocol, connection, context, 'bridge-challenge-failed');
+      } else if (protocol === V2 && authority.retainsChallengeStopV2?.(connection) === true) {
+        // A cooperative authority retains its stop target before awaiting
+        // A's live reply. Keep failures visible even before a challenge exists.
+        await quarantine(protocol, connection, undefined, 'bridge-challenge-failed').catch(() => {});
       }
       refuse();
     } finally { inFlight.delete(connection); }
@@ -425,7 +430,8 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
   async function revokeAll() {
     stopping = true;
     const stops = [];
-    for (const connection of new Set([...challenges.keys(), ...verifying.keys(), ...live.keys()]))
+    const retained = [...inFlight].filter((connection) => authority?.retainsChallengeStopV2?.(connection) === true);
+    for (const connection of new Set([...challenges.keys(), ...verifying.keys(), ...live.keys(), ...retained]))
       stops.push(forgetBridgeConnection(connection, live.get(connection)?.receipt, 'bridge-hq-stopped'));
     // Observe containment failures before waiting on potentially stuck
     // Machine verification. Otherwise an immediate onDisconnect rejection

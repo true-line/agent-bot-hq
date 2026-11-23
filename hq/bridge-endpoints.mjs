@@ -73,6 +73,11 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
       throw new Error('invalid Machine bridge broker directory on disk');
     }
     checkACL(endpoint.directory);
+    const pinned = endpoint.parentIdentity;
+    if (pinned && (String(dir.dev) !== pinned.device || String(dir.ino) !== pinned.inode
+      || String(dir.birthtimeNs) !== pinned.birthtimeNs)) {
+      throw new Error('Machine bridge broker parent identity changed');
+    }
     return dir;
   }
   function checkSocket() {
@@ -118,7 +123,7 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
       const qualification = kind === BRIDGE_QUALIFICATION_MESSAGES;
       const peer = peers.get(session);
       if (!peer || (!protectedBridgeKind(kind) && !(qualification && enableBridgeQualification === true))) refuse();
-      if (qualification && (peer.socket.destroyed || !peer.checkCurrent())) refuse();
+      if ((qualification || endpoint.parentIdentity) && (peer.socket.destroyed || !peer.checkCurrent())) refuse();
       return host.brokerAccept(kind, payload, { connection: session });
     },
   });
@@ -194,6 +199,7 @@ export function bindBridgeAuthority(authority, peers, { hqEpoch } = {}) {
       }, connection, peer) === true;
     },
     isCurrentPeerV2,
+    retainsChallengeStopV2: (connection) => authority.retainsChallengeStopV2?.(connection) === true,
     onDisconnectV2: (...args) => authority.onDisconnectV2(...args),
   });
 }
