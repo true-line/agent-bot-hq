@@ -78,12 +78,45 @@ function activateRunner(runner, assignment, reservationSHA256, live, finalizatio
   });
 }
 
+export function verifyCooperativeMemberReady(bytes, machinePublicKey, {
+  observation, authoritySHA256, bridgeObservedSHA256, hObservationSHA256s, armReceiptSHA256s, now,
+}) {
+  const ready = verifyStage2aMachineEnvelope(bytes, machinePublicKey,
+    'agent-bot/soul-cooperative-member-ready/v3', { schemaVersion: 3, maxBytes: 16_384 });
+  const r = ready.payload, c = observation.payload;
+  const scope = ['profile_in_force', 'host_id', 'installation_id', 'start_id', 'hq_epoch',
+    'reservation_sha256', 'assignment_envelope_sha256', 'provisional_hq_mapping_sha256'];
+  if (!exact(r, ['contract', 'kind', 'schema_version', ...scope, 'child_observation_envelope_sha256',
+    'member_b_authority_envelope_sha256', 'bridge_observed_sha256', 'members', 'issued_at', 'expires_at'])
+    || r.contract !== 'machine/v3' || r.kind !== 'soul-cooperative-member-ready' || r.schema_version !== 3
+    || r.profile_in_force !== 'managed-cooperative' || scope.some((field) => r[field] !== c[field])
+    || r.child_observation_envelope_sha256 !== observation.envelope_sha256
+    || !DIGEST.test(authoritySHA256 ?? '') || r.member_b_authority_envelope_sha256 !== authoritySHA256
+    || !DIGEST.test(bridgeObservedSHA256 ?? '') || r.bridge_observed_sha256 !== bridgeObservedSHA256
+    || !(Date.parse(c.issued_at) <= Date.parse(r.issued_at) && Date.parse(r.issued_at) <= now
+      && now < Date.parse(r.expires_at)) || !Array.isArray(r.members) || r.members.length !== 2
+    || c.members?.length !== 2 || hObservationSHA256s?.length !== 2 || armReceiptSHA256s?.length !== 2) refuse();
+  for (const [i, row] of r.members.entries()) {
+    const observed = c.members[i];
+    if (!exact(row, ['member_id', 'member_launch_id', 'member_selector', 'grant_sha256',
+      'launcher_process', 'child_process', 'h_observation_sha256', 'b_arm_receipt_sha256'])
+      || ['member_id', 'member_selector', 'grant_sha256'].some((field) => row[field] !== observed[field])
+      || row.member_launch_id !== observed.launch_id
+      || canonicalDigest(row.launcher_process) !== canonicalDigest(observed.launcher_process)
+      || canonicalDigest(row.child_process) !== canonicalDigest(observed.child_process)
+      || !DIGEST.test(row.h_observation_sha256 ?? '') || row.h_observation_sha256 !== hObservationSHA256s[i]
+      || !DIGEST.test(row.b_arm_receipt_sha256 ?? '') || row.b_arm_receipt_sha256 !== armReceiptSHA256s[i]) refuse();
+  }
+  return ready;
+}
+
 // One protected start owns both wrappers. This is invoked from the pending
 // Hello transaction boundary. Only the later selector-bound attach owns ACP.
 export function createStage2aPrestartedMembers({ machinePublicKey, schemas, schemaReferences = [],
-  submitMap, startMember, observeChildren, deliverObservation, waitForReady, stop,
+  submitMap, startMember, observeChildren, deliverObservation, waitForReady, stop, recordHChildObservation,
   profile = 'managed-protected', now = Date.now } = {}) {
-  if (!schemas?.assignment || !schemas.mapping || !schemas.authority || !schemas.observation || !schemas.ready
+  if ((profile === 'managed-cooperative' && typeof recordHChildObservation !== 'function')
+    || !schemas?.assignment || !schemas.mapping || !schemas.authority || !schemas.observation || !schemas.ready
     || [submitMap, startMember, observeChildren, deliverObservation, waitForReady, stop, now]
       .some((method) => typeof method !== 'function')) refuse();
   const digest = (bytes) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -151,10 +184,17 @@ export function createStage2aPrestartedMembers({ machinePublicKey, schemas, sche
           || status.child_pid < 2 || status.child_pid === child.pid) refuse();
         return { child, member, status };
       }));
-      const evidence = children.map(({ child, member, status }) => ({
+      const hObservations = profile === 'managed-cooperative'
+        ? await Promise.all(children.map(({ child, member, status }) => recordHChildObservation({
+          member, launcherPid: child.pid, childPid: status.child_pid, grantSHA256: child.grantSHA256,
+        }))) : [];
+      if (cancelled) refuse();
+      const evidence = children.map(({ child, member, status }, i) => ({
         member_id: member.member_id, member_selector: member.member_selector,
         member_launch_id: member.launch_id, child_launcher_pid: child.pid, child_pid: status.child_pid,
         grant_sha256: child.grantSHA256,
+        ...(hObservations[i] ? { h_observation_sha256: hObservations[i].sha256,
+          h_observation_base64url: hObservations[i].base64url } : {}),
       }));
       const observationBytes = await observeChildren({ ...selectors, members: evidence });
       const observation = signed(observationBytes, 'child-observation', schemas.observation);
@@ -165,7 +205,10 @@ export function createStage2aPrestartedMembers({ machinePublicKey, schemas, sche
         || canonicalDigest(c.provisional_hq_mapping) !== mapDigest) refuse();
       const memberGrants = c.members.map((row, i) => {
         const observed = evidence[i];
-        if (row.launcher_process.pid !== observed.child_launcher_pid || row.child_process.pid !== observed.child_pid
+        const h = hObservations[i]?.row;
+        if ((h && (!match(row.launcher_process, h.launcher_process, ['pid','uid','gid','start_seconds','start_micros'])
+          || !match(row.child_process, h.child_process, ['pid','uid','gid','start_seconds','start_micros'])))
+          || row.launcher_process.pid !== observed.child_launcher_pid || row.child_process.pid !== observed.child_pid
           || row.child_process.uid !== a.runner_uid || row.child_process.gid !== a.runner_gid
           || row.child_process.executable_sha256 !== a.members[i].command_sha256
           || row.runtime_id !== map.members[i].runtime_id) refuse();
@@ -177,8 +220,20 @@ export function createStage2aPrestartedMembers({ machinePublicKey, schemas, sche
       await Promise.all(children.map(({ child, member }) =>
         deliverObservation(child, member, observationBytes, observation.envelope_sha256)));
       if (cancelled) refuse();
-      const readyBytes = await waitForReady({ selectors, observationBytes, memberGrants, children,
+      const readiness = await waitForReady({ selectors, observationBytes, memberGrants, children,
         provisionalMappingSHA256: mapDigest });
+      if (cancelled) refuse();
+      if (profile === 'managed-cooperative') {
+        const { readyBytes, armReceiptSHA256s } = readiness ?? {};
+        const readyEvidence = Object.freeze({ observation, authoritySHA256: authority.envelope_sha256,
+          bridgeObservedSHA256: expectedAuthority.bridgeObservedSHA256,
+          hObservationSHA256s: Object.freeze(hObservations.map(({ sha256 }) => sha256)),
+          armReceiptSHA256s: Object.freeze([...(armReceiptSHA256s ?? [])]) });
+        verifyCooperativeMemberReady(readyBytes, machinePublicKey, { ...readyEvidence, now: now() });
+        return Object.freeze({ assignment, assignmentBytes, authorityBytes, observationBytes, readyBytes, readyEvidence,
+          memberGrants: Object.freeze(memberGrants), children: Object.freeze(children), provisionalMappingSHA256: mapDigest });
+      }
+      const readyBytes = readiness;
       const ready = signed(readyBytes, 'ready', schemas.ready);
       const r = ready.payload;
       if (cancelled || !match(r, a, [...scope, 'reservation_sha256'])

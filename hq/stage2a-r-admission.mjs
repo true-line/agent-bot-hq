@@ -10,6 +10,7 @@ import { listenSocket, takeover } from './socket.mjs';
 import { canonicalBytes, canonicalDigest } from '../sdk/wire/canonical-json.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
 import { matchesObservedMemberGrants, verifyStage2aBridgeMemberAuthority } from './stage2a-relay-peer.mjs';
+import { verifyCooperativeMemberReady } from './stage2a-protected-start.mjs';
 import { verifyStage2aMachineEnvelope } from './stage2a-stop.mjs';
 
 const ROOT = '/Library/Application Support/ai.true-line.agent-bot-hq';
@@ -23,6 +24,10 @@ const sameInode = (a, b) => BigInt(a.dev) === BigInt(b.dev) && BigInt(a.ino) ===
 const MEMBER_ATTACH_PREPARE = 'stage2a.member.attach.prepare';
 const MEMBER_ATTACH = 'stage2a.member.attach';
 const COOPERATIVE_MEMBER_LIVE = 'launch.cooperative.live';
+const COOPERATIVE_MEMBER_LIVE_FIELDS = ['installation_id', 'start_id', 'launch_id', 'reservation_sha256',
+  'assignment_envelope_sha256', 'member_b_authority_sha256', 'member_id', 'member_launch_id', 'member_selector',
+  'grant_sha256', 'ready_sha256', 'launcher_pid', 'launcher_start_seconds', 'launcher_start_micros',
+  'child_pid', 'child_start_seconds', 'child_start_micros', 'challenge_nonce_base64url', 'after_sequence', 'prior_expires_at'];
 const OWNER_ACP_TICKET = 'cooperative.owner-acp-ticket.v3';
 const ATTACH_TOKEN = /^[0-9a-f]{64}$/;
 const ATTACH_CAP = 128 * 1024;
@@ -102,7 +107,9 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
       `agent-bot/stage2a-member-set-${kind}/v1`, { maxBytes: ATTACH_ENVELOPE_CAP });
     const assignment = signed(assignmentBytes, 'assignment');
     const child = signed(childObservationBytes, 'child-observation');
-    const ready = signed(readyBytes, 'ready');
+    const ready = cooperative ? verifyCooperativeMemberReady(readyBytes, machinePublicKey, {
+      ...input.readyEvidence, observation: child, authoritySHA256: input.boundAuthoritySHA256, now: now(),
+    }) : signed(readyBytes, 'ready');
     const authority = verifyStage2aBridgeMemberAuthority(authorityBytes, { machinePublicKey,
       schema: provider.authoritySchema, assignmentSchema: provider.assignmentSchema,
       schemas: provider.schemaReferences, assignmentBytes,
@@ -110,25 +117,25 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
         profile_in_force: profile }, now: now() });
     const a = assignment.payload, c = child.payload, r = ready.payload;
     checkSchema(provider.childObservationSchema, c);
-    checkSchema(provider.readySchema, r);
+    if (!cooperative) checkSchema(provider.readySchema, r);
     const bridge = authority.payload.bridge;
     const ids = ['profile_in_force', 'host_id', 'installation_id', 'soul_id', 'start_id', 'hq_epoch',
       'reservation_sha256'];
     if (runnerEndpoint.peerUid !== a.runner_uid
       || authority.envelope_sha256 !== input.boundAuthoritySHA256
-      || !matches(c, a, ids) || !matches(r, a, ids)
+      || !matches(c, a, ids) || (!cooperative && !matches(r, a, ids))
       || c.assignment_envelope_sha256 !== assignment.envelope_sha256
       || r.assignment_envelope_sha256 !== assignment.envelope_sha256
       || r.child_observation_envelope_sha256 !== child.envelope_sha256
       || r.member_b_authority_envelope_sha256 !== authority.envelope_sha256
-      || r.b_authority_sha256 !== a.b_authority.envelope_sha256
+      || (!cooperative && r.b_authority_sha256 !== a.b_authority.envelope_sha256)
       || c.provisional_hq_mapping?.runtime_state !== 'provisional'
       || c.provisional_hq_mapping?.acp_authority !== 'withheld'
       || c.provisional_hq_mapping?.assignment_envelope_sha256 !== assignment.envelope_sha256
       || c.provisional_hq_mapping_sha256 !== canonicalDigest(c.provisional_hq_mapping)
       || r.provisional_hq_mapping_sha256 !== c.provisional_hq_mapping_sha256
-      || !matches(r.bridge_process, bridge, ['uid', 'gid'])
-      || !input.boundBridgeProcess || canonicalDigest(r.bridge_process) !== canonicalDigest(input.boundBridgeProcess)
+      || (!cooperative && (!matches(r.bridge_process, bridge, ['uid', 'gid'])
+        || !input.boundBridgeProcess || canonicalDigest(r.bridge_process) !== canonicalDigest(input.boundBridgeProcess)))
       || [a, c, r].some((p) => !Array.isArray(p.members) || p.members.length !== 2)
       || c.provisional_hq_mapping.members?.length !== 2
       || !matchesObservedMemberGrants(a, c.members, input.memberGrants)) refuse();
@@ -140,13 +147,13 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
       const observed = c.members[i], armed = r.members[i];
       if (!matches(row, mapped, ['member_id', 'member_selector'])
         || !matches(row, observed, ['member_id', 'member_selector', 'launch_id'])
-        || !matches(observed, armed, ['member_id', 'member_selector', 'launch_id', 'runtime_id'])
+        || (!cooperative && !matches(observed, armed, ['member_id', 'member_selector', 'launch_id', 'runtime_id']))
         || observed.runtime_id !== mapped.runtime_id || (i === memberIndex && observed.runtime_id !== runtimeId)
         || observed.child_process?.executable_sha256 !== row.command_sha256
         || observed.child_process?.uid !== a.runner_uid || observed.child_process?.gid !== a.runner_gid
-        || armed.bridge_arm?.state !== 'armed' || armed.bridge_arm?.adapter_pid !== observed.child_process.pid
+        || (!cooperative && (armed.bridge_arm?.state !== 'armed' || armed.bridge_arm?.adapter_pid !== observed.child_process.pid
         || armed.bridge_arm?.child_observation_envelope_sha256 !== child.envelope_sha256
-        || armed.bridge_arm_receipt_sha256 !== canonicalDigest(armed.bridge_arm)) refuse();
+        || armed.bridge_arm_receipt_sha256 !== canonicalDigest(armed.bridge_arm)))) refuse();
     }
     if (!(Date.parse(a.issued_at) <= Date.parse(c.provisional_hq_mapping.issued_at)
       && Date.parse(c.provisional_hq_mapping.issued_at) <= Date.parse(c.issued_at)
@@ -518,6 +525,9 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
   let ticketPending = false;
   let ownerReadySHA256;
   let finalizedReadySHA256;
+  let finalizedReadyBytes;
+  let resolveReady;
+  const readyAvailable = new Promise((resolve) => { resolveReady = resolve; });
   const lose = () => {
     if (lost || closed) return;
     lost = true;
@@ -629,26 +639,54 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
         if (brokered && op === COOPERATIVE_MEMBER_LIVE) {
           const renew = memberAttachProvider.renewWrapperLease;
           const p = meta.payload;
-          if (typeof renew !== 'function' || !attachedSession || !finalizedReadySHA256
-            || memberBootstrap?.isCurrent() !== true || !p || typeof p !== 'object' || Array.isArray(p)
+          const initial = p?.after_sequence === 0;
+          const until = Date.parse(p?.prior_expires_at ?? '');
+          if (typeof renew !== 'function' || !attachedSession || memberBootstrap?.isCurrent() !== true
+            || !p || typeof p !== 'object' || Array.isArray(p)
+            || Object.keys(p).sort().join(',') !== [...COOPERATIVE_MEMBER_LIVE_FIELDS].sort().join(',')
             || canonicalBytes(p).length > 4096
             || p.installation_id !== assignment.installation_id || p.start_id !== assignment.start_id
             || p.launch_id !== assignment.launch_id || p.reservation_sha256 !== digest
             || p.assignment_envelope_sha256 !== memberBootstrap.assignmentSHA256
             || p.member_b_authority_sha256 !== memberBootstrap.authoritySHA256 || p.launcher_pid !== state.peer_pid
-            || (p.after_sequence === 0 ? p.ready_sha256 !== '' : p.ready_sha256 !== finalizedReadySHA256)) refuseCooperative();
+            || !DIGEST.test(p.grant_sha256) || !canonicalBase64(p.challenge_nonce_base64url, 32)
+            || !Number.isSafeInteger(p.after_sequence) || p.after_sequence < 0
+            || !(until > core.clock.now())
+            || (initial ? p.ready_sha256 !== '' : !finalizedReadySHA256 || p.ready_sha256 !== finalizedReadySHA256))
+            refuseCooperative();
           state.state = 'member-live';
           const peer = await observePeerIdentity(state.socket, assignment.runner_uid);
           const original = sessions.get(attachedSession)?.context;
-          if (!peer || peer.pid !== state.peer_pid || peer.gid !== assignment.runner_gid
-            || !attachedPeer(original?.peer_pid) || state.socket.destroyed || memberBootstrap.isCurrent() !== true)
-            refuseCooperative();
-          const result = await renew({ request: p, kernelPeer: peer,
-            context: original, readyEnvelopeSHA256: finalizedReadySHA256 });
-          const rechecked = await observePeerIdentity(state.socket, assignment.runner_uid);
-          if (!rechecked || canonicalDigest(rechecked) !== canonicalDigest(peer) || state.socket.destroyed
-            || !attachedPeer(original.peer_pid) || memberBootstrap.isCurrent() !== true) refuseCooperative();
-          return result;
+          const isCurrent = () => !state.socket.destroyed && attachedPeer(original?.peer_pid) === original
+            && memberBootstrap.isCurrent() === true && core.clock.now() < until;
+          if (!original || !peer || peer.pid !== state.peer_pid || peer.gid !== assignment.runner_gid
+            || peer.start_seconds !== p.launcher_start_seconds || peer.start_micros !== p.launcher_start_micros
+            || !isCurrent()) refuseCooperative();
+          if (initial && !finalizedReadySHA256) {
+            let timer;
+            try {
+              await Promise.race([readyAvailable, new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error('cooperative member Ready is pending')),
+                  Math.min(20_000, Math.max(1, until - core.clock.now())));
+                timer.unref?.();
+              })]);
+            } finally { clearTimeout(timer); }
+          }
+          if (!isCurrent() || !finalizedReadySHA256 || !finalizedReadyBytes) refuseCooperative();
+          const currentPeer = async () => {
+            const rechecked = await observePeerIdentity(state.socket, assignment.runner_uid);
+            return rechecked && canonicalDigest(rechecked) === canonicalDigest(peer) && isCurrent();
+          };
+          if (!await currentPeer()) refuseCooperative();
+          const lease = await renew({ request: p, kernelPeer: peer, context: original,
+            readyEnvelopeSHA256: finalizedReadySHA256, readyEnvelopeBytes: Buffer.from(finalizedReadyBytes) });
+          if (!await currentPeer() || !lease || !DIGEST.test(lease.lease_sha256 ?? '')
+            || typeof lease.lease_envelope_base64url !== 'string'
+            || lease.lease_sequence !== p.after_sequence + 1) refuseCooperative();
+          return Object.freeze({ ready_envelope_base64url: initial ? finalizedReadyBytes.toString('base64url') : '',
+            ready_sha256: initial ? finalizedReadySHA256 : '',
+            lease_envelope_base64url: lease.lease_envelope_base64url,
+            lease_sha256: lease.lease_sha256, lease_sequence: lease.lease_sequence });
         }
         if (memberAttach && op === MEMBER_ATTACH) {
           return memberAttach.attach(meta.payload, { ...meta, runnerPeer: state });
@@ -774,25 +812,23 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
         const prepared = await memberAttachProvider.prepareMemberSet({
           context: state.context, runtimes, hello: meta.payload,
         });
-        const ready = verifyStage2aMachineEnvelope(prepared?.readyBytes, memberBootstrap.machinePublicKey,
-          'agent-bot/stage2a-member-set-ready/v1', { maxBytes: ATTACH_ENVELOPE_CAP });
-        const value = ready.payload;
-        const refs = [...new Map([memberAttachProvider.assignmentSchema,
-          ...(memberAttachProvider.schemaReferences ?? [])].filter((entry) =>
-          entry?.$id && entry.$id !== memberAttachProvider.readySchema.$id).map((entry) => [entry.$id, entry])).values()];
-        if (validate(memberAttachProvider.readySchema, value, { schemas: refs }).length
-          || value.profile_in_force !== 'managed-cooperative'
-          || value.reservation_sha256 !== digest || value.start_id !== assignment.start_id
+        const observation = verifyStage2aMachineEnvelope(prepared?.observationBytes, memberBootstrap.machinePublicKey,
+          'agent-bot/stage2a-member-set-child-observation/v1', { maxBytes: ATTACH_ENVELOPE_CAP });
+        const ready = verifyCooperativeMemberReady(prepared?.readyBytes, memberBootstrap.machinePublicKey, {
+          ...prepared.readyEvidence, observation, authoritySHA256: memberBootstrap.authoritySHA256, now: core.clock.now(),
+        });
+        const value = ready.payload, mapped = observation.payload.members;
+        if (value.reservation_sha256 !== digest || value.start_id !== assignment.start_id
           || value.installation_id !== assignment.installation_id || value.hq_epoch !== assignment.hq_epoch
-          || value.host_id !== pinned.payload.host_id || value.soul_id !== assignment.soul_id
+          || value.host_id !== pinned.payload.host_id || observation.payload.soul_id !== assignment.soul_id
           || value.assignment_envelope_sha256 !== memberBootstrap.assignmentSHA256
-          || value.member_b_authority_envelope_sha256 !== memberBootstrap.authoritySHA256
-          || !(Date.parse(value.expires_at) > core.clock.now())
-          || value.members?.length !== 2 || new Set(value.members.map((row) => row.runtime_id)).size !== 2
-          || !value.members.every((row) => runtimes.some((rt) =>
+          || new Set(mapped.map((row) => row.runtime_id)).size !== 2
+          || !mapped.every((row) => runtimes.some((rt) =>
             rt.member_id === row.member_id && rt.runtime_id === row.runtime_id))
           || memberBootstrap.isCurrent() !== true || attachedPeer(state.peer_pid) !== state.context) refuseCooperative();
         finalizedReadySHA256 = ready.envelope_sha256;
+        finalizedReadyBytes = Buffer.from(prepared.readyBytes);
+        resolveReady();
         return finalizedReadySHA256;
       } : undefined;
       const result = await admissionDispatch(op, { ...meta, cooperativeStart: prepareCooperativeMemberSet

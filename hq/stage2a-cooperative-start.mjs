@@ -3,9 +3,45 @@ import { fail, HostError } from '../sdk/errors.mjs';
 import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
 import { digest } from './stage2a-cooperative-proof.mjs';
 import { pushReceipt } from '../sdk/services.mjs';
+import { observeDarwinProcessIdentity } from './owner-control.mjs';
 import { takeover } from './socket.mjs';
 
 const unavailable = (message) => fail('host.launch_unavailable', message);
+
+export function createCooperativeChildObservationRecorder({ core, readCommittedReceipts, reservation,
+  observeProcess = observeDarwinProcessIdentity } = {}) {
+  const assignment = reservation?.payload?.assignment;
+  if (!assignment || reservation.payload.adapter_transport !== 'brokered-b'
+    || core?.profile !== 'managed-cooperative' || typeof core.persistReceipt !== 'function' || typeof readCommittedReceipts !== 'function')
+    unavailable('cooperative member observation needs a durable HQ store');
+  const spent = new Set();
+  return async ({ member, launcherPid, childPid, grantSHA256 }) => {
+    if (spent.has(member.member_id) || spent.size >= 2 || launcherPid === childPid)
+      unavailable('cooperative member observation was already recorded');
+    spent.add(member.member_id);
+    const observe = (pid) => observeProcess(pid, assignment.runner_uid, assignment.runner_gid);
+    const [launcher, child] = await Promise.all([observe(launcherPid), observe(childPid)]);
+    if (!launcher || !child || launcher.pid !== launcherPid || child.pid !== childPid)
+      unavailable('cooperative member kernel observation is unavailable');
+    const receipt = await pushReceipt(core, {
+      plugin: 'hq', kind: 'hq.soul.member.observed',
+      schema: 'agent-bot-hq/stage2a-cooperative-member-observed/v1',
+      reservation_sha256: reservation.sha256,
+      assignment_envelope_sha256: reservation.member_set_assignment_sha256,
+      installation_id: assignment.installation_id, start_id: assignment.start_id,
+      launch_id: assignment.launch_id, hq_epoch: assignment.hq_epoch,
+      member_id: member.member_id, member_launch_id: member.launch_id, member_selector: member.member_selector,
+      grant_sha256: grantSHA256, launcher_process: launcher, child_process: child,
+    });
+    if (!Number.isSafeInteger(receipt?.seq) || receipt.seq < 1 || !Number.isSafeInteger(receipt.at))
+      unavailable('cooperative member observation was not recorded');
+    const [committed] = await readCommittedReceipts([receipt.seq]);
+    if (!committed) unavailable('committed cooperative member observation is missing');
+    const bytes = canonicalBytes(committed);
+    if (!bytes.equals(canonicalBytes(receipt))) unavailable('committed cooperative member observation changed');
+    return Object.freeze({ row: committed, sha256: digest(bytes), base64url: bytes.toString('base64url') });
+  };
+}
 
 export function createStage2aCooperativeStarter({ machine, core, readCommittedReceipts, openAdmission, brokeredMemberProvider, timeoutMs = 30000 }) {
   const starts = new Map();
@@ -116,7 +152,11 @@ export function createStage2aCooperativeStarter({ machine, core, readCommittedRe
       let accept;
       const acp = new Promise((resolve) => { accept = resolve; });
       const memberAttachProvider = brokered
-        ? await brokeredMemberProvider(item.reservation, machine.brokeredMemberInputs(item.reservation)) : undefined;
+        ? await brokeredMemberProvider(item.reservation, machine.brokeredMemberInputs(item.reservation), {
+          recordHChildObservation: createCooperativeChildObservationRecorder({
+            core, readCommittedReceipts, reservation: item.reservation,
+          }),
+        }) : undefined;
       if (brokered && !memberAttachProvider) unavailable('cooperative B prestart provider is unavailable');
       checkRunning();
       item.listener = await openAdmission({ reservation: item.reservation, memberAttachProvider,

@@ -149,8 +149,9 @@ export function openStore(dir, { uid } = {}) {
       });
     },
     readCommittedReceipts(seqs) {
-      if (!Array.isArray(seqs) || seqs.length !== 2
-        || seqs.some(seq => !Number.isSafeInteger(seq) || seq < 1) || seqs[0] >= seqs[1]) {
+      if (!Array.isArray(seqs) || (seqs.length !== 1 && seqs.length !== 2)
+        || seqs.some(seq => !Number.isSafeInteger(seq) || seq < 1)
+        || (seqs.length === 2 && seqs[0] >= seqs[1])) {
         return Promise.reject(new StoreError('invalid committed receipt sequences'));
       }
       const selectors = [...seqs];

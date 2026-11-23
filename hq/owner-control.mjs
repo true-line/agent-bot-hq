@@ -125,13 +125,12 @@ export function authenticatePeerUid(socket, uid) {
 // Observe the connecting PID from the accepted descriptor, with the same
 // kernel UID check. This is an HQ-local role gate; Machine must authenticate
 // a protected Hello independently before publishing managed provenance.
-function observeSocketPeer(socket, uid, operation, maxBytes) {
+function observeKernel(args, maxBytes, socket) {
   return new Promise((resolve) => {
-    if (!Number.isSafeInteger(uid) || uid < 1) { resolve(null); return; }
     let probe;
     try {
-      probe = spawn(interpreter, [...helper, operation, String(uid)], {
-        ...helperOptions, stdio: ['ignore', 'pipe', 'ignore', socket],
+      probe = spawn(interpreter, [...helper, ...args], {
+        ...helperOptions, stdio: ['ignore', 'pipe', 'ignore', ...(socket ? [socket] : [])],
       });
     } catch { resolve(null); return; }
     let output = '';
@@ -146,15 +145,16 @@ function observeSocketPeer(socket, uid, operation, maxBytes) {
 }
 
 export async function observePeerPid(socket, uid) {
-  const output = await observeSocketPeer(socket, uid, 'peer-pid', 32);
+  if (!Number.isSafeInteger(uid) || uid < 1) return null;
+  const output = await observeKernel(['peer-pid', String(uid)], 32, socket);
   if (!/^[1-9][0-9]{0,9}\n$/.test(output ?? '')) return null;
   const pid = Number(output.trim());
   return Number.isSafeInteger(pid) && pid > 1 ? pid : null;
 }
 
 export async function observeDarwinPeerIdentity(socket, expectedUid) {
-  if (!darwin) return null;
-  const output = await observeSocketPeer(socket, expectedUid, 'peer-audit', 96);
+  if (!darwin || !Number.isSafeInteger(expectedUid) || expectedUid < 1) return null;
+  const output = await observeKernel(['peer-audit', String(expectedUid)], 96, socket);
   if (!/^\d+(?: \d+){5}\n$/.test(output ?? '')) return null;
   const values = output.trim().split(' ').map(Number);
   const [uid, gid, pid, pid_version, start_seconds, start_micros] = values;
@@ -172,4 +172,17 @@ function socketCheck(args, socket) {
     probe.once('error', () => resolve(false));
     probe.once('close', (code) => resolve(code === 0));
   });
+}
+
+
+export async function observeDarwinProcessIdentity(expectedPid, expectedUid, expectedGid) {
+  if (!darwin || ![expectedPid, expectedUid, expectedGid].every((value) =>
+    Number.isSafeInteger(value) && value > 0) || expectedPid < 2) return null;
+  const output = await observeKernel(['process-identity', String(expectedUid), String(expectedGid), String(expectedPid)], 96);
+  if (!/^\d+(?: \d+){4}\n$/.test(output ?? '')) return null;
+  const values = output.trim().split(' ').map(Number);
+  const [uid, gid, pid, start_seconds, start_micros] = values;
+  if (!values.every(Number.isSafeInteger) || uid !== expectedUid || gid !== expectedGid
+    || pid !== expectedPid || start_seconds < 1 || start_micros < 0 || start_micros >= 1e6) return null;
+  return Object.freeze({ uid, gid, pid, start_seconds, start_micros });
 }

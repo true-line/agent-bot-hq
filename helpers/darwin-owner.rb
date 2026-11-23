@@ -166,6 +166,21 @@ end
 
 return unless __FILE__ == $PROGRAM_NAME
 
+# Darwin PROC_PIDTBSDINFO (flavor 3) has a fixed 136-byte proc_bsdinfo
+# on the supported 64-bit ABI. Return only the kernel identity and start.
+def process_identity(pid)
+  return unless pid > 1
+  proc_info = Fiddle::Function.new(Fiddle::Handle.new('/usr/lib/libproc.dylib')['proc_pidinfo'],
+    [Fiddle::TYPE_INT, Fiddle::TYPE_INT, Fiddle::TYPE_LONG_LONG, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+    Fiddle::TYPE_INT)
+  process = "\x00" * 136
+  return unless proc_info.call(pid, 3, 0, process, process.bytesize) == process.bytesize
+  process_pid, uid, gid = [12, 20, 24].map { |offset| process.byteslice(offset, 4).unpack1('L') }
+  seconds, micros = process.byteslice(120, 16).unpack('Q2')
+  return unless process_pid == pid && seconds.positive? && micros < 1_000_000
+  [uid, gid, pid, seconds, micros]
+end
+
 case ARGV.shift
 when 'probe'
   exit 1 unless ARGV.empty?
@@ -226,18 +241,17 @@ when 'peer-audit'
   words = token.unpack('L8')
   uid, gid, pid, version = words.values_at(1, 2, 5, 7)
   exit 1 unless uid == expected_uid && pid > 1 && version.positive?
-  # Darwin PROC_PIDTBSDINFO (flavor 3) has a fixed 136-byte proc_bsdinfo
-  # on the supported 64-bit ABI. Check identity before taking the start time.
-  proc_info = Fiddle::Function.new(Fiddle::Handle.new('/usr/lib/libproc.dylib')['proc_pidinfo'],
-    [Fiddle::TYPE_INT, Fiddle::TYPE_INT, Fiddle::TYPE_LONG_LONG, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
-    Fiddle::TYPE_INT)
-  process = "\x00" * 136
-  exit 1 unless proc_info.call(pid, 3, 0, process, process.bytesize) == process.bytesize
-  process_pid, process_uid, process_gid = [12, 20, 24].map { |offset| process.byteslice(offset, 4).unpack1('L') }
-  seconds, micros = process.byteslice(120, 16).unpack('Q2')
-  exit 1 unless [process_pid, process_uid, process_gid] == [pid, uid, gid] && seconds.positive? && micros < 1_000_000
+  sampled = process_identity(pid)
+  exit 1 unless sampled && sampled[0, 3] == [uid, gid, pid]
+  seconds, micros = sampled[3, 2]
   exit 1 unless socket.getsockopt(0, 0x006).data == token
   STDOUT.write([uid, gid, pid, version, seconds, micros].join(' ') + "\n")
+when 'process-identity'
+  exit 1 unless ARGV.length == 3 && ARGV.all? { |value| /\A[0-9]+\z/.match?(value) }
+  uid, gid, pid = ARGV.map { |value| Integer(value, 10) }
+  sampled = process_identity(pid)
+  exit 1 unless sampled && sampled[0, 3] == [uid, gid, pid]
+  STDOUT.write(sampled.join(' ') + "\n")
 else
   exit 1
 end

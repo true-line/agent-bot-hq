@@ -507,6 +507,7 @@ test('qualification witness reads only the two committed receipt sequences from 
   assert.deepEqual(await store.readCommittedReceipts([first.seq, second.seq]), [
     { ...first, evidence: 'durable' }, second,
   ]);
+  assert.deepEqual(await store.readCommittedReceipts([first.seq]), [{ ...first, evidence: 'durable' }]);
   await assert.rejects(store.readCommittedReceipts([first.seq, first.seq]), /invalid committed receipt/);
   await assert.rejects(store.readCommittedReceipts([first.seq, second.seq + 1]), /committed receipt is missing/);
   chmodSync(store.path, 0o644);
