@@ -66,12 +66,17 @@ function fakeMachineLaunch(calls, overrides = {}, completion = { exit_code: 0, s
   };
 }
 const machineOptions = (machine) => ({ soulLaunch: machine, soulVerifier: machine.verifyReservation,
-  soulCompletionVerifier: machine.verifyCompletion });
+  soulCompletionVerifier: machine.verifyCompletion, machineHqEpoch: 'ab'.repeat(32) });
 const starter = (home, machine) => createSoulStarter({
   core: { random: { hex: (n) => 'ab'.repeat(n) }, clock: { now: () => Date.now() },
     receipts: [], profile: 'managed-cooperative' },
   home, machineLaunch: machine, verifyMachineReservation: machine.verifyReservation,
   verifyMachineCompletion: machine.verifyCompletion, mode: () => 'running',
+  machineHqEpoch: 'ab'.repeat(32),
+});
+test('Machine-backed cooperative starts require a paired HQ epoch before dispatch', () => {
+  assert.throws(() => createSoulStarter({ core: { random: { hex: (n) => 'ab'.repeat(n) } },
+    machineLaunch: fakeMachineLaunch([]) }), /requires a signed HQ pairing epoch/);
 });
 const startRequest = (path) => ({ auth: 'owner', payload: { package_path: path }, takeover: true });
 
