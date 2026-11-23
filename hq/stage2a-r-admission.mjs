@@ -264,6 +264,7 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
   let closePromise;
   const sessions = new Map();
   const peerPids = new WeakMap();
+  const socketSessions = new WeakMap();
   let attachedSession;
   let acpTicket;
   let acpReady = false;
@@ -312,6 +313,10 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
     lose();
     return undefined;
   };
+  const closedSession = (session) => {
+    const state = sessions.get(session);
+    if (state && ['pending', 'attached', 'acp'].includes(state.state)) lose();
+  };
   directory();
   const listener = await listen({
     path: ep.socket_path, auth: 'entry-point', core, mode: 0o660,
@@ -323,10 +328,16 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
       return true;
     },
     newSession: (socket) => {
+      if (typeof socket?.once !== 'function') refuseCooperative();
       const session = `cp_${core.random.hex(12)}`;
       sessions.set(session, { peer_pid: peerPids.get(socket), state: 'new' });
+      socketSessions.set(socket, session);
+      // listenSocket drains dispatch before endSession; this direct close
+      // callback revokes authority in the close event itself.
+      socket.once('close', () => closedSession(session));
       return session;
     },
+    connectionClosed: (socket) => closedSession(socketSessions.get(socket)),
     endSession: (session) => {
       const state = sessions.get(session);
       sessions.delete(session);
@@ -415,6 +426,7 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
       if (state.state !== 'attached' || !ADMISSION_OPERATIONS.has(op)) refuseCooperative();
       if (!attachedPeer(state.peer_pid)) refuseCooperative();
       const result = await admissionDispatch(op, { ...meta, cooperativeStart: state.context });
+      if (!current() || sessions.get(meta.session) !== state) refuseCooperative();
       if (op === 'Hello') acpReady = true;
       return result;
     },

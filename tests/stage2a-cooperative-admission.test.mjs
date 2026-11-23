@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
 import { listenStage2aCooperativeAdmission, listenStage2aCooperativeBroker } from '../hq/stage2a-r-admission.mjs';
 
@@ -45,6 +46,10 @@ function fixture() {
   let admitted = 0;
   let acpOpened = 0;
   let live = true;
+  let attachGate = Promise.resolve();
+  let releaseAttach;
+  let helloGate = Promise.resolve();
+  let releaseHello;
   const lstat = (path) => path === directory
     ? { isDirectory: () => true, uid: 309n, gid: 311n, mode: 0o2750n, dev: 1n, ino: 4n }
     : path === socket_path
@@ -53,7 +58,7 @@ function fixture() {
   const open = () => listenStage2aCooperativeAdmission({ reservation: pinned,
     verifyReservation: async (value) => value, hqUid: 309,
     core: { random: { hex: () => randomBytes(12).toString('hex'), bytes: (n) => randomBytes(n) } },
-    machineAttach: async (input) => { machineCalls++; return { input }; },
+    machineAttach: async (input) => { machineCalls++; await attachGate; return { input }; },
     verifyAttachReceipt: async ({ input }) => receiptValid ? {
       reservation_sha256: input.reservation_sha256,
       start_id: input.start_id, launch_id: input.launch_id,
@@ -62,6 +67,7 @@ function fixture() {
     } : { ...input, challenge_sha256: 'sha256:' + '0'.repeat(64) },
     admissionDispatch: async (op, meta) => {
       admitted++;
+      if (op === 'Hello') await helloGate;
       assert.equal(meta.cooperativeStart.peer_uid, 311);
       assert.equal(meta.cooperativeStart.peer_pid, 402);
       return { op };
@@ -72,9 +78,10 @@ function fixture() {
     observePeer: async (socket, uid) => uid === 311 ? socket.pid : null,
     listen: async (value) => { options = value; return { close: async () => {} }; } });
   const peer = async (pid = 402) => {
-    const socket = { pid };
+    const socket = new EventEmitter();
+    socket.pid = pid;
     const accepted = await options.authenticatePeer(socket);
-    return { accepted, session: accepted ? options.newSession(socket) : undefined };
+    return { socket, accepted, session: accepted ? options.newSession(socket) : undefined };
   };
   return { open, peer, pinned, challenge, lstat,
     get options() { return options; },
@@ -83,6 +90,10 @@ function fixture() {
     get acpOpened() { return acpOpened; },
     get lost() { return lost; },
     badReceipt: () => { receiptValid = false; },
+    holdAttach: () => { attachGate = new Promise((resolve) => { releaseAttach = resolve; }); },
+    releaseAttach: () => releaseAttach(),
+    holdHello: () => { helloGate = new Promise((resolve) => { releaseHello = resolve; }); },
+    releaseHello: () => releaseHello(),
     loseLive: () => { live = false; },
     replaceSocket: () => { socketInode++; } };
 }
@@ -153,6 +164,42 @@ test('closing an attached C listener reports loss once and invalidates the peer 
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(f.lost, 1);
   assert.equal(listener.attachedPeer(402), undefined);
+});
+
+test('C socket close revokes pending Machine attach and pending Hello before queued endSession', async () => {
+  const f = fixture();
+  f.holdAttach();
+  await f.open();
+  const first = await f.peer();
+  const pendingAttach = f.options.dispatch('cooperative.attach.v3', { session: first.session,
+    payload: { reservation_envelope_base64url: f.pinned.envelope_base64url,
+      admission_challenge_base64url: f.challenge } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(f.machineCalls, 1);
+  first.socket.emit('close');
+  assert.equal(f.options.connectionClosed(first.socket), undefined);
+  f.releaseAttach();
+  await assert.rejects(pendingAttach, /cooperative R admission/);
+  assert.equal(f.admitted, 0);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(f.lost, 1);
+
+  const g = fixture();
+  await g.open();
+  const second = await g.peer();
+  await g.options.dispatch('cooperative.attach.v3', { session: second.session,
+    payload: { reservation_envelope_base64url: g.pinned.envelope_base64url,
+      admission_challenge_base64url: g.challenge } });
+  g.holdHello();
+  const pendingHello = g.options.dispatch('Hello', { session: second.session, payload: {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(g.admitted, 1);
+  second.socket.emit('close');
+  assert.equal(g.options.connectionClosed(second.socket), undefined);
+  g.releaseHello();
+  await assert.rejects(pendingHello, /cooperative R admission/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(g.lost, 1);
 });
 
 test('a lost paired R watch revokes the C ticket before ACP takeover', async () => {
