@@ -593,7 +593,7 @@ export function createHQ({
         } });
       } finally { openingRunnerAdmissions.delete(key); }
     },
-    openCooperativeAdmission: async ({ reservation, openAcpStream, onLost }) => {
+    openCooperativeAdmission: async ({ reservation, openAcpStream, onLost, memberAttachProvider }) => {
       const key = reservation?.sha256;
       if (!running || !key || cooperativeGuard?.isRevoked(key)
         || cooperativeListeners.has(key) || openingCooperativeListeners.has(key)
@@ -619,6 +619,8 @@ export function createHQ({
           hqUid: uid, core, machineAttach: (value) => cooperativeAdmission.attach(value),
           verifyAttachReceipt: (receipt, expected) => cooperativeAdmission.verifyAttachReceipt(receipt, expected),
           isLive: (value) => cooperativeGuard.client.watchHealthy(value), openAcpStream, onLost: lost,
+          memberAttachProvider, withLiveRuntime: host.provided('hq-admission')?.withLiveRuntime,
+          assertRunnerLive: (value) => cooperativeGuard.client.assertLive(value),
           admissionDispatch: (op, meta) => {
             if (op !== 'launch' && op !== 'launch.stop') return host.dispatch(op, meta);
             const service = host.provided('hq-admission');

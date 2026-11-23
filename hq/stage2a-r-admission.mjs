@@ -28,10 +28,12 @@ const ATTACH_TTL_MS = 30_000;
 const ATTACH_ENVELOPE_CAP = 16 * 1024;
 
 export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors, runnerEndpoint,
-  core, current, onLost, refreshRunnerPeer } = {}) {
+  core, current, onLost, refreshRunnerPeer, profile = 'managed-protected',
+  cooperativeMemberEndpoint } = {}) {
   if (!provider?.resultSchema || !provider.childObservationSchema || !provider.readySchema
     || typeof provider.select !== 'function'
     || typeof withLiveRuntime !== 'function' || typeof refreshRunnerPeer !== 'function') throw new TypeError('prestarted attach needs a pinned schema and live providers');
+  const cooperative = profile === 'managed-cooperative';
   const slots = new Map();
   const spent = new Set();
   const bridgeTokens = new Set();
@@ -45,17 +47,20 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
   const matches = (a, b, fields) => fields.every((field) => a?.[field] === b?.[field]);
   const usable = (slot) => current() && slot.expires > now() && slot.isCurrent() === true;
 
-  async function prepare(payload, { session, protectedStart }) {
+  async function prepare(payload, { session, runnerPeer }) {
     if (!payload || Object.keys(payload).join(',') !== 'runtime_id' || typeof payload.runtime_id !== 'string'
       || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(payload.runtime_id)
-      || protectedStart?.role !== 'runner' || !current()) refuse();
-    const peer = await refreshRunnerPeer(protectedStart);
+      || runnerPeer?.role !== 'runner' || !current()) refuse();
+    const peer = await refreshRunnerPeer(runnerPeer);
     if (!DIGEST.test(peer?.processSHA256 ?? '') || peer.isCurrent() !== true) refuse();
     const runtimeId = payload.runtime_id;
     const runtime = await withLiveRuntime(runtimeId, session, (rt) => rt);
-    if (runtime.protected_state !== 'active' || runtime.protected_start_id !== selectors.start_id
-      || runtime.installation_id !== selectors.installation_id) refuse();
-    const input = await provider.select({ runtimeId, runtime, selectors, protectedStart });
+    if (runtime.installation_id !== selectors.installation_id
+      || (cooperative ? runtime.cooperative_state !== 'active'
+        || runtime.cooperative_start_key !== `${selectors.installation_id}\0${selectors.start_id}`
+        || runtime.cooperative_reservation_sha256 !== selectors.reservation_sha256
+        : runtime.protected_state !== 'active' || runtime.protected_start_id !== selectors.start_id)) refuse();
+    const input = await provider.select({ runtimeId, runtime, selectors, runnerPeer });
     if (!input || !current() || typeof input.isCurrent !== 'function' || input.isCurrent() !== true
       || typeof input.connect !== 'function' || !DIGEST.test(input.boundAuthoritySHA256 ?? '')) refuse();
     const { machinePublicKey, assignmentBytes, childObservationBytes, readyBytes, authorityBytes } = input;
@@ -68,7 +73,7 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
       schema: provider.authoritySchema, assignmentSchema: provider.assignmentSchema,
       schemas: provider.schemaReferences, assignmentBytes,
       expected: { ...input.expected, ...selectors, soul_id: runtime.soul_id,
-        profile_in_force: 'managed-protected' }, now: now() });
+        profile_in_force: profile }, now: now() });
     const a = assignment.payload, c = child.payload, r = ready.payload;
     checkSchema(provider.childObservationSchema, c);
     checkSchema(provider.readySchema, r);
@@ -118,8 +123,24 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
       ...[a, c, r, authority.payload].map((p) => Date.parse(p.expires_at)));
     if (!Number.isFinite(expires) || expires <= now()) refuse();
     const attach = core.random.hex(32);
-    const ep = bridge.endpoints.member;
-    const { socket_path: memberSocket, ...memberEndpoint } = ep;
+    let ep = bridge.endpoints.member;
+    if (cooperative) {
+      const assignment = verifyStage2aMachineEnvelope(input.cooperativeBridgeBytes, machinePublicKey,
+        'agent-bot/soul-cooperative-bridge-assignment/v3', { schemaVersion: 3, maxBytes: ATTACH_ENVELOPE_CAP });
+      const b = assignment.payload;
+      if (b.contract !== 'machine/v3' || b.kind !== 'soul-cooperative-bridge-assignment'
+        || b.schema_version !== 3 || !Number.isFinite(Date.parse(b.expires_at))
+        || assignment.envelope_sha256 !== a.b_authority.envelope_sha256
+        || !matches(b, a, ['reservation_sha256', 'host_id', 'installation_id', 'start_id', 'plan_id', 'plan_digest', 'hq_epoch'])
+        || !matches(b.bridge, bridge, ['uid', 'gid', 'account']) || Date.parse(b.expires_at) <= now()
+        || !b.endpoints?.member || !cooperativeMemberEndpoint
+        || canonicalDigest(b.endpoints.member) !== canonicalDigest(cooperativeMemberEndpoint)
+        || b.endpoints.member.expected_peer_uid !== bridge.uid
+        || b.endpoints.member.socket_path !== ep.socket_path) refuse();
+      ep = b.endpoints.member;
+    }
+    const { socket_path: memberSocket, ...protectedEndpoint } = ep;
+    const memberEndpoint = cooperative ? ep : protectedEndpoint;
     const reply = Object.freeze({ version: 'stage2a-member-attach/v1', installation_id: selectors.installation_id,
       start_id: selectors.start_id, member_id: member.member_id, member_selector: member.member_selector,
       runtime_id: runtimeId, launch_id: member.launch_id, attach, expires_at: new Date(expires).toISOString(),
@@ -134,7 +155,7 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
     if (!ATTACH_TOKEN.test(attach) || canonicalBytes(reply).length > ATTACH_CAP) refuse();
     checkSchema(provider.resultSchema, reply);
     await withLiveRuntime(runtimeId, session, (rt) => {
-      if (!matches(rt, runtime, ['epoch', 'lease_generation', 'member_id', 'protected_start_id'])
+      if (!matches(rt, runtime, ['epoch', 'lease_generation', 'member_id', 'protected_start_id', 'cooperative_start_key'])
         || !current() || peer.isCurrent() !== true || input.isCurrent() !== true || spent.has(member.launch_id)
         || bridgeTokens.has(reply.member_bridge_token) || bridgeNonces.has(reply.bridge_ready_nonce)) refuse();
       bridgeTokens.add(reply.member_bridge_token);
@@ -146,15 +167,15 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
     return reply;
   }
 
-  async function attach(payload, { takeover: offer, protectedStart }) {
-    if (!offer || protectedStart?.role !== 'runner' || !payload
+  async function attach(payload, { takeover: offer, runnerPeer }) {
+    if (!offer || runnerPeer?.role !== 'runner' || !payload
       || Object.keys(payload).sort().join(',') !== 'attach,launch_id'
       || typeof payload.launch_id !== 'string' || typeof payload.attach !== 'string'
       || !ATTACH_TOKEN.test(payload.attach)) refuse();
     const slot = slots.get(payload.launch_id);
     if (!slot || !usable(slot)
       || !timingSafeEqual(Buffer.from(slot.attach, 'hex'), Buffer.from(payload.attach, 'hex'))) refuse();
-    const peer = await refreshRunnerPeer(protectedStart);
+    const peer = await refreshRunnerPeer(runnerPeer);
     if (peer?.processSHA256 !== slot.processSHA256 || peer.isCurrent() !== true
       || slots.get(payload.launch_id) !== slot || !usable(slot)) refuse();
     slots.delete(payload.launch_id);
@@ -166,6 +187,7 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
     return takeover({ launch_id: payload.launch_id }, {
       open: () => {
         if (peer.isCurrent() !== true || !usable(slot)) { onLost(); refuse(); }
+        peer.markAttached?.();
         return (socket) => {
           try { slot.connect(socket); }
           catch { socket.destroy(); onLost(); }
@@ -308,9 +330,9 @@ export async function listenStage2aRunnerAdmission({ installed, assignment, sele
       if (!current() || !protectedAdmission || !meta.protectedStart) refuse();
       if (memberAttach && op === MEMBER_ATTACH_PREPARE) {
         if (!helloConnections.has(meta.protectedStart)) refuse();
-        return memberAttach.prepare(meta.payload, meta);
+        return memberAttach.prepare(meta.payload, { ...meta, runnerPeer: meta.protectedStart });
       }
-      if (memberAttach && op === MEMBER_ATTACH) return memberAttach.attach(meta.payload, meta);
+      if (memberAttach && op === MEMBER_ATTACH) return memberAttach.attach(meta.payload, { ...meta, runnerPeer: meta.protectedStart });
       if (ADMISSION_OPERATIONS.has(op)) {
         if (typeof admissionDispatch !== 'function'
           || meta.protectedStart.role !== 'runner') refuse();
@@ -374,6 +396,7 @@ export async function listenStage2aRunnerAdmission({ installed, assignment, sele
 // this listener. The protected R listener above never accepts this operation.
 export async function listenStage2aCooperativeAdmission({ reservation, verifyReservation, hqUid, core,
   machineAttach, verifyAttachReceipt, admissionDispatch, openAcpStream, isLive, onLost,
+  memberAttachProvider, withLiveRuntime, assertRunnerLive,
   lstat = (path) => lstatSync(path, { bigint: true }),
   checkACL = checkDarwinACL, observePeer = observePeerPid,
   listen = listenSocket } = {}) {
@@ -485,6 +508,22 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
     lose();
     return undefined;
   };
+  if (memberAttachProvider && (!endpoints.member || typeof assertRunnerLive !== 'function')) refuseCooperative();
+  const memberAttach = memberAttachProvider ? createStage2aMemberAttach({
+    provider: memberAttachProvider, withLiveRuntime,
+    selectors: { ...assignment, reservation_sha256: digest },
+    runnerEndpoint: Object.freeze({ socketPath: ep.socket_path, peerUid: assignment.runner_uid, directory: ep.directory }),
+    cooperativeMemberEndpoint: endpoints.member, profile: 'managed-cooperative',
+    core, current, onLost: lose,
+    refreshRunnerPeer: async (peer) => {
+      const ctx = attachedPeer(peer.peer_pid);
+      if (!ctx || typeof assertRunnerLive !== 'function' || await assertRunnerLive(ctx) !== true
+        || attachedPeer(peer.peer_pid) !== ctx || peer.socket.destroyed) refuseCooperative();
+      return Object.freeze({ processSHA256: canonicalDigest({ uid: ctx.peer_uid, pid: ctx.peer_pid,
+        start: ctx.process_start }), isCurrent: () => !peer.socket.destroyed && attachedPeer(peer.peer_pid) === ctx,
+        markAttached: () => { peer.state = 'acp'; } });
+    },
+  }) : undefined;
   const closedSession = (session) => {
     const state = sessions.get(session);
     if (state && ['pending', 'attached', 'acp'].includes(state.state)) lose();
@@ -502,7 +541,7 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
     newSession: (socket) => {
       if (typeof socket?.once !== 'function') refuseCooperative();
       const session = `cp_${core.random.hex(12)}`;
-      sessions.set(session, { peer_pid: peerPids.get(socket), state: 'new' });
+      sessions.set(session, { role: 'runner', socket, peer_pid: peerPids.get(socket), state: 'new' });
       socketSessions.set(socket, session);
       // listenSocket drains dispatch before endSession; this direct close
       // callback revokes authority in the close event itself.
@@ -520,7 +559,10 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
       const state = sessions.get(meta.session);
       if (!current() || !state || !Number.isSafeInteger(state.peer_pid)) refuseCooperative();
       if (state.state === 'new') {
-        if (op === 'cooperative.acp.v3') {
+        if (memberAttach && op === MEMBER_ATTACH) {
+          return memberAttach.attach(meta.payload, { ...meta, runnerPeer: state });
+        }
+        if (op === 'cooperative.acp.v3' && !memberAttach) {
           state.state = 'acp-check';
           const p = meta.payload;
           if (!meta.takeover || !p || typeof p !== 'object' || Array.isArray(p)
@@ -595,8 +637,11 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
           start_id: assignment.start_id, launch_id: assignment.launch_id,
           broker_socket_path: broker.socket_path, acp_ticket_base64url: acpTicket });
       }
-      if (state.state !== 'attached' || !ADMISSION_OPERATIONS.has(op)) refuseCooperative();
-      if (!attachedPeer(state.peer_pid)) refuseCooperative();
+      if (state.state !== 'attached' || !attachedPeer(state.peer_pid)) refuseCooperative();
+      if (memberAttach && op === MEMBER_ATTACH_PREPARE) {
+        return memberAttach.prepare(meta.payload, { ...meta, runnerPeer: state });
+      }
+      if (!ADMISSION_OPERATIONS.has(op)) refuseCooperative();
       const result = await admissionDispatch(op, { ...meta, cooperativeStart: state.context });
       if (!current() || sessions.get(meta.session) !== state) refuseCooperative();
       if (op === 'Hello') acpReady = true;
