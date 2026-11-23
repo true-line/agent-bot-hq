@@ -6,6 +6,7 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { qualificationApprovalDetail, qualificationPurpose } from '../hq/machine-harness-qualification.mjs';
+import { protectedInstallPurpose } from '../hq/machine-soul-protected-launch.mjs';
 import { machineCommandInHome } from '../hq/machine-channel.mjs';
 
 const action = 'hq-service-recovery';
@@ -42,7 +43,8 @@ async function fixture(t, purpose = action, roleUid = 300) {
   const socket = join(home, 'daemon.sock');
   const requests = [];
   const saved = purpose === action ? savedPlan()
-    : purpose === qualificationPurpose ? qualificationPlan() : upgradePlan();
+    : purpose === qualificationPurpose ? qualificationPlan()
+      : purpose === protectedInstallPurpose ? protectedInstallPlan(hex, roleUid) : upgradePlan();
   const state = { saved, tweak: () => {} };
   let pending;
   const server = createServer((stream) => {
@@ -308,6 +310,100 @@ for (const purpose of ['harness-launch-install', 'harness-launch-retire', accoun
 function harnessJSON(value) {
   return JSON.stringify(value).replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029') + '\n';
 }
+
+function protectedInstallPlan(machineKey, roleUid = 300, change = () => {}) {
+  const root = '/Library/Application Support/ai.true-line.agent-bot-hq';
+  const installation = 'install-one';
+  const sha = value => createHash('sha256').update(value).digest('hex').slice(0, 20);
+  const runnerAccount = '_abm-sr-' + sha(installation);
+  const bridgeAccount = '_abm-br-' + sha('agent-bot-soul-bridge/v1\0' + installation);
+  const artifact = root + '/soul-artifacts/' + sha('agent-bot-soul-endpoint-installation/v1\0' + installation) + '.soul';
+  const soul = 'agent_11111111-1111-1111-1111-111111111111';
+  const emptyDirectory = { path: '', device: 0, inode: '', birth_seconds: 0, birth_nanoseconds: 0 };
+  const policy = {
+    schema: 'agent-bot-machine/stage2a-installed-authority/v1', machine_account: '_agent-bot-machine',
+    machine_uid: 450, machine_gid: 450, plan_owner: 'operator', hq_uid: roleUid,
+    approved_until: '2026-11-23T00:00:00Z', canonical_plan: null, root_receipt: null,
+    claims: emptyDirectory, snapshot_namespace: emptyDirectory, relay_parent: emptyDirectory,
+    legacy_spent_start_ids: [], launcher_sha256: 'a'.repeat(64), artifact_path: artifact,
+    runner: { soul_id: soul, installation_id: installation, account: runnerAccount, uid: 301, gid: 301,
+      package_root: '/reviewed/soul', package_sha256: 'b'.repeat(64) },
+    bridge: { soul_id: soul, installation_id: installation, account: bridgeAccount, uid: 302, gid: 302 },
+    measurement_binding: {
+      contract: 'machine/v2', kind: 'stage2a-measurement-binding', schema_version: 2,
+      installation_id: installation, soul_id: soul, start_id: '', launch_id: '', host_id: 'test-host',
+      hq_epoch: 'c'.repeat(64), plan_id: '', installed_plan_digest: '', package_sha256: 'b'.repeat(64),
+      soul_artifact_sha256: 'd'.repeat(64), profile_in_force: 'managed-protected',
+      claimed_definition_digest: 'sha256:' + 'e'.repeat(64), definition_measurement: 'sha256:' + 'f'.repeat(64),
+      launch_input_measurement: 'sha256:' + '1'.repeat(64), snapshots: {
+        definition: { root_path: '/reviewed/definition', device: '1', inode: '2', generation: '3', birthtime_ns: '4', owner_uid: 450, owner_gid: 301, mode: '0555' },
+        launch_inputs: { root_path: '/reviewed/inputs', device: '1', inode: '5', generation: '3', birthtime_ns: '4', owner_uid: 450, owner_gid: 301, mode: '0555' },
+      },
+    },
+    definition: [{ path: 'SOUL.md', kind: 'regular', sha256: 'e'.repeat(64), size: 1 }],
+    launch_inputs: { files: [], host_projection: {}, selected_command: '/reviewed/node', argv: [],
+      environment: {}, effective_config: {}, system_images: {}, sandbox_policy_digest: 'sha256:' + '2'.repeat(64), component_digests: {} },
+    node: '/reviewed/node', entry: '/reviewed/entry', bridge_executable: { path: '/reviewed/bridge', sha256: '3'.repeat(64) },
+    bridge_qualification: { model: 'test-model', request_sha256: 'sha256:' + '4'.repeat(64) },
+  };
+  const plan = {
+    version: 3, hq_account: role, dir: 'none', members: [bridgeAccount, runnerAccount].sort(),
+    steps: [{ kind: 'soul-protected-launch', target: installation, action: 'write',
+      detail: 'install exact pinned launcher, sandbox policies, Machine public key, per-Soul rule and A-owned authority; publish root applied receipt' }],
+    purpose: protectedInstallPurpose,
+    soul_protected_launch: { schema: 'agent-bot-machine/soul-protected-launch-install/v1',
+      machine_public_key: machineKey, artifact_source: '/reviewed/artifact.soul',
+      bridge_binary_source: '/reviewed/bridge', definition_source: '/reviewed/definition.json',
+      launch_inputs_source: '/reviewed/inputs.json', policy },
+  };
+  change(plan);
+  const plan_canonical = harnessJSON(plan);
+  return { plan_id: id, plan_canonical, plan_digest: createHash('sha256').update(plan_canonical).digest('hex') };
+}
+
+test('paired protected Soul install exports the signed plan and forwards exact owner proof', arm, async (t) => {
+  const f = await fixture(t, protectedInstallPurpose);
+  await assert.rejects(f.issue(), /pin saved by verified Machine status/);
+  await f.pin();
+  await assert.rejects(machineCommandInHome([protectedInstallPurpose, 'export', id, '--socket', f.socket],
+    f.home, process.getuid(), undefined, true), /dedicated HQ/);
+  const line = await f.issue();
+  assert.equal(line, f.state.raw);
+  assert.deepEqual(f.requests.map(r => r.option ?? r.verb), ['status', 'get', 'challenge']);
+  const challenge = JSON.parse(line).body;
+  assert.equal(challenge.plan_canonical, f.state.saved.plan_canonical);
+  writeFileSync(f.challengeFile, line + '\n');
+  writeFileSync(f.proofFile, JSON.stringify(proof({ ...challenge, action: 'harness-launch-install' }, f.owner)));
+  await assert.rejects(f.approve(), /invalid owner signature/);
+  assert.equal(f.requests.length, 3);
+  writeFileSync(f.proofFile, JSON.stringify(proof(challenge, f.owner)));
+  assert.equal((await f.approve()).state, 'approved');
+  assert.ok(f.requests.at(-1).owner_signature);
+  await assert.rejects(f.approve(), /MM_DAEMON_PEER_REFUSED/);
+});
+
+test('paired protected Soul install rejects altered scope before issuing a challenge', arm, async (t) => {
+  const f = await fixture(t, protectedInstallPurpose);
+  await f.pin();
+  const machineKey = JSON.parse(f.state.saved.plan_canonical).soul_protected_launch.machine_public_key;
+  for (const change of [
+    p => { p.soul_protected_launch.machine_public_key = 'f'.repeat(64); },
+    p => { p.soul_protected_launch.policy.hq_uid = 399; },
+    p => { p.soul_protected_launch.policy.artifact_path = '/tmp/other.soul'; },
+    p => { p.soul_protected_launch.policy.claims.inode = '1'; },
+    p => { p.soul_protected_launch.policy.runner.uid = p.soul_protected_launch.policy.bridge.uid; },
+    p => { p.soul_protected_launch.policy.measurement_binding.soul_artifact_sha256 = ''; },
+    p => { p.steps[0].detail = 'install a different policy'; },
+    p => { p.steps.push({ kind: 'file', target: '/tmp/extra', action: 'write' }); },
+    p => { p.soul_protected_launch.launch_inputs_source = '/tmp/../other'; },
+    p => { p.purpose = 'harness-launch-install'; },
+  ]) {
+    f.state.saved = protectedInstallPlan(machineKey, 300, change);
+    const before = f.requests.length;
+    await assert.rejects(f.issue());
+    assert.deepEqual(f.requests.slice(before).map(r => r.verb), ['members-plans']);
+  }
+});
 
 function harnessPlan(purpose, change = () => {}) {
   const root = '/Library/Application Support/ai.true-line.agent-bot-hq';
