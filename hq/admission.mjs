@@ -182,7 +182,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             || !state?.bridge_process
             || canonicalDigest(state.bridge_process) !== canonicalDigest(binding.bridge_process))
             fail('host.launch_unavailable', 'v3 relay state does not match the live B binding');
-          return state;
+          return Object.freeze({ ...state,
+            member_b_authority_envelope_sha256: binding.authority_envelope_sha256 });
         },
         attest: relayPeerAuthority?.attest,
         clock,

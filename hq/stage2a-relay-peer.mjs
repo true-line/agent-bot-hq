@@ -22,7 +22,7 @@ const JOIN = ['profile_in_force', 'host_id', 'installation_id', 'soul_id', 'star
 const READY_FIELDS = ['contract', 'kind', 'schema_version', 'profile_in_force', 'host_id',
   'installation_id', 'soul_id', 'start_id', 'hq_epoch', 'reservation_sha256',
   'assignment_envelope_sha256', 'child_observation_envelope_sha256',
-  'b_authority_sha256', 'provisional_hq_mapping_sha256', 'bridge_process',
+  'b_authority_sha256', 'member_b_authority_envelope_sha256', 'provisional_hq_mapping_sha256', 'bridge_process',
   'members', 'observed_at', 'issued_at', 'expires_at'];
 const READY_MEMBER_FIELDS = ['member_id', 'launch_id', 'member_selector', 'runtime_id',
   'bridge_arm', 'bridge_arm_receipt_sha256'];
@@ -139,6 +139,7 @@ function verifyReady(state, challenge, now) {
     || typeof payload.members[1]?.member_id !== 'string'
     || payload.members[0].member_id >= payload.members[1].member_id
     || payload.b_authority_sha256 !== state.b_authority_sha256
+    || payload.member_b_authority_envelope_sha256 !== state.member_b_authority_envelope_sha256
     || payload.provisional_hq_mapping_sha256 !== state.provisional_hq_mapping_sha256
     || !same(payload.bridge_process, state.bridge_process)
     || ![observed, issued, expires].every(Number.isFinite)
@@ -217,6 +218,7 @@ export function createStage2aRelayPeerChallenge({ current, boundStart, attest,
       || !SHA.test(state.ready_envelope_sha256)
       || !SHA.test(state.finalization_envelope_sha256)
       || !SHA.test(state.b_authority_sha256)
+      || !SHA.test(state.member_b_authority_envelope_sha256)
       || !SHA.test(state.provisional_hq_mapping_sha256)
       || !state.member || JOIN.some((field) => state[field] !== challenge[field])
       || state.member.member_id !== challenge.member_id
@@ -237,6 +239,7 @@ export function createStage2aRelayPeerChallenge({ current, boundStart, attest,
         || rechecked.reservation_expires_at !== state.reservation_expires_at
         || rechecked.finalization_envelope_sha256 !== state.finalization_envelope_sha256
         || rechecked.ready_envelope_sha256 !== state.ready_envelope_sha256
+        || rechecked.member_b_authority_envelope_sha256 !== state.member_b_authority_envelope_sha256
         || JOIN.some((field) => rechecked[field] !== state[field])
         || !Buffer.isBuffer(rechecked.readyEnvelopeBytes)
         || !rechecked.readyEnvelopeBytes.equals(state.readyEnvelopeBytes)

@@ -59,7 +59,8 @@ function fixture(profile = 'managed-protected') {
       'soul_id', 'start_id', 'hq_epoch', 'reservation_sha256',
       'assignment_envelope_sha256', 'child_observation_envelope_sha256']
       .map((field) => [field, challenge[field]])),
-    b_authority_sha256: hash('a'), provisional_hq_mapping_sha256: hash('b'),
+    b_authority_sha256: hash('a'), member_b_authority_envelope_sha256: hash('c'),
+    provisional_hq_mapping_sha256: hash('b'),
     bridge_process,
     members: [{ member_id: 'm_lead', launch_id: `ln_${'a'.repeat(24)}`,
       member_selector: member.member_selector, runtime_id: member.runtime_id,
@@ -79,6 +80,7 @@ function fixture(profile = 'managed-protected') {
     ready_envelope_sha256: SHA(readyEnvelopeBytes),
     finalization_envelope_sha256: hash('7'),
     b_authority_sha256: ready.b_authority_sha256,
+    member_b_authority_envelope_sha256: ready.member_b_authority_envelope_sha256,
     provisional_hq_mapping_sha256: ready.provisional_hq_mapping_sha256,
     bridge_process,
     reservation_expires_at: '2026-11-23T18:31:00Z' };
@@ -136,6 +138,18 @@ test('missing v3 bind, changed member, sibling parent and lost connection refuse
   await assert.rejects(f.service(f.challenge, f.meta, f.receipt), /unavailable/);
   f.disconnect();
   await assert.rejects(f.service(f.challenge, f.meta, f.receipt), /unavailable/);
+});
+
+test('signed Ready must join the member B authority on the current v3 binding', async () => {
+  for (const authority of [undefined, hash('d')]) {
+    const f = fixture();
+    if (authority === undefined) delete f.ready.member_b_authority_envelope_sha256;
+    else f.ready.member_b_authority_envelope_sha256 = authority;
+    f.state.readyEnvelopeBytes = f.envelope(f.ready, READY_PURPOSE);
+    f.state.ready_envelope_sha256 = SHA(f.state.readyEnvelopeBytes);
+    f.payload.ready_envelope_sha256 = f.state.ready_envelope_sha256;
+    await assert.rejects(f.service(f.challenge, f.meta, f.receipt), /unavailable/);
+  }
 });
 
 test('A signature, exact challenge correlation, expiry and duplicate nonce are enforced', async () => {
