@@ -1,7 +1,8 @@
 // HQ has no npm dependencies (§3.4 rule 5): hq/ imports node: built-ins, the
 // SDK and its own modules. Only the command line (main.mjs) reaches into
 // scripts/, to load the pinned soul-contracts schemas, and only the plugin
-// loader (plugins.mjs) imports dynamically.
+// loader (plugins.mjs) imports dynamically. The protected H preloader imports
+// one measured guard module from bytes checked against its A-signed file row.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
@@ -22,7 +23,10 @@ test('hq/ imports only node: built-ins, sdk/ and its own modules', () => {
       const allowed = [HQ + '/', join(ROOT, 'sdk') + '/', ...(f === 'main.mjs' ? [join(ROOT, 'scripts') + '/'] : [])];
       assert.ok(allowed.some((a) => target.startsWith(a)), `hq/${f} imports ${relative(ROOT, target)}`);
     }
-    // Only the plugin loader imports dynamically, after its digest checks.
-    if (f !== 'plugins.mjs') assert.doesNotMatch(src, /\bimport\s*\(/, `hq/${f} uses a dynamic import`);
+    // Keep the two audited dynamic routes singular. The plugin loader checks
+    // its digest; the H preloader hashes the signed guard bytes before import.
+    const dynamicCalls = [...src.matchAll(/\bimport\s*\(/g)].length;
+    assert.equal(dynamicCalls, ['plugins.mjs', 'stage2a-h-preloader.mjs'].includes(f) ? 1 : 0,
+      `hq/${f} has an unreviewed dynamic import`);
   }
 });

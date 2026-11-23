@@ -136,10 +136,32 @@ def activated_socket
   end
 end
 
-def exec_hq(node, entry, arguments, socket)
-  exec({'HQ_LAUNCHD_OWNER_PID' => Process.pid.to_s}, [node, node], entry, *arguments, 3 => socket, 4 => socket, :close_others => true)
+def exec_hq(node, entry, arguments, socket, node_flags: [])
+  exec({'HQ_LAUNCHD_OWNER_PID' => Process.pid.to_s}, [node, node], *node_flags,
+       entry, *arguments, 3 => socket, 4 => socket, :close_others => true)
 rescue SystemCallError
   stop_launch(LAUNCH_EXEC, 'could not exec the approved HQ runtime')
+end
+
+# The opt-in protected service install pins this complete post-helper Node
+# argv in its A-signed H descriptor. The base HQ service keeps its old form.
+# This helper parses the flags before Node exec so launchd socket activation
+# cannot silently strip the preloader, and rejects owner plugin overrides.
+def launch_arguments(argv, role)
+  node, *tail = argv
+  raise ArgumentError unless role == '_agent-bot-hq' && node&.start_with?('/')
+  flags = ['--no-addons', '--disallow-code-generation-from-strings', '--import']
+  if tail[0, 3] == flags
+    preloader, entry, *arguments = tail[3..-1]
+    raise ArgumentError unless preloader&.start_with?('/') && entry&.start_with?('/') &&
+                               arguments.first == 'run' &&
+                               (arguments & ['--plugins', '--dev-plugins']).empty?
+    [node, entry, arguments, flags + [preloader]]
+  else
+    entry, *arguments = tail
+    raise ArgumentError unless entry&.start_with?('/') && arguments.first == 'run'
+    [node, entry, arguments, []]
+  end
 end
 
 return unless __FILE__ == $PROGRAM_NAME
@@ -151,21 +173,23 @@ when 'probe'
   left, right = UNIXSocket.pair
   exit(left.getpeereid.first == Process.euid && right.getpeereid.first == Process.euid)
 when 'launch'
-  node, entry, *arguments = ARGV
   role = begin
     Etc.getpwuid(Process.euid).name
   rescue ArgumentError
     stop_launch(LAUNCH_ROLE, 'cannot resolve the dedicated HQ account')
   end
-  stop_launch(LAUNCH_ROLE, 'expected dedicated HQ launch arguments') unless role == '_agent-bot-hq' &&
-    node && node.start_with?('/') && entry && entry.start_with?('/') && arguments.first == 'run'
+  node, entry, arguments, node_flags = begin
+    launch_arguments(ARGV, role)
+  rescue ArgumentError
+    stop_launch(LAUNCH_ROLE, 'expected dedicated HQ launch arguments')
+  end
   socket = activated_socket
   # HQ verifies the public peer after it can accept paused streams.
   # Machine also waits up to three seconds for launchd to publish the leaf.
   # Missing ancestors and unsafe existing entries still fail immediately.
   code = listener_status(socket, verify_public: false, publication_wait: 3)
   stop_launch(code, 'unexpected launchd listener') unless code.zero?
-  exec_hq(node, entry, arguments, socket)
+  exec_hq(node, entry, arguments, socket, node_flags: node_flags)
 when 'descriptor'
   socket = Socket.for_fd(3)
   copy = Socket.for_fd(4)
