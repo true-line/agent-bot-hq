@@ -45,6 +45,7 @@ import { validate } from '../sdk/wire/schema.mjs';
 import { negotiateVersions, supportWindow } from '../sdk/wire/versions.mjs';
 import { profileWarning } from './profile.mjs';
 import { createBridgeBindAdmission } from './bridge-bind.mjs';
+import { createStage2aRelayPeerChallenge } from './stage2a-relay-peer.mjs';
 import { resolveNoticeScope, validNoticeScope, validNoticeRepository } from './notices-config.mjs';
 
 export const PROTECTED_GRANT_REFUSAL_RECEIPT = Symbol('committed protected grant refusal');
@@ -134,7 +135,7 @@ const unboundOf = (tx) => tx.list('runtimes').map(([, rt]) => rt).filter((rt) =>
 // the account a broker connection arrived from ({ account, uid }), or
 // undefined on the shared socket. HQ core supplies all three; an agent never
 // does.
-export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, qualificationAuthorizer, relayIngressAuthorizer, protectedAdmission, cooperativeAdmission } = {}) {
+export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, qualificationAuthorizer, relayIngressAuthorizer, relayPeerAuthority, protectedAdmission, cooperativeAdmission } = {}) {
   for (const n of SCHEMA_NAMES) if (!schemas?.[n]) throw new TypeError(`admission needs the pinned hq/v1 ${n} schema`);
   if (protectedAdmission && (typeof protectedAdmission.acceptPeer !== 'function'
     || typeof protectedAdmission.verifyHelloStart !== 'function'
@@ -169,6 +170,12 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
       const { store, receipts, clock, random, config, profile } = ctx.services;
       const bridge = createBridgeBindAdmission({ authority: bridgeAuthority, qualificationAuthorizer,
         relayIngressAuthorizer, clock, random, receipts });
+      const relayPeerChallenge = createStage2aRelayPeerChallenge({
+        current: relayPeerAuthority?.current,
+        boundStart: relayPeerAuthority?.boundStart,
+        attest: relayPeerAuthority?.attest,
+        clock,
+      });
       bridgeStates.set(ctx, bridge);
       const atomicAudit = typeof receipts.appendIn === 'function';
       const ttl = () => config.get('leaseTtlMs') ?? DEFAULT_LEASE_TTL_MS;
@@ -852,7 +859,14 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         qualifyBridgeMessagesV2: bridge.qualifyBridgeMessagesV2,
         bridgeRelayIngressEnabledV2: bridge.bridgeRelayIngressEnabledV2,
         relayBridgeIngressV2: bridge.relayBridgeIngressV2,
-        forgetBridgeConnection: bridge.forgetBridgeConnection,
+        stage2aRelayPeerChallengeEnabled: () => typeof relayPeerAuthority?.current === 'function'
+          && typeof relayPeerAuthority?.boundStart === 'function'
+          && typeof relayPeerAuthority?.attest === 'function',
+        stage2aRelayPeerChallenge: relayPeerChallenge,
+        forgetBridgeConnection: (connection, ...args) => {
+          relayPeerChallenge.forgetConnection(connection);
+          return bridge.forgetBridgeConnection(connection, ...args);
+        },
         boundBridge: bridge.boundBridge,
         bridgeStatus: bridge.bridgeStatus,
         revokeBridges: bridge.revokeAll,

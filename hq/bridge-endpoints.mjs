@@ -12,11 +12,14 @@ const ROLE_UID = (uid) => Number.isInteger(uid) && uid >= 300 && uid <= 399;
 const INSTALLATION = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const BRIDGE_QUALIFICATION_MESSAGES = 'bridge.qualification.messages.v1';
 const BRIDGE_RELAY_INGRESS = 'bridge.relay.ingress.v1';
-const protectedBridgeKind = (kind) => kind === 'bridge.bind.v2.challenge' || kind === 'bridge.bind.v2';
+const RELAY_PEER_CHALLENGE = 'stage2a-relay-peer-challenge';
+const protectedBridgeKind = (kind) => kind === 'bridge.bind.v2.challenge' || kind === 'bridge.bind.v2'
+  || kind === 'bridge.bind.v3.challenge' || kind === 'bridge.bind.v3';
 const refuse = () => fail('host.launch_unavailable', 'bridge bind requires the dedicated Machine-assigned B broker');
 
 export function memberBrokerDispatch(host, kind, payload, connection) {
-  if (protectedBridgeKind(kind) || kind === BRIDGE_QUALIFICATION_MESSAGES || kind === BRIDGE_RELAY_INGRESS) refuse();
+  if (protectedBridgeKind(kind) || kind === BRIDGE_QUALIFICATION_MESSAGES || kind === BRIDGE_RELAY_INGRESS
+    || kind === RELAY_PEER_CHALLENGE) refuse();
   return host.brokerAccept(kind, payload, { connection });
 }
 
@@ -59,6 +62,7 @@ export function planBridgeEndpoints(assignments, { platform, account, hqUid, har
 
 export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
   enableBridgeQualification = false, enableBridgeRelayIngress = false,
+  enableRelayPeerChallenge = false,
   lstat = (path) => lstatSync(path, { bigint: true }),
   checkACL = checkDarwinACL, authenticate = authenticatePeerUid, listen = listenSocket } = {}) {
   function checkDirectory() {
@@ -124,10 +128,12 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
     dispatch(kind, { payload, session }) {
       const qualification = kind === BRIDGE_QUALIFICATION_MESSAGES;
       const relayIngress = kind === BRIDGE_RELAY_INGRESS;
+      const livePeer = kind === RELAY_PEER_CHALLENGE;
       const peer = peers.get(session);
       if (!peer || (!protectedBridgeKind(kind) && !(qualification && enableBridgeQualification === true)
-        && !(relayIngress && enableBridgeRelayIngress === true))) refuse();
-      if ((qualification || relayIngress || endpoint.parentIdentity)
+        && !(relayIngress && enableBridgeRelayIngress === true)
+        && !(livePeer && enableRelayPeerChallenge === true))) refuse();
+      if ((qualification || relayIngress || livePeer || endpoint.parentIdentity)
         && (peer.socket.destroyed || !peer.checkCurrent())) refuse();
       return host.brokerAccept(kind, payload, { connection: session });
     },
