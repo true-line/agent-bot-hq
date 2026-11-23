@@ -54,7 +54,7 @@ import { createStage2aCooperativeMachine } from './stage2a-cooperative-machine.m
 import { createStage2aCooperativeStarter } from './stage2a-cooperative-start.mjs';
 import { createStage2aQualificationProvider } from './stage2a-qualification-provider.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul qualify-direct --start-id ID|soul starts|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
@@ -76,8 +76,8 @@ function parse(argv) {
       if (!args.soul || args.cmd !== 'soul' || args.sub !== 'start') throw new Error('--soul DIR is only for soul start');
     } else if (argv[i] === '--start-id') {
       args.startId = argv[++i];
-      if (!/^st_[0-9a-f]{24}$/.test(args.startId ?? '') || args.cmd !== 'soul' || args.sub !== 'stop') {
-        throw new Error('--start-id needs a valid start ID and is only for soul stop');
+      if (!/^st_[0-9a-f]{24}$/.test(args.startId ?? '') || args.cmd !== 'soul' || !['stop', 'qualify-direct'].includes(args.sub)) {
+        throw new Error('--start-id needs a valid start ID and is only for soul stop or soul qualify-direct');
       }
     } else if (argv[i] === '--profile') {
       args.profile = argv[++i];
@@ -377,10 +377,10 @@ async function main(argv) {
       await startSoul(controlPath, args.soul, args.profile);
       return;
     }
-    if (args.sub !== 'stop' && args.sub !== 'starts') throw new Error(USAGE);
-    if (args.sub === 'stop' && !args.startId) throw new Error('soul stop needs --start-id ID');
+    if (!['stop', 'starts', 'qualify-direct'].includes(args.sub)) throw new Error(USAGE);
+    if (['stop', 'qualify-direct'].includes(args.sub) && !args.startId) throw new Error(`soul ${args.sub} needs --start-id ID`);
     const result = await ask(controlPath, `soul.${args.sub}`,
-      args.sub === 'stop' ? { start_id: args.startId } : undefined);
+      args.startId ? { start_id: args.startId } : undefined);
     if (!result.ok) throw new Error(JSON.stringify(result.refusal ?? result.host_refusal ?? result));
     console.log(JSON.stringify(result.result, null, 2));
     if (result.result.state === 'containment_unconfirmed') process.exitCode = 1;

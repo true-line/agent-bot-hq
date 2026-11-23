@@ -456,7 +456,7 @@ export function createHQ({
         ).finally(() => { checkingPair = undefined; });
         await checkingPair;
       }
-      return ['soul.start', 'soul.starts', 'soul.stop'].includes(op) ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta);
+      return ['soul.start', 'soul.starts', 'soul.stop', 'soul.qualify-direct'].includes(op) ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta);
     }
 
     try {

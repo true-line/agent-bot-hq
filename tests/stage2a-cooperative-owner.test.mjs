@@ -349,7 +349,9 @@ test('owner takeover waits for ticketed ACP and stop fences channels before awai
   core.persistReceipt = undefined;
   await assert.rejects(hybrid.qualifyDirectProtectedClaim(token.result.start_id), /unavailable/);
   core.persistReceipt = persistReceipt;
-  const captured = await hybrid.qualifyDirectProtectedClaim(token.result.start_id);
+  const captured = await hybrid.dispatch('soul.qualify-direct', {
+    auth: 'owner', payload: { start_id: token.result.start_id },
+  });
   const raw = Buffer.from(captured.hq_refusal_receipt_base64url, 'base64url');
   assert.equal(captured.hq_refusal_receipt_sha256, digest(raw));
   const receipt = JSON.parse(raw);
@@ -359,7 +361,9 @@ test('owner takeover waits for ticketed ACP and stop fences channels before awai
   assert.equal(receipt.reservation_sha256, fakeReservation.sha256);
   assert.equal(receipt.cooperative_start_receipt_seq, core.receipts[0].seq);
   assert.equal(receipt.cooperative_start_receipt_sha256, digest(canonicalBytes(core.receipts[0])));
-  await assert.rejects(hybrid.qualifyDirectProtectedClaim(token.result.start_id), /already used/);
+  await assert.rejects(hybrid.dispatch('soul.qualify-direct', {
+    auth: 'owner', payload: { start_id: token.result.start_id },
+  }), /already used/);
   const stop = stage.stop(token.result.start_id);
   assert.equal(stage.report()[0].state, 'stopping');
   assert.equal(acp.destroyed, true);

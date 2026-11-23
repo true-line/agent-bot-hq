@@ -68,6 +68,13 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
   }
 
   async function dispatch(op, { auth, payload, takeover: canTakeOver }) {
+    if (op === 'soul.qualify-direct') {
+      if (auth !== 'owner') fail('host.auth_mismatch', 'Direct qualification is owner-only');
+      if (!payload || Object.keys(payload).join(',') !== 'start_id' || !ID.test(payload.start_id ?? '')) {
+        fail('host.invalid_request', 'soul.qualify-direct needs a valid start_id');
+      }
+      return qualifyDirectProtectedClaim(payload.start_id);
+    }
     if (op === 'soul.starts') {
       if (auth !== 'owner') fail('host.auth_mismatch', 'Soul starts are owner-only');
       return { starts: report() };
