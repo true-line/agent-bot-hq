@@ -82,7 +82,7 @@ function activateRunner(runner, assignment, reservationSHA256, live, finalizatio
 // Hello transaction boundary. Only the later selector-bound attach owns ACP.
 export function createStage2aPrestartedMembers({ machinePublicKey, schemas, schemaReferences = [],
   submitMap, startMember, observeChildren, deliverObservation, waitForReady, stop,
-  now = Date.now } = {}) {
+  profile = 'managed-protected', now = Date.now } = {}) {
   if (!schemas?.assignment || !schemas.mapping || !schemas.authority || !schemas.observation || !schemas.ready
     || [submitMap, startMember, observeChildren, deliverObservation, waitForReady, stop, now]
       .some((method) => typeof method !== 'function')) refuse();
@@ -118,7 +118,7 @@ export function createStage2aPrestartedMembers({ machinePublicKey, schemas, sche
       const authority = verifyStage2aBridgeMemberAuthority(authorityBytes, { machinePublicKey,
         schema: schemas.authority, assignmentSchema: schemas.assignment,
         schemas: refs(schemas.assignment).filter((schema) => schema.$id !== schemas.authority.$id),
-        expected: { ...expectedAuthority, ...selectors, profile_in_force: 'managed-protected' },
+        expected: { ...expectedAuthority, ...selectors, profile_in_force: profile },
         assignmentBytes, now: now() });
       const match = (left, right, fields) => fields.every((field) => left?.[field] === right?.[field]);
       const scope = ['profile_in_force', 'host_id', 'installation_id', 'soul_id', 'start_id', 'hq_epoch'];

@@ -7,7 +7,7 @@ import { takeover } from './socket.mjs';
 
 const unavailable = (message) => fail('host.launch_unavailable', message);
 
-export function createStage2aCooperativeStarter({ machine, core, readCommittedReceipts, openAdmission, timeoutMs = 30000 }) {
+export function createStage2aCooperativeStarter({ machine, core, readCommittedReceipts, openAdmission, brokeredMemberProvider, timeoutMs = 30000 }) {
   const starts = new Map();
   const paths = new Set();
   const installations = new Set();
@@ -103,6 +103,9 @@ export function createStage2aCooperativeStarter({ machine, core, readCommittedRe
       item.reserveSelectors = Object.freeze({
         startId: id, launchId: `ln_${core.random.hex(12)}`, challenge: randomBytes(32),
       });
+      const brokered = item.installation.adapter_transport === 'brokered-b';
+      if (brokered && typeof brokeredMemberProvider !== 'function')
+        unavailable('cooperative B prestart provider is unavailable');
       item.reservation = await machine.reserve(item.installation, item.reserveSelectors);
       machine.watch(item.reservation, lost);
       if (!running()) machine.revoke(item.reservation);
@@ -112,7 +115,11 @@ export function createStage2aCooperativeStarter({ machine, core, readCommittedRe
 
       let accept;
       const acp = new Promise((resolve) => { accept = resolve; });
-      item.listener = await openAdmission({ reservation: item.reservation,
+      const memberAttachProvider = brokered
+        ? await brokeredMemberProvider(item.reservation, machine.brokeredMemberInputs(item.reservation)) : undefined;
+      if (brokered && !memberAttachProvider) unavailable('cooperative B prestart provider is unavailable');
+      checkRunning();
+      item.listener = await openAdmission({ reservation: item.reservation, memberAttachProvider,
         openAcpStream: (socket, context) => {
           if (!running()) { socket.destroy(); return; }
           machine.markAcp(item.reservation, context, socket);

@@ -1,6 +1,7 @@
 import { isAbsolute, join } from 'node:path';
 import { fail } from '../sdk/errors.mjs';
-import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
+import { canonicalBytes, canonicalDigest } from '../sdk/wire/canonical-json.mjs';
+import { verifyStage2aMachineEnvelope } from './stage2a-stop.mjs';
 import { digest, match, SHA256, verifyCooperativeProof, verifyDirectQualificationCapture, verifyDirectQualificationPre } from './stage2a-cooperative-proof.mjs';
 
 const HEX256 = /^[0-9a-f]{64}$/;
@@ -23,9 +24,10 @@ function freezeJSON(value) {
   return value;
 }
 
-export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, machinePublicKey, now = Date.now }) {
+export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, machinePublicKey, enableBrokeredB = false, verifyBrokeredContainment, now = Date.now }) {
   if (typeof exchange !== 'function' || !SHA256.test(hDescriptorDigest ?? '')
     || !HEX256.test(machinePublicKey ?? '')) invalid();
+  const allowsTransport = (value) => value === 'direct-comms' || (enableBrokeredB === true && value === 'brokered-b');
   const active = new Map();
   const owned = (reservation) => {
     const entry = active.get(reservation?.sha256);
@@ -99,7 +101,7 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
   }
 
   function reservationRequest(installed, { startId, launchId, challenge }) {
-    if (installed.adapter_transport !== 'direct-comms' || startId !== installed.reviewed_start_id) invalid();
+    if (!allowsTransport(installed.adapter_transport) || startId !== installed.reviewed_start_id) invalid();
     return Object.freeze({ profile: 'managed-cooperative', host_id: installed.host_id,
       plan_digest: installed.plan_digest, installation_id: installed.installation_id,
       start_id: startId, launch_id: launchId, hq_epoch: installed.hq_epoch,
@@ -107,8 +109,47 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       admission_challenge_base64url: challenge.toString('base64url') });
   }
 
+  function brokeredInputs(body, machineKey, payload, installed) {
+    const decode = (prefix, purpose, schemaVersion) => {
+      const encoded = body[`${prefix}_envelope_base64url`], sha = body[`${prefix}_sha256`];
+      if (typeof encoded !== 'string' || encoded.length > 22_000 || !SHA256.test(sha)) invalid();
+      const bytes = Buffer.from(encoded, 'base64url');
+      if (bytes.toString('base64url') !== encoded) invalid();
+      const signed = verifyStage2aMachineEnvelope(bytes, machineKey, purpose, { schemaVersion, maxBytes: 16_384 });
+      if (signed.envelope_sha256 !== sha) invalid();
+      return signed.payload;
+    };
+    const detached = decode('bridge_assignment', 'agent-bot/soul-cooperative-bridge-assignment/v3', 3);
+    const members = decode('member_set_assignment', 'agent-bot/stage2a-member-set-assignment/v1', 1);
+    const a = payload.assignment;
+    const shared = { ...pick(a, selectionFields.filter((field) => field !== 'launch_id')),
+      host_id: payload.host_id, reservation_sha256: body.sha256 };
+    if (!match(detached, { ...shared, kind: 'soul-cooperative-bridge-assignment',
+      contract: 'machine/v3', schema_version: 3, launch_id: a.launch_id,
+      bridge_launch_sha256: payload.bridge_launch_sha256, expires_at: payload.expires_at })
+      || !match(members, { ...shared, contract: 'machine/v3', kind: 'stage2a-member-set-assignment',
+        schema_version: 1, profile_in_force: 'managed-cooperative', soul_id: a.soul_id,
+        runner_uid: a.runner_uid, runner_gid: a.runner_gid, expires_at: payload.expires_at })
+      || !match(members.b_authority, { purpose: 'agent-bot/soul-cooperative-bridge-assignment/v3',
+        envelope_sha256: body.bridge_assignment_sha256 })
+      || !match(members.bridge, pick(detached.bridge, ['uid', 'gid', 'account']))
+      || detached.endpoints?.broker?.socket_path !== installed.broker_socket_path
+      || canonicalDigest(detached.endpoints.member) !== canonicalDigest(payload.endpoints.member)
+      || canonicalDigest(detached.endpoints.relay) !== canonicalDigest(payload.endpoints.relay)
+      || canonicalDigest(members.bridge.endpoints) !== canonicalDigest(detached.endpoints)
+      || !SHA256.test(members.owner_plan_member_set_sha256 ?? '') || members.members?.length !== 2) invalid();
+    return Object.freeze({ detached, members });
+  }
+
   function acceptReservation(response, installed, request, recovered = false) {
-    const payload = proof(response, 'reservation');
+    const brokered = installed.adapter_transport === 'brokered-b';
+    const body = response.body;
+    if (!allowsTransport(installed.adapter_transport) || (brokered
+      && Object.keys(body ?? {}).sort().join(',') !== ['envelope_base64url', 'sha256',
+        'bridge_assignment_envelope_base64url', 'bridge_assignment_sha256',
+        'member_set_assignment_envelope_base64url', 'member_set_assignment_sha256'].sort().join(','))) invalid();
+    const payload = brokered ? verifyCooperativeProof(pick(body, ['envelope_base64url', 'sha256']),
+      response.machineKey, 'reservation') : proof(response, 'reservation');
     const a = payload.assignment, m = payload.measurement_binding;
     const issued = instant(payload.issued_at), expires = instant(payload.expires_at);
     if (!match(payload, pick(request, ['host_id', 'admission_challenge_sha256']))
@@ -120,7 +161,8 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       || a.runner_uid !== installed.runner_uid || a.runner_gid !== installed.runner_gid
       || payload.endpoints?.admission?.directory !== installed.admission_directory
       || payload.endpoints?.admission?.socket_path !== installed.admission_socket_path
-      || payload.endpoints?.broker?.socket_path !== installed.broker_socket_path
+      || (brokered ? Object.keys(payload.endpoints ?? {}).sort().join(',') !== 'admission,member,relay'
+        : payload.endpoints?.broker?.socket_path !== installed.broker_socket_path)
       || a.hq_uid !== process.getuid?.() || !Number.isSafeInteger(a.runner_uid) || a.runner_uid < 300
       || a.runner_uid === a.hq_uid || a.runner_uid === a.machine_uid || a.runner_gid !== a.runner_uid
       || !/^agent_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(a.soul_id ?? '')
@@ -131,9 +173,10 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
         profile_in_force: 'managed-cooperative', host_id: payload.host_id, installed_plan_digest: a.plan_digest })
       || !SHA256.test(m.launch_input_measurement ?? '') || m.h_service_descriptor_digest !== hDescriptorDigest
       || !SHA256.test(m.claimed_definition_digest ?? '')) invalid();
-    const reservation = freezeJSON({ ...response.body, payload });
+    const memberInputs = brokered ? brokeredInputs(body, response.machineKey, payload, installed) : undefined;
+    const reservation = freezeJSON({ ...body, payload });
     if (active.has(reservation.sha256)) invalid();
-    active.set(reservation.sha256, { reservation, machineKey: response.machineKey, expires, revoked: false });
+    active.set(reservation.sha256, { reservation, machineKey: response.machineKey, expires, memberInputs, revoked: false });
     return reservation;
   }
 
@@ -151,7 +194,7 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
         || !path(installed.broker_socket_path) || !Buffer.isBuffer(installed.machineKey) || installed.machineKey.length !== 32) invalid();
       // Only A's installed policy can select an adapter that speaks Comms
       // directly. A stock vendor HTTP client needs the separate pre-ACP B bind.
-      if (installed.adapter_transport !== 'direct-comms') {
+      if (!allowsTransport(installed.adapter_transport)) {
         fail('profile_insufficient', 'the installed Soul has no approved direct Comms adapter');
       }
       if (typeof installed.reviewed_start_id !== 'string' || !REVIEWED_START_ID.test(installed.reviewed_start_id)) invalid();
@@ -177,6 +220,13 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       const entry = owned(reservation);
       if (entry.revoked || now() >= entry.expires) invalid();
       return reservation;
+    },
+    brokeredMemberInputs(reservation) {
+      const entry = owned(reservation);
+      if (entry.revoked || now() >= entry.expires || !entry.memberInputs) invalid();
+      return Object.freeze({ machinePublicKey: Buffer.from(entry.machineKey),
+        assignmentBytes: Buffer.from(reservation.member_set_assignment_envelope_base64url, 'base64url'),
+        cooperativeBridgeBytes: Buffer.from(reservation.bridge_assignment_envelope_base64url, 'base64url') });
     },
     async projection(reservation) {
       const entry = owned(reservation);
@@ -255,7 +305,7 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
     async provide({ context, request }) {
       const entry = active.get(context?.reservation_sha256);
       const live = () => entry?.acp && !entry.acp.destroyed && watchHealthy(entry.acpContext);
-      if (!live() || !contextMatches(entry, context) || entry.providerSpent
+      if (!live() || entry.memberInputs || !contextMatches(entry, context) || entry.providerSpent
         || !request || Object.keys(request).sort().join(',') !== 'model,prompt_sha256'
         || !ID.test(request.model ?? '') || !SHA256.test(request.prompt_sha256 ?? '')) invalid();
       const reviewed = entry.reservation.payload.qualification_provider;
@@ -284,13 +334,13 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
     },
     async beginDirectQualification(reservation) {
       const entry = owned(reservation);
-      if (!entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)) invalid();
+      if (entry.memberInputs || !entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)) invalid();
       const { body } = await call('q-begin', { ...requestOf(reservation), attach_sha256: entry.attach.sha256 }, entry);
       return Object.freeze({ ...body });
     },
     async beginDirectQualificationWitness(reservation, preResult) {
       const entry = owned(reservation);
-      if (!entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)) invalid();
+      if (entry.memberInputs || !entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)) invalid();
       const pre = verifyDirectQualificationPre(preResult, entry.machineKey);
       const { body } = await call('q-witness-begin', { ...requestOf(reservation), attach_sha256: entry.attach.sha256,
         pre_response_sha256: preResult.sha256 }, entry);
@@ -305,7 +355,7 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
     },
     async finishDirectQualificationWitness(reservation, preResult, challenge, rows) {
       const entry = owned(reservation);
-      if (!entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)) invalid();
+      if (entry.memberInputs || !entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)) invalid();
       const { body } = await call('q-witness-finish', { ...requestOf(reservation), attach_sha256: entry.attach.sha256,
         pre_response_sha256: preResult.sha256, challenge_base64url: challenge,
         cooperative_start_receipt_base64url: rows.cooperative_start_receipt_base64url,
@@ -318,7 +368,7 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
     },
     async finishDirectQualification(reservation, preResult, witnessSHA256, refusalSHA256) {
       const entry = owned(reservation);
-      if (!entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)
+      if (entry.memberInputs || !entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)
         || !SHA256.test(witnessSHA256 ?? '') || !SHA256.test(refusalSHA256 ?? '')) invalid();
       const pre = verifyDirectQualificationPre(preResult, entry.machineKey);
       const { body } = await call('q-finish', { ...requestOf(reservation), attach_sha256: entry.attach.sha256,
@@ -373,6 +423,9 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       if (entry.attach && (!match(payload, { attach_sha256: entry.attach.sha256,
         dispatcher_pid: entry.attach.dispatcher_pid, runner_pid: entry.attach.runner_pid })
         || !SHA256.test(payload.dispatch_completion_sha256 ?? ''))) invalid();
+      if (entry.memberInputs && (typeof verifyBrokeredContainment !== 'function'
+        || await verifyBrokeredContainment({ reservation, detachedBridge: entry.memberInputs.detached,
+          runnerStop: response.body }) !== true)) invalid();
       active.delete(reservation.sha256);
       return Object.freeze({ sha256: response.body.sha256 });
     },
