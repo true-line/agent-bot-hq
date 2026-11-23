@@ -77,7 +77,11 @@ export const bridgeBindProofV2 = (key, nonce, context) => proofFor(V2, key, nonc
 // onDisconnectV2 uses that retained target even if HQ cannot validate the
 // projection. It returns true only after independently confirming the durable
 // containment request, and rejects on uncertainty.
-export function createBridgeBindAdmission({ authority, qualificationAuthorizer, clock, random, receipts, timers = { setTimeout, clearTimeout } } = {}) {
+export function createBridgeBindAdmission({ authority, qualificationAuthorizer, relayIngressAuthorizer,
+  clock, random, receipts, timers = { setTimeout, clearTimeout } } = {}) {
+  if (typeof qualificationAuthorizer === 'function' && typeof relayIngressAuthorizer === 'function') {
+    throw new TypeError('fixture qualification and production relay ingress cannot share a bridge');
+  }
   const challenges = new Map();
   const verifying = new Map();
   const live = new Map();
@@ -394,6 +398,19 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     return null;
   }
 
+  // Comms has already authenticated this B connection and holds its raw bind
+  // receipt. Recheck A's current lease on that exact connection before any
+  // future relay ingress; a digest-only lookup cannot establish this join.
+  async function boundBridgeConnectionV2(connection, receipt) {
+    if (!available(V2) || typeof connection !== 'string' || !connection
+      || !matches(SHA, receipt)) refuse();
+    const binding = live.get(connection);
+    if (binding?.context.protocol !== V2 || binding.receipt !== receipt) refuse();
+    const observation = await recheckBridge(connection, binding);
+    if (live.get(connection) !== binding || binding.receipt !== receipt) refuse();
+    return observation;
+  }
+
   // Source-only qualification fixture. This injected host boundary must verify
   // the exact pinned provider plan and atomically consume its durable one-use
   // operation before returning the fixture result. There is no default authorizer.
@@ -423,6 +440,41 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
       return response;
     } catch {
       await forgetBridgeConnection(connection, binding.receipt, 'bridge-qualification-failed');
+      refuse();
+    }
+  }
+
+  // The Stage 2a installed test-provider relay has its own authorizer and
+  // one-use fence. B verifies the raw vendor request before sending this
+  // digest-only message; this is not a general provider-byte transport. The
+  // synthetic qualification callback cannot enable or spend this route.
+  async function relayBridgeIngressV2(input, { connection } = {}, receipt) {
+    if (typeof relayIngressAuthorizer !== 'function' || !available(V2)
+      || !record(input) || Object.keys(input).length !== 2
+      || !Object.hasOwn(input, 'model') || !Object.hasOwn(input, 'prompt_sha256')
+      || !matches(ID, input.model) || !matches(DIGEST, input.prompt_sha256)) refuse();
+    const binding = live.get(connection);
+    if (binding?.context.protocol !== V2 || binding.receipt !== receipt
+      || binding.relayIngressAttempted) refuse();
+    binding.relayIngressAttempted = true;
+    const request = Object.freeze({ model: input.model, prompt_sha256: input.prompt_sha256 });
+    try {
+      const observation = await boundBridgeConnectionV2(connection, receipt);
+      if (!binding.finalized) refuse();
+      const result = await bounded(Promise.resolve().then(() => relayIngressAuthorizer({
+        request, observation: Object.freeze(observation),
+      })), 'Machine relay ingress authorization deadline exceeded');
+      if (!record(result) || result.model !== request.model || result.stop_reason !== 'end_turn'
+        || typeof result.text !== 'string' || !result.text || result.text.length > 4096
+        || !Number.isSafeInteger(result.usage?.input_tokens) || result.usage.input_tokens < 0
+        || !Number.isSafeInteger(result.usage?.output_tokens) || result.usage.output_tokens < 0) refuse();
+      const response = { model: result.model, stop_reason: result.stop_reason, text: result.text,
+        usage: { input_tokens: result.usage.input_tokens, output_tokens: result.usage.output_tokens } };
+      await boundBridgeConnectionV2(connection, receipt);
+      if (!binding.finalized) refuse();
+      return response;
+    } catch {
+      await forgetBridgeConnection(connection, receipt, 'bridge-relay-ingress-failed');
       refuse();
     }
   }
@@ -460,7 +512,10 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     bridgeBindChallengeV2: (...args) => track(bridgeBindChallenge(V2, ...args)),
     verifyBridgeBindingV2: (...args) => track(verifyBridgeBinding(V2, ...args)),
     boundBridgeV2: (...args) => track(boundBridge(V2, ...args)),
+    boundBridgeConnectionV2: (...args) => track(boundBridgeConnectionV2(...args)),
     qualifyBridgeMessagesV2: (...args) => track(qualifyBridgeMessagesV2(...args)),
+    bridgeRelayIngressEnabledV2: () => typeof relayIngressAuthorizer === 'function' && available(V2),
+    relayBridgeIngressV2: (...args) => track(relayBridgeIngressV2(...args)),
     forgetBridgeConnection, revokeAll,
   });
 }
