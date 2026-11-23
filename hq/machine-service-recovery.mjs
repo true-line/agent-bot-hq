@@ -10,11 +10,12 @@ import { soulRunnerAccountsPurpose } from './machine-soul-runner-accounts.mjs';
 import { qualificationApprovalDetail, qualificationPurpose } from './machine-harness-qualification.mjs';
 import { checkUpgradeRecords } from './machine-service-upgrade.mjs';
 import { checkHarnessLaunchPlan, isHarnessLaunchHandoff } from './machine-harness-launch.mjs';
+import { checkCooperativeInstallPlan, cooperativeInstallPurpose } from './machine-soul-cooperative-launch.mjs';
 import { checkProtectedInstallPlan, protectedInstallPurpose } from './machine-soul-protected-launch.mjs';
 
 export const isServiceHandoff = (verb) => verb === 'hq-service-recovery' || verb === 'hq-service-upgrade' ||
   isHarnessLaunchHandoff(verb) || verb === accountsPurpose || verb === soulRunnerAccountsPurpose ||
-  verb === qualificationPurpose || verb === protectedInstallPurpose;
+  verb === qualificationPurpose || verb === protectedInstallPurpose || verb === cooperativeInstallPurpose;
 const role = '_agent-bot-hq';
 const maxFrame = 64 * 1024;
 const fieldsAre = (o, names) => o && typeof o === 'object' && !Array.isArray(o) &&
@@ -60,6 +61,10 @@ function ownerPublicKey(encoded) {
 }
 
 function checkPlanScope(plan, action, id, roleUid, machineKey) {
+  if (action === cooperativeInstallPurpose || plan.purpose === cooperativeInstallPurpose) {
+    if (action !== plan.purpose) throw new Error('outside the paired cooperative Soul launch install plan scope');
+    return checkCooperativeInstallPlan(plan, roleUid, machineKey);
+  }
   if (action === protectedInstallPurpose || plan.purpose === protectedInstallPurpose) {
     if (action !== plan.purpose) throw new Error('outside the paired protected Soul launch install plan scope');
     return checkProtectedInstallPlan(plan, roleUid, machineKey);
