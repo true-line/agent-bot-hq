@@ -256,8 +256,11 @@ in place of `approve` and its arguments. A replacement challenge requires a fres
 
 Once Machine applies the account plan, check that its receipt lists the intended
 accounts and the directory `/Library/Application Support/ai.true-line.agent-bot-hq/ipc`.
-HQ reads its adapter-to-account mapping at startup. For a dedicated service
-with Codex and Claude Code, merge this section into the HQ home's `config.json`.
+HQ reads an adapter-to-account mapping only when the operator configures
+selected harnesses. Base HQ, Machine, Souls and Comms installation and clean HQ
+startup require no harness packages, credentials or `harnesses` section. For a
+Soul explicitly selecting Codex and Claude Code, merge this example into the
+HQ home's `config.json`.
 Preserve existing settings. The file must belong to the dedicated HQ account.
 Use mode `0600`.
 
