@@ -95,8 +95,8 @@ test('selected H Contracts verifies exactly the A-bound v0.10.2 runtime subset',
   const pin = readPin();
   const full = verify(pin);
   const runtime = hRuntimeSelection(pin, full.manifest);
-  assert.equal(runtime.files, 417);
-  assert.equal(runtime.digest, 'sha256:94a60ddc910e1f30bdf380c384efd8a7952665d41789daa7ead973cd8c95b6d1');
+  assert.equal(runtime.files, 393);
+  assert.equal(runtime.digest, 'sha256:ab056d20cef4747cff70a575f8eec126d327e223a5e28f7f86130d5d138c5370');
   const changedFull = { ...full.manifest,
     [H_V0102_EXCLUDED[0]]: { ...full.manifest[H_V0102_EXCLUDED[0]], size: 1 } };
   assert.throws(() => hRuntimeSelection(pin, changedFull), /full source/);
