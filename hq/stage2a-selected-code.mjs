@@ -18,6 +18,31 @@ const BLOCKED_BUILTINS = new Set(['node:vm', 'node:module', 'node:worker_threads
   'node:repl', 'node:inspector', 'node:inspector/promises', 'node:wasi']);
 let activeDescriptorDigest;
 
+function sealDynamicCodeEntrypoints() {
+  // Import hooks do not intercept these process APIs. The selected preloader
+  // installs this seal before the first selected HQ module runs. Code that
+  // executed earlier is outside this boundary and must be A-measured too.
+  for (const name of ['getBuiltinModule', 'binding', '_linkedBinding', 'dlopen']) {
+    const descriptor = Object.getOwnPropertyDescriptor(process, name);
+    if (!descriptor || typeof descriptor.value !== 'function' || !descriptor.configurable) refuse();
+    Object.defineProperty(process, name, {
+      value: refuse, writable: false, configurable: false,
+      enumerable: descriptor.enumerable,
+    });
+  }
+  if (Object.hasOwn(process, 'mainModule') && process.mainModule !== undefined) refuse();
+  Object.defineProperty(process, 'mainModule', {
+    value: undefined, writable: false, configurable: false,
+  });
+  for (const name of ['WebAssembly', 'Worker']) {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+    if (descriptor && !descriptor.configurable) refuse();
+    Object.defineProperty(globalThis, name, {
+      value: undefined, writable: false, configurable: false,
+    });
+  }
+}
+
 function checkedPath(path) {
   if (typeof path !== 'string' || path.length > 1024 || !RECORD_PATH.test(path) || path.includes('\\')
     || path.startsWith('/') || path.endsWith('/')
@@ -189,6 +214,7 @@ export function registerSelectedHQCode(verified, descriptorDigest) {
     || !process.execArgv.includes('--disallow-code-generation-from-strings')
     || !DIGEST.test(descriptorDigest) || activeDescriptorDigest) refuse();
   nodeModule.registerHooks(selectedHQCodeHooks(verified));
+  sealDynamicCodeEntrypoints();
   activeDescriptorDigest = descriptorDigest;
 }
 

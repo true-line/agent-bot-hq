@@ -138,6 +138,19 @@ test('Node loads the selected graph and blocks a later outside import', unixOnly
   const source = `import { verifySelectedHQCode, registerSelectedHQCode, assertSelectedHQCodeDigest } from ${JSON.stringify(guard)};
     registerSelectedHQCode(verifySelectedHQCode(${JSON.stringify(options)}), ${JSON.stringify(descriptorDigest)});
     assertSelectedHQCodeDigest(${JSON.stringify(descriptorDigest)});
+    for (const attempt of [
+      () => process.getBuiltinModule('vm').runInThisContext('40+2'),
+      () => process.getBuiltinModule('module').registerHooks({ resolve() {} }),
+      () => process.binding('contextify'),
+      () => process._linkedBinding('contextify'),
+      () => process.dlopen({}, '/outside/addon.node'),
+    ]) {
+      try { attempt(); process.exitCode = 9; }
+      catch (error) { if (!error.message.includes('Machine selected HQ code is unavailable')) throw error; }
+    }
+    if (process.mainModule !== undefined || globalThis.WebAssembly !== undefined
+      || Object.getOwnPropertyDescriptor(process, 'getBuiltinModule').writable
+      || Object.getOwnPropertyDescriptor(process, 'binding').configurable) process.exitCode = 10;
     try { assertSelectedHQCodeDigest('sha256:${'0'.repeat(64)}'); process.exitCode = 8; }
     catch (error) { if (!error.message.includes('Machine selected HQ code is unavailable')) throw error; }
     await import(${JSON.stringify(main)});
