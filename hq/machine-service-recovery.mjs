@@ -6,7 +6,7 @@ import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
 import { validatedMembersPlan, validPlanId } from './machine-members-plans.mjs';
 import { accountsPurpose } from './machine-harness-accounts.mjs';
-import { soulRunnerAccountsPurpose } from './machine-soul-runner-accounts.mjs';
+import { soulBridgeAccountsPurpose, soulRunnerAccountsPurpose } from './machine-soul-runner-accounts.mjs';
 import { qualificationApprovalDetail, qualificationPurpose } from './machine-harness-qualification.mjs';
 import { checkUpgradeRecords } from './machine-service-upgrade.mjs';
 import { checkHarnessLaunchPlan, isHarnessLaunchHandoff } from './machine-harness-launch.mjs';
@@ -15,7 +15,7 @@ import { checkProtectedInstallPlan, protectedInstallPurpose } from './machine-so
 
 export const isServiceHandoff = (verb) => verb === 'hq-service-recovery' || verb === 'hq-service-upgrade' ||
   isHarnessLaunchHandoff(verb) || verb === accountsPurpose || verb === soulRunnerAccountsPurpose ||
-  verb === qualificationPurpose || verb === protectedInstallPurpose || verb === cooperativeInstallPurpose;
+  verb === soulBridgeAccountsPurpose || verb === qualificationPurpose || verb === protectedInstallPurpose || verb === cooperativeInstallPurpose;
 const role = '_agent-bot-hq';
 const maxFrame = 64 * 1024;
 const fieldsAre = (o, names) => o && typeof o === 'object' && !Array.isArray(o) &&
@@ -77,6 +77,10 @@ function checkPlanScope(plan, action, id, roleUid, machineKey) {
   }
   if (action === accountsPurpose || plan.purpose === accountsPurpose) {
     if (action !== plan.purpose || plan.steps[0].uid !== roleUid) throw new Error('outside the paired HQ harness account scope');
+    return;
+  }
+  if (action === soulBridgeAccountsPurpose || plan.purpose === soulBridgeAccountsPurpose) {
+    if (action !== plan.purpose || plan.steps[0].uid !== roleUid) throw new Error('outside the paired HQ Soul bridge account scope');
     return;
   }
   if (action === soulRunnerAccountsPurpose || plan.purpose === soulRunnerAccountsPurpose) {

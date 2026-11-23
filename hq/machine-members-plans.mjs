@@ -1,7 +1,7 @@
 // Read-only responses for Machine's members-plans verb. The digest covers the
 // original Go Plan.Canonical() bytes, including its final LF.
 import { accountsPurpose, validHarnessAccounts } from './machine-harness-accounts.mjs';
-import { soulRunnerAccountsPurpose, validSoulRunnerAccounts } from './machine-soul-runner-accounts.mjs';
+import { soulRunnerAccountsPurpose, validSoulRunnerAccounts, soulBridgeAccountsPurpose, validSoulBridgeAccounts } from './machine-soul-runner-accounts.mjs';
 import { qualificationPurpose, validHarnessQualification } from './machine-harness-qualification.mjs';
 import { protectedInstallPurpose, validProtectedInstallPlan } from './machine-soul-protected-launch.mjs';
 import { cooperativeInstallPurpose, validCooperativeInstallPlan } from './machine-soul-cooperative-launch.mjs';
@@ -54,6 +54,7 @@ export function validatedMembersPlan(id, response) {
   const p = parseStrict(plan_canonical, { maxDepth: 32 });
   const accounts = p?.purpose === accountsPurpose;
   const soulRunners = p?.purpose === soulRunnerAccountsPurpose;
+  const soulBridges = p?.purpose === soulBridgeAccountsPurpose;
   const qualification = p?.purpose === qualificationPurpose;
   const protectedInstall = p?.purpose === protectedInstallPurpose;
   const cooperativeInstall = p?.purpose === cooperativeInstallPurpose;
@@ -61,6 +62,7 @@ export function validatedMembersPlan(id, response) {
   // previous depth limit for every other members-plan shape.
   if (!protectedInstall && !cooperativeInstall) parseStrict(plan_canonical, { maxDepth: 6 });
   const fields = soulRunners ? 'version,hq_account,dir,members,steps,purpose,soul_runners'
+    : soulBridges ? 'version,hq_account,dir,members,steps,purpose,soul_bridges'
     : protectedInstall ? 'version,hq_account,dir,members,steps,purpose,soul_protected_launch'
     : cooperativeInstall ? 'version,hq_account,dir,members,steps,purpose,soul_cooperative_launch'
     : accounts || qualification ? 'version,hq_account,dir,members,steps,purpose' : 'version,hq_account,dir,members,steps';
@@ -68,6 +70,7 @@ export function validatedMembersPlan(id, response) {
       p.version !== 3 || !isAccount(p.hq_account) || typeof p.dir !== 'string' || !p.dir ||
       !Array.isArray(p.steps) || !p.steps.length || !validMembers(p) ||
       (soulRunners ? Buffer.byteLength(plan_canonical) > 32768 || !validSoulRunnerAccounts(p)
+        : soulBridges ? Buffer.byteLength(plan_canonical) > 32768 || !validSoulBridgeAccounts(p)
         : accounts ? Buffer.byteLength(plan_canonical) > 32768 || !validHarnessAccounts(p)
         : qualification ? !validHarnessQualification(p, Buffer.byteLength(plan_canonical))
           : protectedInstall ? Buffer.byteLength(plan_canonical) > 48 * 1024 || !validProtectedInstallPlan(p)
