@@ -129,7 +129,10 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
     if (!enabled || current(connection, receipt) !== true
       || request?.kind !== 'bridge.member.observe.v3.request') refuse();
     check(provider.schema, request);
-    const state = connections.get(connection) ?? { members: new Map(), nonces: new Set(), pending: new Map() };
+    const state = connections.get(connection) ?? { members: new Map(), nonces: new Set(),
+      pending: new Map(), arms: new Map(), receipt, selectors: Object.freeze({ ...request.selectors }) };
+    if (state.receipt !== receipt || !exact(state.selectors, BIND_SELECTORS)
+      || BIND_SELECTORS.some((field) => state.selectors[field] !== request.selectors[field])) refuse();
     if (state.members.has(request.member_id) || state.pending.has(request.member_id)
       || state.members.size + state.pending.size >= 2 || state.nonces.has(request.observe_nonce)
       || [...state.pending.values()].some((slot) => slot.nonce === request.observe_nonce)) refuse();
@@ -229,13 +232,40 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
       || slot.expires <= clock.now()) refuse();
     if (await provider.recordArm(binding, canonicalBytes(row), request.bridge_arm_receipt_sha256) !== true
       || !active(connection, receipt, state) || slot.expires <= clock.now()) refuse();
-    return check(provider.schema, { kind: 'bridge.member.arm.v3.result', member_id: request.member_id,
+    const result = check(provider.schema, { kind: 'bridge.member.arm.v3.result', member_id: request.member_id,
       member_selector: request.member_selector, arm_nonce: request.arm_nonce,
       bridge_arm_receipt_sha256: request.bridge_arm_receipt_sha256, state: 'recorded-pending-aggregate-ready',
       expires_at: slot.expiresAt });
+    state.arms.set(request.member_id, Object.freeze({ arm_request: Object.freeze({ ...request }),
+      arm_result: Object.freeze({ ...result }) }));
+    return result;
   }
 
-  return Object.freeze({ enabled, observe, arm, forgetConnection: (connection) => connections.delete(connection) });
+  // H may ask for the two canonical arm pairs only while the very same B
+  // connection and broker receipt remain live. These are H-validated B
+  // messages, not an H observation of B's private relay socket.
+  async function armsFor(selectors, bindReceiptSHA256) {
+    if (!enabled || !exact(selectors, BIND_SELECTORS)
+      || !SHA.test(bindReceiptSHA256 ?? '')) refuse();
+    const matches = [...connections].filter(([, state]) =>
+      state?.arms.size === 2 && state.receipt && sha(Buffer.from(state.receipt)) === bindReceiptSHA256
+      && BIND_SELECTORS.every((field) => state.selectors[field] === selectors[field]));
+    if (matches.length !== 1) refuse();
+    const [connection, state] = matches[0];
+    const binding = await bound({ selectors }, connection, state.receipt, state);
+    if (!active(connection, state.receipt, state) || state.arms.size !== 2
+      || BIND_SELECTORS.some((field) => binding[field] !== selectors[field])) refuse();
+    const arms = [...state.arms.entries()].sort(([a], [b]) => a.localeCompare(b))
+      .map(([, pair]) => ({ arm_request: pair.arm_request, arm_result: pair.arm_result }));
+    if (arms[0].arm_request.member_id === arms[1].arm_request.member_id
+      || arms.some((pair) => pair.arm_result.state !== 'recorded-pending-aggregate-ready')) refuse();
+    return Object.freeze({ arms: Object.freeze(arms),
+      child_observation_envelope_sha256: state.childSHA256,
+      member_b_authority_envelope_sha256: selectors.authority_envelope_sha256 });
+  }
+
+  return Object.freeze({ enabled, observe, arm, armsFor,
+    forgetConnection: (connection) => connections.delete(connection) });
 }
 
 function validChallenge(c, now) {

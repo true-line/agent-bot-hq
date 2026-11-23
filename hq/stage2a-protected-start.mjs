@@ -115,11 +115,6 @@ export function createStage2aPrestartedMembers({ machinePublicKey, schemas, sche
     const work = async () => {
       const assignment = signed(assignmentBytes, 'assignment', schemas.assignment);
       const a = assignment.payload;
-      const authority = verifyStage2aBridgeMemberAuthority(authorityBytes, { machinePublicKey,
-        schema: schemas.authority, assignmentSchema: schemas.assignment,
-        schemas: refs(schemas.assignment).filter((schema) => schema.$id !== schemas.authority.$id),
-        expected: { ...expectedAuthority, ...selectors, profile_in_force: 'managed-protected' },
-        assignmentBytes, now: now() });
       const match = (left, right, fields) => fields.every((field) => left?.[field] === right?.[field]);
       const scope = ['profile_in_force', 'host_id', 'installation_id', 'soul_id', 'start_id', 'hq_epoch'];
       const runtime = new Map(pendingRuntimes.map((row) => [row.member_id, row]));
@@ -151,6 +146,21 @@ export function createStage2aPrestartedMembers({ machinePublicKey, schemas, sche
           || status.child_pid < 2 || status.child_pid === child.pid) refuse();
         return { child, member, status };
       }));
+      // A includes the same signed B authority in each member child grant.
+      // The paired H channel can recover it after the provisional map, so H
+      // need not ask B to expose another socket or grant H access to B files.
+      const fromGrants = children.map(({ child }) => child.memberAuthorityBytes);
+      if (fromGrants.some((value) => value !== undefined)
+        && (fromGrants.some((value) => !Buffer.isBuffer(value) || !value.length
+          || value.length > 16_384 || !value.equals(fromGrants[0]))
+          || (authorityBytes !== undefined && !authorityBytes.equals(fromGrants[0])))) refuse();
+      const boundAuthorityBytes = authorityBytes ?? fromGrants[0];
+      if (!Buffer.isBuffer(boundAuthorityBytes)) refuse();
+      const authority = verifyStage2aBridgeMemberAuthority(boundAuthorityBytes, { machinePublicKey,
+        schema: schemas.authority, assignmentSchema: schemas.assignment,
+        schemas: refs(schemas.assignment).filter((schema) => schema.$id !== schemas.authority.$id),
+        expected: { ...expectedAuthority, ...selectors, profile_in_force: 'managed-protected' },
+        assignmentBytes, now: now() });
       const evidence = children.map(({ child, member, status }) => ({
         member_id: member.member_id, member_selector: member.member_selector,
         member_launch_id: member.launch_id, child_launcher_pid: child.pid, child_pid: status.child_pid,
@@ -200,7 +210,8 @@ export function createStage2aPrestartedMembers({ machinePublicKey, schemas, sche
             arm[`adapter_${field}`] !== observed.child_process[field])
           || canonicalDigest(arm) !== row.bridge_arm_receipt_sha256) refuse();
       }
-      return Object.freeze({ assignment, observation, ready, assignmentBytes, authorityBytes, observationBytes, readyBytes,
+      return Object.freeze({ assignment, observation, ready, assignmentBytes,
+        authorityBytes: boundAuthorityBytes, observationBytes, readyBytes,
         memberGrants: Object.freeze(memberGrants), children: Object.freeze(children), provisionalMappingSHA256: mapDigest });
     };
     try {

@@ -4,7 +4,10 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
-import { machineRoleStage2aExec, machineRoleStage2aPrepareB } from './machine-channel.mjs';
+import { machineRoleStage2aExec, machineRoleStage2aMemberChildGrant,
+  machineRoleStage2aPrepareB } from './machine-channel.mjs';
+import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
+import { verifyStage2aMachineEnvelope } from './stage2a-stop.mjs';
 import { join } from 'node:path';
 
 export const STAGE2A_LAUNCHER = '/Library/Application Support/ai.true-line.agent-bot-hq/soul-launch';
@@ -270,14 +273,22 @@ function childProgress(child) {
 // A returned role is *started*, not contained or protected. The caller must
 // bind the reservation to an authenticated live start and obtain Machine's
 // signed stop/completion before releasing any installation occupancy.
-export async function startStage2aRole({ account, role, reservationSHA256,
-  machineExec = machineRoleStage2aExec, spawnProcess = spawn, timeoutMs = 12000 } = {}) {
+export async function startStage2aRole({ account, role, reservationSHA256, memberGrant,
+  machineExec = machineRoleStage2aExec, memberMachineExec = machineRoleStage2aMemberChildGrant,
+  spawnProcess = spawn, timeoutMs = 12000 } = {}) {
   if (typeof account !== 'string'
     || !(role === 'runner' && RUNNER_ACCOUNT.test(account)
       || role === 'bridge' && BRIDGE_ACCOUNT.test(account)
       || role === 'child' && RUNNER_ACCOUNT.test(account))
     || !DIGEST.test(reservationSHA256 ?? '')
-    || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 14000) {
+    || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 14000
+    || (memberGrant !== undefined && (role !== 'child'
+      || !memberGrant?.selectors || memberGrant.selectors.reservation_sha256 !== reservationSHA256
+      || !Buffer.isBuffer(memberGrant.machinePublicKey) || memberGrant.machinePublicKey.length !== 32
+      || !DIGEST.test(memberGrant.assignmentSHA256 ?? '')
+      || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(memberGrant.member?.member_id ?? '')
+      || !/^mb_[0-9a-f]{64}$/.test(memberGrant.member?.member_selector ?? '')
+      || !/^ln_[0-9a-f]{24}$/.test(memberGrant.member?.launch_id ?? '')))) {
     throw new Error('invalid Soul launcher assignment');
   }
   const command = role === 'runner' ? 'soul-run'
@@ -294,13 +305,57 @@ export async function startStage2aRole({ account, role, reservationSHA256,
   child.stdout.on('error', () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); });
   try {
     const challenge = await firstLine(child, (line) => challengeFrom(line, role), timeoutMs, 512);
-    const grant = await bounded(machineExec({ reservation_sha256: reservationSHA256,
-      role, nonce: challenge.nonce, pid: challenge.pid }), timeoutMs, 'Machine role grant');
+    const grant = await bounded(memberGrant
+      ? memberMachineExec({ ...memberGrant.selectors, member_id: memberGrant.member.member_id,
+        member_selector: memberGrant.member.member_selector,
+        nonce: challenge.nonce, pid: challenge.pid })
+      : machineExec({ reservation_sha256: reservationSHA256,
+        role, nonce: challenge.nonce, pid: challenge.pid }), timeoutMs, 'Machine role grant');
+    let memberAuthorityBytes;
+    if (memberGrant) {
+      if (!Buffer.isBuffer(grant?.envelope) || !Buffer.isBuffer(grant?.invocation)
+        || grant.invocation.length === 0 || grant.invocation.length > 64 * 1024
+        || !DIGEST.test(grant?.sha256 ?? '')) throw new Error('invalid A member child grant');
+      const signed = verifyStage2aMachineEnvelope(grant.envelope, memberGrant.machinePublicKey,
+        'agent-bot/stage2a-exec/v1', { maxBytes: 8192 });
+      const p = signed.payload;
+      if (signed.envelope_sha256 !== grant.sha256 || p?.role !== 'child'
+        || p.reservation_sha256 !== reservationSHA256 || p.pid !== challenge.pid
+        || p.nonce !== challenge.nonce || p.member_id !== memberGrant.member.member_id
+        || p.member_selector !== memberGrant.member.member_selector
+        || p.member_launch_id !== memberGrant.member.launch_id
+        || p.member_set_assignment_envelope_sha256 !== memberGrant.assignmentSHA256
+        || p.invocation_sha256 !== `sha256:${createHash('sha256').update(grant.invocation).digest('hex')}`) {
+        throw new Error('A member child grant differs from assignment');
+      }
+      const invocation = parseStrict(grant.invocation.toString('utf8'));
+      if (!canonicalBytes(invocation).equals(grant.invocation)
+        || invocation.child_exec?.member_id !== p.member_id
+        || invocation.child_exec?.member_selector !== p.member_selector
+        || invocation.child_exec?.member_launch_id !== p.member_launch_id
+        || invocation.child_exec?.reservation_sha256 !== reservationSHA256) {
+        throw new Error('A member child invocation differs from grant');
+      }
+      const assignmentEncoded = invocation.child_exec.member_set_assignment_envelope_base64url;
+      const authorityEncoded = invocation.child_exec.member_b_authority_envelope_base64url;
+      if (typeof assignmentEncoded !== 'string' || typeof authorityEncoded !== 'string'
+        || !/^[A-Za-z0-9_-]{1,21846}$/.test(assignmentEncoded)
+        || !/^[A-Za-z0-9_-]{1,21846}$/.test(authorityEncoded)
+        || Buffer.from(assignmentEncoded, 'base64url').toString('base64url') !== assignmentEncoded
+        || Buffer.from(authorityEncoded, 'base64url').toString('base64url') !== authorityEncoded
+        || `sha256:${createHash('sha256').update(Buffer.from(assignmentEncoded, 'base64url')).digest('hex')}`
+          !== memberGrant.assignmentSHA256) throw new Error('A member child authority differs from assignment');
+      memberAuthorityBytes = Buffer.from(authorityEncoded, 'base64url');
+      if (!memberAuthorityBytes.length || memberAuthorityBytes.length > 16_384) {
+        throw new Error('A member child authority is oversized');
+      }
+    }
     await writeGrant(child, grant?.grantLine);
     let readinessAttempted = false;
     let activationAttempted = false;
     let childReadyAttempted = false;
     return Object.freeze({ pid: challenge.pid, role, stdin: child.stdin, stdout: child.stdout,
+      ...(memberAuthorityBytes ? { memberAuthorityBytes } : {}),
       grantSHA256: grant?.sha256, done,
       resumeOutput: () => child.stdout.resume(),
       waitChildStarted: async () => {

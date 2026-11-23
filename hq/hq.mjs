@@ -596,6 +596,12 @@ export function createHQ({
     },
     readCommittedMemberFinalization: (key, digest, options) =>
       store.readCommittedMemberFinalization(key, digest, options),
+    memberArmsV3: (selectors, bindReceiptSHA256) => {
+      if (!running) fail('host.launch_unavailable', 'protected B arm evidence is unavailable');
+      const retrieve = host.provided('hq-admission')?.stage2aMemberArmsV3;
+      if (typeof retrieve !== 'function') fail('host.launch_unavailable', 'protected B arm evidence is unavailable');
+      return retrieve(selectors, bindReceiptSHA256);
+    },
     openCooperativeAdmission: async ({ reservation, openAcpStream, onLost }) => {
       const key = reservation?.sha256;
       if (!running || !key || cooperativeGuard?.isRevoked(key)

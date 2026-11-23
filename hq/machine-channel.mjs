@@ -111,6 +111,19 @@ const COOPERATIVE_STATES = new Map([
   ['stage2a-cooperative-stop-v3', 'cooperative-stopped'],
 ]);
 const MEMBER_FIELDS = Object.freeze({
+  'stage2a-member-set-assign': ['reservation_sha256', 'installation_id', 'start_id',
+    'launch_id', 'plan_id', 'plan_digest', 'hq_epoch'],
+  'stage2a-member-provisional-map': ['reservation_sha256', 'installation_id', 'start_id',
+    'launch_id', 'plan_id', 'plan_digest', 'hq_epoch',
+    'provisional_hq_mapping_base64url', 'provisional_hq_mapping_sha256'],
+  'stage2a-member-child-grant': ['reservation_sha256', 'installation_id', 'start_id',
+    'launch_id', 'plan_id', 'plan_digest', 'hq_epoch', 'member_id', 'member_selector',
+    'nonce', 'pid'],
+  'stage2a-member-child-observe': ['reservation_sha256', 'installation_id', 'start_id',
+    'launch_id', 'plan_id', 'plan_digest', 'hq_epoch', 'members'],
+  'stage2a-member-ready': ['reservation_sha256', 'installation_id', 'start_id',
+    'launch_id', 'plan_id', 'plan_digest', 'hq_epoch',
+    'child_observation_envelope_sha256', 'member_b_authority_envelope_sha256', 'arms'],
   'stage2a-member-finalization': ['reservation_sha256', 'installation_id', 'start_id',
     'launch_id', 'plan_id', 'plan_digest', 'hq_epoch', 'finalization_base64url',
     'finalization_sha256'],
@@ -123,15 +136,20 @@ const MEMBER_FIELDS = Object.freeze({
     'hq_finalization_base64url', 'hq_finalization_sha256'],
 });
 const MEMBER_STATES = Object.freeze({
+  'stage2a-member-set-assign': 'member-set-assigned',
+  'stage2a-member-provisional-map': 'member-map-withheld',
+  'stage2a-member-child-grant': 'member-child-granted',
+  'stage2a-member-child-observe': 'member-children-observed',
+  'stage2a-member-ready': 'member-ready',
   'stage2a-member-finalization': 'member-finalized',
   'stage2a-member-runtime': 'member-runtime',
 });
 const memberVerb = (verb) => Object.hasOwn(MEMBER_FIELDS, verb);
-function validMemberRecord(encoded, digest) {
+function validMemberRecord(encoded, digest, limit = 8192) {
   if (typeof encoded !== 'string' || !/^[A-Za-z0-9_-]{1,10924}$/.test(encoded)
     || typeof digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(digest)) return false;
   const raw = Buffer.from(encoded, 'base64url');
-  if (!raw.length || raw.length > 8192 || !isUtf8(raw)
+  if (!raw.length || raw.length > limit || !isUtf8(raw)
     || raw.toString('base64url') !== encoded
     || `sha256:${fingerprint(raw)}` !== digest) return false;
   try { return canonicalBytes(parseStrict(raw.toString('utf8'))).equals(raw); }
@@ -415,6 +433,11 @@ export const machineRoleStage2aHelloStart = (request) => machineRoleStage2a('sta
 export const machineRoleStage2aHelloFinalize = (request) => machineRoleStage2a('stage2a-hello-finalize', request);
 export const machineRoleStage2aHelloAbort = (request) => machineRoleStage2a('stage2a-hello-abort', request);
 export const machineRoleStage2aPeerRole = (request) => machineRoleStage2a('stage2a-peer-role', request);
+export const machineRoleStage2aMemberSetAssign = (request) => machineRoleStage2a('stage2a-member-set-assign', request);
+export const machineRoleStage2aMemberProvisionalMap = (request) => machineRoleStage2a('stage2a-member-provisional-map', request);
+export const machineRoleStage2aMemberChildGrant = (request) => machineRoleStage2a('stage2a-member-child-grant', request);
+export const machineRoleStage2aMemberChildObserve = (request) => machineRoleStage2a('stage2a-member-child-observe', request);
+export const machineRoleStage2aMemberReady = (request) => machineRoleStage2a('stage2a-member-ready', request);
 export const machineRoleStage2aMemberFinalization = (request) => machineRoleStage2a('stage2a-member-finalization', request);
 export const machineRoleStage2aMemberRuntime = (request) => machineRoleStage2a('stage2a-member-runtime', request);
 export const machineRoleStage2aCaptureBegin = (request) => machineRoleStage2a('stage2a-capture-begin', request);
@@ -737,7 +760,40 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || Buffer.byteLength(JSON.stringify(deviceFields.expected)) > 4096))
       || (verb === 'stage2a-provider' && (!reservation.test(deviceFields.bind_receipt_sha256)
         || !id.test(deviceFields.model) || !reservation.test(deviceFields.prompt_sha256)))
-      || (memberVerb(verb) && (!validMemberRecord(deviceFields.finalization_base64url
+      || (verb === 'stage2a-member-provisional-map' && !validMemberRecord(
+        deviceFields.provisional_hq_mapping_base64url,
+        deviceFields.provisional_hq_mapping_sha256, 4096))
+      || (verb === 'stage2a-member-child-grant' && (!id.test(deviceFields.member_id)
+        || !/^mb_[0-9a-f]{64}$/.test(deviceFields.member_selector)
+        || !/^[A-Za-z0-9_-]{43}$/.test(deviceFields.nonce ?? '')
+        || Buffer.from(deviceFields.nonce, 'base64url').length !== 32
+        || Buffer.from(deviceFields.nonce, 'base64url').toString('base64url') !== deviceFields.nonce
+        || !Number.isSafeInteger(deviceFields.pid) || deviceFields.pid < 2))
+      || (verb === 'stage2a-member-child-observe' && (!Array.isArray(deviceFields.members)
+        || deviceFields.members.length !== 2
+        || deviceFields.members[0]?.member_id >= deviceFields.members[1]?.member_id
+        || deviceFields.members[0]?.child_launcher_pid === deviceFields.members[1]?.child_launcher_pid
+        || deviceFields.members[0]?.child_pid === deviceFields.members[1]?.child_pid
+        || deviceFields.members.some((row) => !row || typeof row !== 'object'
+          || Array.isArray(row)
+          || Object.keys(row).sort().join(',') !== 'child_launcher_pid,child_pid,grant_sha256,member_id,member_launch_id,member_selector'
+          || !id.test(row.member_id) || !/^ln_[0-9a-f]{24}$/.test(row.member_launch_id)
+          || !/^mb_[0-9a-f]{64}$/.test(row.member_selector)
+          || !reservation.test(row.grant_sha256)
+          || !Number.isSafeInteger(row.child_launcher_pid) || row.child_launcher_pid < 2
+          || !Number.isSafeInteger(row.child_pid) || row.child_pid < 2
+          || row.child_pid === row.child_launcher_pid)))
+      || (verb === 'stage2a-member-ready' && (!reservation.test(deviceFields.child_observation_envelope_sha256)
+        || !reservation.test(deviceFields.member_b_authority_envelope_sha256)
+        || !Array.isArray(deviceFields.arms) || deviceFields.arms.length !== 2
+        || deviceFields.arms.some((arm) => !arm || typeof arm !== 'object' || Array.isArray(arm)
+          || Object.keys(arm).sort().join(',') !== 'arm_request,arm_result'
+          || !arm.arm_request || typeof arm.arm_request !== 'object' || Array.isArray(arm.arm_request)
+          || !arm.arm_result || typeof arm.arm_result !== 'object' || Array.isArray(arm.arm_result)
+          || Buffer.byteLength(JSON.stringify(arm.arm_request)) > 4096
+          || Buffer.byteLength(JSON.stringify(arm.arm_result)) > 2048)))
+      || (['stage2a-member-finalization', 'stage2a-member-runtime'].includes(verb)
+        && (!validMemberRecord(deviceFields.finalization_base64url
         ?? deviceFields.hq_finalization_base64url,
       deviceFields.finalization_sha256 ?? deviceFields.hq_finalization_sha256)
         || Buffer.byteLength(JSON.stringify(deviceFields)) > 16 * 1024))
@@ -760,6 +816,10 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || (deviceFields.after_sequence === 0
           ? deviceFields.previous_lease_envelope_sha256 !== null
           : !reservation.test(deviceFields.previous_lease_envelope_sha256 ?? ''))))
+      || (memberVerb(verb) && Buffer.byteLength(JSON.stringify(deviceFields)) >
+        (verb === 'stage2a-member-ready' || verb === 'stage2a-member-finalization'
+          || verb === 'stage2a-member-runtime' ? 16 * 1024
+          : verb === 'stage2a-member-provisional-map' ? 8192 : 4096))
       || (isCaptureVerb(verb) && (!validStage2aCaptureRequest(verb, deviceFields)
         || Buffer.byteLength(JSON.stringify(deviceFields)) > 48 * 1024))) {
       throw new Error('invalid Stage 2a Machine reservation selectors');
@@ -942,6 +1002,16 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       }
       return Object.freeze({ aborted: true, daemon_fingerprint: fingerprint(daemon) });
     }
+    if (verb === 'stage2a-member-provisional-map') {
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).sort().join(',') !== 'accepted,sha256'
+        || body.accepted !== true || !/^sha256:[0-9a-f]{64}$/.test(body.sha256 ?? '')
+        || body.sha256 !== deviceFields.provisional_hq_mapping_sha256) {
+        throw new Error('invalid Machine provisional member map acceptance');
+      }
+      return Object.freeze({ accepted: true, sha256: body.sha256,
+        daemon_fingerprint: fingerprint(daemon) });
+    }
     if (verb === 'stage2a-member-runtime') {
       if (!body || typeof body !== 'object' || Array.isArray(body)
         || Object.keys(body).sort().join(',') !== 'lease_envelope_base64url,lease_sequence,lease_sha256'
@@ -970,7 +1040,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         throw new Error('invalid signed Machine Stage 2a finalization');
       }
     }
-    const expected = verb === 'stage2a-exec'
+    const expected = verb === 'stage2a-exec' || verb === 'stage2a-member-child-grant'
       ? ['envelope_base64url', 'sha256', 'invocation_base64url']
       : verb === 'stage2a-finalize-b'
         ? ['envelope_base64url', 'sha256', 'finalized_live_expires_at']
@@ -989,7 +1059,9 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     if (verb === 'stage2a-reserve' || verb === 'stage2a-stop'
       || verb === 'stage2a-finalize-b' || verb === 'stage2a-child-ready'
       || verb === 'stage2a-hello-start' || verb === 'stage2a-hello-finalize'
-      || verb === 'stage2a-peer-role' || verb === 'stage2a-member-finalization') {
+      || verb === 'stage2a-peer-role' || verb === 'stage2a-member-finalization'
+      || verb === 'stage2a-member-set-assign' || verb === 'stage2a-member-child-observe'
+      || verb === 'stage2a-member-ready') {
       return Object.freeze({ envelope, sha256: body.sha256,
         ...(verb === 'stage2a-finalize-b' ? { finalized_live_expires_at: body.finalized_live_expires_at } : {}),
         ...(verb === 'stage2a-child-ready' ? { expires_at_ms: body.expires_at_ms } : {}),

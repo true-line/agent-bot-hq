@@ -910,6 +910,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           && typeof bridgeAuthority?.verifyLiveStartV3 === 'function',
         stage2aMemberObserveV3: memberArmExchange.observe,
         stage2aMemberArmV3: memberArmExchange.arm,
+        stage2aMemberArmsV3: memberArmExchange.armsFor,
         forgetBridgeConnection: (connection, ...args) => {
           relayPeerChallenge.forgetConnection(connection);
           memberArmExchange.forgetConnection(connection);
