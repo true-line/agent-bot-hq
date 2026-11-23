@@ -628,9 +628,9 @@ export function createHQ({
               fail('host.launch_unavailable', 'cooperative member launch is unavailable');
             return service.cooperativeMemberLaunch(op, meta);
           } });
-        if (admission.brokerPin.reservation_sha256 !== key)
+        if (admission.reservationSHA256 !== key)
           fail('host.launch_unavailable', 'cooperative reservation digest changed after verification');
-        broker = await listenStage2aCooperativeBroker({ admission, hqUid: uid, core,
+        if (admission.brokerPin) broker = await listenStage2aCooperativeBroker({ admission, hqUid: uid, core,
           callers: brokerCallers, onLost: lost,
           brokerDispatch: (kind, payload, session) => memberBrokerDispatch(host, kind, payload, session),
           brokerClosed: (session) => host.brokerClosed(session) });
@@ -640,11 +640,11 @@ export function createHQ({
           if (!closing) {
             cooperativeGuard.revoke(key);
             if (cooperativeListeners.get(key)?.close === close) cooperativeListeners.delete(key);
-            closing = Promise.all([broker.close(), admission.close()]).then(() => {});
+            closing = Promise.all([broker?.close(), admission.close()]).then(() => {});
           }
           return closing;
         };
-        const listener = Object.freeze({ path: admission.path, brokerPath: broker.path, close });
+        const listener = Object.freeze({ path: admission.path, brokerPath: broker?.path, close });
         cooperativeListeners.set(key, listener);
         return listener;
       } catch (error) {

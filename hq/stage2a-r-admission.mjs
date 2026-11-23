@@ -22,10 +22,41 @@ const sameInode = (a, b) => BigInt(a.dev) === BigInt(b.dev) && BigInt(a.ino) ===
 
 const MEMBER_ATTACH_PREPARE = 'stage2a.member.attach.prepare';
 const MEMBER_ATTACH = 'stage2a.member.attach';
+const OWNER_ACP_TICKET = 'cooperative.owner-acp-ticket.v3';
 const ATTACH_TOKEN = /^[0-9a-f]{64}$/;
 const ATTACH_CAP = 128 * 1024;
 const ATTACH_TTL_MS = 30_000;
 const ATTACH_ENVELOPE_CAP = 16 * 1024;
+
+function verifyCooperativeMemberBootstrap(input, { reservation, provider, hqUid, now }) {
+  if (!input || typeof input.isCurrent !== 'function' || input.isCurrent() !== true) refuse();
+  const p = reservation.payload, a = p.assignment;
+  const { machinePublicKey, assignmentBytes, authorityBytes, cooperativeBridgeBytes } = input;
+  const detached = verifyStage2aMachineEnvelope(cooperativeBridgeBytes, machinePublicKey,
+    'agent-bot/soul-cooperative-bridge-assignment/v3', { schemaVersion: 3, maxBytes: ATTACH_ENVELOPE_CAP });
+  const b = detached.payload;
+  if (b.contract !== 'machine/v3' || b.kind !== 'soul-cooperative-bridge-assignment'
+    || b.schema_version !== 3 || b.reservation_sha256 !== reservation.sha256 || b.host_id !== p.host_id
+    || ['installation_id', 'start_id', 'launch_id', 'plan_id', 'plan_digest', 'hq_epoch']
+      .some((key) => b[key] !== a[key])
+    || b.bridge_launch_sha256 !== p.bridge_launch_sha256 || b.expires_at !== p.expires_at
+    || !(Date.parse(b.expires_at) > now)
+    || b.endpoints?.broker?.owner_uid !== hqUid || b.endpoints.broker.expected_peer_uid !== b.bridge?.uid
+    || typeof b.endpoints.broker.socket_path !== 'string'
+    || canonicalDigest(b.endpoints.member) !== canonicalDigest(p.endpoints.member)
+    || canonicalDigest(b.endpoints.relay) !== canonicalDigest(p.endpoints.relay)) refuse();
+  const authority = verifyStage2aBridgeMemberAuthority(authorityBytes, { machinePublicKey,
+    schema: provider.authoritySchema, assignmentSchema: provider.assignmentSchema,
+    schemas: provider.schemaReferences, assignmentBytes,
+    expected: { ...input.expected, ...a, host_id: p.host_id, hq_uid: hqUid,
+      reservation_sha256: reservation.sha256, profile_in_force: 'managed-cooperative',
+      bridge_uid: b.bridge.uid, bridge_gid: b.bridge.gid, broker_socket: b.endpoints.broker.socket_path },
+    now });
+  if (authority.payload.b_authority.envelope_sha256 !== detached.envelope_sha256
+    || authority.envelope_sha256 !== input.boundAuthoritySHA256 || input.isCurrent() !== true) refuse();
+  return Object.freeze({ assignmentSHA256: authority.payload.member_set_assignment_envelope_sha256,
+    authoritySHA256: authority.envelope_sha256, brokerPath: b.endpoints.broker.socket_path, isCurrent: input.isCurrent });
+}
 
 export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors, runnerEndpoint,
   core, current, onLost, refreshRunnerPeer, profile = 'managed-protected',
@@ -35,6 +66,7 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
     || typeof withLiveRuntime !== 'function' || typeof refreshRunnerPeer !== 'function') throw new TypeError('prestarted attach needs a pinned schema and live providers');
   const cooperative = profile === 'managed-cooperative';
   const slots = new Map();
+  const attached = new Map();
   const spent = new Set();
   const bridgeTokens = new Set();
   const bridgeNonces = new Set();
@@ -162,6 +194,7 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
       bridgeNonces.add(reply.bridge_ready_nonce);
       spent.add(member.launch_id);
       slots.set(member.launch_id, { attach, runtimeId, session, expires, processSHA256: peer.processSHA256,
+        memberId: member.member_id, readinessSHA256: ready.envelope_sha256,
         isCurrent: input.isCurrent, connect: input.connect });
     });
     return reply;
@@ -189,14 +222,20 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
         if (peer.isCurrent() !== true || !usable(slot)) { onLost(); refuse(); }
         peer.markAttached?.();
         return (socket) => {
-          try { slot.connect(socket); }
+          try {
+            slot.connect(socket);
+            attached.set(slot.memberId, { readySHA256: slot.readinessSHA256, socket, slot });
+          }
           catch { socket.destroy(); onLost(); }
         };
       },
       cancel: onLost,
     });
   }
-  return Object.freeze({ prepare, attach });
+  const bothAttached = (readySHA256) => attached.size === 2
+    && [...attached.values()].every((row) => row.readySHA256 === readySHA256
+      && !row.socket.destroyed && row.slot.isCurrent() === true);
+  return Object.freeze({ prepare, attach, bothAttached });
 }
 
 function checkedEndpoint(installed, assignment, selectors, hqUid) {
@@ -406,6 +445,7 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
   const endpoints = pinned?.payload?.endpoints;
   const binding = pinned?.payload?.measurement_binding;
   const ep = endpoints?.admission;
+  const brokered = pinned?.payload?.adapter_transport === 'brokered-b';
   const broker = endpoints?.broker;
   const digest = pinned?.sha256;
   const envelope = pinned?.envelope_base64url;
@@ -419,7 +459,7 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
     `agent-bot-soul-endpoint-installation/v1\0${assignment?.installation_id ?? ''}`).digest('hex').slice(0, 20);
   const startSlot = createHash('sha256').update(
     `agent-bot-soul-endpoint-start/v1\0${assignment?.installation_id ?? ''}\0${assignment?.start_id ?? ''}`).digest('hex').slice(0, 20);
-  if (!assignment || !ep || !broker || !binding || !DIGEST.test(digest ?? '')
+  if (!assignment || !ep || (!brokered && !broker) || !binding || !DIGEST.test(digest ?? '')
     || typeof envelope !== 'string' || envelope.length > 16384
     || !canonicalBase64(envelope, Buffer.from(envelope ?? '', 'base64url').length)
     || `sha256:${createHash('sha256').update(Buffer.from(envelope, 'base64url')).digest('hex')}` !== digest
@@ -438,16 +478,18 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
     || !DIGEST.test(binding.h_service_descriptor_digest ?? '')
     || !/^st_[0-9a-f]{24}$/.test(assignment.start_id ?? '')
     || !/^ln_[0-9a-f]{24}$/.test(assignment.launch_id ?? '')
-    || ep.directory !== join(ROOT, 'c', installationSlot)
+    || ep.directory !== join(ROOT, brokered ? 'r' : 'c', installationSlot)
     || ep.socket_path !== join(ep.directory, `${startSlot}.sock`)
     || ep.owner_uid !== hqUid || ep.group_gid !== assignment.runner_gid
     || ep.expected_peer_uid !== assignment.runner_uid
     || ep.dir_mode !== 0o2750 || ep.socket_mode !== 0o660
-    || broker.owner_uid !== hqUid || broker.group_gid !== assignment.runner_gid
-    || broker.directory !== join(ROOT, 'broker', assignment.runner_account)
-    || broker.socket_path !== join(broker.directory, 'broker.sock')
-    || broker.expected_peer_uid !== assignment.runner_uid
-    || broker.dir_mode !== 0o2750 || broker.socket_mode !== 0o660
+    || (brokered ? !!broker || !memberAttachProvider
+      || typeof memberAttachProvider.bootstrap !== 'function' || typeof memberAttachProvider.ownerReady !== 'function'
+      : !!memberAttachProvider || broker.owner_uid !== hqUid || broker.group_gid !== assignment.runner_gid
+      || broker.directory !== join(ROOT, 'broker', assignment.runner_account)
+      || broker.socket_path !== join(broker.directory, 'broker.sock')
+      || broker.expected_peer_uid !== assignment.runner_uid
+      || broker.dir_mode !== 0o2750 || broker.socket_mode !== 0o660)
     || typeof machineAttach !== 'function' || typeof verifyAttachReceipt !== 'function'
     || typeof admissionDispatch !== 'function' || typeof openAcpStream !== 'function'
     || typeof isLive !== 'function'
@@ -464,13 +506,21 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
   let acpTicket;
   let acpReady = false;
   let acpSpent = false;
+  const issueAcpTicket = () => {
+    const bytes = core.random.bytes(32);
+    if (!Buffer.isBuffer(bytes) || bytes.length !== 32) refuseCooperative();
+    return bytes.toString('base64url');
+  };
+  let memberBootstrap;
+  let ticketPending = false;
+  let ownerReadySHA256;
   const lose = () => {
     if (lost || closed) return;
     lost = true;
     void Promise.resolve().then(onLost).catch(() => {});
   };
   function directory() {
-    for (const path of ['/', '/Library', '/Library/Application Support', ROOT, join(ROOT, 'c')]) {
+    for (const path of ['/', '/Library', '/Library/Application Support', ROOT, join(ROOT, brokered ? 'r' : 'c')]) {
       const st = lstat(path);
       if (!st.isDirectory() || Number(st.uid) !== 0 || (Number(st.mode) & 0o022)
         || !(Number(st.mode) & 0o001)) refuseCooperative();
@@ -510,7 +560,18 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
   };
   if (memberAttachProvider && (!endpoints.member || typeof assertRunnerLive !== 'function')) refuseCooperative();
   const memberAttach = memberAttachProvider ? createStage2aMemberAttach({
-    provider: memberAttachProvider, withLiveRuntime,
+    provider: {
+      ...memberAttachProvider,
+      async select(request) {
+        if (memberBootstrap?.isCurrent() !== true) refuseCooperative();
+        const selected = await memberAttachProvider.select(request);
+        if (!selected || memberBootstrap.isCurrent() !== true
+          || !Buffer.isBuffer(selected.assignmentBytes)
+          || `sha256:${createHash('sha256').update(selected.assignmentBytes).digest('hex')}` !== memberBootstrap.assignmentSHA256
+          || selected.boundAuthoritySHA256 !== memberBootstrap.authoritySHA256) refuseCooperative();
+        return selected;
+      },
+    }, withLiveRuntime,
     selectors: { ...assignment, reservation_sha256: digest },
     runnerEndpoint: Object.freeze({ socketPath: ep.socket_path, peerUid: assignment.runner_uid, directory: ep.directory }),
     cooperativeMemberEndpoint: endpoints.member, profile: 'managed-cooperative',
@@ -562,7 +623,7 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
         if (memberAttach && op === MEMBER_ATTACH) {
           return memberAttach.attach(meta.payload, { ...meta, runnerPeer: state });
         }
-        if (op === 'cooperative.acp.v3' && !memberAttach) {
+        if (op === 'cooperative.acp.v3') {
           state.state = 'acp-check';
           const p = meta.payload;
           if (!meta.takeover || !p || typeof p !== 'object' || Array.isArray(p)
@@ -575,7 +636,9 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
           return takeover({ schema: 'hq/cooperative-acp/v3', reservation_sha256: digest,
             start_id: assignment.start_id, launch_id: assignment.launch_id }, {
             open: () => {
-              if (!attachedPeer(state.peer_pid) || acpSpent) refuseCooperative();
+              if (!attachedPeer(state.peer_pid) || acpSpent
+                || (brokered && (memberBootstrap?.isCurrent() !== true
+                  || !memberAttach.bothAttached(ownerReadySHA256)))) refuseCooperative();
               acpSpent = true;
               state.state = 'acp';
               return (socket) => { void Promise.resolve().then(() => openAcpStream(socket, context))
@@ -619,8 +682,13 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
           || typeof verified.process_start !== 'string' || !verified.process_start
           || !Number.isFinite(Date.parse(verified.attached_at))
           || sessions.get(meta.session) !== state || !current()) refuseCooperative();
-        const ticketBytes = core.random.bytes(32);
-        if (!Buffer.isBuffer(ticketBytes) || ticketBytes.length !== 32) refuseCooperative();
+        if (brokered) {
+          const bootstrap = await memberAttachProvider.bootstrap(pinned);
+          if (!current() || sessions.get(meta.session) !== state) refuseCooperative();
+          memberBootstrap = verifyCooperativeMemberBootstrap(bootstrap, {
+            reservation: pinned, provider: memberAttachProvider, hqUid, now: core.clock.now(),
+          });
+        }
         state.context = Object.freeze({ reservation_sha256: digest,
           installation_id: assignment.installation_id, soul_id: assignment.soul_id,
           start_id: assignment.start_id, launch_id: assignment.launch_id,
@@ -630,9 +698,18 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
           definition_digest: binding.claimed_definition_digest,
           h_service_descriptor_digest: binding.h_service_descriptor_digest,
           profile_in_force: 'managed-cooperative' });
+        if (brokered && (await assertRunnerLive(state.context) !== true || !current()
+          || sessions.get(meta.session) !== state || memberBootstrap.isCurrent() !== true)) refuseCooperative();
         state.state = 'attached';
         attachedSession = meta.session;
-        acpTicket = ticketBytes.toString('base64url');
+        if (brokered) return Object.freeze({
+          schema: 'hq/cooperative-member-set-attach/v3', reservation_sha256: digest,
+          start_id: assignment.start_id, launch_id: assignment.launch_id,
+          broker_socket_path: memberBootstrap.brokerPath,
+          member_set_assignment_envelope_sha256: memberBootstrap.assignmentSHA256,
+          member_b_authority_envelope_sha256: memberBootstrap.authoritySHA256,
+        });
+        acpTicket = issueAcpTicket();
         return Object.freeze({ schema: 'hq/cooperative-attach/v3', reservation_sha256: digest,
           start_id: assignment.start_id, launch_id: assignment.launch_id,
           broker_socket_path: broker.socket_path, acp_ticket_base64url: acpTicket });
@@ -641,20 +718,40 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
       if (memberAttach && op === MEMBER_ATTACH_PREPARE) {
         return memberAttach.prepare(meta.payload, { ...meta, runnerPeer: state });
       }
+      if (memberAttach && op === OWNER_ACP_TICKET) {
+        const p = meta.payload;
+        if (ticketPending || acpTicket || !p || Object.keys(p).join(',') !== 'ready_envelope_sha256'
+          || !DIGEST.test(p.ready_envelope_sha256 ?? '') || memberBootstrap?.isCurrent() !== true
+          || !memberAttach.bothAttached(p.ready_envelope_sha256)) refuseCooperative();
+        ticketPending = true;
+        try {
+          if (await memberAttachProvider.ownerReady({ context: state.context,
+            readyEnvelopeSHA256: p.ready_envelope_sha256, authoritySHA256: memberBootstrap.authoritySHA256 }) !== true
+            || !attachedPeer(state.peer_pid) || memberBootstrap.isCurrent() !== true
+            || !memberAttach.bothAttached(p.ready_envelope_sha256)) refuseCooperative();
+          acpTicket = issueAcpTicket();
+          ownerReadySHA256 = p.ready_envelope_sha256;
+          acpReady = true;
+          return Object.freeze({ schema: 'hq/cooperative-owner-acp-ticket/v3', reservation_sha256: digest,
+            start_id: assignment.start_id, launch_id: assignment.launch_id,
+            ready_envelope_sha256: p.ready_envelope_sha256, acp_ticket_base64url: acpTicket });
+        } finally { ticketPending = false; }
+      }
       if (!ADMISSION_OPERATIONS.has(op)) refuseCooperative();
       const result = await admissionDispatch(op, { ...meta, cooperativeStart: state.context });
       if (!current() || sessions.get(meta.session) !== state) refuseCooperative();
-      if (op === 'Hello') acpReady = true;
+      if (op === 'Hello' && !brokered) acpReady = true;
       return result;
     },
   });
   try { identity = { dir: directory(), socket: socketIdentity() }; }
   catch (error) { await listener.close(); throw error; }
   return Object.freeze({ path: ep.socket_path, checkCurrent: current, attachedPeer,
-    brokerPin: Object.freeze({ endpoint: Object.freeze({ ...broker }),
+    reservationSHA256: digest,
+    ...(!brokered ? { brokerPin: Object.freeze({ endpoint: Object.freeze({ ...broker }),
       runner_uid: assignment.runner_uid, runner_gid: assignment.runner_gid,
       runner_account: assignment.runner_account,
-      start_id: assignment.start_id, reservation_sha256: digest }),
+      start_id: assignment.start_id, reservation_sha256: digest }) } : {}),
     close: () => {
       if (!closePromise) { lose(); closed = true; closePromise = listener.close(); }
       return closePromise;
