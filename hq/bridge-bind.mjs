@@ -443,12 +443,12 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
       && binding.expires > nowMs() && usable(binding.context, connection);
   }
 
-  async function finalizedBridgeConnectionV3(connection, receipt) {
+  async function boundBridgeConnectionV3(connection, receipt, requireFinalized = false) {
     if (!currentBridgeConnectionV3(connection, receipt)) refuse();
     const binding = live.get(connection);
     const state = await recheckBridge(connection, binding);
     if (!currentBridgeConnectionV3(connection, receipt) || live.get(connection) !== binding
-      || !binding.finalized) refuse();
+      || (requireFinalized && !binding.finalized)) refuse();
     return state;
   }
 
@@ -557,7 +557,8 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     verifyBridgeBindingV3: (...args) => track(verifyBridgeBinding(V3, ...args)),
     boundBridgeV3: (...args) => track(boundBridge(V3, ...args)),
     currentBridgeConnectionV3,
-    finalizedBridgeConnectionV3: (...args) => track(finalizedBridgeConnectionV3(...args)),
+    boundBridgeConnectionV3: (connection, receipt) => track(boundBridgeConnectionV3(connection, receipt)),
+    finalizedBridgeConnectionV3: (connection, receipt) => track(boundBridgeConnectionV3(connection, receipt, true)),
     boundBridgeConnectionV2: (...args) => track(boundBridgeConnectionV2(...args)),
     qualifyBridgeMessagesV2: (...args) => track(qualifyBridgeMessagesV2(...args)),
     bridgeRelayIngressEnabledV2: () => typeof relayIngressAuthorizer === 'function' && available(V2),

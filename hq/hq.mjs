@@ -195,6 +195,7 @@ export function createHQ({
   bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
   qualificationAuthorizer,       // trusted one-use installed test-provider operation; never owner config
   relayIngressAuthorizer,        // trusted one-use B test-provider; absent until A finalization is wired
+  memberArmProvider,             // trusted paired A observation/arm provider; absent in production
   relayPeerAuthority,            // trusted v3 bound B + paired A live CLI verifier; absent in production
   protectedAdmission,            // future pinned Machine verifier; absent in production until signed contracts ship
   createCooperativeStart,        // owner lifecycle for a paired cooperative launch
@@ -394,6 +395,7 @@ export function createHQ({
       qualificationAuthorizer,
       relayIngressAuthorizer,
       relayPeerAuthority,
+      memberArmProvider,
       protectedAdmission,
       cooperativeAdmission: cooperativeGuard?.client,
     });
@@ -506,6 +508,7 @@ export function createHQ({
         const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
           enableBridgeQualification: typeof qualificationAuthorizer === 'function',
           enableBridgeRelayIngress: typeof relayIngressAuthorizer === 'function',
+          enableMemberArmExchange: host.provided('hq-admission')?.stage2aMemberArmExchangeEnabledV3?.() === true,
           enableRelayPeerChallenge: typeof bridgeAuthority?.verifyLiveStartV3 === 'function'
             && typeof relayPeerAuthority?.boundStart === 'function'
             && typeof relayPeerAuthority?.attest === 'function' });

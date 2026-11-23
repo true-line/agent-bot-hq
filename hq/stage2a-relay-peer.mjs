@@ -74,6 +74,117 @@ export function verifyStage2aBridgeMemberAuthority(bytes, { machinePublicKey, sc
   return proof;
 }
 
+const BIND_SELECTORS = ['installation_id', 'start_id', 'plan_id', 'plan_digest', 'reservation_digest',
+  'assignment_envelope_sha256', 'authority_envelope_sha256', 'member_selectors_sha256'];
+
+export function createStage2aMemberArmExchange({ provider, current, boundStart, clock }) {
+  const connections = new Map();
+  const enabled = !!provider?.schema && !!provider.childObservationSchema
+    && typeof provider.observe === 'function' && typeof provider.recordArm === 'function';
+  const check = (schema, payload) => {
+    if (validate(schema, payload, { schemas: (provider.schemaReferences ?? []).filter((entry) =>
+      entry.$id !== schema.$id) }).length) refuse();
+    return payload;
+  };
+  const active = (connection, receipt, state) =>
+    current(connection, receipt) === true && connections.get(connection) === state;
+  const bound = async (request, connection, receipt, state) => {
+    if (!active(connection, receipt, state)) refuse();
+    const binding = await boundStart(connection, receipt);
+    if (!active(connection, receipt, state)
+      || !exact(request.selectors, BIND_SELECTORS)
+      || BIND_SELECTORS.some((field) => request.selectors[field] !== binding[field])) refuse();
+    return binding;
+  };
+
+  async function observe(request, { connection } = {}, receipt) {
+    if (!enabled || current(connection, receipt) !== true
+      || request?.kind !== 'bridge.member.observe.v3.request') refuse();
+    check(provider.schema, request);
+    const state = connections.get(connection) ?? { members: new Map(), nonces: new Set() };
+    if (state.members.has(request.member_id) || state.members.size >= 2
+      || state.nonces.has(request.observe_nonce)) refuse();
+    connections.set(connection, state);
+    const slot = { nonce: request.observe_nonce };
+    state.members.set(request.member_id, slot);
+    state.nonces.add(slot.nonce);
+    const binding = await bound(request, connection, receipt, state);
+    const observation = await provider.observe(binding);
+    if (!active(connection, receipt, state) || !observation) refuse();
+    const { envelopeBytes, assignmentBytes, machinePublicKey, provisionalMappingSHA256 } = observation;
+    const signed = (bytes, purpose) => verifyStage2aMachineEnvelope(bytes, machinePublicKey,
+      `agent-bot/stage2a-member-set-${purpose}/v1`, { maxBytes: 16_384 });
+    const assignment = signed(assignmentBytes, 'assignment');
+    const child = signed(envelopeBytes, 'child-observation');
+    const a = assignment.payload, c = check(provider.childObservationSchema, child.payload);
+    const mapping = c.provisional_hq_mapping;
+    const startFields = ['profile_in_force', 'host_id', 'installation_id', 'soul_id', 'start_id', 'hq_epoch'];
+    if (assignment.envelope_sha256 !== binding.assignment_envelope_sha256
+      || a.profile_in_force !== 'managed-protected'
+      || a.reservation_sha256 !== binding.reservation_digest || c.reservation_sha256 !== binding.reservation_digest
+      || c.assignment_envelope_sha256 !== assignment.envelope_sha256
+      || startFields.some((field) => c[field] !== a[field] || mapping[field] !== a[field])
+      || mapping.assignment_envelope_sha256 !== assignment.envelope_sha256
+      || mapping.runtime_state !== 'provisional' || mapping.acp_authority !== 'withheld'
+      || !SHA.test(provisionalMappingSHA256) || c.provisional_hq_mapping_sha256 !== provisionalMappingSHA256
+      || sha(canonicalBytes(mapping)) !== provisionalMappingSHA256
+      || !Array.isArray(a.members) || a.members.length !== 2 || c.members.length !== 2
+      || mapping.members.length !== 2 || a.members[0].member_id >= a.members[1].member_id
+      || c.members[0].runtime_id === c.members[1].runtime_id
+      || c.members[0].child_process.pid === c.members[1].child_process.pid) refuse();
+    for (const [i, member] of a.members.entries()) {
+      const observed = c.members[i], mapped = mapping.members[i], p = observed.child_process;
+      if (['member_id', 'member_selector'].some((k) => observed[k] !== member[k] || mapped[k] !== member[k])
+        || observed.launch_id !== member.launch_id || observed.runtime_id !== mapped.runtime_id
+        || p.uid !== a.runner_uid || p.gid !== a.runner_gid || p.executable_sha256 !== member.command_sha256) refuse();
+    }
+    const member = c.members.find((m) => m.member_id === request.member_id);
+    const issued = time(c.issued_at), expires = time(c.expires_at);
+    if (!member || member.member_selector !== request.member_selector
+      || !(time(c.observed_at) <= issued && issued <= clock.now()
+        && clock.now() < expires && expires <= time(a.expires_at))
+      || (state.childSHA256 && state.childSHA256 !== child.envelope_sha256)
+      || !active(connection, receipt, state)) refuse();
+    const result = check(provider.schema, { kind: 'bridge.member.observe.v3.result', member_id: member.member_id,
+      member_selector: member.member_selector, observe_nonce: slot.nonce,
+      child_observation_envelope_base64url: envelopeBytes.toString('base64url'),
+      child_observation_envelope_sha256: child.envelope_sha256, expires_at: c.expires_at });
+    state.childSHA256 = child.envelope_sha256;
+    Object.assign(slot, { member, expires, expiresAt: c.expires_at, observedAt: time(c.observed_at),
+      childSHA256: child.envelope_sha256 });
+    return result;
+  }
+
+  async function arm(request, { connection } = {}, receipt) {
+    if (!enabled || request?.kind !== 'bridge.member.arm.v3.request') refuse();
+    check(provider.schema, request);
+    const state = connections.get(connection), slot = state?.members.get(request.member_id);
+    if (!state || !active(connection, receipt, state) || !slot?.member || slot.armSpent
+      || state.nonces.has(request.arm_nonce) || slot.expires <= clock.now()
+      || request.observe_nonce !== slot.nonce || request.member_selector !== slot.member.member_selector
+      || request.child_observation_envelope_sha256 !== slot.childSHA256) refuse();
+    slot.armSpent = true;
+    state.nonces.add(request.arm_nonce);
+    const binding = await bound(request, connection, receipt, state);
+    const row = request.bridge_arm, p = slot.member.child_process;
+    if (row.member_id !== request.member_id || row.member_selector !== request.member_selector
+      || row.runtime_id !== slot.member.runtime_id || row.bridge_uid !== binding.bridge_uid
+      || row.child_observation_envelope_sha256 !== slot.childSHA256
+      || ['pid', 'uid', 'gid', 'start_seconds', 'start_micros'].some((field) => row[`adapter_${field}`] !== p[field])
+      || !(slot.observedAt <= time(row.armed_at) && time(row.armed_at) <= clock.now())
+      || sha(canonicalBytes(row)) !== request.bridge_arm_receipt_sha256
+      || slot.expires <= clock.now()) refuse();
+    if (await provider.recordArm(binding, canonicalBytes(row), request.bridge_arm_receipt_sha256) !== true
+      || !active(connection, receipt, state) || slot.expires <= clock.now()) refuse();
+    return check(provider.schema, { kind: 'bridge.member.arm.v3.result', member_id: request.member_id,
+      member_selector: request.member_selector, arm_nonce: request.arm_nonce,
+      bridge_arm_receipt_sha256: request.bridge_arm_receipt_sha256, state: 'recorded-pending-aggregate-ready',
+      expires_at: slot.expiresAt });
+  }
+
+  return Object.freeze({ enabled, observe, arm, forgetConnection: (connection) => connections.delete(connection) });
+}
+
 function validChallenge(c, now) {
   if (!exact(c, FIELDS) || c.contract !== 'hq/v1' || c.kind !== 'stage2a-relay-peer-challenge'
     || c.schema_version !== 1 || !['managed-protected', 'managed-cooperative'].includes(c.profile_in_force)
