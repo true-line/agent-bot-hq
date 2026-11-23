@@ -3,6 +3,7 @@
 // independently pinned A key. This module never grants provider ingress.
 import { createHash } from 'node:crypto';
 import { canonicalBytes, canonicalize } from '../sdk/wire/canonical-json.mjs';
+import { HostError } from '../sdk/errors.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
 import { verifyStage2aMachineEnvelope } from './stage2a-stop.mjs';
 
@@ -141,7 +142,9 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
         new Promise((_, reject) => {
           timer = setTimeout(() => {
             slot.timedOut = true;
-            reject(new Error('Stage 2a child observation deadline exceeded'));
+            reject(slot.waitingForEvidence && active(connection, receipt, state)
+              ? new HostError('host.launch_busy', 'child observation pending')
+              : new HostError('host.launch_unavailable', 'live v3 binding could not be verified'));
           }, 4_000);
           timer.unref?.();
         })]);
@@ -154,8 +157,11 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
   async function observed(request, connection, receipt, state, slot) {
     const binding = await bound(request, connection, receipt, state);
     if (slot.timedOut) refuse();
+    slot.waitingForEvidence = true;
     const observation = await provider.observe(binding);
-    if (slot.timedOut || !active(connection, receipt, state) || !observation) refuse();
+    if (slot.timedOut || !active(connection, receipt, state)) refuse();
+    if (observation === undefined) throw new HostError('host.launch_busy', 'child observation pending');
+    if (!observation) refuse();
     const { envelopeBytes, assignmentBytes, machinePublicKey, provisionalMappingSHA256,
       memberGrants } = observation;
     const signed = (bytes, purpose) => verifyStage2aMachineEnvelope(bytes, machinePublicKey,
