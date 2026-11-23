@@ -513,3 +513,45 @@ export function createCooperativeBPolicyDelivery({ reservation, bridgeAssignment
     } finally { pending = false; }
   };
 }
+
+
+// Register the signed endpoint and callbacks before exec so the fixed B
+// wrapper can complete its HMAC challenge on the same listener it will use
+// for policy. The role promise releases policy only after signed FD5 proof.
+export async function openCooperativeBStage({ reservation, bridgeAssignment, machinePublicKey,
+  schemas, schemaReferences, expected, openEndpoint, kernelPeer, exchange, random, contain,
+  now = Date.now } = {}) {
+  if (!schemas || typeof openEndpoint !== 'function') refuse();
+  const machine = createCooperativeBRoleClient({ reservation, bridgeAssignment, machinePublicKey, exchange, now });
+  const bind = createCooperativeBBind({ reservation, bridgeAssignment, schema: schemas.bind,
+    schemaReferences, machine, kernelPeer, random, contain, now });
+  let resolveRole, rejectRole;
+  const roleReady = new Promise((resolve, reject) => { resolveRole = resolve; rejectRole = reject; });
+  void roleReady.catch(() => {});
+  const policy = createCooperativeBPolicyDelivery({ reservation, bridgeAssignment, machinePublicKey,
+    assignmentSchema: schemas.assignment, authoritySchema: schemas.authority, requestSchema: schemas.policyRequest,
+    resultSchema: schemas.policyResult, schemaReferences, expected, boundConnection: bind.binding, now,
+    observeWrapperBind: async (binding) => (await roleReady).observeWrapperBind(binding),
+    loadPolicy: async (wrapper) => (await roleReady).loadPolicy(wrapper) });
+  let endpoint;
+  try {
+    endpoint = await openEndpoint({ bridgeAssignment, handlers: {
+      stage2aCooperativeBBindChallengeV3: bind.begin,
+      stage2aCooperativeBBindV3: bind.finish,
+      stage2aCooperativeBPolicyV3: policy,
+      forgetBridgeConnection: bind.stop,
+    } });
+    const role = await startCooperativeBRole({ reservation, bridgeAssignment, machinePublicKey,
+      observationSchema: schemas.observation, schemaReferences, exchange, boundByReceiptSHA256: bind.byReceiptSHA256, now });
+    resolveRole(role);
+    let closing;
+    return Object.freeze({ wrapper: role.wrapper, close: () => {
+      closing ??= Promise.all([role.wrapper.stop(), endpoint.close()]).then(() => {});
+      return closing;
+    } });
+  } catch (error) {
+    rejectRole(error);
+    await endpoint?.close();
+    throw error;
+  }
+}

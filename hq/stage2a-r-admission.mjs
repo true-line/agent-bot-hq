@@ -5,7 +5,7 @@ import { lstatSync } from 'node:fs';
 import { join } from 'node:path';
 import { fail } from '../sdk/errors.mjs';
 import { checkDarwinACL } from './darwin-harness-accounts.mjs';
-import { observePeerPid } from './owner-control.mjs';
+import { observeDarwinPeerIdentity, observePeerPid } from './owner-control.mjs';
 import { listenSocket, takeover } from './socket.mjs';
 import { canonicalBytes, canonicalDigest } from '../sdk/wire/canonical-json.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
@@ -22,6 +22,7 @@ const sameInode = (a, b) => BigInt(a.dev) === BigInt(b.dev) && BigInt(a.ino) ===
 
 const MEMBER_ATTACH_PREPARE = 'stage2a.member.attach.prepare';
 const MEMBER_ATTACH = 'stage2a.member.attach';
+const COOPERATIVE_MEMBER_LIVE = 'launch.cooperative.live';
 const OWNER_ACP_TICKET = 'cooperative.owner-acp-ticket.v3';
 const ATTACH_TOKEN = /^[0-9a-f]{64}$/;
 const ATTACH_CAP = 128 * 1024;
@@ -438,7 +439,7 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
   machineAttach, verifyAttachReceipt, admissionDispatch, openAcpStream, isLive, onLost,
   memberAttachProvider, withLiveRuntime, assertRunnerLive,
   lstat = (path) => lstatSync(path, { bigint: true }),
-  checkACL = checkDarwinACL, observePeer = observePeerPid,
+  checkACL = checkDarwinACL, observePeer = observePeerPid, observePeerIdentity = observeDarwinPeerIdentity,
   listen = listenSocket } = {}) {
   const pinned = typeof verifyReservation === 'function'
     ? await verifyReservation(reservation) : undefined;
@@ -625,6 +626,30 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
       const state = sessions.get(meta.session);
       if (!current() || !state || !Number.isSafeInteger(state.peer_pid)) refuseCooperative();
       if (state.state === 'new') {
+        if (brokered && op === COOPERATIVE_MEMBER_LIVE) {
+          const renew = memberAttachProvider.renewWrapperLease;
+          const p = meta.payload;
+          if (typeof renew !== 'function' || !attachedSession || !finalizedReadySHA256
+            || memberBootstrap?.isCurrent() !== true || !p || typeof p !== 'object' || Array.isArray(p)
+            || canonicalBytes(p).length > 4096
+            || p.installation_id !== assignment.installation_id || p.start_id !== assignment.start_id
+            || p.launch_id !== assignment.launch_id || p.reservation_sha256 !== digest
+            || p.assignment_envelope_sha256 !== memberBootstrap.assignmentSHA256
+            || p.member_b_authority_sha256 !== memberBootstrap.authoritySHA256 || p.launcher_pid !== state.peer_pid
+            || (p.after_sequence === 0 ? p.ready_sha256 !== '' : p.ready_sha256 !== finalizedReadySHA256)) refuseCooperative();
+          state.state = 'member-live';
+          const peer = await observePeerIdentity(state.socket, assignment.runner_uid);
+          const original = sessions.get(attachedSession)?.context;
+          if (!peer || peer.pid !== state.peer_pid || peer.gid !== assignment.runner_gid
+            || !attachedPeer(original?.peer_pid) || state.socket.destroyed || memberBootstrap.isCurrent() !== true)
+            refuseCooperative();
+          const result = await renew({ request: p, kernelPeer: peer,
+            context: original, readyEnvelopeSHA256: finalizedReadySHA256 });
+          const rechecked = await observePeerIdentity(state.socket, assignment.runner_uid);
+          if (!rechecked || canonicalDigest(rechecked) !== canonicalDigest(peer) || state.socket.destroyed
+            || !attachedPeer(original.peer_pid) || memberBootstrap.isCurrent() !== true) refuseCooperative();
+          return result;
+        }
         if (memberAttach && op === MEMBER_ATTACH) {
           return memberAttach.attach(meta.payload, { ...meta, runnerPeer: state });
         }

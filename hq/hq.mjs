@@ -229,6 +229,7 @@ export function createHQ({
   const brokerCallers = new Map();
   const bridgePeers = new Map();
   const bridgeListeners = new Map();
+  const cooperativeBridgeListeners = new Map();
   const runnerAdmissions = new Map();
   const openingRunnerAdmissions = new Set();
   const cooperativeListeners = new Map();
@@ -568,6 +569,7 @@ export function createHQ({
     for (const s of sockets) await s.close();
     sockets = [];
     bridgeListeners.clear();
+    cooperativeBridgeListeners.clear();
     const report = await host.stop({ reason });
     await bridgeStop; // uncertain B containment cannot produce hq.stopped
     for (const [id, s] of coreTable(core, 'sessions')) if (!s.closed_at) coreTable(core, 'sessions').set(id, { ...s, closed_at: clock.now() });
@@ -662,6 +664,43 @@ export function createHQ({
     qualifyDirectProtectedClaim: (startId) => {
       if (!running) fail('host.launch_unavailable', 'HQ direct qualification is unavailable');
       return soulStarter.qualifyDirectProtectedClaim(startId);
+    },
+    openCooperativeBridgeEndpoint: async ({ bridgeAssignment, handlers }) => {
+      const endpoint = bridgeAssignment?.endpoint;
+      const key = endpoint?.installationId;
+      if (!running || platform !== 'darwin' || !key || !endpoint.parentIdentity
+        || cooperativeBridgeListeners.has(key) || bridgeEndpoints.some((other) => other.path === endpoint.path || other.uid === endpoint.uid)
+        || [...cooperativeBridgeListeners.values()].some((other) =>
+          other.endpoint.path === endpoint.path || other.endpoint.uid === endpoint.uid)
+        || typeof handlers?.stage2aCooperativeBBindChallengeV3 !== 'function'
+        || typeof handlers.stage2aCooperativeBBindV3 !== 'function'
+        || typeof handlers.stage2aCooperativeBPolicyV3 !== 'function') {
+        fail('host.launch_unavailable', 'cooperative B endpoint is unavailable');
+      }
+      const marker = { endpoint };
+      cooperativeBridgeListeners.set(key, marker);
+      try {
+        const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
+          enableCooperativeBBind: true, enableCooperativeBPolicy: true, cooperativeHandlers: handlers });
+        if (!running || cooperativeBridgeListeners.get(key) !== marker) {
+          await listener.close();
+          fail('host.launch_unavailable', 'cooperative B endpoint stopped during startup');
+        }
+        marker.listener = listener;
+        sockets.push(listener);
+        let closed;
+        return Object.freeze({ close: () => {
+          if (!closed) {
+            if (cooperativeBridgeListeners.get(key) === marker) cooperativeBridgeListeners.delete(key);
+            sockets = sockets.filter((entry) => entry !== listener);
+            closed = listener.close();
+          }
+          return closed;
+        } });
+      } catch (error) {
+        if (cooperativeBridgeListeners.get(key) === marker) cooperativeBridgeListeners.delete(key);
+        throw error;
+      }
     },
     cooperativeBridgeKernelPeer: (connection, expected) => {
       if (!running) fail('host.launch_unavailable', 'cooperative B broker is unavailable');

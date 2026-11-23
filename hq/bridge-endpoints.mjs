@@ -67,12 +67,12 @@ export function planBridgeEndpoints(assignments, { platform, account, hqUid, har
 
 export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
   enableBridgeQualification = false, enableBridgeRelayIngress = false,
-  enableRelayPeerChallenge = false, enableMemberArmExchange = false, enableCooperativeBPolicy = false, enableCooperativeBBind = false,
+  enableRelayPeerChallenge = false, enableMemberArmExchange = false, enableCooperativeBPolicy = false, enableCooperativeBBind = false, cooperativeHandlers,
   lstat = (path) => lstatSync(path, { bigint: true }),
   checkACL = checkDarwinACL, authenticate = authenticatePeerUid, listen = listenSocket } = {}) {
   const cooperative = new Map();
   async function cooperativeDispatch(kind, payload, connection, peer) {
-    const methods = host.provided('hq-admission');
+    const methods = cooperativeHandlers ?? host.provided('hq-admission');
     const meta = Object.freeze({ connection });
     const current = () => peers.get(connection) === peer && !peer.socket.destroyed && peer.checkCurrent();
     const state = cooperative.get(connection);
@@ -162,6 +162,7 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
       const end = () => {
         peers.delete(connection);
         cooperative.delete(connection);
+        void cooperativeHandlers?.forgetBridgeConnection?.(connection)?.catch(() => {});
         // Revoke HQ's receipt before pending broker dispatch can finish.
         void host.provided('hq-admission')?.forgetBridgeConnection?.(connection)?.catch(() => {});
         void host.brokerClosed(connection).catch(() => {});
@@ -178,6 +179,7 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
       const policy = kind === COOPERATIVE_MEMBER_POLICY;
       const cooperativeBind = kind === COOPERATIVE_B_BIND;
       const peer = peers.get(session);
+      if (cooperativeHandlers && !cooperativeBind && !policy && !memberArm) refuse();
       if (!peer || (!protectedBridgeKind(kind) && !(qualification && enableBridgeQualification === true)
         && !(relayIngress && enableBridgeRelayIngress === true)
         && !(livePeer && enableRelayPeerChallenge === true)
