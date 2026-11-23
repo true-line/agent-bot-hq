@@ -267,7 +267,7 @@ export async function listenStage2aRunnerAdmission({ installed, assignment, sele
   const memberAttach = memberAttachProvider ? createStage2aMemberAttach({
     provider: memberAttachProvider, withLiveRuntime, selectors, core, current, onLost: lose,
     refreshRunnerPeer: protectedAdmission?.refreshRunnerPeer,
-    runnerEndpoint: Object.freeze({ socketPath: ep.socket_path, peerUid: hqUid, directory: ep.directory }),
+    runnerEndpoint: Object.freeze({ socketPath: ep.socket_path, peerUid: installed.runner_uid, directory: ep.directory }),
   }) : undefined;
   checkDirectory();
   const listener = await listen({
