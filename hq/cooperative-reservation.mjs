@@ -1,7 +1,10 @@
 // Independent HQ verification for Machine's cooperative one-use reservation.
 // This proof is separate from protected Stage 2a and never authorizes a
 // protected claim. Machine's installed authority and durable spend remain the
-// source of launch permission.
+// source of launch permission. v1 binds R's frozen package only; it does not
+// attest to selected H/HQ/Comms/contracts code. Production needs a new signed
+// purpose/version that binds A's H descriptor to HQ's startup-loaded digest,
+// with A rechecking H bytes at launch. The R digest cannot substitute for it.
 import { createHash, createPublicKey, verify } from 'node:crypto';
 import { isAbsolute, join, normalize } from 'node:path';
 import { canonicalize } from '../sdk/wire/canonical-json.mjs';

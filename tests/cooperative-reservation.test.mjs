@@ -82,4 +82,7 @@ test('never accepts a signed protected profile or changed H/R socket assignment'
   assert.throws(() => verifyCooperativeReservation(signedFixture((p) => {
     p.runner_uid = 310;
   }), context()));
+  assert.throws(() => verifyCooperativeReservation(signedFixture((p) => {
+    p.hq_code_descriptor_sha256 = '3'.repeat(64);
+  }), context()));
 });
