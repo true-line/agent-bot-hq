@@ -144,9 +144,29 @@ function observeKernel(args, maxBytes, socket) {
   });
 }
 
+const peerObservations = new WeakMap();
+async function observeKernelPeer(socket, args, maxBytes) {
+  if (!socket || socket.destroyed) return null;
+  if (process.platform !== 'darwin') return observeKernel(args, maxBytes, socket);
+  // Passing the accepted descriptor through the helper interrupts libuv's
+  // Darwin read registration. Stop reading before the probe and rearm it
+  // afterward, preserving a listener's existing pause before authentication.
+  const prior = peerObservations.get(socket);
+  const observation = Promise.resolve(prior).then(async () => {
+    if (socket.destroyed) return null;
+    const wasFlowing = socket.readableFlowing === true;
+    if (wasFlowing) socket.pause();
+    try { return await observeKernel(args, maxBytes, socket); }
+    finally { if (wasFlowing && !socket.destroyed) socket.resume(); }
+  });
+  peerObservations.set(socket, observation);
+  try { return await observation; }
+  finally { if (peerObservations.get(socket) === observation) peerObservations.delete(socket); }
+}
+
 export async function observePeerPid(socket, uid) {
   if (!Number.isSafeInteger(uid) || uid < 1) return null;
-  const output = await observeKernel(['peer-pid', String(uid)], 32, socket);
+  const output = await observeKernelPeer(socket, ['peer-pid', String(uid)], 32);
   if (!/^[1-9][0-9]{0,9}\n$/.test(output ?? '')) return null;
   const pid = Number(output.trim());
   return Number.isSafeInteger(pid) && pid > 1 ? pid : null;
@@ -154,7 +174,7 @@ export async function observePeerPid(socket, uid) {
 
 export async function observeDarwinPeerIdentity(socket, expectedUid) {
   if (!darwin || !Number.isSafeInteger(expectedUid) || expectedUid < 1) return null;
-  const output = await observeKernel(['peer-audit', String(expectedUid)], 96, socket);
+  const output = await observeKernelPeer(socket, ['peer-audit', String(expectedUid)], 96);
   if (!/^\d+(?: \d+){5}\n$/.test(output ?? '')) return null;
   const values = output.trim().split(' ').map(Number);
   const [uid, gid, pid, pid_version, start_seconds, start_micros] = values;
