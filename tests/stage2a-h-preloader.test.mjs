@@ -4,7 +4,7 @@ import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { canonicalize } from '../sdk/wire/canonical-json.mjs';
-import { hInventoryDigest, verifyStage2aHEnvelope } from '../hq/stage2a-h-preloader.mjs';
+import { authenticatedSelectedH, hInventoryDigest, verifyStage2aHEnvelope } from '../hq/stage2a-h-preloader.mjs';
 
 const purpose = 'agent-bot/stage2a-h-service-descriptor/v3';
 const sha = (bytes) => 'sha256:' + createHash('sha256').update(bytes).digest('hex');
@@ -14,6 +14,10 @@ const digest = 'sha256:' + 'a'.repeat(64);
 const { publicKey, privateKey } = generateKeyPairSync('ed25519');
 const pin = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
 const unixOnly = { skip: process.platform === 'win32' };
+
+test('unprotected imports expose no authenticated H selection', () => {
+  assert.equal(authenticatedSelectedH(), null);
+});
 
 test('H inventory digest uses the domain purpose, not the sidecar file hash', () => {
   const bytes = Buffer.from('{"a":1}');

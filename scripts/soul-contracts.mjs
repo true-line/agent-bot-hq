@@ -15,12 +15,32 @@ import { execFileSync } from 'node:child_process';
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { authenticatedSelectedH } from '../hq/stage2a-h-preloader.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const PIN_PATH = join(ROOT, 'governance/soul-contracts.json');
 export const ALGORITHM = 'sha256-manifest-v1';
 const CACHE = join(ROOT, '.cache/soul-contracts');
 const MODES = new Set(['100644', '100755']);
+const H_V09 = Object.freeze({
+  tag: 'v0.9.0',
+  commit: 'e668085d31a02a7e72928a50849494a7b00ec742',
+  digest: 'sha256:9b929a2c9ecbf304380a8588e7a20c2df1f3148d3390ec2d9bea09d48f7a3e38',
+  files: 428,
+  runtimeDigest: 'sha256:25486824df6e2fc2df87c8cfa0721384f9e5650a6519dc87c53ece8377d7447e',
+  runtimeFiles: 420,
+});
+const VENDOR_PREFIX = 'vendor/soul-contracts/';
+export const H_V09_EXCLUDED = Object.freeze([
+  'fixtures/negative/stage2a-qualification-candidate-binding.v3-synthetic.bad.json',
+  'fixtures/negative/stage2a-qualification-candidate-reservation-payload.v3-synthetic.bad.json',
+  'fixtures/negative/stage2a-qualification-candidate-signed-reservation.v3-synthetic.bad.json',
+  'fixtures/positive/stage2a-qualification-candidate-binding.v3-synthetic.json',
+  'fixtures/positive/stage2a-qualification-candidate-reservation-payload.v3-synthetic.json',
+  'fixtures/positive/stage2a-qualification-candidate-signed-reservation.v3-synthetic.json',
+  'fixtures/reservation/v3/machine-qualification-candidate-invalid-bytes.json',
+  'fixtures/reservation/v3/machine-qualification-candidate-synthetic.json',
+]);
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 
@@ -46,6 +66,31 @@ export function manifestDigest(entries) {
     manifest[path] = { sha256: sha256(bytes), size: bytes.length, mode };
   }
   return { manifest, digest: `sha256:${sha256(Buffer.from(canonicalize(manifest), 'utf8'))}`, files: entries.length };
+}
+
+const isHV09 = (pin) => pin.tag === H_V09.tag && pin.commit === H_V09.commit
+  && pin.digest === H_V09.digest && pin.files === H_V09.files;
+
+// The raw release is checked against the entire pin before this projection is
+// computed. Machine A separately proves selected+excluded equals that full
+// release at installation; H rechecks the exact selected bytes at startup.
+export function hRuntimeSelection(pin, fullManifest) {
+  if (!isHV09(pin) || !fullManifest || typeof fullManifest !== 'object'
+    || Array.isArray(fullManifest) || Object.keys(fullManifest).length !== H_V09.files
+    || H_V09_EXCLUDED.some((path) => !Object.hasOwn(fullManifest, path))) {
+    throw new Error('H runtime Contracts selection is unavailable for this release');
+  }
+  if (`sha256:${sha256(Buffer.from(canonicalize(fullManifest), 'utf8'))}` !== pin.digest) {
+    throw new Error('H runtime Contracts full source differs from the pin');
+  }
+  const omitted = new Set(H_V09_EXCLUDED);
+  const selected = Object.fromEntries(Object.entries(fullManifest).filter(([path]) => !omitted.has(path)));
+  const digest = `sha256:${sha256(Buffer.from(canonicalize(selected), 'utf8'))}`;
+  if (Object.keys(selected).length !== H_V09.runtimeFiles || digest !== H_V09.runtimeDigest) {
+    throw new Error('H runtime Contracts selection differs from the reviewed release');
+  }
+  return Object.freeze({ digest_algorithm: ALGORITHM, digest, files: H_V09.runtimeFiles,
+    excluded_hq_release_paths: Object.freeze(H_V09_EXCLUDED.map((path) => `${VENDOR_PREFIX}${path}`)) });
 }
 
 export function compareSemver(a, b) {
@@ -160,16 +205,17 @@ function materialize(dir, entries, work) {
   publishTree(stage, dir, work);
 }
 
-// Interim release entrypoint requires a public contracts tree. Verify every
-// file before use; never fall back to the network for an interim release.
-export function verifyVendored(dir, pin = readPin()) {
+// The raw interim artifact keeps and verifies the complete public Contracts
+// tree. The protected H snapshot uses the separately authenticated selection
+// below; neither path falls back to the network.
+function vendoredEntries(dir, paths) {
   const root = resolve(dir);
   for (let path = root; ; path = dirname(path)) {
     const stat = lstatSync(path);
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('vendored contracts ancestry must be directories without symlinks');
     if (dirname(path) === path) break;
   }
-  if (JSON.stringify(readdirSync(root).sort()) !== JSON.stringify([...pin.paths].sort())) throw new Error('vendored contracts root entries differ from the pin');
+  if (JSON.stringify(readdirSync(root).sort()) !== JSON.stringify([...paths].sort())) throw new Error('vendored contracts root entries differ from the pin');
   const entries = [];
   let total = 0;
   const maxFile = 8 * 1024 * 1024, maxTotal = 32 * 1024 * 1024;
@@ -192,15 +238,94 @@ export function verifyVendored(dir, pin = readPin()) {
       } finally { closeSync(fd); }
     } else throw new Error(`vendored contracts contain a non-regular file: ${relative}`);
   }
-  for (const path of pin.paths) visit(path);
+  for (const path of paths) visit(path);
+  return { root, entries };
+}
+
+export function verifyVendored(dir, pin = readPin()) {
+  const { root, entries } = vendoredEntries(dir, pin.paths);
   const got = manifestDigest(entries);
   if (got.digest !== pin.digest || got.files !== pin.files) throw new Error(`vendored soul-contracts digest ${got.digest} (${got.files} files) does not match the pin ${pin.digest} (${pin.files} files)`);
   return { dir: root, ...got };
 }
 
+// This check is selected only by the actual Machine-authenticated H preloader.
+// The selected inventory has already measured every file in the A-owned H
+// snapshot. Recompute the source-mode manifest here so an omitted, extra or
+// changed Contracts file cannot be accepted by metadata alone.
+export function verifySelectedVendored(dir, pin, selection) {
+  if (!isHV09(pin) || !selection || selection.root !== ROOT
+    || !/^sha256:[0-9a-f]{64}$/.test(selection.metadataSha256)
+    || !Number.isSafeInteger(selection.metadataSize) || selection.metadataSize < 1
+    || selection.metadataSize > 65536 || !Array.isArray(selection.vendorRows)) {
+    throw new Error('authenticated H Contracts selection is unavailable');
+  }
+  const metadataPath = join(ROOT, 'governance/interim-release.json');
+  const fd = openSync(metadataPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  let metadataBytes;
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size !== selection.metadataSize) throw new Error('H release metadata differs from Machine inventory');
+    metadataBytes = readFileSync(fd);
+  } finally { closeSync(fd); }
+  if (metadataBytes.length !== selection.metadataSize
+    || `sha256:${sha256(metadataBytes)}` !== selection.metadataSha256) {
+    throw new Error('H release metadata differs from Machine inventory');
+  }
+  const metadata = JSON.parse(metadataBytes.toString('utf8'));
+  return verifySelectedVendoredTree(dir, pin, metadata, selection.vendorRows);
+}
+
+// Pure content check for the authenticated wrapper above. A direct call to
+// this helper does not set preloader state or grant protected launch authority.
+export function verifySelectedVendoredTree(dir, pin, metadata, vendorRows) {
+  if (!isHV09(pin) || !metadata || typeof metadata !== 'object'
+    || !Array.isArray(vendorRows)) {
+    throw new Error('H release metadata does not bind the reviewed Contracts subset');
+  }
+  const runtime = metadata?.contracts_runtime;
+  if (metadata.schema_version !== 1 || metadata.target_platform !== 'darwin'
+    || metadata.contracts_commit !== pin.commit || metadata.contracts_digest !== pin.digest
+    || !runtime || typeof runtime !== 'object' || Array.isArray(runtime)
+    || Object.keys(runtime).sort().join(',') !== ['digest_algorithm', 'digest', 'files',
+      'excluded_hq_release_paths'].sort().join(',')
+    || runtime.digest_algorithm !== ALGORITHM || runtime.digest !== H_V09.runtimeDigest
+    || runtime.files !== H_V09.runtimeFiles
+    || JSON.stringify(runtime.excluded_hq_release_paths) !== JSON.stringify(
+      H_V09_EXCLUDED.map((path) => `${VENDOR_PREFIX}${path}`))) {
+    throw new Error('H release metadata does not bind the reviewed Contracts subset');
+  }
+  const { root, entries } = vendoredEntries(dir, pin.paths);
+  const got = manifestDigest(entries);
+  if (got.digest !== runtime.digest || got.files !== runtime.files
+    || vendorRows.length !== runtime.files) {
+    throw new Error('vendored H Contracts subset differs from the reviewed release');
+  }
+  const seen = new Set();
+  for (const row of vendorRows) {
+    if (!row || typeof row.path !== 'string' || !row.path.startsWith(VENDOR_PREFIX)
+      || row.mode !== '0440' || !Number.isSafeInteger(row.size_bytes)
+      || !/^sha256:[0-9a-f]{64}$/.test(row.sha256)) {
+      throw new Error('H Contracts row differs from Machine inventory');
+    }
+    const path = row.path.slice(VENDOR_PREFIX.length);
+    const actual = got.manifest[path];
+    if (seen.has(path) || !actual || actual.mode !== '100644'
+      || actual.size !== row.size_bytes || `sha256:${actual.sha256}` !== row.sha256) {
+      throw new Error('H Contracts row differs from Machine inventory');
+    }
+    seen.add(path);
+  }
+  return { dir: root, ...got };
+}
+
 // Fetch and verify the pinned release; return the directory tests load from.
 export function verify(pin = readPin()) {
-  if (process.env.HQ_INTERIM_OFFLINE === '1') return verifyVendored(join(ROOT, 'vendor/soul-contracts'), pin);
+  if (process.env.HQ_INTERIM_OFFLINE === '1') {
+    const dir = join(ROOT, 'vendor/soul-contracts');
+    const selection = authenticatedSelectedH();
+    return selection ? verifySelectedVendored(dir, pin, selection) : verifyVendored(dir, pin);
+  }
   return withFetchedTag(pin.repository, pin.tag, (repo, commit, work) => {
     if (commit !== pin.commit) throw new Error(`tag ${pin.tag} now points at ${commit}, not the pinned ${pin.commit}; refusing a moved tag`);
     const entries = treeEntries(repo, commit, pin.paths);

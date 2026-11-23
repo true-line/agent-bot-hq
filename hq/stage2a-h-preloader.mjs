@@ -16,6 +16,13 @@ export const H_DESCRIPTOR = BASE + '/h-v3/descriptor.json';
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const refuse = () => { throw new Error('Machine selected HQ code is unavailable'); };
 const sha = (bytes) => 'sha256:' + createHash('sha256').update(bytes).digest('hex');
+let completedSelection = null;
+
+// This module is loaded by Machine's exact --import argv before HQ's entry.
+// A caller cannot create this result with an environment variable or config
+// file. It is published only after the descriptor, inventory and selected
+// bytes have all been authenticated and the import guard is active.
+export function authenticatedSelectedH() { return completedSelection; }
 export const hInventoryDigest = (bytes) => sha(Buffer.concat([
   Buffer.from('agent-bot/stage2a-h-code-inventory/v3\0'), bytes,
 ]));
@@ -220,6 +227,14 @@ export async function preloadSelectedHQCode() {
   });
   if (selected.count !== ref.file_count || selected.bytes !== ref.total_bytes) refuse();
   registerSelectedHQCode(selected, descriptorDigest);
+  const releaseMetadata = inventory.files.find((row) => row.path === 'governance/interim-release.json');
+  if (!releaseMetadata || releaseMetadata.mode !== '0440') refuse();
+  const vendorRows = inventory.files.filter((row) => row.path.startsWith('vendor/soul-contracts/'))
+    .map((row) => Object.freeze({ path: row.path, sha256: row.sha256,
+      size_bytes: row.size_bytes, mode: row.mode }));
+  completedSelection = Object.freeze({ root: ref.snapshot.path, descriptorDigest,
+    metadataSha256: releaseMetadata.sha256, metadataSize: releaseMetadata.size_bytes,
+    vendorRows: Object.freeze(vendorRows) });
   return descriptorDigest;
 }
 

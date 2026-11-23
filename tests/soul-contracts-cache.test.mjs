@@ -42,6 +42,9 @@ test('concurrent verifiers publish a complete cache, repair it and still refuse 
     schema_version: 1, repository, tag: 'v1.0.0', commit, paths: ['schemas'], digest_algorithm: ALGORITHM, digest, files,
   }));
   mkdirSync(join(root, 'scripts'));
+  mkdirSync(join(root, 'hq'));
+  writeFileSync(join(root, 'hq/stage2a-h-preloader.mjs'),
+    'export function authenticatedSelectedH() { return null; }\n');
   copyFileSync(new URL('../scripts/soul-contracts.mjs', import.meta.url), cli);
   const verify = () => run(process.execPath, [cli, 'verify'], { env });
   const cache = join(root, '.cache/soul-contracts');
