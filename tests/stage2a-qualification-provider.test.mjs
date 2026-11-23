@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { canonicalize } from '../sdk/wire/canonical-json.mjs';
-import { createStage2aQualificationProvider } from '../hq/stage2a-qualification-provider.mjs';
+import { createStage2aQualificationProvider, stage2aLocalProviderPort }
+  from '../hq/stage2a-qualification-provider.mjs';
 
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const digest = (bytes) => `sha256:${sha(bytes)}`;
@@ -25,10 +26,23 @@ function reply(expiresAt = 5_000) {
     config_base64url: configBytes.toString('base64url'), expires_at_ms: expiresAt };
 }
 
-test('installed B ingress spends one Machine provider response with exact selectors', async () => {
+test('installed B ingress reaches the local service once with exact selectors', async (t) => {
   const calls = [];
   const provider = createStage2aQualificationProvider({ plan, now: () => 1_000,
     machineProvide: async (input) => { calls.push(input); return reply(); } });
+  t.after(() => provider.close());
+  await provider.ready;
+  assert.equal(stage2aLocalProviderPort(plan), 58878);
+  assert.equal(provider.port, 58878);
+  const endpoint = `http://127.0.0.1:${provider.port}/stage2a/local-provider/v1`;
+  const getServiceObservation = () => fetch(`${endpoint}/observation`).then((response) => response.json());
+  assert.deepEqual(await getServiceObservation(), { invocations: 0, last_request_sha256: '',
+    last_response_sha256: '' });
+  const wrongBody = canonicalize({ model, request_sha256: digest('wrong request') });
+  const wrong = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: wrongBody });
+  assert.equal(wrong.status, 403);
+  assert.equal((await getServiceObservation()).invocations, 0);
   const result = await provider({ request, observation });
   assert.deepEqual(result, { model, stop_reason: 'end_turn', text: responseText,
     usage: { input_tokens: 7, output_tokens: 3 } });
@@ -39,12 +53,26 @@ test('installed B ingress spends one Machine provider response with exact select
     model, prompt_sha256: requestSHA256 }]);
   await assert.rejects(provider({ request, observation }), /already spent/);
   assert.equal(calls.length, 1);
+  assert.deepEqual(await getServiceObservation(), { invocations: 1, last_request_sha256: requestSHA256,
+    last_response_sha256: digest(responseText) });
+  await provider.close();
+  await assert.rejects(fetch(`${endpoint}/observation`), /fetch failed/);
 });
 
-test('wrong B observation spends the attempt without provider dispatch', async () => {
+test('a colliding local service refuses a second protected start', async (t) => {
+  const first = createStage2aQualificationProvider({ plan, machineProvide: async () => reply() });
+  t.after(() => first.close());
+  await first.ready;
+  const second = createStage2aQualificationProvider({ plan, machineProvide: async () => reply() });
+  t.after(() => second.close());
+  await assert.rejects(second.ready, /EADDRINUSE/);
+});
+
+test('wrong B observation spends the attempt without provider dispatch', async (t) => {
   let calls = 0;
   const provider = createStage2aQualificationProvider({ plan, now: () => 1_000,
     machineProvide: async () => { calls++; return reply(); } });
+  t.after(() => provider.close());
   await assert.rejects(provider({ request, observation: {
     ...observation, reservation_digest: digest('another start'),
   } }), /differs from the signed installed plan/);
@@ -56,7 +84,9 @@ test('altered or expired Machine provider bytes are refused', async () => {
   const altered = createStage2aQualificationProvider({ plan, now: () => 1_000,
     machineProvide: async () => ({ ...reply(), response_text: 'changed' }) });
   await assert.rejects(altered({ request, observation }), /differs from its signed installed pin/);
+  await altered.close();
   const expired = createStage2aQualificationProvider({ plan, now: () => 5_001,
     machineProvide: async () => reply() });
   await assert.rejects(expired({ request, observation }), /differs from its signed installed pin/);
+  await expired.close();
 });

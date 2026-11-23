@@ -285,16 +285,35 @@ async function main(argv) {
             } });
           } catch (error) { registration.close(); throw error; }
         },
-        onFinalized: ({ installed: plan, assignment, selectors }) => {
-          providers.set(selectors.reservation_sha256, createStage2aQualificationProvider({
+        onFinalized: async ({ installed: plan, assignment, selectors }) => {
+          const provider = createStage2aQualificationProvider({
             plan: { installation_id: plan.installation_id, start_id: assignment.start_id,
               launch_id: assignment.launch_id, hq_epoch: plan.hq_epoch, plan_id: plan.plan_id,
               plan_digest: plan.plan_digest, reservation_sha256: selectors.reservation_sha256,
               soul_artifact_sha256: `sha256:${plan.soul_artifact_sha256}`,
               provider_config_sha256: plan.provider_config_sha256 },
-          }));
+          });
+          providers.set(selectors.reservation_sha256, provider);
+          try {
+            // The unprivileged HQ listener must be reachable before ACP is
+            // released. A port collision or bind error refuses the start.
+            await provider.ready;
+            if (providers.get(selectors.reservation_sha256) !== provider) {
+              throw new Error('local provider stopped during activation');
+            }
+          } catch (error) {
+            if (providers.get(selectors.reservation_sha256) === provider) {
+              providers.delete(selectors.reservation_sha256);
+            }
+            await provider.close();
+            throw error;
+          }
         },
-        onStopped: (reservationSHA256) => { providers.delete(reservationSHA256); },
+        onStopped: async (reservationSHA256) => {
+          const provider = providers.get(reservationSHA256);
+          providers.delete(reservationSHA256);
+          await provider?.close();
+        },
       }) : undefined;
       hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins,
         pluginsDir, devPlugins: args.devPlugins, bridgeAssignments: installed,
