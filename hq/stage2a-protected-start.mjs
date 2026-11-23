@@ -80,6 +80,7 @@ export function createStage2aProtectedStarter({ installations, authority, verify
   machineChildReady = machineRoleStage2aChildReady,
   openProtectedAdmission,
   prepareBridge = prepareStage2aBridge, startRole = startStage2aRole,
+  verifyHQCodeReady = () => false,
   onFinalized, onStopped, random = (bytes) => randomBytes(bytes).toString('hex') } = {}) {
   if (!Array.isArray(installations) || typeof authority?.register !== 'function'
     || typeof authority.stopStart !== 'function' || typeof authority.currentLiveStart !== 'function'
@@ -89,7 +90,7 @@ export function createStage2aProtectedStarter({ installations, authority, verify
     || typeof machineReserve !== 'function' || typeof machineFinalize !== 'function'
     || typeof machineChildReady !== 'function'
     || typeof prepareBridge !== 'function' || typeof startRole !== 'function'
-    || typeof random !== 'function') refuse();
+    || typeof verifyHQCodeReady !== 'function' || typeof random !== 'function') refuse();
   const byId = new Map(installations.map((i) => [i.installation_id, i]));
   if (byId.size !== installations.length) refuse();
   const slots = new Map();
@@ -126,6 +127,11 @@ export function createStage2aProtectedStarter({ installations, authority, verify
       || !exact(payload, ['package_path', 'requested_profile'])
       || payload.requested_profile !== 'managed-protected'
       || typeof payload.package_path !== 'string' || !payload.package_path.startsWith('/')) refuse();
+    // The machine/v2 installed policy does not authenticate HQ's selected
+    // installed code. A trusted entry point must prove the static A-signed H
+    // descriptor before any Machine lookup or one-use reservation. There is no
+    // owner-config or v2 fallback while the versioned H seam is unfinished.
+    if (await verifyHQCodeReady() !== true) refuse();
     let source;
     try {
       source = realpathSync(payload.package_path);
