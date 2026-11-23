@@ -36,7 +36,7 @@ import { fileURLToPath } from 'node:url';
 import { verify } from '../scripts/soul-contracts.mjs';
 import { HOST_CODES, REGISTRY_CODES } from '../sdk/errors.mjs';
 import { SCHEMA_NAMES } from './admission.mjs';
-import { NOTICE_SCHEMA_NAMES } from './notices.mjs';
+import { NOTICE_SCHEMA_NAMES, PROTECTED_NOTICE_PEEK_SCHEMA } from './notices.mjs';
 import { TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES } from './tasks.mjs';
 import { createHQ } from './hq.mjs';
 import { productionPluginsDir, readPins } from './plugins.mjs';
@@ -103,7 +103,11 @@ function parse(argv) {
 function loadSchemas() {
   const { dir } = verify();
   const load = (contract, names) => names.map((n) => [n, JSON.parse(readFileSync(join(dir, 'schemas', contract, `${n}.schema.json`), 'utf8'))]);
-  return Object.fromEntries([...load('hq/v1', [...SCHEMA_NAMES, ...NOTICE_SCHEMA_NAMES]), ...load('task/v1', TASK_SCHEMA_NAMES), ...load('wire/v1', TASK_WIRE_SCHEMA_NAMES)]);
+  const noticeSchemas = [...NOTICE_SCHEMA_NAMES];
+  if (existsSync(join(dir, 'schemas', 'hq/v1', `${PROTECTED_NOTICE_PEEK_SCHEMA}.schema.json`))) {
+    noticeSchemas.push(PROTECTED_NOTICE_PEEK_SCHEMA);
+  }
+  return Object.fromEntries([...load('hq/v1', [...SCHEMA_NAMES, ...noticeSchemas]), ...load('task/v1', TASK_SCHEMA_NAMES), ...load('wire/v1', TASK_WIRE_SCHEMA_NAMES)]);
 }
 
 function loadStage2aSchemas() {

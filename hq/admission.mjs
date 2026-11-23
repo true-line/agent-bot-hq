@@ -37,7 +37,7 @@
 //
 // Equip carries no credentials yet: grants and credential references arrive
 // with §9 PRs 18 and 21. It hands out one opaque grant handle per member.
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { definePlugin } from '../sdk/plugin.mjs';
 import { fail, HostError } from '../sdk/errors.mjs';
 import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
@@ -46,6 +46,8 @@ import { negotiateVersions, supportWindow } from '../sdk/wire/versions.mjs';
 import { profileWarning } from './profile.mjs';
 import { createBridgeBindAdmission } from './bridge-bind.mjs';
 import { resolveNoticeScope, validNoticeScope, validNoticeRepository } from './notices-config.mjs';
+
+export const PROTECTED_GRANT_REFUSAL_RECEIPT = Symbol('committed protected grant refusal');
 
 export const CURRENT_VERSIONS = Object.freeze({ hq: 1, wire: 1, task: 1 });
 export const SCHEMA_NAMES = Object.freeze(['hello', 'admission-result', 'equip', 'ready-and-lease-renewal']);
@@ -62,6 +64,8 @@ const CHALLENGE_TTL_MS = 60_000;
 const MAX_CHALLENGES = 4096;
 const PROTECTED_MACHINE_DEADLINE_MS = 5_000;
 const SHA256 = /^sha256:[0-9a-f]{64}$/;
+const GRANT_HANDLE = /^gh_[0-9a-f]{32}$/;
+const grantHandleDigest = (handle) => 'sha256:' + createHash('sha256').update(handle, 'ascii').digest('hex');
 const START_ID = /^st_[0-9a-f]{24}$/;
 const LAUNCH_ID = /^ln_[0-9a-f]{24}$/;
 
@@ -586,7 +590,9 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             budget_sub_allocations: { working: 0, maintenance: 0 },
           };
           check('equip', result, false);
-          const audit = { kind: 'hq.equip', runtime_id: payload.runtime_id, credential_references: 0, caller };
+          const audit = { kind: 'hq.equip', runtime_id: payload.runtime_id, credential_references: 0, caller,
+            ...(rt.protected_start_id ? { start_id: rt.protected_start_id, installation_id: rt.installation_id,
+              member_id: rt.member_id, grant_handle_sha256: grantHandleDigest(handle) } : {}) };
           if (atomicAudit) receipts.appendIn(tx, audit);
           return { record: result, audit };
         });
@@ -756,16 +762,60 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         if (!rt) fail('host.invalid_request', `unknown runtime ${runtimeId}`);
         return fn(Object.freeze(current(rt, runtimeId, clock.now())));
       });
+      // A trusted protected-operation consumer supplies the authenticated
+      // runtime ID and digest of its validated request. No caller-supplied
+      // runtime selector is accepted here. The operation still applies its
+      // own authorization before using protected resources.
+      async function withProtectedGrant(boundRuntimeId, handle, requestSHA256, effect, noticeContext) {
+        if (!atomicAudit) fail('host.launch_unavailable', 'protected grant checks need atomic receipts');
+        if (typeof boundRuntimeId !== 'string' || !RUNTIME_ID.test(boundRuntimeId)
+          || typeof requestSHA256 !== 'string' || requestSHA256.length !== 71 || !SHA256.test(requestSHA256)
+          || typeof handle !== 'string' || handle.length !== 35 || !GRANT_HANDLE.test(handle)
+          || typeof effect !== 'function') fail('host.invalid_request', 'invalid protected grant use');
+
+        const result = await store.tx(async (tx) => {
+          const rt = tx.get('runtimes', boundRuntimeId);
+          let scope;
+          try {
+            if (rt && !rt.protected_start_key) fail('profile_insufficient', 'grant use requires a protected runtime');
+            if (!rt?.handle || !sameBinding(rt.handle, handle))
+              fail('caller_mismatch', 'grant handle does not belong to this runtime');
+            current(rt, boundRuntimeId, clock.now());
+            await live(watchedStarts.get(rt.protected_start_key));
+            current(rt, boundRuntimeId, clock.now());
+            if (noticeContext !== undefined) scope = noticeScope(rt, noticeContext);
+          } catch (error) {
+            if (!(error instanceof HostError)) throw error;
+            const committed = receipts.appendIn(tx, { kind: 'hq.protected.grant.refused',
+              code: error.code, runtime_id: boundRuntimeId, request_sha256: requestSHA256,
+              grant_handle_sha256: grantHandleDigest(handle), effect_invoked: false,
+              ...(rt?.protected_start_id ? { start_id: rt.protected_start_id, installation_id: rt.installation_id,
+                member_id: rt.member_id, installation_epoch: rt.epoch, lease_generation: rt.lease_generation } : {}) });
+            return { error, committed };
+          }
+          return { value: await effect(scope ?? Object.freeze({ runtime_id: boundRuntimeId,
+            member_id: rt.member_id, soul_id: rt.soul_id, installation_id: rt.installation_id,
+            start_id: rt.protected_start_id, installation_epoch: rt.epoch,
+            lease_generation: rt.lease_generation })) };
+        });
+        if (result.error) {
+          const receipt = typeof result.committed === 'function' ? result.committed() : undefined;
+          if (receipt) Object.defineProperty(result.error, PROTECTED_GRANT_REFUSAL_RECEIPT,
+            { value: Object.freeze(receipt) });
+          throw result.error;
+        }
+        return result.value;
+      }
       // Trusted broker consumers pass the bound runtime id, never a payload
       // runtime selector. Keep liveness, assignment and mailbox effect in the
       // same admission queue used by Hello/Lease and task commits.
-      const withNoticeScope = (boundRuntimeId, context, effect) => withBoundRuntime(boundRuntimeId, (rt) => {
+      function noticeScope(rt, context) {
         if (!context || typeof context !== 'object' || Array.isArray(context)
           || Object.keys(context).some((key) => !['installation_epoch', 'lease_generation', 'expected_repository'].includes(key))
           || !Number.isSafeInteger(context.installation_epoch) || context.installation_epoch < 1
           || !Number.isSafeInteger(context.lease_generation) || context.lease_generation < 1
-          || (Object.hasOwn(context, 'expected_repository') && !validNoticeRepository(context.expected_repository))
-          || typeof effect !== 'function') fail('host.invalid_request', 'notice scope needs epoch/generation assertions and a trusted effect');
+          || (Object.hasOwn(context, 'expected_repository') && !validNoticeRepository(context.expected_repository)))
+          fail('host.invalid_request', 'notice scope needs epoch/generation assertions');
         if (context.installation_epoch !== rt.epoch) fail('stale_epoch', 'notice request epoch does not match the bound admission');
         if (context.lease_generation !== rt.lease_generation) fail('lease_expired', 'notice request generation does not match the bound admission');
         const frozen = rt.notice_scope;
@@ -774,8 +824,14 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           || !accepted(rt.soul_id, rt.definition_digest) || !configured
           || configured.harness !== frozen.harness || configured.repo.toLowerCase() !== frozen.repo.toLowerCase()) fail('caller_mismatch', 'no current owner-authorized notice scope; send Hello again');
         if (Object.hasOwn(context, 'expected_repository') && context.expected_repository.toLowerCase() !== frozen.repo.toLowerCase()) fail('caller_mismatch', 'expected repository differs from the frozen notice scope');
-        return effect(Object.freeze({ harness: frozen.harness, repo: frozen.repo }));
+        return Object.freeze({ harness: frozen.harness, repo: frozen.repo });
+      }
+      const withNoticeScope = (boundRuntimeId, context, effect) => withBoundRuntime(boundRuntimeId, (rt) => {
+        if (typeof effect !== 'function') fail('host.invalid_request', 'notice scope needs a trusted effect');
+        return effect(noticeScope(rt, context));
       });
+      const withProtectedNoticePeek = (runtimeId, handle, requestSHA256, context, peek) =>
+        withProtectedGrant(runtimeId, handle, requestSHA256, peek, context);
       // For HQ core's profile reasons (§9 row 16b): the live runtimes with no
       // harness account, as { soul_id, member_id, adapter_id }. HQ core reads
       // them only through this, never this plugin's tables.
@@ -800,7 +856,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         boundBridge: bridge.boundBridge,
         bridgeStatus: bridge.bridgeStatus,
         revokeBridges: bridge.revokeAll,
-        withBoundRuntime, withNoticeScope, unboundRuntimes } };
+        withBoundRuntime, withProtectedGrant, withNoticeScope, withProtectedNoticePeek, unboundRuntimes } };
     },
     async start(ctx) { await normalizeScopes.get(ctx)(); },
     async stop(ctx) { await bridgeStates.get(ctx)?.revokeAll(); },
