@@ -22,24 +22,32 @@ export const PIN_PATH = join(ROOT, 'governance/soul-contracts.json');
 export const ALGORITHM = 'sha256-manifest-v1';
 const CACHE = join(ROOT, '.cache/soul-contracts');
 const MODES = new Set(['100644', '100755']);
-const H_V09 = Object.freeze({
-  tag: 'v0.9.0',
-  commit: 'e668085d31a02a7e72928a50849494a7b00ec742',
-  digest: 'sha256:9b929a2c9ecbf304380a8588e7a20c2df1f3148d3390ec2d9bea09d48f7a3e38',
-  files: 428,
-  runtimeDigest: 'sha256:25486824df6e2fc2df87c8cfa0721384f9e5650a6519dc87c53ece8377d7447e',
-  runtimeFiles: 420,
+const H_V010 = Object.freeze({
+  tag: 'v0.10.0',
+  commit: '8b32e7a1b85b464dca0b15c3b7da891a92ed1229',
+  digest: 'sha256:fdb218fcb2ac73d92c9db019a33c7317d9d691032a6d6e66e6021ca07704f47d',
+  files: 438,
+  runtimeDigest: 'sha256:d15ca359f6ee567c45fa496f0d98b1d1321f29c7ce1d14ae43acee29c2528cb6',
+  runtimeFiles: 422,
 });
 const VENDOR_PREFIX = 'vendor/soul-contracts/';
-export const H_V09_EXCLUDED = Object.freeze([
+export const H_V010_EXCLUDED = Object.freeze([
+  'fixtures/negative/soul-cooperative-reservation-payload.bridge-claim.json',
+  'fixtures/negative/soul-cooperative-reservation-payload.missing-broker.json',
+  'fixtures/negative/soul-cooperative-signed-reservation.wrong-purpose.json',
   'fixtures/negative/stage2a-qualification-candidate-binding.v3-synthetic.bad.json',
   'fixtures/negative/stage2a-qualification-candidate-reservation-payload.v3-synthetic.bad.json',
   'fixtures/negative/stage2a-qualification-candidate-signed-reservation.v3-synthetic.bad.json',
+  'fixtures/positive/soul-cooperative-reservation-payload.v3-synthetic.json',
+  'fixtures/positive/soul-cooperative-signed-reservation.v3-synthetic.json',
   'fixtures/positive/stage2a-qualification-candidate-binding.v3-synthetic.json',
   'fixtures/positive/stage2a-qualification-candidate-reservation-payload.v3-synthetic.json',
   'fixtures/positive/stage2a-qualification-candidate-signed-reservation.v3-synthetic.json',
   'fixtures/reservation/v3/machine-qualification-candidate-invalid-bytes.json',
   'fixtures/reservation/v3/machine-qualification-candidate-synthetic.json',
+  'fixtures/reservation/v3/soul-cooperative-launch-inputs.synthetic.json',
+  'fixtures/reservation/v3/soul-cooperative-r-inventory.synthetic.json',
+  'fixtures/reservation/v3/soul-cooperative-signed-reservation.synthetic.json',
 ]);
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
@@ -68,29 +76,29 @@ export function manifestDigest(entries) {
   return { manifest, digest: `sha256:${sha256(Buffer.from(canonicalize(manifest), 'utf8'))}`, files: entries.length };
 }
 
-const isHV09 = (pin) => pin.tag === H_V09.tag && pin.commit === H_V09.commit
-  && pin.digest === H_V09.digest && pin.files === H_V09.files;
+const isHV010 = (pin) => pin.tag === H_V010.tag && pin.commit === H_V010.commit
+  && pin.digest === H_V010.digest && pin.files === H_V010.files;
 
 // The raw release is checked against the entire pin before this projection is
 // computed. Machine A separately proves selected+excluded equals that full
 // release at installation; H rechecks the exact selected bytes at startup.
 export function hRuntimeSelection(pin, fullManifest) {
-  if (!isHV09(pin) || !fullManifest || typeof fullManifest !== 'object'
-    || Array.isArray(fullManifest) || Object.keys(fullManifest).length !== H_V09.files
-    || H_V09_EXCLUDED.some((path) => !Object.hasOwn(fullManifest, path))) {
+  if (!isHV010(pin) || !fullManifest || typeof fullManifest !== 'object'
+    || Array.isArray(fullManifest) || Object.keys(fullManifest).length !== H_V010.files
+    || H_V010_EXCLUDED.some((path) => !Object.hasOwn(fullManifest, path))) {
     throw new Error('H runtime Contracts selection is unavailable for this release');
   }
   if (`sha256:${sha256(Buffer.from(canonicalize(fullManifest), 'utf8'))}` !== pin.digest) {
     throw new Error('H runtime Contracts full source differs from the pin');
   }
-  const omitted = new Set(H_V09_EXCLUDED);
+  const omitted = new Set(H_V010_EXCLUDED);
   const selected = Object.fromEntries(Object.entries(fullManifest).filter(([path]) => !omitted.has(path)));
   const digest = `sha256:${sha256(Buffer.from(canonicalize(selected), 'utf8'))}`;
-  if (Object.keys(selected).length !== H_V09.runtimeFiles || digest !== H_V09.runtimeDigest) {
+  if (Object.keys(selected).length !== H_V010.runtimeFiles || digest !== H_V010.runtimeDigest) {
     throw new Error('H runtime Contracts selection differs from the reviewed release');
   }
-  return Object.freeze({ digest_algorithm: ALGORITHM, digest, files: H_V09.runtimeFiles,
-    excluded_hq_release_paths: Object.freeze(H_V09_EXCLUDED.map((path) => `${VENDOR_PREFIX}${path}`)) });
+  return Object.freeze({ digest_algorithm: ALGORITHM, digest, files: H_V010.runtimeFiles,
+    excluded_hq_release_paths: Object.freeze(H_V010_EXCLUDED.map((path) => `${VENDOR_PREFIX}${path}`)) });
 }
 
 export function compareSemver(a, b) {
@@ -254,7 +262,7 @@ export function verifyVendored(dir, pin = readPin()) {
 // snapshot. Recompute the source-mode manifest here so an omitted, extra or
 // changed Contracts file cannot be accepted by metadata alone.
 export function verifySelectedVendored(dir, pin, selection) {
-  if (!isHV09(pin) || !selection || selection.root !== ROOT
+  if (!isHV010(pin) || !selection || selection.root !== ROOT
     || !/^sha256:[0-9a-f]{64}$/.test(selection.metadataSha256)
     || !Number.isSafeInteger(selection.metadataSize) || selection.metadataSize < 1
     || selection.metadataSize > 65536 || !Array.isArray(selection.vendorRows)) {
@@ -279,7 +287,7 @@ export function verifySelectedVendored(dir, pin, selection) {
 // Pure content check for the authenticated wrapper above. A direct call to
 // this helper does not set preloader state or grant protected launch authority.
 export function verifySelectedVendoredTree(dir, pin, metadata, vendorRows) {
-  if (!isHV09(pin) || !metadata || typeof metadata !== 'object'
+  if (!isHV010(pin) || !metadata || typeof metadata !== 'object'
     || !Array.isArray(vendorRows)) {
     throw new Error('H release metadata does not bind the reviewed Contracts subset');
   }
@@ -289,10 +297,10 @@ export function verifySelectedVendoredTree(dir, pin, metadata, vendorRows) {
     || !runtime || typeof runtime !== 'object' || Array.isArray(runtime)
     || Object.keys(runtime).sort().join(',') !== ['digest_algorithm', 'digest', 'files',
       'excluded_hq_release_paths'].sort().join(',')
-    || runtime.digest_algorithm !== ALGORITHM || runtime.digest !== H_V09.runtimeDigest
-    || runtime.files !== H_V09.runtimeFiles
+    || runtime.digest_algorithm !== ALGORITHM || runtime.digest !== H_V010.runtimeDigest
+    || runtime.files !== H_V010.runtimeFiles
     || JSON.stringify(runtime.excluded_hq_release_paths) !== JSON.stringify(
-      H_V09_EXCLUDED.map((path) => `${VENDOR_PREFIX}${path}`))) {
+      H_V010_EXCLUDED.map((path) => `${VENDOR_PREFIX}${path}`))) {
     throw new Error('H release metadata does not bind the reviewed Contracts subset');
   }
   const { root, entries } = vendoredEntries(dir, pin.paths);
