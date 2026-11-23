@@ -55,6 +55,10 @@ test('installed B ingress reaches the local service once with exact selectors', 
   assert.equal(calls.length, 1);
   assert.deepEqual(await getServiceObservation(), { invocations: 1, last_request_sha256: requestSHA256,
     last_response_sha256: digest(responseText) });
+  const replay = await fetch(endpoint, { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: canonicalize({ model, request_sha256: requestSHA256 }) });
+  assert.equal(replay.status, 403);
+  assert.equal((await getServiceObservation()).invocations, 1);
   await provider.close();
   await assert.rejects(fetch(`${endpoint}/observation`), /fetch failed/);
 });

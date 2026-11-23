@@ -71,7 +71,7 @@ function openLocalProviderService(plan) {
       if (bytes.length !== Number(request.headers['content-length'])) throw new Error('length mismatch');
       const input = parseStrict(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
       if (!exact(input, ['model', 'request_sha256']) || !Buffer.from(canonicalize(input)).equals(bytes)
-        || !config || input.model !== config.model
+        || !config || invocations !== 0 || input.model !== config.model
         || input.request_sha256 !== config.request_sha256) {
         reply(403, { error: 'not_authorized' }); return;
       }
@@ -101,7 +101,7 @@ function openLocalProviderService(plan) {
     async invoke(approved) {
       await ready;
       config = Object.freeze({ ...approved });
-      const before = invocations;
+      if (invocations !== 0) throw new Error('local provider was already invoked');
       const body = Buffer.from(canonicalize({ model: config.model,
         request_sha256: config.request_sha256 }));
       const result = await new Promise((resolve, reject) => {
@@ -139,7 +139,7 @@ function openLocalProviderService(plan) {
         || result.request_sha256 !== config.request_sha256
         || result.response_text !== config.response_text
         || result.response_sha256 !== digest(Buffer.from(config.response_text))
-        || result.invocation !== before + 1 || invocations !== before + 1) {
+        || result.invocation !== 1 || invocations !== 1) {
         throw new Error('local provider invocation differs from the signed plan');
       }
       return result;
