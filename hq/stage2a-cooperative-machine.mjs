@@ -144,8 +144,10 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       || canonicalDigest(detached.endpoints.member) !== canonicalDigest(payload.endpoints.member)
       || canonicalDigest(detached.endpoints.relay) !== canonicalDigest(payload.endpoints.relay)
       || canonicalDigest(members.bridge.endpoints) !== canonicalDigest(detached.endpoints)
-      || !SHA256.test(members.owner_plan_member_set_sha256 ?? '') || members.members?.length !== 2) invalid();
-    return Object.freeze({ detached, members });
+      || members.owner_plan_member_set_sha256 !== installed.owner_plan_member_set_sha256
+      || payload.bridge_launch_sha256 !== installed.bridge_launch_sha256
+      || canonicalDigest(detached.bridge) !== installed.bridge_launch_sha256 || members.members?.length !== 2) invalid();
+    return Object.freeze({ detached, members, ownerPlanMemberSetSHA256: installed.owner_plan_member_set_sha256 });
   }
 
   function acceptReservation(response, installed, request, recovered = false) {
@@ -204,6 +206,8 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       if (!allowsTransport(installed.adapter_transport)) {
         fail('profile_insufficient', 'the installed Soul has no approved direct Comms adapter');
       }
+      if (installed.adapter_transport === 'brokered-b' && (!SHA256.test(installed.owner_plan_member_set_sha256 ?? '')
+        || !SHA256.test(installed.bridge_launch_sha256 ?? ''))) invalid();
       if (typeof installed.reviewed_start_id !== 'string' || !REVIEWED_START_ID.test(installed.reviewed_start_id)) invalid();
       const slot = digest(`agent-bot-soul-endpoint-start/v1\0${installed.installation_id}\0${installed.reviewed_start_id}`).slice(7, 27);
       if (installed.admission_socket_path !== join(installed.admission_directory, `${slot}.sock`)) invalid();
@@ -231,8 +235,8 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
     brokeredMemberInputs(reservation) {
       const entry = owned(reservation);
       if (entry.revoked || now() >= entry.expires || !entry.memberInputs) invalid();
-      return Object.freeze({ machinePublicKey: Buffer.from(entry.machineKey),
-        assignmentBytes: Buffer.from(reservation.member_set_assignment_envelope_base64url, 'base64url'),
+      return Object.freeze({ machinePublicKey: Buffer.from(entry.machineKey), installedBridge: entry.memberInputs.detached.bridge,
+        ownerPlanMemberSetSHA256: entry.memberInputs.ownerPlanMemberSetSHA256, assignmentBytes: Buffer.from(reservation.member_set_assignment_envelope_base64url, 'base64url'),
         cooperativeBridgeBytes: Buffer.from(reservation.bridge_assignment_envelope_base64url, 'base64url') });
     },
     async submitMemberMap(reservation, input) {
@@ -269,7 +273,9 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       if (bytes.toString('base64url') !== encoded || digest(bytes) !== body.sha256) invalid();
       return bytes;
     },
-    async renewMemberChild(reservation, { request, kernelPeer, readyEnvelopeSHA256, readyEnvelopeBytes }) {
+    async renewMemberChild(reservation, {
+      request, kernelPeer, readyEnvelopeSHA256, readyEnvelopeBytes, bridgeObservedBase64url, bridgeObservedSHA256,
+    }) {
       if (!kernelPeer || request.launcher_pid !== kernelPeer.pid
         || request.launcher_start_seconds !== kernelPeer.start_seconds
         || request.launcher_start_micros !== kernelPeer.start_micros
@@ -280,10 +286,10 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
           'child_pid', 'child_start_seconds', 'child_start_micros', 'challenge_nonce_base64url', 'after_sequence', 'prior_expires_at']),
         ready_sha256: readyEnvelopeSHA256, peer_uid: kernelPeer.uid, peer_pid: kernelPeer.pid,
       });
-      if (!body || body.lease_sequence !== request.after_sequence + 1
-        || (request.after_sequence === 0 ? body.ready_sha256 !== readyEnvelopeSHA256
-          || body.ready_envelope_base64url !== readyEnvelopeBytes.toString('base64url')
-          : Object.hasOwn(body, 'ready_sha256') || Object.hasOwn(body, 'ready_envelope_base64url'))) invalid();
+      if (!body || body.lease_sequence !== request.after_sequence + 1 || body.ready_sha256 !== readyEnvelopeSHA256
+        || body.ready_envelope_base64url !== readyEnvelopeBytes.toString('base64url')
+        || body.bridge_observed_sha256 !== bridgeObservedSHA256
+        || body.bridge_observed_envelope_base64url !== bridgeObservedBase64url) invalid();
       return body;
     },
     async projection(reservation) {
@@ -359,6 +365,38 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       if (entry.acp || !watchHealthy(context) || socket.destroyed) invalid();
       entry.acp = socket;
       entry.acpContext = context;
+    },
+    async authorizeRelayIngress(reservation, request, qualification, current) {
+      const entry = owned(reservation);
+      const live = () => entry?.acp && !entry.acp.destroyed && watchHealthy(entry.acpContext) && current();
+      if (!entry.memberInputs || !live() || entry.providerSpent
+        || request.model !== qualification.model || request.prompt_sha256 !== qualification.request_sha256
+        || !ID.test(request.model) || !SHA256.test(request.prompt_sha256)) invalid();
+      entry.providerSpent = true;
+      const asked = { ...requestOf(reservation), attach_sha256: entry.attach.sha256, ...request };
+      const body = await memberCall(reservation, 'relay-ingress', {
+        ...request, attach_sha256: entry.attach.sha256,
+      });
+      const config = { model: qualification.model, request_sha256: qualification.request_sha256,
+        response_text: qualification.response_text };
+      const bytes = canonicalBytes(config), configSHA256 = digest(bytes);
+      if (!live() || !body || Object.keys(body).sort().join(',') !== [
+        'receipt_envelope_base64url', 'receipt_sha256', 'model', 'request_sha256', 'provider_config_sha256',
+        'config_base64url', 'response_text', 'expires_at_ms',
+      ].sort().join(',') || !match(body, { ...config, config_base64url: bytes.toString('base64url'),
+        provider_config_sha256: configSHA256.slice(7) }) || typeof config.response_text !== 'string'
+        || !config.response_text || config.response_text.length > 2048) invalid();
+      const grant = verifyCooperativeProof({ envelope_base64url: body.receipt_envelope_base64url,
+        sha256: body.receipt_sha256 }, entry.machineKey, 'relay-ingress');
+      const issued = instant(grant.issued_at), expires = instant(grant.expires_at);
+      const { prompt_sha256, plan_id, plan_digest, ...bindings } = asked;
+      if (Object.keys(grant).sort().join(',') !== [...Object.keys(bindings), 'contract', 'kind', 'schema_version',
+        'profile_in_force', 'request_sha256', 'provider_config_sha256', 'response_sha256', 'issued_at', 'expires_at',
+      ].sort().join(',') || !match(grant, { ...bindings, profile_in_force: 'managed-cooperative', request_sha256: prompt_sha256,
+        provider_config_sha256: configSHA256, response_sha256: digest(Buffer.from(config.response_text)) })
+        || !Number.isFinite(issued) || issued > now() || expires <= now() || expires - issued > 5000
+        || expires !== body.expires_at_ms || !live()) invalid();
+      return Object.freeze({ config: Object.freeze(config), expiresAt: expires });
     },
     async provide({ context, request }) {
       const entry = active.get(context?.reservation_sha256);
@@ -481,9 +519,16 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       if (entry.attach && (!match(payload, { attach_sha256: entry.attach.sha256,
         dispatcher_pid: entry.attach.dispatcher_pid, runner_pid: entry.attach.runner_pid })
         || !SHA256.test(payload.dispatch_completion_sha256 ?? ''))) invalid();
-      if (entry.memberInputs && (typeof verifyBrokeredContainment !== 'function'
-        || await verifyBrokeredContainment({ reservation, detachedBridge: entry.memberInputs.detached,
-          runnerStop: response.body }) !== true)) invalid();
+      if (entry.memberInputs) {
+        const bridge = entry.memberInputs.detached.bridge;
+        const pidOrAbsent = (value) => value === 0 || pid(value);
+        if (payload.bridge_uid !== bridge.uid || payload.bridge_uid_idle !== true || payload.bridge_endpoints_absent !== true
+          || !pidOrAbsent(payload.bridge_launcher_pid) || !pidOrAbsent(payload.bridge_native_pid)
+          || (pid(payload.bridge_native_pid) && (!pid(payload.bridge_launcher_pid)
+            || payload.bridge_native_pid === payload.bridge_launcher_pid))
+          || (verifyBrokeredContainment && await verifyBrokeredContainment({ reservation,
+            detachedBridge: entry.memberInputs.detached, runnerStop: response.body }) !== true)) invalid();
+      }
       active.delete(reservation.sha256);
       return Object.freeze({ sha256: response.body.sha256 });
     },

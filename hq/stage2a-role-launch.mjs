@@ -212,7 +212,7 @@ function bounded(promise, timeoutMs, label) {
 
 // Machine writes child lifecycle receipts to the fixed wrapper's stderr.
 // ACP stdout remains reserved for the stock protocol stream.
-function childProgress(child) {
+function childProgress(child, cooperative) {
   if (!child.stderr || typeof child.stderr.on !== 'function') {
     throw new Error('protected child status pipe is unavailable');
   }
@@ -250,8 +250,9 @@ function childProgress(child) {
         fail(new Error('unexpected protected child status')); return;
       }
       const fields = phase === 0
-        ? ['kind', 'child_pid', 'child_launcher_pid', 'grant_sha256']
-        : phase === 1 ? ['kind', 'receipt_sha256', 'lease_sequence'] : ['kind'];
+        ? ['kind', 'child_pid', 'child_launcher_pid', 'grant_sha256',
+          ...(cooperative ? ['child_process', 'launcher_process'] : [])]
+        : phase === 1 ? ['kind', cooperative ? 'ready_sha256' : 'receipt_sha256', 'lease_sequence'] : ['kind'];
       if (Object.keys(event).sort().join(',') !== fields.sort().join(',')) {
         fail(new Error('unexpected protected child status fields')); return;
       }
@@ -279,23 +280,23 @@ function childProgress(child) {
 // bind the reservation to an authenticated live start and obtain Machine's
 // signed stop/completion before releasing any installation occupancy.
 export async function startStage2aRole({ account, role, reservationSHA256,
-  machineExec = machineRoleStage2aExec, spawnProcess = spawn, timeoutMs = 12000, cooperativeBridge = false } = {}) {
+  machineExec = machineRoleStage2aExec, spawnProcess = spawn, timeoutMs = 12000, cooperativeBridge = false, cooperativeChild = false } = {}) {
   if (typeof account !== 'string'
     || !(role === 'runner' && RUNNER_ACCOUNT.test(account)
       || role === 'bridge' && BRIDGE_ACCOUNT.test(account)
       || role === 'child' && RUNNER_ACCOUNT.test(account))
-    || (cooperativeBridge && role !== 'bridge')
+    || (cooperativeBridge && role !== 'bridge') || (cooperativeChild && role !== 'child')
     || !DIGEST.test(reservationSHA256 ?? '')
     || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 14000) {
     throw new Error('invalid Soul launcher assignment');
   }
   const command = role === 'runner' ? 'soul-run'
-    : role === 'bridge' ? (cooperativeBridge ? 'cooperative-soul-bridge' : 'soul-bridge') : 'soul-child';
+    : role === 'bridge' ? (cooperativeBridge ? 'cooperative-soul-bridge' : 'soul-bridge') : cooperativeChild ? 'cooperative-soul-child' : 'soul-child';
   const child = spawnProcess('/usr/bin/sudo', ['-n', '-u', account, '--', STAGE2A_LAUNCHER, command], {
     stdio: ['pipe', 'pipe', role === 'child' ? 'pipe' : 'ignore'], shell: false,
     env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C' },
   });
-  const progress = role === 'child' ? childProgress(child) : undefined;
+  const progress = role === 'child' ? childProgress(child, cooperativeChild) : undefined;
   const done = new Promise((resolve) => {
     child.once('close', (exit_code, signal) => resolve({ exit_code, signal, contained: false }));
   });
@@ -321,7 +322,7 @@ export async function startStage2aRole({ account, role, reservationSHA256,
         return started;
       },
       sendChildReceipt: async (receipt) => {
-        if (role !== 'child' || !Buffer.isBuffer(receipt?.envelope)
+        if (role !== 'child' || cooperativeChild || !Buffer.isBuffer(receipt?.envelope)
           || !DIGEST.test(receipt?.sha256 ?? '')
           || !Number.isSafeInteger(receipt?.expires_at_ms)
           || receipt.expires_at_ms <= Date.now()) throw new Error('invalid protected child receipt');
@@ -336,7 +337,7 @@ export async function startStage2aRole({ account, role, reservationSHA256,
           throw new Error('invalid protected child receipt selector');
         }
         const accepted = await progress.next('child-accepted', 5000);
-        if (accepted.receipt_sha256 !== receiptSHA256
+        if ((cooperativeChild ? accepted.ready_sha256 : accepted.receipt_sha256) !== receiptSHA256
           || !Number.isSafeInteger(accepted.lease_sequence)
           || accepted.lease_sequence < 1) throw new Error('protected child receipt was not accepted');
         await progress.next('started', 5000);

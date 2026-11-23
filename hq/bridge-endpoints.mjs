@@ -22,8 +22,9 @@ const COOPERATIVE_MEMBER_ARM = 'bridge.member.arm.cooperative.v3';
 const COOPERATIVE_BRIDGE_READY = 'bridge.ready.cooperative.v3';
 const COOPERATIVE_BRIDGE_LIVE = 'bridge.live.cooperative.v3';
 const COOPERATIVE_BRIDGE_PEER = 'bridge.peer.cooperative.v3';
+const COOPERATIVE_RELAY_INGRESS = 'bridge.relay.ingress.cooperative.v3';
 const cooperativeGateKind = (kind) => kind === COOPERATIVE_BRIDGE_READY || kind === COOPERATIVE_BRIDGE_LIVE
-  || kind === COOPERATIVE_BRIDGE_PEER;
+  || kind === COOPERATIVE_BRIDGE_PEER || kind === COOPERATIVE_RELAY_INGRESS;
 const cooperativeArmKind = (kind) => kind === COOPERATIVE_MEMBER_OBSERVE || kind === COOPERATIVE_MEMBER_ARM;
 const memberArmKind = (kind) => kind === 'bridge.member.observe.v3' || kind === 'bridge.member.arm.v3';
 const protectedBridgeKind = (kind) => kind === 'bridge.bind.v2.challenge' || kind === 'bridge.bind.v2'
@@ -118,7 +119,8 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
       if (state?.phase !== 'policy-delivered') refuse();
       const method = kind === COOPERATIVE_BRIDGE_READY ? methods?.stage2aCooperativeBridgeReadyV3
         : kind === COOPERATIVE_BRIDGE_LIVE ? methods?.stage2aCooperativeBridgeLiveV3
-          : methods?.stage2aCooperativeBridgePeerV3;
+          : kind === COOPERATIVE_BRIDGE_PEER ? methods?.stage2aCooperativeBridgePeerV3
+            : methods?.stage2aCooperativeRelayIngressV3;
       if (typeof method !== 'function') refuse();
       const result = await method(payload, meta, state.receipt);
       if (!current() || cooperative.get(connection) !== state) refuse();

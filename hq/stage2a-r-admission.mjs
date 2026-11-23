@@ -23,6 +23,7 @@ const sameInode = (a, b) => BigInt(a.dev) === BigInt(b.dev) && BigInt(a.ino) ===
 
 const MEMBER_ATTACH_PREPARE = 'stage2a.member.attach.prepare';
 const MEMBER_ATTACH = 'stage2a.member.attach';
+const COOPERATIVE_MEMBER_BRIDGE_READY = 'launch.bridge_ready';
 const COOPERATIVE_MEMBER_LIVE = 'launch.cooperative.live';
 const COOPERATIVE_MEMBER_LIVE_FIELDS = ['installation_id', 'start_id', 'launch_id', 'reservation_sha256',
   'assignment_envelope_sha256', 'member_b_authority_sha256', 'member_id', 'member_launch_id', 'member_selector',
@@ -80,8 +81,8 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
   const bridgeNonces = new Set();
   const now = () => core.clock.now();
   const checkSchema = (schema, payload) => {
-    const references = [provider.assignmentSchema, ...(provider.schemaReferences ?? [])].filter((entry) =>
-      entry?.$id && entry.$id !== schema.$id);
+    const references = [...new Map([provider.assignmentSchema, ...(provider.schemaReferences ?? [])]
+      .filter((entry) => entry?.$id && entry.$id !== schema.$id).map((entry) => [entry.$id, entry])).values()];
     if (validate(schema, payload, { schemas: references }).length) refuse();
   };
   const matches = (a, b, fields) => fields.every((field) => a?.[field] === b?.[field]);
@@ -102,7 +103,8 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
         : runtime.protected_state !== 'active' || runtime.protected_start_id !== selectors.start_id)) refuse();
     const input = await provider.select({ runtimeId, runtime, selectors, runnerPeer });
     if (!input || !current() || typeof input.isCurrent !== 'function' || input.isCurrent() !== true
-      || typeof input.connect !== 'function' || !DIGEST.test(input.boundAuthoritySHA256 ?? '')) refuse();
+      || typeof input.connect !== 'function' || !DIGEST.test(input.boundAuthoritySHA256 ?? '')
+      || (cooperative && (typeof input.waitBridgeLive !== 'function' || typeof input.isBridgeLive !== 'function'))) refuse();
     const { machinePublicKey, assignmentBytes, childObservationBytes, readyBytes, authorityBytes } = input;
     const signed = (bytes, kind) => verifyStage2aMachineEnvelope(bytes, machinePublicKey,
       `agent-bot/stage2a-member-set-${kind}/v1`, { maxBytes: ATTACH_ENVELOPE_CAP });
@@ -226,9 +228,32 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
       spent.add(member.launch_id);
       slots.set(member.launch_id, { attach, runtimeId, session, expires, processSHA256: peer.processSHA256,
         memberId: member.member_id, readinessSHA256: ready.envelope_sha256,
-        isCurrent: input.isCurrent, connect: input.connect });
+        isCurrent: input.isCurrent, connect: input.connect,
+        bridgeReadyNonce: reply.bridge_ready_nonce, waitBridgeLive: input.waitBridgeLive, isBridgeLive: input.isBridgeLive });
     });
     return reply;
+  }
+
+  async function bridgeReady(payload, { runnerPeer }) {
+    if (!cooperative || runnerPeer?.role !== 'runner'
+      || !payload || Object.keys(payload).sort().join(',') !== 'attach,bridge_ready_nonce,launch_id'
+      || !ATTACH_TOKEN.test(payload.attach ?? '') || !ATTACH_TOKEN.test(payload.bridge_ready_nonce ?? '')) refuse();
+    const slot = slots.get(payload.launch_id);
+    if (!slot || !usable(slot) || slot.bridgeReadyPending || slot.bridgeReady
+      || !timingSafeEqual(Buffer.from(slot.attach, 'hex'), Buffer.from(payload.attach, 'hex'))
+      || !timingSafeEqual(Buffer.from(slot.bridgeReadyNonce, 'hex'), Buffer.from(payload.bridge_ready_nonce, 'hex'))) refuse();
+    slot.bridgeReadyPending = true;
+    try {
+      const peer = await refreshRunnerPeer(runnerPeer);
+      if (peer?.processSHA256 !== slot.processSHA256 || peer.isCurrent() !== true) refuse();
+      if (await slot.waitBridgeLive(slot.readinessSHA256) !== true
+        || slots.get(payload.launch_id) !== slot || !usable(slot) || !slot.isBridgeLive(slot.readinessSHA256)) refuse();
+      const refreshed = await refreshRunnerPeer(runnerPeer);
+      if (refreshed?.processSHA256 !== slot.processSHA256 || refreshed.isCurrent() !== true
+        || slots.get(payload.launch_id) !== slot || !usable(slot) || !slot.isBridgeLive(slot.readinessSHA256)) refuse();
+      slot.bridgeReady = true;
+      return Object.freeze({ launch_id: payload.launch_id, bridge_ready: true });
+    } finally { slot.bridgeReadyPending = false; }
   }
 
   async function attach(payload, { takeover: offer, runnerPeer }) {
@@ -237,20 +262,21 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
       || typeof payload.launch_id !== 'string' || typeof payload.attach !== 'string'
       || !ATTACH_TOKEN.test(payload.attach)) refuse();
     const slot = slots.get(payload.launch_id);
-    if (!slot || !usable(slot)
+    const valid = () => usable(slot) && (!cooperative || (slot.bridgeReady && slot.isBridgeLive(slot.readinessSHA256)));
+    if (!slot || !valid()
       || !timingSafeEqual(Buffer.from(slot.attach, 'hex'), Buffer.from(payload.attach, 'hex'))) refuse();
     const peer = await refreshRunnerPeer(runnerPeer);
     if (peer?.processSHA256 !== slot.processSHA256 || peer.isCurrent() !== true
-      || slots.get(payload.launch_id) !== slot || !usable(slot)) refuse();
+      || slots.get(payload.launch_id) !== slot || !valid()) refuse();
     slots.delete(payload.launch_id);
     try {
       await withLiveRuntime(slot.runtimeId, slot.session, () => {
-        if (peer.isCurrent() !== true || !usable(slot)) refuse();
+        if (peer.isCurrent() !== true || !valid()) refuse();
       });
     } catch (error) { onLost(); throw error; }
     return takeover({ launch_id: payload.launch_id }, {
       open: () => {
-        if (peer.isCurrent() !== true || !usable(slot)) { onLost(); refuse(); }
+        if (peer.isCurrent() !== true || !valid()) { onLost(); refuse(); }
         peer.markAttached?.();
         return (socket) => {
           try {
@@ -265,8 +291,9 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
   }
   const bothAttached = (readySHA256) => attached.size === 2
     && [...attached.values()].every((row) => row.readySHA256 === readySHA256
-      && !row.socket.destroyed && row.slot.isCurrent() === true);
-  return Object.freeze({ prepare, attach, bothAttached });
+      && !row.socket.destroyed && row.slot.isCurrent() === true
+      && (!cooperative || row.slot.isBridgeLive(readySHA256)));
+  return Object.freeze({ prepare, bridgeReady, attach, bothAttached });
 }
 
 function checkedEndpoint(installed, assignment, selectors, hqUid) {
@@ -547,7 +574,7 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
   let ticketPending = false;
   let ownerReadySHA256;
   let finalizedReadySHA256;
-  let finalizedReadyBytes;
+  let finalizedReadyBytes, finalizedBridgeObserved;
   let resolveReady;
   const readyAvailable = new Promise((resolve) => { resolveReady = resolve; });
   const lose = () => {
@@ -694,23 +721,29 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
               })]);
             } finally { clearTimeout(timer); }
           }
-          if (!isCurrent() || !finalizedReadySHA256 || !finalizedReadyBytes) refuseCooperative();
+          if (!isCurrent() || !finalizedReadySHA256 || !finalizedReadyBytes || !finalizedBridgeObserved) refuseCooperative();
           const currentPeer = async () => {
             const rechecked = await observePeerIdentity(state.socket, assignment.runner_uid);
             return rechecked && canonicalDigest(rechecked) === canonicalDigest(peer) && isCurrent();
           };
           if (!await currentPeer()) refuseCooperative();
           const lease = await renew({ request: p, kernelPeer: peer, context: original,
-            readyEnvelopeSHA256: finalizedReadySHA256, readyEnvelopeBytes: Buffer.from(finalizedReadyBytes) });
+            readyEnvelopeSHA256: finalizedReadySHA256, readyEnvelopeBytes: Buffer.from(finalizedReadyBytes), ...finalizedBridgeObserved });
           if (!await currentPeer() || !lease || !DIGEST.test(lease.lease_sha256 ?? '')
             || typeof lease.lease_envelope_base64url !== 'string'
             || lease.lease_sequence !== p.after_sequence + 1) refuseCooperative();
           memberAttachProvider.rememberWrapperLease(lease, { request: p, kernelPeer: peer,
             readyEnvelopeSHA256: finalizedReadySHA256 });
-          return Object.freeze({ ready_envelope_base64url: initial ? finalizedReadyBytes.toString('base64url') : '',
-            ready_sha256: initial ? finalizedReadySHA256 : '',
+          return Object.freeze({ ...(initial ? {
+            ready_envelope_base64url: finalizedReadyBytes.toString('base64url'), ready_sha256: finalizedReadySHA256,
+            bridge_observed_envelope_base64url: finalizedBridgeObserved.bridgeObservedBase64url,
+            bridge_observed_sha256: finalizedBridgeObserved.bridgeObservedSHA256,
+          } : {}),
             lease_envelope_base64url: lease.lease_envelope_base64url,
             lease_sha256: lease.lease_sha256, lease_sequence: lease.lease_sequence });
+        }
+        if (memberAttach && op === COOPERATIVE_MEMBER_BRIDGE_READY) {
+          return memberAttach.bridgeReady(meta.payload, { ...meta, runnerPeer: state });
         }
         if (memberAttach && op === MEMBER_ATTACH) {
           return memberAttach.attach(meta.payload, { ...meta, runnerPeer: state });
@@ -850,6 +883,13 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
           || !mapped.every((row) => runtimes.some((rt) =>
             rt.member_id === row.member_id && rt.runtime_id === row.runtime_id))
           || memberBootstrap.isCurrent() !== true || attachedPeer(state.peer_pid) !== state.context) refuseCooperative();
+        const bBytes = Buffer.from(prepared.bridgeObservedBase64url ?? '', 'base64url');
+        if (bBytes.toString('base64url') !== prepared.bridgeObservedBase64url) refuseCooperative();
+        const bObserved = verifyStage2aMachineEnvelope(bBytes, memberBootstrap.machinePublicKey,
+          'agent-bot/soul-cooperative-b-observed/v3', { schemaVersion: 3, maxBytes: ATTACH_ENVELOPE_CAP });
+        if (bObserved.envelope_sha256 !== value.bridge_observed_sha256) refuseCooperative();
+        finalizedBridgeObserved = Object.freeze({ bridgeObservedBase64url: prepared.bridgeObservedBase64url,
+          bridgeObservedSHA256: bObserved.envelope_sha256 });
         finalizedReadySHA256 = ready.envelope_sha256;
         finalizedReadyBytes = Buffer.from(prepared.readyBytes);
         resolveReady();

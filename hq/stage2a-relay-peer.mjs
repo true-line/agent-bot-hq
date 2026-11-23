@@ -47,12 +47,13 @@ export function verifyStage2aBridgeMemberAuthority(bytes, { machinePublicKey, sc
   if (!schema || !assignmentSchema || !expected) refuse();
   const assignment = verifyStage2aMachineEnvelope(assignmentBytes, machinePublicKey,
     'agent-bot/stage2a-member-set-assignment/v1', { maxBytes: 16_384 });
-  if (validate(assignmentSchema, assignment.payload, { schemas }).length) refuse();
+  const referencesFor = (root) => [...new Map([...(schemas ?? []), assignmentSchema, schema]
+    .filter((entry) => entry?.$id && entry.$id !== root.$id).map((entry) => [entry.$id, entry])).values()];
+  if (validate(assignmentSchema, assignment.payload, { schemas: referencesFor(assignmentSchema) }).length) refuse();
   const proof = verifyStage2aMachineEnvelope(bytes, machinePublicKey,
     'agent-bot/stage2a-b-member-authority/v1', { maxBytes: 16_384 });
   const a = proof.payload;
-  const references = assignmentSchema.$id ? [...(schemas ?? []), assignmentSchema] : schemas;
-  if (validate(schema, a, { schemas: references }).length) refuse();
+  if (validate(schema, a, { schemas: referencesFor(schema) }).length) refuse();
   const shared = ['profile_in_force', 'host_id', 'installation_id', 'soul_id',
     'start_id', 'hq_epoch', 'plan_id', 'plan_digest', 'reservation_sha256',
     'owner_plan_member_set_sha256', 'runner_uid'];

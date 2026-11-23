@@ -30,7 +30,7 @@ export function stage2aLocalProviderPort(plan) {
   return 49152 + (value % 16384);
 }
 
-function openLocalProviderService(plan) {
+export function openLocalProviderService(plan) {
   const port = stage2aLocalProviderPort(plan);
   let config;
   let invocations = 0;
