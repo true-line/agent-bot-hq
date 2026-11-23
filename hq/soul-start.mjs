@@ -3,7 +3,7 @@
 // its private account. The owner connection becomes the runner's ACP stream.
 // This local event is not a protected qualification or signed provenance.
 import { lstatSync, realpathSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, normalize, sep } from 'node:path';
 import { fail } from '../sdk/errors.mjs';
 import { pushReceipt } from '../sdk/services.mjs';
 import { takeover } from './socket.mjs';
@@ -18,9 +18,9 @@ const PACKAGE_SHA256 = /^[0-9a-f]{64}$/;
 // machineLaunch is supplied only by a trusted Machine client wired into HQ's
 // entry point. reserve() must not start a process; verifyMachineReservation()
 // must authenticate Machine's one-use binding independently of that client.
-// Production passes no client until Machine #629/#630 implement that proof.
+// The production Stage 2a route uses cooperativeStart and the C socket.
 export function createSoulStarter({ core, home, machineLaunch, verifyMachineReservation, verifyMachineCompletion,
-  protectedStart, mode, hqUid = process.getuid?.(), harnessUids = [], machineHqEpoch } = {}) {
+  protectedStart, cooperativeStart, mode, hqUid = process.getuid?.(), harnessUids = [], machineHqEpoch } = {}) {
   // Protected starts use Machine's current paired HQ epoch, not a local
   // process nonce. A pairing rotation invalidates every installed policy.
   // A Machine-backed cooperative start must use that same paired epoch.
@@ -39,7 +39,7 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
   const installationBinding = new Map();
   const uidOwner = new Map();
   let shuttingDown = false;
-  const report = () => [...starts.values()].map(({ id, path, pid, uid, gid, soulId, installationId, packageDigest, startedAt, state }) => ({
+  const reportLegacy = () => [...starts.values()].map(({ id, path, pid, uid, gid, soulId, installationId, packageDigest, startedAt, state }) => ({
     start_id: id, package_path: path, pid, runner_uid: uid, runner_gid: gid,
     soul_id: soulId, installation_id: installationId, package_digest: packageDigest,
     hq_epoch: hqEpoch, started_at: startedAt, state,
@@ -59,10 +59,20 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
     return item.stopPromise;
   }
 
+  const report = () => [...reportLegacy(), ...(cooperativeStart?.report() ?? [])];
+
   async function dispatch(op, { auth, payload, takeover: canTakeOver }) {
     if (op === 'soul.starts') {
       if (auth !== 'owner') fail('host.auth_mismatch', 'Soul starts are owner-only');
       return { starts: report() };
+    }
+    if (op === 'soul.stop') {
+      if (auth !== 'owner') fail('host.auth_mismatch', 'Soul stop is owner-only');
+      if (!payload || Object.keys(payload).join(',') !== 'start_id' || !ID.test(payload.start_id ?? '')) {
+        fail('host.invalid_request', 'soul.stop needs a valid start_id');
+      }
+      if (cooperativeStart) return cooperativeStart.stop(payload.start_id);
+      fail('host.launch_unavailable', 'no managed-cooperative Soul start with that ID');
     }
     if (op !== START_OP) fail('host.invalid_request', `unknown Soul start operation ${op}`);
     if (auth !== 'owner') fail('host.auth_mismatch', 'Soul start is owner-only');
@@ -74,21 +84,28 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
       }
       return protectedStart.start(payload);
     }
-    if (!machineLaunch || typeof machineLaunch.reserve !== 'function'
-      || typeof verifyMachineReservation !== 'function' || typeof verifyMachineCompletion !== 'function'
-      || typeof machineLaunch.start !== 'function') {
-      fail('host.launch_unavailable', 'Machine has not provisioned an authenticated Soul runner launch route');
-    }
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)
       || Object.keys(payload).some((k) => k !== 'package_path')
       || typeof payload.package_path !== 'string' || !isAbsolute(payload.package_path)) {
       fail('host.invalid_request', 'soul.start needs an absolute package_path');
+    }
+    if (cooperativeStart) {
+      const path = payload.package_path;
+      if (path !== normalize(path) || path.endsWith(sep) || /[\x00\r\n]/.test(path)) {
+        fail('host.invalid_request', 'soul.start needs a canonical package_path');
+      }
+      return cooperativeStart.start(path);
     }
     let path;
     try {
       path = realpathSync(payload.package_path);
       if (!lstatSync(path).isDirectory()) throw new Error('not a directory');
     } catch { fail('host.invalid_request', 'soul.start package_path is not an existing directory'); }
+    if (!machineLaunch || typeof machineLaunch.reserve !== 'function'
+      || typeof verifyMachineReservation !== 'function' || typeof verifyMachineCompletion !== 'function'
+      || typeof machineLaunch.start !== 'function') {
+      fail('host.launch_unavailable', 'Machine has not provisioned an authenticated Soul runner launch route');
+    }
     const hqRoot = realpathSync(home);
     const canonicalCandidate = (candidate) => {
       let existing = candidate;
@@ -289,7 +306,7 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
 
   return { dispatch, report, hqEpoch, stopAll: async () => {
     shuttingDown = true;
-    await protectedStart?.stopAll?.();
-    await Promise.all([...starts.values()].map(stop));
+    await Promise.all([protectedStart?.stopAll?.(), cooperativeStart?.stopAll(),
+      ...[...starts.values()].map(stop)]);
   } };
 }
