@@ -21,7 +21,7 @@ const CHALLENGE = Buffer.alloc(32, 7).toString('base64url');
 const CHALLENGE2 = Buffer.alloc(32, 8).toString('base64url');
 
 function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckFails = false,
-  ackIsPreviousLease = false } = {}) {
+  ackIsPreviousLease = false, hqCodeReady = true } = {}) {
   const events = [];
   let providerAttempts = 0;
   let activation;
@@ -60,8 +60,10 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckF
   };
   const starter = createStage2aProtectedStarter({
     installations: [installed], authority,
-    machineLookup: async () => installed,
+    ...(hqCodeReady ? { verifyHQCodeReady: () => true } : {}),
+    machineLookup: async () => { events.push('lookup'); return installed; },
     machineReserve: async ({ start_id, launch_id }) => {
+      events.push('reserved');
       assignment = { start_id, launch_id };
       return { envelope: 'signed', sha256: RESERVATION };
     },
@@ -164,6 +166,18 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckF
   return { starter, events, get providerAttempts() { return providerAttempts; },
     get activation() { return activation; } };
 }
+
+test('machine/v2 policy refuses protected start before Machine lookup without H code proof', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-start-'));
+  try {
+    const root = realpathSync(dir);
+    const f = fixture(root, { hqCodeReady: false });
+    await assert.rejects(f.starter.start({ package_path: root,
+      requested_profile: 'managed-protected' }), /Machine protected Soul start is unavailable/);
+    assert.deepEqual(f.events, []);
+    assert.equal(f.providerAttempts, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('one-use provider opens only after B, R and stock child are ready', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-start-'));
