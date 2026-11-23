@@ -70,7 +70,7 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
     if (shuttingDown || mode() !== 'running') fail('host.launch_unavailable', 'HQ is not running admissions');
     if (payload?.requested_profile === 'managed-protected') {
       if (typeof protectedStart?.start !== 'function') {
-        fail('host.launch_unavailable', 'Machine protected R/B bridge start is not installed');
+        fail('profile_insufficient', 'protected Soul launch is unavailable under the cooperative profile');
       }
       return protectedStart.start(payload);
     }

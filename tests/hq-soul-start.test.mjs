@@ -80,12 +80,14 @@ test('Machine-backed cooperative starts require a paired HQ epoch before dispatc
 });
 const startRequest = (path) => ({ auth: 'owner', payload: { package_path: path }, takeover: true });
 
-async function rawStart(t, path) {
+async function rawStart(t, path, requestedProfile) {
   const stream = connect(t.hq.paths.control);
   await new Promise((resolve, reject) => { stream.once('connect', resolve); stream.once('error', reject); });
   let text = '';
   stream.on('data', (chunk) => { text += chunk; });
-  stream.write(`${JSON.stringify({ id: 1, op: 'soul.start', payload: { package_path: path } })}\n`);
+  stream.write(`${JSON.stringify({ id: 1, op: 'soul.start', payload: {
+    package_path: path, ...(requestedProfile ? { requested_profile: requestedProfile } : {}),
+  } })}\n`);
   await waitFor(() => text.includes('\n'));
   return { stream, response: JSON.parse(text.slice(0, text.indexOf('\n'))) };
 }
@@ -100,8 +102,22 @@ test('an explicit protected Soul start never falls back to the cooperative Machi
   const machine = fakeMachineLaunch(launches);
   await assert.rejects(starter(home, machine).dispatch('soul.start', {
     ...startRequest(home), payload: { package_path: home, requested_profile: 'managed-protected' },
-  }), (error) => error.code === 'host.launch_unavailable');
+  }), (error) => error.code === 'profile_insufficient');
   assert.deepEqual(launches, []);
+});
+
+test('cooperative HQ reports profile_insufficient on the owner control socket before reservation', async () => {
+  const launches = [];
+  const t = await startHQ(machineOptions(fakeMachineLaunch(launches)));
+  let stream;
+  try {
+    const refused = await rawStart(t, t.home, 'managed-protected');
+    stream = refused.stream;
+    assert.equal(refused.response.ok, false);
+    assert.equal(refused.response.refusal.error, 'profile_insufficient');
+    assert.deepEqual(launches, []);
+    assert.deepEqual(t.hq.status().hq.soulStarts, []);
+  } finally { stream?.destroy(); await t.done(); }
 });
 
 test('an ACP runner stream error stops the Machine process and releases only after containment', { timeout: 10000 }, async () => {
