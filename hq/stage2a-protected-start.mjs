@@ -267,18 +267,6 @@ export function createStage2aProtectedStarter({ installations, authority, verify
           await Promise.allSettled(roles.map((role) => role.stop()));
         } });
       registered = true;
-      const captureInput = await selectAcpCapture?.(Object.freeze({ ...selectors }));
-      const capture = captureInput && verifyCaptureSelection(captureInput, selectors, captureMachineKey);
-      if (capture) {
-        const { selector } = capture;
-        const replayKey = [selector.session_id, selector.sequence, selector.challenge_base64url].join(':');
-        for (const [key, expires] of spentCaptureSelections) {
-          if (expires <= Date.now()) spentCaptureSelections.delete(key);
-        }
-        if (spentCaptureSelections.has(replayKey) || spentCaptureSelections.size >= 256) refuse();
-        spentCaptureSelections.set(replayKey, selector.expires_at_ms);
-      }
-      if (slot.stopPromise || stopping) refuse();
       slot.admission = await openProtectedAdmission({ installed, assignment, selectors,
         getBindReceiptSHA256: () => slot.bindReceiptSHA256 });
       if (typeof slot.admission?.close !== 'function') refuse();
@@ -358,6 +346,21 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         || !Number.isSafeInteger(childReceipt?.expires_at_ms)
         || childReceipt.expires_at_ms <= Date.now()) refuse();
       await slot.child.sendChildReceipt(childReceipt);
+      // ChildReady is now visible to the child onStart gate, but neither
+      // acknowledgement nor the owner ACP takeover has been released by HQ.
+      const captureInput = await selectAcpCapture?.(Object.freeze({ ...selectors,
+        child_start_receipt_sha256: childReceipt.sha256 }));
+      const capture = captureInput && verifyCaptureSelection(captureInput, selectors, captureMachineKey);
+      if (capture) {
+        const { selector } = capture;
+        const replayKey = [selector.session_id, selector.sequence, selector.challenge_base64url].join(':');
+        for (const [key, expires] of spentCaptureSelections) {
+          if (expires <= Date.now()) spentCaptureSelections.delete(key);
+        }
+        if (spentCaptureSelections.has(replayKey) || spentCaptureSelections.size >= 256) refuse();
+        spentCaptureSelections.set(replayKey, selector.expires_at_ms);
+      }
+      if (slot.stopPromise || stopping) refuse();
       await slot.child.waitChildAccepted(childReceipt.sha256);
       await slot.runner.waitRunnerChildReady({ reservationSHA256: reserved.sha256,
         startId, launchId, childStartSHA256: childReceipt.sha256,

@@ -26,7 +26,8 @@ const CHALLENGE2 = Buffer.alloc(32, 8).toString('base64url');
 const CAPTURE_SCHEMA = 'agent-bot-machine/stage2a-inner-acp-capture-selector/v1';
 const captureKeys = generateKeyPairSync('ed25519');
 const captureMachinePublicKey = captureKeys.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
-function signedCapture(selectors, register, changes = {}) {
+function signedCapture({ child_start_receipt_sha256, ...selectors }, register, changes = {}) {
+  assert.equal(child_start_receipt_sha256, CHILD);
   const selector = { ...selectors, schema: CAPTURE_SCHEMA, session_id: 'a'.repeat(32), sequence: 1,
     test_plan_sha256: CHILD_GRANT, challenge_base64url: CHALLENGE, expires_at_ms: Date.now() + 30000, ...changes };
   const raw = Buffer.concat([Buffer.from(CAPTURE_SCHEMA + '\0'), canonicalBytes(selector)]);
@@ -184,6 +185,7 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckF
       providerAttempts++;
       events.push('provider-registered');
     },
+    onStopped: () => { providerAttempts = 0; },
     random: () => 'a'.repeat(24),
   });
   return { starter, events, childStdin, childStdout, get providerAttempts() { return providerAttempts; },
@@ -415,7 +417,7 @@ test('inner ACP capture overflow discards evidence and contains the protected la
 });
 
 
-test('protected capture rejects stale, forged and mismatched A selectors before opening roles', async (t) => {
+test('protected capture rejects stale, forged and mismatched A selectors before ACP', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-capture-auth-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const register = () => assert.fail('untrusted selector must not expose capture control');
@@ -427,7 +429,11 @@ test('protected capture rejects stale, forged and mismatched A selectors before 
     const f = fixture(realpathSync(dir), { selectAcpCapture });
     await assert.rejects(f.starter.start({ package_path: realpathSync(dir),
       requested_profile: 'managed-protected' }), /unavailable/);
-    assert.deepEqual(f.events, ['lookup', 'reserved', 'registered', 'Machine-stop']);
+    assert.ok(f.events.includes('child-receipt-sent'));
+    assert.ok(!f.events.includes('child-accepted'));
+    assert.ok(!f.events.includes('launch-receipt'));
+    assert.equal(f.providerAttempts, 0);
+    assert.ok(f.events.includes('Machine-stop'));
   }
 });
 
