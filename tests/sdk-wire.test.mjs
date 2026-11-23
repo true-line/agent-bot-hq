@@ -90,6 +90,27 @@ test('the validator fails closed on keywords it does not check, and checks what 
   assert.equal(validate({ type: 'array', contains: { const: 1 }, minContains: 2 }, [1, 2]).length, 1);
 });
 
+test('prefixItems validates tuple positions and items validates only the remaining array', () => {
+  const tuple = { type: 'array', prefixItems: [{ type: 'string' }, { type: 'integer' }], items: false };
+  assert.deepEqual(validate(tuple, ['name', 3]), []);
+  assert.deepEqual(validate(tuple, ['name']), [], 'prefixItems does not require every position');
+  assert.equal(validate(tuple, [3, 'name'])[0].path, '/0');
+  assert.equal(validate(tuple, ['name', '3'])[0].path, '/1');
+  assert.deepEqual(validate(tuple, ['name', 3, true]).map(({ path, keyword }) => [path, keyword]),
+    [['/2', 'false']], 'items closes only the suffix');
+
+  const open = { prefixItems: [true, { const: 'fixed' }], items: { type: 'number' } };
+  assert.deepEqual(validate(open, ['anything', 'fixed', 1, 2]), []);
+  assert.deepEqual(validate(open, ['anything', 'fixed', 'bad']).map(({ path, keyword }) => [path, keyword]),
+    [['/2', 'type']]);
+  assert.deepEqual(validate({ items: { type: 'number' } }, [1, 2]), []);
+  assert.equal(validate({ items: { type: 'number' } }, ['bad'])[0].path, '/0');
+
+  for (const bad of [[], {}, [null], [{ dependentSchemas: {} }]]) {
+    assert.throws(() => checkSchemaSupported({ prefixItems: bad }), TypeError, JSON.stringify(bad));
+  }
+});
+
 test('offline references and composition validate every branch and fail closed', () => {
   const external = {
     $id: 'https://example.test/defs.json',
