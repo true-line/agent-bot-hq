@@ -187,6 +187,36 @@ export function createCooperativeBRoleClient({ reservation, bridgeAssignment, ma
         launcherProcess: Object.freeze({ pid, uid: grant.bridge_uid, gid: grant.bridge_gid,
           start_seconds: grant.pid_start_sec, start_micros: grant.pid_start_usec }) });
     },
+    async loadPolicy(observed) {
+      if (!DIGEST.test(observed?.envelopeSHA256 ?? '')
+        || observed.reservationSHA256 !== reservation.sha256
+        || observed.bridgeAssignmentSHA256 !== bridgeAssignment.assignmentSHA256
+        || observed.memberSetAssignmentSHA256 !== reservation.member_set_assignment_sha256
+        || !matchFields(observed, bridgeAssignment.selectors, SELECTORS)
+        || !(Date.parse(observed.expiresAt) > now())) refuse();
+      const response = await exchange('stage2a-cooperative-member-policy-v3', {
+        ...bridgeAssignment.selectors, reservation_sha256: reservation.sha256,
+        bridge_observed_sha256: observed.envelopeSHA256,
+      });
+      const body = response?.body;
+      if (!Buffer.isBuffer(response?.machineKey) || !response.machineKey.equals(key)
+        || !exactly(body, ['member_set_assignment_envelope_base64url', 'member_set_assignment_sha256',
+          'member_b_authority_envelope_base64url', 'member_b_authority_sha256', 'bridge_observed_sha256'])
+        || body.bridge_observed_sha256 !== observed.envelopeSHA256
+        || body.member_set_assignment_sha256 !== reservation.member_set_assignment_sha256
+        || body.member_set_assignment_envelope_base64url !== reservation.member_set_assignment_envelope_base64url
+        || !(Date.parse(observed.expiresAt) > now())) refuse();
+      const decode = (encoded, sha256) => {
+        if (typeof encoded !== 'string' || encoded.length > 22_000 || !DIGEST.test(sha256)) refuse();
+        const bytes = Buffer.from(encoded, 'base64url');
+        if (bytes.length > 16_384 || bytes.toString('base64url') !== encoded || digest(bytes) !== sha256) refuse();
+        return bytes;
+      };
+      return Object.freeze({
+        assignmentBytes: decode(body.member_set_assignment_envelope_base64url, body.member_set_assignment_sha256),
+        authorityBytes: decode(body.member_b_authority_envelope_base64url, body.member_b_authority_sha256),
+      });
+    },
     async verifyHMAC({ nonce, proof }) {
       if (!/^[0-9a-f]{64}$/.test(nonce ?? '') || !/^[0-9a-f]{64}$/.test(proof ?? '')) refuse();
       const body = await call('verify', { ...bridgeAssignment.selectors,
@@ -398,7 +428,8 @@ export async function startCooperativeBRole({ reservation, bridgeAssignment, mac
       await observeWrapperBind({ ...binding, fd5: status });
       return true;
     });
-    return Object.freeze({ wrapper, observeWrapperBind: (binding) => observeWrapperBind({ ...binding, fd5 }) });
+    return Object.freeze({ wrapper, observeWrapperBind: (binding) => observeWrapperBind({ ...binding, fd5 }),
+      loadPolicy: machine.loadPolicy });
   } catch (error) {
     await wrapper.stop();
     throw error;
@@ -450,7 +481,7 @@ export function createCooperativeBPolicyDelivery({ reservation, bridgeAssignment
         || wrapper.brokerPath !== bridgeAssignment.endpoint.path
         || !matches(wrapper, a, SELECTORS) || !matches(wrapper.bridgeProcess, peer, KERNEL_B_IDENTITY)
         || !Number.isFinite(expires) || expires <= now() || binding.isCurrent() !== true) refuse();
-      const records = await loadPolicy(binding);
+      const records = await loadPolicy(wrapper, binding);
       if (!records || !matches(await binding.readKernelBridge(), peer, KERNEL_B_IDENTITY)
         || binding.isCurrent() !== true || expires <= now()) refuse();
       const proof = verifyStage2aBridgeMemberAuthority(records.authorityBytes, { machinePublicKey,
