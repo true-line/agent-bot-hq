@@ -105,7 +105,17 @@ export function matchesObservedMemberGrants(assignment, observedMembers, memberG
 const BIND_SELECTORS = ['installation_id', 'start_id', 'plan_id', 'plan_digest', 'reservation_digest',
   'assignment_envelope_sha256', 'authority_envelope_sha256', 'member_selectors_sha256'];
 
-export function createStage2aMemberArmExchange({ provider, current, boundStart, clock }) {
+export function createStage2aMemberArmExchange({ provider, current, boundStart, clock,
+  profile = 'managed-protected' }) {
+  const cooperative = profile === 'managed-cooperative';
+  if (!cooperative && profile !== 'managed-protected') refuse();
+  const name = (action, type) => `bridge.member.${action}.${cooperative ? 'cooperative.' : ''}v3.${type}`;
+  const frame = (action, type, payload) => {
+    const kind = name(action, type);
+    if (payload.kind !== kind) refuse();
+    check(provider.schema, payload);
+    return payload;
+  };
   const connections = new Map();
   const enabled = !!provider?.schema && !!provider.childObservationSchema
     && typeof provider.observe === 'function' && typeof provider.recordArm === 'function';
@@ -127,8 +137,8 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
 
   async function observe(request, { connection } = {}, receipt) {
     if (!enabled || current(connection, receipt) !== true
-      || request?.kind !== 'bridge.member.observe.v3.request') refuse();
-    check(provider.schema, request);
+      || request?.kind !== name('observe', 'request')) refuse();
+    frame('observe', 'request', request);
     const state = connections.get(connection) ?? { members: new Map(), nonces: new Set(), pending: new Map() };
     if (state.members.has(request.member_id) || state.pending.has(request.member_id)
       || state.members.size + state.pending.size >= 2 || state.nonces.has(request.observe_nonce)
@@ -172,7 +182,7 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
     const mapping = c.provisional_hq_mapping;
     const startFields = ['profile_in_force', 'host_id', 'installation_id', 'soul_id', 'start_id', 'hq_epoch'];
     if (assignment.envelope_sha256 !== binding.assignment_envelope_sha256
-      || a.profile_in_force !== 'managed-protected'
+      || a.profile_in_force !== profile
       || a.reservation_sha256 !== binding.reservation_digest || c.reservation_sha256 !== binding.reservation_digest
       || c.assignment_envelope_sha256 !== assignment.envelope_sha256
       || startFields.some((field) => c[field] !== a[field] || mapping[field] !== a[field])
@@ -197,7 +207,7 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
         && clock.now() < expires && expires <= time(a.expires_at))
       || (state.childSHA256 && state.childSHA256 !== child.envelope_sha256)
       || !active(connection, receipt, state)) refuse();
-    const result = check(provider.schema, { kind: 'bridge.member.observe.v3.result', member_id: member.member_id,
+    const result = frame('observe', 'result', { kind: name('observe', 'result'), member_id: member.member_id,
       member_selector: member.member_selector, observe_nonce: request.observe_nonce,
       child_observation_envelope_base64url: envelopeBytes.toString('base64url'),
       child_observation_envelope_sha256: child.envelope_sha256, expires_at: c.expires_at });
@@ -209,8 +219,8 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
   }
 
   async function arm(request, { connection } = {}, receipt) {
-    if (!enabled || request?.kind !== 'bridge.member.arm.v3.request') refuse();
-    check(provider.schema, request);
+    if (!enabled || request?.kind !== name('arm', 'request')) refuse();
+    frame('arm', 'request', request);
     const state = connections.get(connection), slot = state?.members.get(request.member_id);
     if (!state || !active(connection, receipt, state) || !slot?.member || slot.armSpent
       || state.nonces.has(request.arm_nonce) || [...state.pending.values()].some((pending) => pending.nonce === request.arm_nonce) || slot.expires <= clock.now()
@@ -227,12 +237,16 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
       || !(slot.observedAt <= time(row.armed_at) && time(row.armed_at) <= clock.now())
       || sha(canonicalBytes(row)) !== request.bridge_arm_receipt_sha256
       || slot.expires <= clock.now()) refuse();
-    if (await provider.recordArm(binding, canonicalBytes(row), request.bridge_arm_receipt_sha256) !== true
-      || !active(connection, receipt, state) || slot.expires <= clock.now()) refuse();
-    return check(provider.schema, { kind: 'bridge.member.arm.v3.result', member_id: request.member_id,
+    const result = frame('arm', 'result', { kind: name('arm', 'result'), member_id: request.member_id,
       member_selector: request.member_selector, arm_nonce: request.arm_nonce,
       bridge_arm_receipt_sha256: request.bridge_arm_receipt_sha256, state: 'recorded-pending-aggregate-ready',
       expires_at: slot.expiresAt });
+    const armBytes = canonicalBytes(row);
+    const recorded = cooperative
+      ? await provider.recordArm(binding, armBytes, request.bridge_arm_receipt_sha256, request, result)
+      : await provider.recordArm(binding, armBytes, request.bridge_arm_receipt_sha256);
+    if (recorded !== true || !active(connection, receipt, state) || slot.expires <= clock.now()) refuse();
+    return result;
   }
 
   return Object.freeze({ enabled, observe, arm, forgetConnection: (connection) => connections.delete(connection) });

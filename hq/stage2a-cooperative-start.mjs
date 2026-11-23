@@ -153,6 +153,10 @@ export function createStage2aCooperativeStarter({ machine, core, readCommittedRe
       const acp = new Promise((resolve) => { accept = resolve; });
       const memberAttachProvider = brokered
         ? await brokeredMemberProvider(item.reservation, machine.brokeredMemberInputs(item.reservation), {
+          submitMap: (input) => machine.submitMemberMap(item.reservation, input),
+          grantMemberChild: (input) => machine.grantMemberChild(item.reservation, input),
+          observeChildren: (input) => machine.observeMemberChildren(item.reservation, input),
+          finalizeMemberReady: (input) => machine.finalizeMemberReady(item.reservation, input),
           recordHChildObservation: createCooperativeChildObservationRecorder({
             core, readCommittedReceipts, reservation: item.reservation,
           }),

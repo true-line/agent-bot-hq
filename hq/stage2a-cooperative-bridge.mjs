@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { canonicalDigest, canonicalize } from '../sdk/wire/canonical-json.mjs';
 import { DARWIN_HARNESS_DIR } from './darwin-harness-accounts.mjs';
 import { planBridgeEndpoints } from './bridge-endpoints.mjs';
-import { verifyStage2aBridgeMemberAuthority } from './stage2a-relay-peer.mjs';
+import { createStage2aMemberArmExchange, verifyStage2aBridgeMemberAuthority } from './stage2a-relay-peer.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
 import { verifyCooperativeProof } from './stage2a-cooperative-proof.mjs';
 import { startStage2aRole } from './stage2a-role-launch.mjs';
@@ -441,7 +441,7 @@ export async function startCooperativeBRole({ reservation, bridgeAssignment, mac
 // trusted entry point. Until A exposes that proof, no policy can be read.
 export function createCooperativeBPolicyDelivery({ reservation, bridgeAssignment, machinePublicKey,
   assignmentSchema, authoritySchema, requestSchema, resultSchema, schemaReferences, expected, boundConnection,
-  observeWrapperBind, loadPolicy, now = Date.now } = {}) {
+  observeWrapperBind, loadPolicy, policyDelivered, now = Date.now } = {}) {
   const a = reservation?.payload?.assignment;
   if (!a || reservation.payload.adapter_transport !== 'brokered-b'
     || bridgeAssignment?.reservationSHA256 !== reservation.sha256
@@ -508,6 +508,7 @@ export function createCooperativeBPolicyDelivery({ reservation, bridgeAssignment
         member_b_authority_envelope_sha256: proof.envelope_sha256,
       });
       if (validate(resultSchema, result, { schemas: schemaReferences }).length) refuse();
+      policyDelivered?.(Object.freeze({ binding, wrapper, records, proof }));
       delivered = true;
       return result;
     } finally { pending = false; }
@@ -515,16 +516,97 @@ export function createCooperativeBPolicyDelivery({ reservation, bridgeAssignment
 }
 
 
+function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bind, finalizeMemberReady, now }) {
+  let policy, observation;
+  const arms = new Map();
+  let resolvePolicy, rejectPolicy, resolveReady, rejectReady;
+  const policyResult = new Promise((resolve, reject) => { resolvePolicy = resolve; rejectPolicy = reject; });
+  void policyResult.catch(() => {});
+  const readyResult = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+  void readyResult.catch(() => {});
+  const current = (connection, receipt) => policy?.binding.connection === connection
+    && policy.binding.receipt === receipt && policy.binding.isCurrent() === true;
+  const exchange = createStage2aMemberArmExchange({
+    profile: 'managed-cooperative', current, clock: { now },
+    provider: {
+      schema: schemas.armExchange, childObservationSchema: schemas.childObservation, schemaReferences,
+      observe: () => observation,
+      async recordArm(binding, bytes, sha256, arm_request, arm_result) {
+        if (!current(binding.connection, binding.receipt) || arms.has(arm_request.member_id)
+          || arms.size >= 2 || digest(bytes) !== sha256) refuse();
+        arms.set(arm_request.member_id, { arm_request, arm_result, bytes, sha256 });
+        if (arms.size === 2) {
+          const ordered = [...arms.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, row]) => row);
+          // Defer signing so the second pending ACK can return before the aggregate Ready.
+          setImmediate(async () => {
+            try {
+              if (!current(binding.connection, binding.receipt)) refuse();
+              await bind.binding(binding.connection, binding.receipt);
+              const readyBytes = await finalizeMemberReady({
+                child_observation_envelope_sha256: arm_request.child_observation_envelope_sha256,
+                member_b_authority_envelope_sha256: policy.proof.envelope_sha256,
+                bridge_observed_sha256: policy.wrapper.envelopeSHA256,
+                arms: ordered.map(({ arm_request, arm_result }) => ({ arm_request, arm_result })),
+              });
+              await bind.binding(binding.connection, binding.receipt);
+              const ready = Object.freeze({ readyBytes, armReceiptSHA256s: ordered.map(({ sha256 }) => sha256),
+                armRowsBase64url: ordered.map(({ bytes }) => bytes.toString('base64url')),
+                bridgeObservedBase64url: policy.wrapper.envelopeBase64url });
+              resolveReady(ready);
+            } catch (error) { rejectReady(error); }
+          });
+        }
+        return true;
+      },
+    },
+    async boundStart(connection, receipt) {
+      const kernel = await bind.binding(connection, receipt);
+      if (!current(connection, receipt)) refuse();
+      const a = reservation.payload.assignment;
+      return Object.freeze({ ...kernel, installation_id: a.installation_id, start_id: a.start_id,
+        plan_id: a.plan_id, plan_digest: a.plan_digest, reservation_digest: reservation.sha256,
+        assignment_envelope_sha256: policy.proof.payload.member_set_assignment_envelope_sha256,
+        authority_envelope_sha256: policy.proof.envelope_sha256, bridge_uid: kernel.kernelBridge.uid,
+        member_selectors_sha256: canonicalDigest(policy.proof.payload.members.map((row) => row.member_selector)) });
+    },
+  });
+  return Object.freeze({
+    policyDelivered(value) {
+      if (policy) refuse();
+      policy = value;
+      resolvePolicy(value);
+    },
+    waitForPolicy: () => policyResult,
+    observation(value) { if (observation) refuse(); observation = value; },
+    waitForReady: () => readyResult,
+    verifiedPolicy() {
+      if (!policy || !current(policy.binding.connection, policy.binding.receipt)) refuse();
+      return policy;
+    },
+    observe: exchange.observe, arm: exchange.arm,
+    close(connection) {
+      exchange.forgetConnection(connection);
+      if (connection === undefined || policy?.binding.connection === connection) {
+        const error = new Error('cooperative B broker closed');
+        rejectPolicy(error);
+        rejectReady(error);
+      }
+    },
+  });
+}
+
 // Register the signed endpoint and callbacks before exec so the fixed B
 // wrapper can complete its HMAC challenge on the same listener it will use
 // for policy. The role promise releases policy only after signed FD5 proof.
 export async function openCooperativeBStage({ reservation, bridgeAssignment, machinePublicKey,
-  schemas, schemaReferences, expected, openEndpoint, kernelPeer, exchange, random, contain,
+  schemas, schemaReferences, expected, openEndpoint, kernelPeer, exchange, random, contain, finalizeMemberReady,
   now = Date.now } = {}) {
   if (!schemas || typeof openEndpoint !== 'function') refuse();
   const machine = createCooperativeBRoleClient({ reservation, bridgeAssignment, machinePublicKey, exchange, now });
   const bind = createCooperativeBBind({ reservation, bridgeAssignment, schema: schemas.bind,
     schemaReferences, machine, kernelPeer, random, contain, now });
+  const armStage = schemas.armExchange && schemas.childObservation && typeof finalizeMemberReady === 'function'
+    ? createCooperativeBArmStage({ schemas, schemaReferences, reservation, bind, finalizeMemberReady, now }) : undefined;
   let resolveRole, rejectRole;
   const roleReady = new Promise((resolve, reject) => { resolveRole = resolve; rejectRole = reject; });
   void roleReady.catch(() => {});
@@ -532,25 +614,30 @@ export async function openCooperativeBStage({ reservation, bridgeAssignment, mac
     assignmentSchema: schemas.assignment, authoritySchema: schemas.authority, requestSchema: schemas.policyRequest,
     resultSchema: schemas.policyResult, schemaReferences, expected, boundConnection: bind.binding, now,
     observeWrapperBind: async (binding) => (await roleReady).observeWrapperBind(binding),
-    loadPolicy: async (wrapper) => (await roleReady).loadPolicy(wrapper) });
+    loadPolicy: async (wrapper) => (await roleReady).loadPolicy(wrapper),
+    policyDelivered: armStage?.policyDelivered });
   let endpoint;
   try {
     endpoint = await openEndpoint({ bridgeAssignment, handlers: {
       stage2aCooperativeBBindChallengeV3: bind.begin,
       stage2aCooperativeBBindV3: bind.finish,
       stage2aCooperativeBPolicyV3: policy,
-      forgetBridgeConnection: bind.stop,
+      ...(armStage ? { stage2aCooperativeMemberObserveV3: armStage.observe,
+        stage2aCooperativeMemberArmV3: armStage.arm } : {}),
+      async forgetBridgeConnection(connection) { armStage?.close(connection); await bind.stop(connection); },
     } });
     const role = await startCooperativeBRole({ reservation, bridgeAssignment, machinePublicKey,
       observationSchema: schemas.observation, schemaReferences, exchange, boundByReceiptSHA256: bind.byReceiptSHA256, now });
     resolveRole(role);
     let closing;
-    return Object.freeze({ wrapper: role.wrapper, close: () => {
+    return Object.freeze({ wrapper: role.wrapper, armStage, close: () => {
+      armStage?.close();
       closing ??= Promise.all([role.wrapper.stop(), endpoint.close()]).then(() => {});
       return closing;
     } });
   } catch (error) {
     rejectRole(error);
+    armStage?.close();
     await endpoint?.close();
     throw error;
   }

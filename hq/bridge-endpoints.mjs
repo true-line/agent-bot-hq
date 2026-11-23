@@ -17,6 +17,9 @@ const BRIDGE_RELAY_INGRESS = 'bridge.relay.ingress.v1';
 const RELAY_PEER_CHALLENGE = 'stage2a-relay-peer-challenge';
 const COOPERATIVE_B_BIND = 'bridge.bind.cooperative.v3';
 const COOPERATIVE_MEMBER_POLICY = 'bridge.member-policy.v3';
+const COOPERATIVE_MEMBER_OBSERVE = 'bridge.member.observe.cooperative.v3';
+const COOPERATIVE_MEMBER_ARM = 'bridge.member.arm.cooperative.v3';
+const cooperativeArmKind = (kind) => kind === COOPERATIVE_MEMBER_OBSERVE || kind === COOPERATIVE_MEMBER_ARM;
 const memberArmKind = (kind) => kind === 'bridge.member.observe.v3' || kind === 'bridge.member.arm.v3';
 const protectedBridgeKind = (kind) => kind === 'bridge.bind.v2.challenge' || kind === 'bridge.bind.v2'
   || kind === 'bridge.bind.v3.challenge' || kind === 'bridge.bind.v3';
@@ -24,7 +27,7 @@ const refuse = () => fail('host.launch_unavailable', 'bridge bind requires the d
 
 export function memberBrokerDispatch(host, kind, payload, connection) {
   if (protectedBridgeKind(kind) || kind === BRIDGE_QUALIFICATION_MESSAGES || kind === BRIDGE_RELAY_INGRESS
-    || kind === RELAY_PEER_CHALLENGE || kind === COOPERATIVE_B_BIND || kind === COOPERATIVE_MEMBER_POLICY || memberArmKind(kind)) refuse();
+    || kind === RELAY_PEER_CHALLENGE || kind === COOPERATIVE_B_BIND || kind === COOPERATIVE_MEMBER_POLICY || cooperativeArmKind(kind) || memberArmKind(kind)) refuse();
   return host.brokerAccept(kind, payload, { connection });
 }
 
@@ -96,6 +99,15 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
       state.phase = 'bound';
       state.receipt = result.bind_receipt;
       return Object.freeze({ bind_receipt_sha256: result.bind_receipt_sha256 });
+    }
+    if (cooperativeArmKind(kind)) {
+      if (state?.phase !== 'policy-delivered') refuse();
+      const method = kind === COOPERATIVE_MEMBER_OBSERVE
+        ? methods?.stage2aCooperativeMemberObserveV3 : methods?.stage2aCooperativeMemberArmV3;
+      if (typeof method !== 'function') refuse();
+      const result = await method(payload, meta, state.receipt);
+      if (!current() || cooperative.get(connection) !== state) refuse();
+      return result;
     }
     if (state?.phase !== 'bound' || typeof methods?.stage2aCooperativeBPolicyV3 !== 'function') refuse();
     state.phase = 'policy-pending';
@@ -176,19 +188,21 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
       const relayIngress = kind === BRIDGE_RELAY_INGRESS;
       const livePeer = kind === RELAY_PEER_CHALLENGE;
       const memberArm = memberArmKind(kind);
+      const cooperativeArm = cooperativeArmKind(kind);
       const policy = kind === COOPERATIVE_MEMBER_POLICY;
       const cooperativeBind = kind === COOPERATIVE_B_BIND;
       const peer = peers.get(session);
-      if (cooperativeHandlers && !cooperativeBind && !policy && !memberArm) refuse();
+      if (cooperativeHandlers && !cooperativeBind && !policy && !cooperativeArm) refuse();
       if (!peer || (!protectedBridgeKind(kind) && !(qualification && enableBridgeQualification === true)
         && !(relayIngress && enableBridgeRelayIngress === true)
         && !(livePeer && enableRelayPeerChallenge === true)
         && !(memberArm && enableMemberArmExchange === true)
         && !(policy && enableCooperativeBPolicy === true)
+        && !(cooperativeArm && cooperativeHandlers && enableMemberArmExchange === true)
         && !(cooperativeBind && enableCooperativeBBind === true))) refuse();
-      if ((qualification || relayIngress || livePeer || memberArm || policy || cooperativeBind || endpoint.parentIdentity)
+      if ((qualification || relayIngress || livePeer || memberArm || cooperativeArm || policy || cooperativeBind || endpoint.parentIdentity)
         && (peer.socket.destroyed || !peer.checkCurrent())) refuse();
-      if (cooperativeBind || policy) return cooperativeDispatch(kind, payload, session, peer);
+      if (cooperativeBind || policy || cooperativeArm) return cooperativeDispatch(kind, payload, session, peer);
       return host.brokerAccept(kind, payload, { connection: session });
     },
   });

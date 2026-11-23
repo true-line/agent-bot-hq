@@ -53,6 +53,13 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
   const identityOf = (reservation) => ({ reservation_sha256: reservation.sha256,
     ...pick(reservation.payload.assignment, idFields),
     h_service_descriptor_digest: reservation.payload.measurement_binding.h_service_descriptor_digest });
+  const memberCall = async (reservation, operation, fields) => {
+    const entry = owned(reservation);
+    if (entry.revoked || now() >= entry.expires || !entry.memberInputs) invalid();
+    const response = await call(operation, { ...requestOf(reservation), ...fields }, entry);
+    if (entry.revoked || now() >= entry.expires) invalid();
+    return response.body;
+  };
   const watchHealthy = (context) => {
     const entry = active.get(context?.reservation_sha256);
     return Boolean(entry && !entry.revoked && entry.liveUntil > now() && contextMatches(entry, context));
@@ -227,6 +234,40 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       return Object.freeze({ machinePublicKey: Buffer.from(entry.machineKey),
         assignmentBytes: Buffer.from(reservation.member_set_assignment_envelope_base64url, 'base64url'),
         cooperativeBridgeBytes: Buffer.from(reservation.bridge_assignment_envelope_base64url, 'base64url') });
+    },
+    async submitMemberMap(reservation, input) {
+      const body = await memberCall(reservation, 'provisional-map', pick(input,
+        ['provisional_hq_mapping_base64url', 'provisional_hq_mapping_sha256']));
+      if (body?.accepted !== true || body.sha256 !== input.provisional_hq_mapping_sha256) invalid();
+      return body;
+    },
+    async grantMemberChild(reservation, input) {
+      return memberCall(reservation, 'child-exec', pick(input,
+        ['member_id', 'member_launch_id', 'member_selector', 'nonce', 'pid']));
+    },
+    async observeMemberChildren(reservation, { members }) {
+      if (!Array.isArray(members) || members.length !== 2) invalid();
+      const body = await memberCall(reservation, 'child-observe', { members: members.map((row) => pick(row,
+        ['member_id', 'member_launch_id', 'member_selector', 'child_launcher_pid', 'child_pid',
+          'grant_sha256', 'h_observation_base64url', 'h_observation_sha256'])) });
+      const encoded = body?.envelope_base64url;
+      if (typeof encoded !== 'string' || encoded.length > 21_846) invalid();
+      const bytes = Buffer.from(encoded, 'base64url');
+      if (bytes.toString('base64url') !== encoded || digest(bytes) !== body.sha256) invalid();
+      const observation = verifyStage2aMachineEnvelope(bytes, owned(reservation).machineKey,
+        'agent-bot/stage2a-member-set-child-observation/v1', { maxBytes: 16_384 });
+      if (observation.payload.profile_in_force !== 'managed-cooperative'
+        || observation.payload.reservation_sha256 !== reservation.sha256) invalid();
+      return bytes;
+    },
+    async finalizeMemberReady(reservation, input) {
+      const body = await memberCall(reservation, 'member-ready', pick(input,
+        ['child_observation_envelope_sha256', 'member_b_authority_envelope_sha256', 'bridge_observed_sha256', 'arms']));
+      const encoded = body?.envelope_base64url;
+      if (typeof encoded !== 'string' || encoded.length > 21_846) invalid();
+      const bytes = Buffer.from(encoded, 'base64url');
+      if (bytes.toString('base64url') !== encoded || digest(bytes) !== body.sha256) invalid();
+      return bytes;
     },
     async projection(reservation) {
       const entry = owned(reservation);
