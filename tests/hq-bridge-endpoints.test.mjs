@@ -221,6 +221,11 @@ test('cooperative B challenge, proof and policy dispatch stay on one dedicated s
       assert.equal(presented, receipt);
       return { observation: 'accepted' };
     },
+    stage2aCooperativeBridgeReadyV3: async (_request, { connection }, presented) => {
+      assert.equal(connection, challengedSession);
+      assert.equal(presented, receipt);
+      return { ready: 'accepted' };
+    },
   };
   await listenBridgeEndpoint(endpoint, { hqUid, peers: new Map(),
     enableCooperativeBBind: true, enableCooperativeBPolicy: true,
@@ -240,8 +245,9 @@ test('cooperative B challenge, proof and policy dispatch stay on one dedicated s
   const session = handler.newSession(socket);
   const other = handler.newSession(new EventEmitter());
   const bind = 'bridge.bind.cooperative.v3', policy = 'bridge.member-policy.v3';
-  const observe = 'bridge.member.observe.cooperative.v3';
+  const observe = 'bridge.member.observe.cooperative.v3', ready = 'bridge.ready.cooperative.v3';
   await assert.rejects(handler.dispatch(observe, { session, payload: {} }), isolation);
+  await assert.rejects(handler.dispatch(ready, { session, payload: {} }), isolation);
   await assert.rejects(handler.dispatch(policy, { session, payload: {} }), isolation);
   assert.ok((await handler.dispatch(bind, { session, payload: {} })).nonce);
   await assert.rejects(handler.dispatch(bind, { session: other, payload: { proof_hex: 'd'.repeat(64) } }), isolation);
@@ -250,6 +256,8 @@ test('cooperative B challenge, proof and policy dispatch stay on one dedicated s
   assert.deepEqual(await handler.dispatch(policy, { session, payload: {} }), { policy: 'accepted' });
   await assert.rejects(handler.dispatch(observe, { session: other, payload: {} }), isolation);
   assert.deepEqual(await handler.dispatch(observe, { session, payload: {} }), { observation: 'accepted' });
+  await assert.rejects(handler.dispatch(ready, { session: other, payload: {} }), isolation);
+  assert.deepEqual(await handler.dispatch(ready, { session, payload: {} }), { ready: 'accepted' });
   await assert.rejects(handler.dispatch(policy, { session, payload: {} }), isolation);
   socket.emit('close');
   assert.throws(() => handler.dispatch(policy, { session, payload: {} }), isolation);

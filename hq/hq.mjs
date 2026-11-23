@@ -681,7 +681,9 @@ export function createHQ({
       cooperativeBridgeListeners.set(key, marker);
       try {
         const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
-          enableCooperativeBBind: true, enableCooperativeBPolicy: true, cooperativeHandlers: handlers });
+          enableCooperativeBBind: true, enableCooperativeBPolicy: true,
+          enableMemberArmExchange: typeof handlers.stage2aCooperativeMemberObserveV3 === 'function'
+            && typeof handlers.stage2aCooperativeMemberArmV3 === 'function', cooperativeHandlers: handlers });
         if (!running || cooperativeBridgeListeners.get(key) !== marker) {
           await listener.close();
           fail('host.launch_unavailable', 'cooperative B endpoint stopped during startup');

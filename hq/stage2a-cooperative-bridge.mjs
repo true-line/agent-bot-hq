@@ -395,7 +395,7 @@ export function createCooperativeBObservation({ reservation, bridgeAssignment, m
         bridgeAssignmentSHA256: value.bridge_assignment_sha256, brokerPath: bridgeAssignment.endpoint.path,
         bridgeProcess: Object.freeze({ ...value.bridge, pid_version: peer.pid_version }),
         memberSetAssignmentSHA256: reservation.member_set_assignment_sha256, expiresAt: value.expires_at,
-        envelopeSHA256: response.body.sha256, envelopeBase64url: response.body.envelope_base64url });
+        relaySocket: value.relay_socket, envelopeSHA256: response.body.sha256, envelopeBase64url: response.body.envelope_base64url });
       return observed;
     } finally { pending = false; }
   };
@@ -516,8 +516,8 @@ export function createCooperativeBPolicyDelivery({ reservation, bridgeAssignment
 }
 
 
-function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bind, finalizeMemberReady, recordArmEvidence, now }) {
-  let policy, observation;
+function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bind, machinePublicKey, exchangeToMachine, finalizeMemberReady, recordArmEvidence, now }) {
+  let policy, observation, lease, pendingLease = false;
   const arms = new Map(), pendingArms = new Set();
   let resolvePolicy, rejectPolicy, resolveReady, rejectReady;
   const policyResult = new Promise((resolve, reject) => { resolvePolicy = resolve; rejectPolicy = reject; });
@@ -577,6 +577,69 @@ function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bi
         member_selectors_sha256: canonicalDigest(policy.proof.payload.members.map((row) => row.member_selector)) });
     },
   });
+  async function leaseB(input, { connection }, receipt, initial) {
+    const fields = initial ? ['child_observation_envelope_sha256', 'member_b_authority_envelope_sha256']
+      : ['ready_envelope_sha256', 'after_sequence', 'prior_expires_at'];
+    const nonce = input?.challenge_nonce_base64url;
+    if (!current(connection, receipt) || pendingLease || !exactly(input, [...fields, 'challenge_nonce_base64url'])
+      || typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(nonce)
+      || Buffer.from(nonce, 'base64url').toString('base64url') !== nonce
+      || (initial ? !!lease || arms.size !== 2 : !lease || input.after_sequence !== lease.sequence
+        || input.ready_envelope_sha256 !== lease.readySHA256 || input.prior_expires_at !== lease.expiresAt
+        || Date.parse(lease.expiresAt) <= now())) refuse();
+    pendingLease = true;
+    try {
+      const result = await readyResult;
+      const ready = verifyStage2aMachineEnvelope(result.readyBytes, machinePublicKey,
+        'agent-bot/soul-cooperative-member-ready/v3', { schemaVersion: 3, maxBytes: 16_384 });
+      const r = ready.payload, wrapper = policy.wrapper;
+      const binding = await bind.binding(connection, receipt);
+      const fresh = binding.kernelBridge;
+      if (!current(connection, receipt) || !matchFields(fresh, wrapper.bridgeProcess, KERNEL_B_IDENTITY)
+        || r.profile_in_force !== 'managed-cooperative' || r.reservation_sha256 !== reservation.sha256
+        || r.member_b_authority_envelope_sha256 !== policy.proof.envelope_sha256
+        || r.bridge_observed_sha256 !== wrapper.envelopeSHA256
+        || r.assignment_envelope_sha256 !== wrapper.memberSetAssignmentSHA256
+        || (initial && (input.child_observation_envelope_sha256 !== r.child_observation_envelope_sha256
+          || input.member_b_authority_envelope_sha256 !== policy.proof.envelope_sha256))) refuse();
+      const request = { ...Object.fromEntries(SELECTORS.map((key) => [key, reservation.payload.assignment[key]])),
+        reservation_sha256: reservation.sha256, bridge_observed_sha256: wrapper.envelopeSHA256,
+        ready_sha256: ready.envelope_sha256, bridge_pid: fresh.pid, bridge_start_seconds: fresh.start_seconds,
+        bridge_start_micros: fresh.start_micros, challenge_nonce_base64url: nonce,
+        after_sequence: initial ? 0 : input.after_sequence,
+        prior_expires_at: initial ? r.expires_at : input.prior_expires_at };
+      const reply = await exchangeToMachine('stage2a-cooperative-b-live-v3', request);
+      if (!reply?.machineKey?.equals(machinePublicKey)) refuse();
+      const b = reply.body, leaseFields = ['lease_envelope_base64url', 'lease_sha256', 'lease_sequence'];
+      if (!exactly(b, [...leaseFields, 'ready_envelope_base64url', 'ready_sha256',
+        'bridge_observed_envelope_base64url', 'bridge_observed_sha256'])
+        || b.ready_envelope_base64url !== result.readyBytes.toString('base64url')
+        || b.ready_sha256 !== request.ready_sha256 || b.bridge_observed_sha256 !== wrapper.envelopeSHA256
+        || b.bridge_observed_envelope_base64url !== wrapper.envelopeBase64url
+        || typeof b.lease_envelope_base64url !== 'string' || b.lease_envelope_base64url.length > 10_923
+        || b.lease_sequence !== request.after_sequence + 1) refuse();
+      const bytes = Buffer.from(b.lease_envelope_base64url, 'base64url');
+      if (bytes.toString('base64url') !== b.lease_envelope_base64url) refuse();
+      const proof = verifyStage2aMachineEnvelope(bytes, machinePublicKey,
+        'agent-bot/soul-cooperative-b-live-lease/v3', { schemaVersion: 3, maxBytes: 8192 });
+      const p = proof.payload, issued = Date.parse(p.issued_at), expires = Date.parse(p.expires_at);
+      if (proof.envelope_sha256 !== b.lease_sha256 || p.contract !== 'machine/v3'
+        || p.kind !== 'soul-cooperative-b-live-lease' || p.schema_version !== 3 || p.profile_in_force !== 'managed-cooperative'
+        || p.host_id !== reservation.payload.host_id || !matchFields(p, request, [...SELECTORS, 'reservation_sha256',
+          'bridge_observed_sha256', 'ready_sha256', 'challenge_nonce_base64url'])
+        || p.bridge_assignment_sha256 !== wrapper.bridgeAssignmentSHA256
+        || p.assignment_envelope_sha256 !== wrapper.memberSetAssignmentSHA256
+        || p.member_b_authority_envelope_sha256 !== policy.proof.envelope_sha256
+        || !exactly(p.bridge_process, PROCESS_IDENTITY) || !matchFields(p.bridge_process, fresh, PROCESS_IDENTITY)
+        || canonicalDigest(p.relay_socket) !== canonicalDigest(wrapper.relaySocket) || p.sequence !== b.lease_sequence
+        || !(issued <= now() && now() < expires && expires - issued <= 5000 && expires <= Date.parse(r.expires_at))
+        || !matchFields((await bind.binding(connection, receipt)).kernelBridge, fresh, KERNEL_B_IDENTITY)
+        || !current(connection, receipt) || expires <= now()) refuse();
+      lease = Object.freeze({ sequence: p.sequence, expiresAt: p.expires_at, readySHA256: b.ready_sha256 });
+      return initial ? Object.freeze(b) : Object.freeze(Object.fromEntries(leaseFields.map((key) => [key, b[key]])));
+    } finally { pendingLease = false; }
+  }
+
   return Object.freeze({
     policyDelivered(value) {
       if (policy) refuse();
@@ -591,6 +654,10 @@ function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bi
       return policy;
     },
     observe: exchange.observe, arm: exchange.arm,
+    ready: (input, meta, receipt) => leaseB(input, meta, receipt, true),
+    renew: (input, meta, receipt) => leaseB(input, meta, receipt, false),
+    isLive: (sha256) => !!lease && lease.readySHA256 === sha256 && Date.parse(lease.expiresAt) > now()
+      && current(policy.binding.connection, policy.binding.receipt),
     close(connection) {
       exchange.forgetConnection(connection);
       if (connection === undefined || policy?.binding.connection === connection) {
@@ -613,7 +680,7 @@ export async function openCooperativeBStage({ reservation, bridgeAssignment, mac
   const bind = createCooperativeBBind({ reservation, bridgeAssignment, schema: schemas.bind,
     schemaReferences, machine, kernelPeer, random, contain, now });
   const armStage = schemas.armExchange && schemas.childObservation && typeof finalizeMemberReady === 'function' && typeof recordArmEvidence === 'function'
-    ? createCooperativeBArmStage({ schemas, schemaReferences, reservation, bind, finalizeMemberReady, recordArmEvidence, now }) : undefined;
+    ? createCooperativeBArmStage({ schemas, schemaReferences, reservation, bind, machinePublicKey, exchangeToMachine: exchange, finalizeMemberReady, recordArmEvidence, now }) : undefined;
   let resolveRole, rejectRole;
   const roleReady = new Promise((resolve, reject) => { resolveRole = resolve; rejectRole = reject; });
   void roleReady.catch(() => {});
@@ -630,7 +697,8 @@ export async function openCooperativeBStage({ reservation, bridgeAssignment, mac
       stage2aCooperativeBBindV3: bind.finish,
       stage2aCooperativeBPolicyV3: policy,
       ...(armStage ? { stage2aCooperativeMemberObserveV3: armStage.observe,
-        stage2aCooperativeMemberArmV3: armStage.arm } : {}),
+        stage2aCooperativeMemberArmV3: armStage.arm,
+        stage2aCooperativeBridgeReadyV3: armStage.ready, stage2aCooperativeBridgeLiveV3: armStage.renew } : {}),
       async forgetBridgeConnection(connection) { armStage?.close(connection); await bind.stop(connection); },
     } });
     const role = await startCooperativeBRole({ reservation, bridgeAssignment, machinePublicKey,
