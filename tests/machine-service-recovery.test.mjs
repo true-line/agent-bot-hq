@@ -766,7 +766,8 @@ function cooperativePlan(machineKey, roleUid = 300, change = () => {}) {
     soul_artifact_sha256: 'c'.repeat(64), definition_sha256: 'd'.repeat(64), node_path: '/node',
     node_sha256: 'e'.repeat(64), entry: 'bin/agent-bot-souls.mjs', launcher_path: '/launcher',
     launcher_sha256: 'f'.repeat(64), approved_until: '2030-01-01T00:00:00Z', runtime_v3: {},
-    adapter_release: {}, hq_broker: {}, adapter_transport: 'direct-comms', adapter_code_inputs: ['one']
+    adapter_release: {}, hq_broker: {}, adapter_transport: 'direct-comms', reviewed_start_id: 'st_' + 'a'.repeat(24),
+    adapter_code_inputs: ['one']
   } };
   change(p);
   const plan_canonical = JSON.stringify(p) + '\n';
@@ -792,6 +793,13 @@ test('paired cooperative install rejects wrong pairing and scope before challeng
     p => { p.soul_cooperative_launch.profile_in_force = 'managed-protected'; },
     p => { p.steps[0].target = 'other'; }, p => { p.members.push('_other'); },
     p => { delete p.soul_cooperative_launch.runtime_v3; },
+    p => { delete p.soul_cooperative_launch.reviewed_start_id; },
+    p => { p.soul_cooperative_launch.reviewed_start_id = 'other'; },
+    p => {
+      const value = p.soul_cooperative_launch.reviewed_start_id;
+      delete p.soul_cooperative_launch.reviewed_start_id;
+      p.soul_cooperative_launch.reviewed_start_id = value;
+    },
     p => { p.soul_cooperative_launch.unexpected = true; }]) {
     f.state.saved = cooperativePlan(machineKey, 300, change);
     await assert.rejects(f.issue(), /unsupported structure|outside the paired cooperative/);
