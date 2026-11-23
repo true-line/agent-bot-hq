@@ -128,16 +128,34 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
     if (!enabled || current(connection, receipt) !== true
       || request?.kind !== 'bridge.member.observe.v3.request') refuse();
     check(provider.schema, request);
-    const state = connections.get(connection) ?? { members: new Map(), nonces: new Set() };
-    if (state.members.has(request.member_id) || state.members.size >= 2
-      || state.nonces.has(request.observe_nonce)) refuse();
+    const state = connections.get(connection) ?? { members: new Map(), nonces: new Set(), pending: new Map() };
+    if (state.members.has(request.member_id) || state.pending.has(request.member_id)
+      || state.members.size + state.pending.size >= 2 || state.nonces.has(request.observe_nonce)
+      || [...state.pending.values()].some((slot) => slot.nonce === request.observe_nonce)) refuse();
     connections.set(connection, state);
-    const slot = { nonce: request.observe_nonce };
-    state.members.set(request.member_id, slot);
-    state.nonces.add(slot.nonce);
+    const slot = { nonce: request.observe_nonce, timedOut: false };
+    state.pending.set(request.member_id, slot);
+    let timer;
+    try {
+      return await Promise.race([observed(request, connection, receipt, state, slot),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            slot.timedOut = true;
+            reject(new Error('Stage 2a child observation deadline exceeded'));
+          }, 4_000);
+          timer.unref?.();
+        })]);
+    } finally {
+      clearTimeout(timer);
+      state.pending.delete(request.member_id);
+    }
+  }
+
+  async function observed(request, connection, receipt, state, slot) {
     const binding = await bound(request, connection, receipt, state);
+    if (slot.timedOut) refuse();
     const observation = await provider.observe(binding);
-    if (!active(connection, receipt, state) || !observation) refuse();
+    if (slot.timedOut || !active(connection, receipt, state) || !observation) refuse();
     const { envelopeBytes, assignmentBytes, machinePublicKey, provisionalMappingSHA256,
       memberGrants } = observation;
     const signed = (bytes, purpose) => verifyStage2aMachineEnvelope(bytes, machinePublicKey,
@@ -174,12 +192,13 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
       || (state.childSHA256 && state.childSHA256 !== child.envelope_sha256)
       || !active(connection, receipt, state)) refuse();
     const result = check(provider.schema, { kind: 'bridge.member.observe.v3.result', member_id: member.member_id,
-      member_selector: member.member_selector, observe_nonce: slot.nonce,
+      member_selector: member.member_selector, observe_nonce: request.observe_nonce,
       child_observation_envelope_base64url: envelopeBytes.toString('base64url'),
       child_observation_envelope_sha256: child.envelope_sha256, expires_at: c.expires_at });
     state.childSHA256 = child.envelope_sha256;
-    Object.assign(slot, { member, expires, expiresAt: c.expires_at, observedAt: time(c.observed_at),
-      childSHA256: child.envelope_sha256 });
+    state.members.set(request.member_id, { member, nonce: request.observe_nonce,
+      expires, expiresAt: c.expires_at, observedAt: time(c.observed_at), childSHA256: child.envelope_sha256 });
+    state.nonces.add(request.observe_nonce);
     return result;
   }
 
@@ -188,7 +207,7 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
     check(provider.schema, request);
     const state = connections.get(connection), slot = state?.members.get(request.member_id);
     if (!state || !active(connection, receipt, state) || !slot?.member || slot.armSpent
-      || state.nonces.has(request.arm_nonce) || slot.expires <= clock.now()
+      || state.nonces.has(request.arm_nonce) || [...state.pending.values()].some((pending) => pending.nonce === request.arm_nonce) || slot.expires <= clock.now()
       || request.observe_nonce !== slot.nonce || request.member_selector !== slot.member.member_selector
       || request.child_observation_envelope_sha256 !== slot.childSHA256) refuse();
     slot.armSpent = true;

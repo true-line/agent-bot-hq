@@ -75,7 +75,8 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
     const bridge = authority.payload.bridge;
     const ids = ['profile_in_force', 'host_id', 'installation_id', 'soul_id', 'start_id', 'hq_epoch',
       'reservation_sha256'];
-    if (authority.envelope_sha256 !== input.boundAuthoritySHA256
+    if (runnerEndpoint.peerUid !== a.runner_uid
+      || authority.envelope_sha256 !== input.boundAuthoritySHA256
       || !matches(c, a, ids) || !matches(r, a, ids)
       || c.assignment_envelope_sha256 !== assignment.envelope_sha256
       || r.assignment_envelope_sha256 !== assignment.envelope_sha256
