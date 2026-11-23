@@ -6,6 +6,8 @@ import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { qualificationApprovalDetail, qualificationPurpose } from '../hq/machine-harness-qualification.mjs';
+import { validatedMembersPlan } from '../hq/machine-members-plans.mjs';
+import { cooperativeInstallPurpose } from '../hq/machine-soul-cooperative-launch.mjs';
 import { protectedInstallPurpose } from '../hq/machine-soul-protected-launch.mjs';
 import { machineCommandInHome } from '../hq/machine-channel.mjs';
 
@@ -44,7 +46,8 @@ async function fixture(t, purpose = action, roleUid = 300) {
   const requests = [];
   const saved = purpose === action ? savedPlan()
     : purpose === qualificationPurpose ? qualificationPlan()
-      : purpose === protectedInstallPurpose ? protectedInstallPlan(hex, roleUid) : upgradePlan();
+      : purpose === protectedInstallPurpose ? protectedInstallPlan(hex, roleUid)
+        : purpose === cooperativeInstallPurpose ? cooperativePlan(hex, roleUid) : upgradePlan();
   const state = { saved, tweak: () => {} };
   let pending;
   const server = createServer((stream) => {
@@ -743,4 +746,62 @@ test('runner account owner handoff binds purpose and HQ role without a harness',
   await wrongPurpose.pin();
   await assert.rejects(wrongPurpose.issue(), /outside the paired protected Soul launch install plan scope/);
   assert.deepEqual(wrongPurpose.requests.map(r => r.verb), ['status', 'members-plans']);
+});
+
+function cooperativePlan(machineKey, roleUid = 300, change = () => {}) {
+  const installation = 'installation-1';
+  const account = `_abm-sr-${createHash('sha256').update(installation).digest('hex').slice(0, 20)}`;
+  const p = { version: 3, hq_account: role, dir: 'none', members: [account], steps: [{
+    kind: 'soul-cooperative-launch', target: installation, action: 'write',
+    detail: 'seal R runtime and frozen Soul inputs; install fixed per-R launchd WatchPaths job; A:runner-group 2700 staging dir, 2750 request dir, and 2770 completion dir; write A-only signed pending journal before one-use claim; publish applied root receipt'
+  }], purpose: cooperativeInstallPurpose, soul_cooperative_launch: {
+    schema: 'agent-bot-machine/soul-cooperative-launch-install/v3', purpose: cooperativeInstallPurpose,
+    profile_in_force: 'managed-cooperative', host_id: 'host-1', hq_installation_id: 'hq-1',
+    h_owner_plan_digest: 'a'.repeat(64), hq_uid: roleUid, machine_uid: 501, machine_gid: 20, hq_epoch: 'a'.repeat(64),
+    machine_public_key_base64url: Buffer.from(machineKey, 'hex').toString('base64url'), source_package_path: '/source',
+    definition_source: '/source', launch_inputs_source: '/inputs', definition: [], launch_inputs: {},
+    definition_measurement: 'sha256:' + 'a'.repeat(64), launch_input_measurement: 'sha256:' + 'b'.repeat(64),
+    state_root: '/state', runtime_root: '/runtime', runner: { soul_id: 'agent_12345678-1234-1234-1234-123456789abc', installation_id: installation,
+      account, uid: 311, gid: 311, package_root: '/sealed', package_sha256: 'b'.repeat(64) },
+    soul_artifact_sha256: 'c'.repeat(64), definition_sha256: 'd'.repeat(64), node_path: '/node',
+    node_sha256: 'e'.repeat(64), entry: 'bin/agent-bot-souls.mjs', launcher_path: '/launcher',
+    launcher_sha256: 'f'.repeat(64), approved_until: '2030-01-01T00:00:00Z', runtime_v3: {},
+    adapter_release: {}, hq_broker: {}, adapter_transport: 'direct-comms', adapter_code_inputs: ['one']
+  } };
+  change(p);
+  const plan_canonical = JSON.stringify(p) + '\n';
+  return { plan_id: id, plan_digest: createHash('sha256').update(plan_canonical).digest('hex'), plan_canonical };
+}
+
+test('paired cooperative install exports and approves the exact Machine challenge', arm, async t => {
+  const f = await fixture(t, cooperativeInstallPurpose);
+  await f.pin();
+  const line = await f.issue();
+  assert.equal(JSON.parse(line).body.plan_canonical, f.state.saved.plan_canonical);
+  writeFileSync(f.challengeFile, line + '\n');
+  writeFileSync(f.proofFile, JSON.stringify(proof(JSON.parse(line).body, f.owner)));
+  assert.equal((await f.approve()).state, 'approved');
+});
+
+test('paired cooperative install rejects wrong pairing and scope before challenge', arm, async t => {
+  const f = await fixture(t, cooperativeInstallPurpose);
+  await f.pin();
+  const machineKey = Buffer.from(JSON.parse(f.state.saved.plan_canonical).soul_cooperative_launch.machine_public_key_base64url, 'base64url').toString('hex');
+  for (const change of [p => { p.soul_cooperative_launch.hq_uid = 301; },
+    p => { p.soul_cooperative_launch.machine_public_key_base64url = Buffer.alloc(32, 1).toString('base64url'); },
+    p => { p.soul_cooperative_launch.profile_in_force = 'managed-protected'; },
+    p => { p.steps[0].target = 'other'; }, p => { p.members.push('_other'); },
+    p => { delete p.soul_cooperative_launch.runtime_v3; },
+    p => { p.soul_cooperative_launch.unexpected = true; }]) {
+    f.state.saved = cooperativePlan(machineKey, 300, change);
+    await assert.rejects(f.issue(), /unsupported structure|outside the paired cooperative/);
+    assert.notEqual(f.requests.at(-1).option, 'challenge');
+  }
+});
+
+test('cooperative plans exceeding the signed channel limit are refused', () => {
+  const saved = cooperativePlan('a'.repeat(64), 300, p => {
+    p.soul_cooperative_launch.launch_inputs.payload = 'x'.repeat(64 * 1024);
+  });
+  assert.throws(() => validatedMembersPlan(id, { state: 'found', body: saved }), /unsupported structure/);
 });
