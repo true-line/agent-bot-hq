@@ -3,9 +3,12 @@
 import { createHash, createPublicKey, verify } from 'node:crypto';
 import { canonicalize } from '../sdk/wire/canonical-json.mjs';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
+import { authenticatedSelectedH } from './stage2a-h-preloader.mjs';
 
 const V1 = Object.freeze({ purpose: 'agent-bot/stage2a-reservation/v1', contract: 'machine/v1', schemaVersion: 1 });
 const V2 = Object.freeze({ purpose: 'agent-bot/stage2a-reservation/v2', contract: 'machine/v2', schemaVersion: 2 });
+const V3 = Object.freeze({ purpose: 'agent-bot/stage2a-reservation/v3', contract: 'machine/v3', schemaVersion: 3 });
+const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const sha = bytes => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 const fail = () => { throw new Error('invalid Stage 2a reservation'); };
 const same = (a, b) => canonicalize(a) === canonicalize(b);
@@ -74,12 +77,13 @@ async function verifyReservation(raw, { enrolledMachineKey, expected, clock, con
   const { socket_path, ...endpoint } = ep;
   if (typeof socket_path !== 'string' || !socket_path || member.member_socket !== socket_path ||
       !same(member.member_endpoint, endpoint)) fail();
-  if (format === V2 && (m.contract !== V2.contract || m.schema_version !== 2
+  const protectedFormat = format === V2 || format === V3;
+  if (protectedFormat && (m.contract !== format.contract || m.schema_version !== format.schemaVersion
     || m.profile_in_force !== 'managed-protected'
     || !Number.isSafeInteger(a.machine_uid) || a.machine_uid <= 399
     || m.snapshots.definition.owner_uid !== a.machine_uid
     || m.snapshots.launch_inputs.owner_uid !== a.machine_uid)) fail();
-  if (format === V2) {
+  if (protectedFormat) {
     const slot = createHash('sha256').update(`agent-bot-soul-endpoint-installation/v1\0${a.installation_id}`)
       .digest('hex').slice(0, 20);
     const namespace = `/private/var/db/managed-machine/soul-snapshots/${slot}/snap_`;
@@ -90,7 +94,7 @@ async function verifyReservation(raw, { enrolledMachineKey, expected, clock, con
   }
   const issued = Date.parse(p.issued_at), expires = Date.parse(p.expires_at);
   if (typeof p.issued_at !== 'string' || typeof p.expires_at !== 'string' || !Number.isFinite(issued) || !Number.isFinite(expires) ||
-      expires <= issued || (format === V2 && expires - issued > 30000)
+      expires <= issued || (protectedFormat && expires - issued > 30000)
       || p.assignment.expires_at !== p.expires_at) fail();
   const reservationSHA256 = sha(raw);
   if (!consumeClaim) return { payload: p, reservationSHA256 };
@@ -110,3 +114,29 @@ export const verifyStage2aReservationV2 = (raw, options) => verifyReservation(ra
 // authenticated so that Machine can renew the finalized live lease.
 export const inspectStage2aReservationV2 = (raw, options) =>
   verifyReservation(raw, options, V2, { consumeClaim: false });
+
+// Machine spends the durable claim before it issues this reservation. This
+// checks the fresh response; the caller must also match its issued start and
+// installed plan before admitting B or R.
+export async function verifyStage2aReservationV3(raw, { enrolledMachineKey, selectedH,
+  expected, validatePayload, reservationSHA256, clock = () => new Date() } = {}) {
+  if (!Buffer.isBuffer(enrolledMachineKey) || enrolledMachineKey.length !== 32
+    || typeof selectedH?.descriptorDigest !== 'string' || !DIGEST.test(selectedH.descriptorDigest)
+    || selectedH.machinePublicKey !== enrolledMachineKey.toString('hex')
+    || typeof clock !== 'function') fail();
+  const { descriptorDigest } = selectedH;
+  const checked = await verifyReservation(raw, { enrolledMachineKey, expected, validatePayload },
+    V3, { consumeClaim: false });
+  const { payload } = checked;
+  const now = clock();
+  if (checked.reservationSHA256 !== reservationSHA256
+    || payload.assignment.h_service_descriptor_digest !== descriptorDigest
+    || payload.measurement_binding.h_service_descriptor_digest !== descriptorDigest
+    || !(now instanceof Date) || !Number.isFinite(now.getTime())
+    || now.getTime() < Date.parse(payload.issued_at) || now.getTime() >= Date.parse(payload.expires_at)) fail();
+  return checked;
+}
+
+// The protected-start caller gets H only from the authenticated preloader.
+export const verifyStage2aProtectedReservationV3 = (raw, options) =>
+  verifyStage2aReservationV3(raw, { ...options, selectedH: authenticatedSelectedH() });

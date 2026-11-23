@@ -161,7 +161,7 @@ export function createStage2aProtectedStarter({ installations, authority, verify
       const reserved = await machineReserve({ plan_digest: installed.plan_digest,
         installation_id: installed.installation_id, start_id: startId,
         hq_epoch: installed.hq_epoch, launch_id: launchId });
-      const checked = await verifyReservation(reserved?.envelope, installed);
+      const checked = await verifyReservation(reserved?.envelope, installed, reserved?.sha256);
       if (checked?.reservationSHA256 !== reserved?.sha256
         || checked.payload.assignment.start_id !== startId
         || checked.payload.assignment.launch_id !== launchId) refuse();

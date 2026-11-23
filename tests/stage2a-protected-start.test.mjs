@@ -21,7 +21,7 @@ const CHALLENGE = Buffer.alloc(32, 7).toString('base64url');
 const CHALLENGE2 = Buffer.alloc(32, 8).toString('base64url');
 
 function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckFails = false,
-  ackIsPreviousLease = false, hqCodeReady = true } = {}) {
+  ackIsPreviousLease = false, hqCodeReady = true, reservationVerifier } = {}) {
   const events = [];
   let providerAttempts = 0;
   let activation;
@@ -67,8 +67,8 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckF
       assignment = { start_id, launch_id };
       return { envelope: 'signed', sha256: RESERVATION };
     },
-    verifyReservation: async () => ({ reservationSHA256: RESERVATION,
-      payload: { assignment } }),
+    verifyReservation: reservationVerifier ?? (async () => ({ reservationSHA256: RESERVATION,
+      payload: { assignment } })),
     openProtectedAdmission: async () => {
       events.push('R-admission-open');
       return { helloFinalization: () => ({ envelope: HELLO_BYTES, sha256: HELLO }),
@@ -175,6 +175,23 @@ test('machine/v2 policy refuses protected start before Machine lookup without H 
     await assert.rejects(f.starter.start({ package_path: root,
       requested_profile: 'managed-protected' }), /Machine protected Soul start is unavailable/);
     assert.deepEqual(f.events, []);
+    assert.equal(f.providerAttempts, 0);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a refused reservation leaves B registration and R admission unopened', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-start-'));
+  try {
+    const root = realpathSync(dir);
+    const f = fixture(root, { reservationVerifier: async (envelope, installed, reservationSHA256) => {
+      assert.equal(envelope, 'signed');
+      assert.equal(installed.package_root, root);
+      assert.equal(reservationSHA256, RESERVATION);
+      throw new Error('invalid Stage 2a reservation');
+    } });
+    await assert.rejects(f.starter.start({ package_path: root,
+      requested_profile: 'managed-protected' }), /invalid Stage 2a reservation/);
+    assert.deepEqual(f.events, ['lookup', 'reserved']);
     assert.equal(f.providerAttempts, 0);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
