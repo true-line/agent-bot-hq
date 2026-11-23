@@ -49,7 +49,7 @@ export function validatedMembersPlan(id, response) {
       createHash('sha256').update(plan_canonical, 'utf8').digest('hex') !== plan_digest) {
     throw new Error('Machine members plan does not match the requested ID and canonical digest');
   }
-  const p = parseStrict(plan_canonical, { maxDepth: 12 });
+  const p = parseStrict(plan_canonical, { maxDepth: 32 });
   const accounts = p?.purpose === accountsPurpose;
   const qualification = p?.purpose === qualificationPurpose;
   const protectedInstall = p?.purpose === protectedInstallPurpose;
