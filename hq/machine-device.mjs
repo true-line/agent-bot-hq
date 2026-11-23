@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { isUtf8 } from 'node:buffer';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
 import { fail } from '../sdk/errors.mjs';
-import { disconnectedMachinePair, machineRoleDevice } from './machine-channel.mjs';
+import { capturePairedEnrollmentProof, disconnectedMachinePair, machineRoleDevice } from './machine-channel.mjs';
+import { DEFAULT_IDENTITY_SERVICE } from './enrollment.mjs';
 import { releaseServerKeys, signatureBytes } from './identity-service.mjs';
 import { jwkThumbprint, publicJwk, SIGNATURE_PREFIX } from './signer.mjs';
 
@@ -56,7 +57,7 @@ function checkLegacy(home) {
     ' Verify enrollment history before authorizing a custody change.');
 }
 
-export function createMachineSigner({ home, enrollment, request = machineRoleDevice, keysFor = releaseServerKeys, clock = { now: Date.now } }) {
+export function createMachineSigner({ home, enrollment, request = machineRoleDevice, capture = capturePairedEnrollmentProof, keysFor = releaseServerKeys, clock = { now: Date.now } }) {
   let current;
   let reason = 'Machine device identity has not been verified';
   let disconnectedPair;
@@ -116,6 +117,24 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
     if (started !== revision) unavailable('Machine custody changed during this operation');
     return response;
   }
+  function checkEnrollmentProof(response, expected, aud) {
+    const actual = checkReply(response, 'proved');
+    if (actual.epoch !== expected.epoch || actual.thumbprint !== expected.thumbprint || actual.generation !== expected.generation) throw new Error('Machine device identity changed during enrollment');
+    const proof = response.body.proof;
+    const parts = typeof proof === 'string' && proof.split('.');
+    if (!parts || parts.length !== 3) throw new Error('invalid Machine enrollment proof');
+    const [head, body, sig] = parts.map(decode);
+    if (!isUtf8(head) || !isUtf8(body)) throw new Error('invalid Machine enrollment proof text');
+    const h = parseStrict(head.toString()), p = parseStrict(body.toString());
+    if (!only(h, ['alg', 'typ', 'jwk']) || h.alg !== 'ES256' || h.typ !== 'ab-enroll+jwt'
+      || !only(h.jwk, ['kty', 'crv', 'x', 'y']) || jwkThumbprint(h.jwk) !== expected.thumbprint
+      || !only(p, ['aud', 'iat', 'jti']) || p.aud !== aud || !Number.isSafeInteger(p.iat)
+      || Math.abs(clock.now() / 1000 - p.iat) > 120 || typeof p.jti !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(p.jti)
+      || sig.length !== 64 || !verify('sha256', Buffer.from(parts.slice(0, 2).join('.')), {
+        key: createPublicKey({ key: expected.jwk, format: 'jwk' }), dsaEncoding: 'ieee-p1363',
+      }, sig)) throw new Error('Machine enrollment proof failed device, audience, freshness or signature verification');
+    return proof;
+  }
   function report() {
     try { checkLegacy(home); } catch (error) { return { available: false, backend: 'machine', reason: error.message }; }
     return current ? { available: true, backend: 'machine', key_storage: 'hardware', alg: 'ES256',
@@ -143,22 +162,23 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
       const expected = current;
       if (!expected) unavailable('Machine device identity is unavailable');
       const response = await requestPurpose('enrollment-proof', { hq_epoch: expected.epoch });
-      const actual = checkReply(response, 'proved');
-      if (actual.epoch !== expected.epoch || actual.thumbprint !== expected.thumbprint || actual.generation !== expected.generation) throw new Error('Machine device identity changed during enrollment');
-      const proof = response.body.proof;
-      const parts = typeof proof === 'string' && proof.split('.');
-      if (!parts || parts.length !== 3) throw new Error('invalid Machine enrollment proof');
-      const [head, body, sig] = parts.map(decode);
-      if (!isUtf8(head) || !isUtf8(body)) throw new Error('invalid Machine enrollment proof text');
-      const h = parseStrict(head.toString()), p = parseStrict(body.toString());
-      if (!only(h, ['alg', 'typ', 'jwk']) || h.alg !== 'ES256' || h.typ !== 'ab-enroll+jwt'
-        || !only(h.jwk, ['kty', 'crv', 'x', 'y']) || jwkThumbprint(h.jwk) !== expected.thumbprint
-        || !only(p, ['aud', 'iat', 'jti']) || p.aud !== aud || !Number.isSafeInteger(p.iat)
-        || Math.abs(clock.now() / 1000 - p.iat) > 120 || typeof p.jti !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(p.jti)
-        || sig.length !== 64 || !verify('sha256', Buffer.from(parts.slice(0, 2).join('.')), {
-          key: createPublicKey({ key: expected.jwk, format: 'jwk' }), dsaEncoding: 'ieee-p1363',
-        }, sig)) throw new Error('Machine enrollment proof failed device, audience, freshness or signature verification');
-      return proof;
+      return checkEnrollmentProof(response, expected, aud);
+    },
+    async captureT02EnrollmentProof(caseNonce) {
+      checkLegacy(home);
+      const expected = current;
+      const started = revision;
+      if (!expected) unavailable('Machine device identity is unavailable');
+      const observation = await capture(expected.epoch, caseNonce);
+      if (started !== revision) unavailable('Machine custody changed during this operation');
+      checkLegacy(home);
+      const response = observation.responseRaw === undefined ? null : parseStrict(observation.responseRaw);
+      if (response?.ok === true) {
+        checkEnrollmentProof(response, expected, DEFAULT_IDENTITY_SERVICE + '/oauth/device_authorization');
+      } else {
+        unavailableIdentity(new Error('Machine refused the qualification operation'));
+      }
+      return observation;
     },
     acceptsRecord(rec) {
       try {

@@ -28,6 +28,7 @@ const COOPERATIVE_STATES = new Map([
 ]);
 const fingerprint = (raw) => createHash('sha256').update(raw).digest('hex');
 const disconnectedPairs = new WeakMap();
+const qualificationOutagePurpose = 'agent-bot-hq/t02-machine-outage/v1';
 export const disconnectedMachinePair = (error) => disconnectedPairs.get(error);
 
 function checkAcl(path, allowDeny = false) {
@@ -146,7 +147,7 @@ function responseFields(line) {
   return { value, body: fields.get('body') ?? '' };
 }
 
-function authenticatedResponse(line, nonce, pinned, verb) {
+function authenticatedResponse(line, nonce, pinned, verb, capture = false) {
   const { value: r, body } = responseFields(line);
   if ((isServiceHandoff(verb) || verb === 'hq-device' || COOPERATIVE_STATES.has(verb)
     || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)) && Object.keys(r).some((field) =>
@@ -166,6 +167,7 @@ function authenticatedResponse(line, nonce, pinned, verb) {
     throw new Error(`Machine ${verb} signature does not match the daemon pin`);
   }
   if (!r.ok) {
+    if (capture) return r;
     let error = new Error(`Machine refused signed ${verb}: ${r.diagnostic || 'unspecified'}`);
     if (verb === 'hq-device') {
       if (r.diagnostic === 'MM_DAEMON_UNKNOWN_KEY') {
@@ -244,6 +246,18 @@ export function machineRoleDevice(option, fields, expectedPair) {
     : process.platform === 'linux' && ['x64', 'arm64'].includes(process.arch) ? '/home/linuxbrew/.linuxbrew' : null;
   if (!prefix) throw new Error('Machine device custody is unavailable on this platform');
   return machineCommandInHome(['hq-device', option, '--socket', join(prefix, 'var/agent-machine/daemon.sock')], account.homedir, account.uid, fields, ordinary, account.uid, expectedPair);
+}
+
+// Internal qualification operation for the dedicated HQ service. The caller
+// must derive caseNonce from an authenticated A-owned driver command.
+export function capturePairedEnrollmentProof(hqEpoch, caseNonce) {
+  const { account } = roleAccount(true);
+  if (process.platform !== 'darwin' || process.arch !== 'arm64') {
+    throw new Error('protected qualification requires Apple Silicon macOS');
+  }
+  const socket = '/opt/homebrew/var/agent-machine/daemon.sock';
+  return machineCommandInHome(['hq-device', 'enrollment-proof', '--socket', socket],
+    account.homedir, account.uid, { hq_epoch: hqEpoch }, false, account.uid, undefined, caseNonce);
 }
 
 export function machineRoleCommand(argv) {
@@ -402,7 +416,7 @@ function validStage2aSignedLiveLease(body) {
 
 // Also exercised with a temporary private home in the protocol tests. The CLI
 // always obtains its home and UID from the kernel-backed account lookup above.
-export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false, roleUid = uid, expectedPair) {
+export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false, roleUid = uid, expectedPair, caseNonce) {
   const [verb, ...args] = argv;
   const identity = verb === 'identity' && !args.length;
   let socket, hex, handoff, option = '', planID = '';
@@ -430,6 +444,12 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   }
   if (!identity && (!socket || !isAbsolute(socket))) {
     throw new Error('usage: machine identity | status --socket PATH [--daemon-key HEX] | members-plans list --socket PATH [--after PLAN_ID] | members-plans get PLAN_ID --socket PATH');
+  }
+  const capture = caseNonce !== undefined;
+  if (capture && (ordinary || verb !== 'hq-device' || option !== 'enrollment-proof'
+    || typeof caseNonce !== 'string' || !/^[A-Za-z0-9_-]{22}$/.test(caseNonce)
+    || Buffer.from(caseNonce, 'base64url').toString('base64url') !== caseNonce)) {
+    throw new Error('qualification capture requires a fixed paired enrollment proof and a case nonce');
   }
   if (ordinary && !['identity', 'status', 'hq-device'].includes(verb)) throw new Error('operation requires the dedicated HQ service account');
   roleDir(home, uid, false, { allowReadTraverse: ordinary, allowDeny: ordinary });
@@ -465,15 +485,26 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   if (expectedPair !== undefined && expectedPair !== pair) throw new Error('the local Machine pairing changed after HQ started');
   async function send(fields) {
     const timestamp = Math.floor(Date.now() / 1000);
-    const nonce = randomBytes(16).toString('base64url');
+    const nonce = caseNonce ?? randomBytes(16).toString('base64url');
     const parts = [fields.verb, '', fields.option ?? '', '', fields.plan_id ?? '', '', '', '', timestamp, nonce];
     for (const field of ['plan_digest', 'challenge_nonce', 'owner_signature', 'hq_epoch', 'session', 'receipt_body', 'receipt_jti', 'receipt_kid', 'receipt_signature', 'stage2a_request']) {
       if (fields[field] !== undefined) parts.push(field, fields[field]);
     }
     const request = { ...fields, timestamp, nonce, public_key: pub.toString('base64'),
       signature: sign(null, Buffer.from(parts.join('\n')), key).toString('base64') };
-    const line = await exchange(socket, request);
-    return { line, response: authenticatedResponse(line, nonce, daemon, fields.verb) };
+    let line;
+    try {
+      line = await exchange(socket, request);
+    } catch (error) {
+      if (!capture || !disconnectedPairs.has(error)) throw error;
+      // Only a positively identified connect failure can attest that no
+      // request reached Machine. A must corroborate the outage independently.
+      const requestRaw = JSON.stringify(request);
+      const evidence = [qualificationOutagePurpose, fingerprint(Buffer.from(requestRaw)), 'machine-unreachable'].join('\n');
+      return { capture: Object.freeze({ requestRaw, outageSignature: sign(null, Buffer.from(evidence), key).toString('base64') }) };
+    }
+    const response = authenticatedResponse(line, nonce, daemon, fields.verb, capture);
+    return { line, response, ...(capture && { capture: Object.freeze({ requestRaw: JSON.stringify(request), responseRaw: line }) }) };
   }
   if (handoff) return serviceHandoff(verb, handoff, daemon.toString('hex'), pub.toString('hex'), send,
     (line) => authenticatedResponse(line, null, daemon, verb), roleUid);
@@ -621,13 +652,15 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   const fields = { verb, ...(verb === 'hq-device' ? deviceFields : {}),
     ...(stage2aRequest && { stage2a_request: stage2aRequest }),
     ...(option && { option }), ...(planID && { plan_id: planID }) };
-  const { response: r } = await send(fields).catch(error => {
+  const resultOfSend = await send(fields).catch(error => {
     if (pair && disconnectedPairs.has(error)) disconnectedPairs.set(error, pair);
     // keyd binds this exact signed receipt idempotently. Reconnect once with
     // a fresh channel nonce if Machine closed without returning any bytes.
     if (verb === 'hq-device' && option === 'bind-access' && error instanceof MissingMachineReply) return send(fields);
     throw error;
   });
+  if (capture) return resultOfSend.capture;
+  const { response: r } = resultOfSend;
   const result = { client: 'agent-daemon', channel: 'signed', state: r.state, daemon_fingerprint: fingerprint(daemon) };
   if (verb === 'hq-device') return r;
   if (COOPERATIVE_STATES.has(verb)) {
