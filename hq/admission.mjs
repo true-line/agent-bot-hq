@@ -135,7 +135,7 @@ const unboundOf = (tx) => tx.list('runtimes').map(([, rt]) => rt).filter((rt) =>
 // the account a broker connection arrived from ({ account, uid }), or
 // undefined on the shared socket. HQ core supplies all three; an agent never
 // does.
-export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, qualificationAuthorizer, relayIngressAuthorizer, relayPeerAuthority, memberArmProvider, protectedAdmission, cooperativeAdmission } = {}) {
+export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, qualificationAuthorizer, relayIngressAuthorizer, relayPeerAuthority, memberArmProvider, cooperativeBPolicyProvider, protectedAdmission, cooperativeAdmission } = {}) {
   for (const n of SCHEMA_NAMES) if (!schemas?.[n]) throw new TypeError(`admission needs the pinned hq/v1 ${n} schema`);
   if (protectedAdmission && (typeof protectedAdmission.acceptPeer !== 'function'
     || typeof protectedAdmission.verifyHelloStart !== 'function'
@@ -934,6 +934,12 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           && typeof relayPeerAuthority?.boundStart === 'function'
           && typeof relayPeerAuthority?.attest === 'function',
         stage2aRelayPeerChallenge: relayPeerChallenge,
+        stage2aCooperativeBPolicyEnabledV3: () => typeof cooperativeBPolicyProvider === 'function',
+        stage2aCooperativeBPolicyV3: (request, meta, receipt) => {
+          if (typeof cooperativeBPolicyProvider !== 'function')
+            fail('host.launch_unavailable', 'cooperative B signed policy is unavailable');
+          return cooperativeBPolicyProvider(request, meta, receipt);
+        },
         stage2aMemberArmExchangeEnabledV3: () => memberArmExchange.enabled
           && typeof bridgeAuthority?.verifyLiveStartV3 === 'function',
         stage2aMemberObserveV3: memberArmExchange.observe,
