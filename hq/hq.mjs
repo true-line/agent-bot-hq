@@ -130,6 +130,27 @@ export function validateConfig(c) {
   return c;
 }
 
+// A healthy A watch cannot keep a runtime admitted after its local C/H sockets
+// disappear. This guard belongs to H and cannot be reset by R or a wire field.
+export function cooperativeLivenessGuard(machine) {
+  if (!machine || typeof machine.assertLive !== 'function'
+    || typeof machine.watchHealthy !== 'function' || typeof machine.abort !== 'function')
+    throw new TypeError('cooperative liveness needs paired Machine methods');
+  const revoked = new Set();
+  const live = (binding) => typeof binding?.reservation_sha256 === 'string'
+    && !revoked.has(binding.reservation_sha256);
+  return Object.freeze({
+    revoke: (digest) => { if (typeof digest === 'string') revoked.add(digest); },
+    isRevoked: (digest) => revoked.has(digest),
+    client: Object.freeze({
+      assertLive: async (binding) => live(binding)
+        && await machine.assertLive(binding) === true && live(binding),
+      watchHealthy: (binding) => live(binding) && machine.watchHealthy(binding) === true,
+      abort: (binding) => machine.abort(binding),
+    }),
+  });
+}
+
 export function createHQ({
   home,
   schemas,                       // pinned schemas by name: hq/v1 (admission.mjs SCHEMA_NAMES), task/v1 and wire/v1 (tasks.mjs TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES)
@@ -194,6 +215,7 @@ export function createHQ({
   const openingRunnerAdmissions = new Set();
   const cooperativeListeners = new Map();
   const openingCooperativeListeners = new Set();
+  const cooperativeGuard = cooperativeAdmission ? cooperativeLivenessGuard(cooperativeAdmission) : undefined;
   // Agent launch (§9 row 16b) and what the profile reasons say about it.
   let launcher;
   let soulStarter;
@@ -356,7 +378,7 @@ export function createHQ({
           onDisconnect: bridgeAuthority?.onDisconnect?.bind(bridgeAuthority) },
       qualificationAuthorizer,
       protectedAdmission,
-      cooperativeAdmission,
+      cooperativeAdmission: cooperativeGuard?.client,
     });
     const builtIn = [admission, tasksPlugin({ schemas }), noticesPlugin({ schemas }), ...plugins];
     pluginLoad = [];
@@ -546,7 +568,8 @@ export function createHQ({
     },
     openCooperativeAdmission: async ({ reservation, openAcpStream, onLost }) => {
       const key = reservation?.sha256;
-      if (!running || !key || cooperativeListeners.has(key) || openingCooperativeListeners.has(key)
+      if (!running || !key || cooperativeGuard?.isRevoked(key)
+        || cooperativeListeners.has(key) || openingCooperativeListeners.has(key)
         || typeof cooperativeAdmission?.verifyReservation !== 'function'
         || typeof cooperativeAdmission?.attach !== 'function'
         || typeof cooperativeAdmission?.verifyAttachReceipt !== 'function'
@@ -556,23 +579,31 @@ export function createHQ({
       openingCooperativeListeners.add(key);
       let admission;
       let broker;
+      let notified = false;
+      const lost = () => {
+        cooperativeGuard.revoke(key);
+        if (notified) return;
+        notified = true;
+        return onLost();
+      };
       try {
         admission = await listenStage2aCooperativeAdmission({ reservation,
           verifyReservation: (value) => cooperativeAdmission.verifyReservation(value),
           hqUid: uid, core, machineAttach: (value) => cooperativeAdmission.attach(value),
           verifyAttachReceipt: (receipt, expected) => cooperativeAdmission.verifyAttachReceipt(receipt, expected),
-          isLive: (value) => cooperativeAdmission.watchHealthy(value), openAcpStream, onLost,
+          isLive: (value) => cooperativeGuard.client.watchHealthy(value), openAcpStream, onLost: lost,
           admissionDispatch: (op, meta) => host.dispatch(op, meta) });
         if (admission.brokerPin.reservation_sha256 !== key)
           fail('host.launch_unavailable', 'cooperative reservation digest changed after verification');
         broker = await listenStage2aCooperativeBroker({ admission, hqUid: uid, core,
-          callers: brokerCallers, onLost,
+          callers: brokerCallers, onLost: lost,
           brokerDispatch: (kind, payload, session) => memberBrokerDispatch(host, kind, payload, session),
           brokerClosed: (session) => host.brokerClosed(session) });
         if (!running) fail('host.launch_unavailable', 'HQ stopped during cooperative admission');
         let closing;
         const close = () => {
           if (!closing) {
+            cooperativeGuard.revoke(key);
             if (cooperativeListeners.get(key)?.close === close) cooperativeListeners.delete(key);
             closing = Promise.all([broker.close(), admission.close()]).then(() => {});
           }

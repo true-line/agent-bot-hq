@@ -139,6 +139,22 @@ test('C ACP takeover needs the one-use ticket, same kernel PID and completed Hel
     takeover: true, payload: { acp_ticket_base64url: attached.acp_ticket_base64url } }), /cooperative R admission/);
 });
 
+test('closing an attached C listener reports loss once and invalidates the peer even when A remains healthy', async () => {
+  const f = fixture();
+  const listener = await f.open();
+  const first = await f.peer();
+  await f.options.dispatch('cooperative.attach.v3', { session: first.session,
+    payload: { reservation_envelope_base64url: f.pinned.envelope_base64url,
+      admission_challenge_base64url: f.challenge } });
+  await f.options.dispatch('Hello', { session: first.session, payload: {} });
+  assert.ok(listener.attachedPeer(402));
+  await listener.close();
+  await listener.close();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(f.lost, 1);
+  assert.equal(listener.attachedPeer(402), undefined);
+});
+
 test('a lost paired R watch revokes the C ticket before ACP takeover', async () => {
   const f = fixture();
   await f.open();

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { admissionPlugin, bindProof } from '../hq/admission.mjs';
+import { cooperativeLivenessGuard } from '../hq/hq.mjs';
 import { createTestHost } from '../sdk/test-host.mjs';
 import { DIGEST, hello, schemas, SOUL } from './hq-harness.mjs';
 
@@ -79,5 +80,29 @@ test('unverified cooperative metadata cannot upgrade a generic Hello', async () 
       payload: hello({ installation_id: start.installation_id }), cooperativeStart: start }),
     /Machine did not authenticate the cooperative start/);
     assert.equal(Object.keys(host.table('hq-admission', 'runtimes')).length, 0);
+  } finally { await host.stop(); }
+});
+
+test('local C/H loss revokes a live cooperative runtime even while Machine reports a healthy runner', async () => {
+  let aborts = 0;
+  const guard = cooperativeLivenessGuard({ assertLive: async () => true,
+    watchHealthy: () => true, abort: async () => { aborts++; } });
+  const host = createTestHost({
+    config: { 'hq-admission': { acceptedDefinitions: { [SOUL]: [DIGEST] } } },
+    plugins: [admissionPlugin({ schemas, cooperativeAdmission: guard.client })],
+  });
+  try {
+    await host.start();
+    const result = await host.dispatch('Hello', { auth: 'entry-point', session: 'ep_r',
+      payload: hello({ installation_id: start.installation_id }), cooperativeStart: start });
+    const runtimeId = result.admitted_runtimes[0].runtime_id;
+    assert.equal(guard.client.watchHealthy(start), true);
+    guard.revoke(start.reservation_sha256);
+    assert.equal(guard.client.watchHealthy(start), false);
+    assert.equal(await guard.client.assertLive(start), false);
+    await assert.rejects(host.provided('hq-admission').withBoundRuntime(runtimeId, async () => true),
+      /cooperative R disconnected/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(aborts, 1);
   } finally { await host.stop(); }
 });

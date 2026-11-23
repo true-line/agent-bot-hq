@@ -427,7 +427,7 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
       runner_account: assignment.runner_account,
       start_id: assignment.start_id, reservation_sha256: digest }),
     close: () => {
-      if (!closePromise) { closed = true; closePromise = listener.close(); }
+      if (!closePromise) { lose(); closed = true; closePromise = listener.close(); }
       return closePromise;
     } });
 }
@@ -531,7 +531,7 @@ export async function listenStage2aCooperativeBroker({ admission, hqUid, core,
   catch (error) { await listener.close(); throw error; }
   return Object.freeze({ path: ep.socket_path, checkCurrent: current,
     close: () => {
-      if (!closePromise) { closed = true; closePromise = listener.close(); }
+      if (!closePromise) { lose(); closed = true; closePromise = listener.close(); }
       return closePromise;
     } });
 }
