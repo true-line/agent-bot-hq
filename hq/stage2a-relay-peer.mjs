@@ -3,6 +3,7 @@
 // independently pinned A key. This module never grants provider ingress.
 import { createHash } from 'node:crypto';
 import { canonicalBytes, canonicalize } from '../sdk/wire/canonical-json.mjs';
+import { validate } from '../sdk/wire/schema.mjs';
 import { verifyStage2aMachineEnvelope } from './stage2a-stop.mjs';
 
 const PURPOSE = 'agent-bot/stage2a-relay-peer-attestation/v1';
@@ -37,6 +38,40 @@ const time = (value) => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d
   ? Date.parse(value) : NaN;
 const positive = (value) => Number.isSafeInteger(value) && value > 0;
 const same = (a, b) => canonicalize(a) === canonicalize(b);
+
+// The expected selectors and bridge endpoint come from the registered start
+// and the current kernel-authenticated B broker connection.
+export function verifyStage2aBridgeMemberAuthority(bytes, { machinePublicKey, schema,
+  assignmentSchema, schemas, expected, assignmentBytes, now = Date.now() } = {}) {
+  if (!schema || !assignmentSchema || !expected) refuse();
+  const assignment = verifyStage2aMachineEnvelope(assignmentBytes, machinePublicKey,
+    'agent-bot/stage2a-member-set-assignment/v1', { maxBytes: 16_384 });
+  if (validate(assignmentSchema, assignment.payload, { schemas }).length) refuse();
+  const proof = verifyStage2aMachineEnvelope(bytes, machinePublicKey,
+    'agent-bot/stage2a-b-member-authority/v1', { maxBytes: 16_384 });
+  const a = proof.payload;
+  if (validate(schema, a, { schemas }).length) refuse();
+  const shared = ['profile_in_force', 'host_id', 'installation_id', 'soul_id',
+    'start_id', 'hq_epoch', 'plan_id', 'plan_digest', 'reservation_sha256',
+    'owner_plan_member_set_sha256', 'runner_uid'];
+  const signed = assignment.payload;
+  if (shared.some((field) => a[field] !== expected[field] || a[field] !== signed[field])
+    || a.member_set_assignment_envelope_sha256 !== assignment.envelope_sha256
+    || a.hq_uid !== expected.hq_uid
+    || !same(a.bridge, signed.bridge)
+    || a.bridge.uid !== expected.bridge_uid || a.bridge.gid !== expected.bridge_gid
+    || a.bridge.endpoints.broker.socket_path !== expected.broker_socket
+    || !same(a.b_authority, signed.b_authority)
+    || !(time(signed.issued_at) <= time(a.issued_at) && time(a.issued_at) <= now
+      && now < time(a.expires_at) && time(a.expires_at) <= time(signed.expires_at))
+    || a.members.length !== 2 || signed.members?.length !== 2
+    || a.members[0].member_id >= a.members[1].member_id
+    || ['launch_id', 'member_selector'].some((field) => a.members[0][field] === a.members[1][field])) refuse();
+  const memberFields = ['member_id', 'launch_id', 'member_selector', 'adjacent_cli_path', 'adjacent_cli_sha256'];
+  if (a.members.some((member, index) =>
+    memberFields.some((field) => member[field] !== signed.members[index][field]))) refuse();
+  return proof;
+}
 
 function validChallenge(c, now) {
   if (!exact(c, FIELDS) || c.contract !== 'hq/v1' || c.kind !== 'stage2a-relay-peer-challenge'
@@ -171,7 +206,9 @@ export function createStage2aRelayPeerChallenge({ current, boundStart, attest,
             Math.max(1, deadline - clock.now())); })]);
       } finally { if (timer !== undefined) timers.clearTimeout(timer); }
     }
-    const state = await beforeDeadline(() => boundStart(connection, receipt));
+    const member = Object.freeze({ member_id: challenge.member_id, member_selector: challenge.member_selector,
+      runtime_id: challenge.runtime_id });
+    const state = await beforeDeadline(() => boundStart(connection, receipt, member));
     if (current(connection, receipt) !== true || state?.finalized !== true
       || state?.protocol !== 'bridge.bind.v3' || !Buffer.isBuffer(state.machinePublicKey)
       || state.machinePublicKey.length !== 32 || !Buffer.isBuffer(state.readyEnvelopeBytes)
@@ -193,7 +230,7 @@ export function createStage2aRelayPeerChallenge({ current, boundStart, attest,
       const verifiedAt = clock.now();
       const expires = verifyPayload(payload, challenge, state, challengeBytes, verifiedAt);
       if (verifiedAt >= deadline || current(connection, receipt) !== true) refuse();
-      const rechecked = await beforeDeadline(() => boundStart(connection, receipt));
+      const rechecked = await beforeDeadline(() => boundStart(connection, receipt, member));
       if (current(connection, receipt) !== true || rechecked?.finalized !== true
         || rechecked?.protocol !== 'bridge.bind.v3'
         || rechecked.reservation_expires_at !== state.reservation_expires_at

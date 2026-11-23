@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { test } from 'node:test';
 import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
-import { createStage2aRelayPeerChallenge } from '../hq/stage2a-relay-peer.mjs';
+import { createStage2aRelayPeerChallenge, verifyStage2aBridgeMemberAuthority } from '../hq/stage2a-relay-peer.mjs';
 
 const SHA = (s) => `sha256:${createHash('sha256').update(s).digest('hex')}`;
 const PURPOSE = 'agent-bot/stage2a-relay-peer-attestation/v1';
@@ -97,14 +97,20 @@ function fixture(profile = 'managed-protected') {
     issued_at: issued, expires_at: expires };
   let connected = true;
   const service = createStage2aRelayPeerChallenge({
-    current: () => connected, boundStart: async () => state,
+    current: () => connected,
+    boundStart: async (_connection, _receipt, selectors) => {
+      if (selectors.member_id !== state.member.member_id
+        || selectors.member_selector !== state.member.member_selector
+        || selectors.runtime_id !== state.member.runtime_id) return null;
+      return state;
+    },
     attest: async (bytes, ready) => {
       assert.deepEqual(bytes, canonicalBytes(challenge));
       assert.deepEqual(ready, readyEnvelopeBytes);
       return envelope(payload);
     }, clock: { now: () => now },
   });
-  return { challenge, state, payload, ready, envelope, service,
+  return { challenge, state, payload, ready, envelope, key, service,
     disconnect: () => { connected = false; }, meta: { connection: 'bb_fixture' },
     receipt: 'c'.repeat(64) };
 }
@@ -164,4 +170,26 @@ test('a paired A timeout spends the RPC and cannot produce a late result', async
   });
   await assert.rejects(service(f.challenge, f.meta, f.receipt), /deadline exceeded/);
   await assert.rejects(service(f.challenge, f.meta, f.receipt), /unavailable/);
+});
+
+test('signed B authorization remains tied to the assigned CLI and current broker endpoint', () => {
+  const { envelope, key, challenge } = fixture();
+  const { profile_in_force, host_id, installation_id, soul_id, start_id, hq_epoch, reservation_sha256 } = challenge;
+  const expected = { profile_in_force, host_id, installation_id, soul_id, start_id, hq_epoch, reservation_sha256,
+    plan_id: 'plan', plan_digest: 'd'.repeat(64), owner_plan_member_set_sha256: hash('3'),
+    runner_uid: 331, hq_uid: 332, bridge_uid: 333, bridge_gid: 333, broker_socket: '/fixture/broker.sock' };
+  const bridge = { uid: 333, gid: 333, endpoints: { broker: { socket_path: expected.broker_socket } } };
+  const members = ['lead', 'specialist'].map((id) => ({ member_id: id, launch_id: `launch-${id}`,
+    member_selector: `selector-${id}`, adjacent_cli_path: `/${id}/claude`, adjacent_cli_sha256: hash('a') }));
+  const assignment = { ...expected, bridge, members, b_authority: { envelope_sha256: reservation_sha256 },
+    issued_at: at, expires_at: expires };
+  const assignmentBytes = envelope(assignment, 'agent-bot/stage2a-member-set-assignment/v1');
+  const authority = { ...assignment, member_set_assignment_envelope_sha256: SHA(assignmentBytes) };
+  const verify = (value, context = expected) => verifyStage2aBridgeMemberAuthority(
+    envelope(value, 'agent-bot/stage2a-b-member-authority/v1'),
+    { machinePublicKey: key, schema: true, assignmentSchema: true, expected: context, assignmentBytes, now });
+  assert.match(verify(authority).envelope_sha256, /^sha256:/);
+  assert.throws(() => verify({ ...authority,
+    members: [{ ...members[0], adjacent_cli_sha256: hash('b') }, members[1]] }), /unavailable/);
+  assert.throws(() => verify(authority, { ...expected, broker_socket: '/other.sock' }), /unavailable/);
 });
