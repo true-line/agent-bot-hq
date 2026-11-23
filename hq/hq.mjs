@@ -194,6 +194,7 @@ export function createHQ({
   bridgeAuthority,               // authenticated Machine live-start/B proof client; never config or owner input
   bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
   qualificationAuthorizer,       // trusted one-use installed test-provider operation; never owner config
+  relayIngressAuthorizer,        // trusted one-use B test-provider; absent until A finalization is wired
   protectedAdmission,            // future pinned Machine verifier; absent in production until signed contracts ship
   createCooperativeStart,        // owner lifecycle for a paired cooperative launch
   cooperativeAdmission,          // paired A reservation/attach/watch client; never owner config
@@ -390,6 +391,7 @@ export function createHQ({
         : { verifyLiveStart: bridgeAuthority?.verifyLiveStart?.bind(bridgeAuthority),
           onDisconnect: bridgeAuthority?.onDisconnect?.bind(bridgeAuthority) },
       qualificationAuthorizer,
+      relayIngressAuthorizer,
       protectedAdmission,
       cooperativeAdmission: cooperativeGuard?.client,
     });
@@ -500,7 +502,8 @@ export function createHQ({
       }
       for (const endpoint of bridgeEndpoints) {
         const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
-          enableBridgeQualification: typeof qualificationAuthorizer === 'function' });
+          enableBridgeQualification: typeof qualificationAuthorizer === 'function',
+          enableBridgeRelayIngress: typeof relayIngressAuthorizer === 'function' });
         bridgeListeners.set(endpoint.installationId, listener);
         sockets.push(listener);
       }
