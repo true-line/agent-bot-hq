@@ -53,7 +53,7 @@ try {
   mkdirSync(vendor, { recursive: true });
   for (const path of pin.paths) cpSync(join(resolve(contracts), path), join(vendor, path), { recursive: true, dereference: false, preserveTimestamps: false });
   const fullContracts = verifyVendored(vendor, pin);
-  const contractsRuntime = darwinTarget && pin.tag === 'v0.10.2'
+  const contractsRuntime = darwinTarget && (pin.tag === 'v0.10.2' || pin.private_candidate === true)
     ? hRuntimeSelection(pin, fullContracts.manifest) : undefined;
   const broker = darwinTarget ? (await import('./darwin-broker.mjs')).stageDarwinBroker(tree, work) : undefined;
   writeFileSync(join(tree, 'governance/interim-release.json'), `${JSON.stringify({ schema_version: 1, hq_commit: commit, contracts_commit: pin.commit, contracts_digest: pin.digest, ...(darwinTarget ? { target_platform: target, owner_control_capability: 'darwin-owner-control/v2', broker, ...(contractsRuntime ? { contracts_runtime: contractsRuntime } : {}) } : {}) }, null, 2)}\n`);
