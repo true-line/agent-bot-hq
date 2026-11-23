@@ -111,6 +111,20 @@ test('prefixItems validates tuple positions and items validates only the remaini
   }
 });
 
+test('dependentRequired validates present properties and refuses malformed dependency declarations', () => {
+  const schema = { type: 'object', dependentRequired: { qualification_provider: ['config_base64url', 'config_sha256'] } };
+  assert.deepEqual(validate(schema, {}), []);
+  assert.deepEqual(validate(schema, { config_base64url: 'only' }), []);
+  assert.deepEqual(validate(schema, { qualification_provider: null,
+    config_base64url: 'value', config_sha256: 'digest' }), []);
+  assert.deepEqual(validate(schema, { qualification_provider: null }).map(({ keyword, message }) => [keyword, message]),
+    [['dependentRequired', 'qualification_provider requires config_base64url'],
+      ['dependentRequired', 'qualification_provider requires config_sha256']]);
+  for (const value of [null, [], { a: [] }, { a: ['x', 'x'] }, { a: [1] }]) {
+    assert.throws(() => checkSchemaSupported({ dependentRequired: value }), TypeError, JSON.stringify(value));
+  }
+});
+
 test('offline references and composition validate every branch and fail closed', () => {
   const external = {
     $id: 'https://example.test/defs.json',
