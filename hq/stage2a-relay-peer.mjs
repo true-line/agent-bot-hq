@@ -74,6 +74,33 @@ export function verifyStage2aBridgeMemberAuthority(bytes, { machinePublicKey, sc
   return proof;
 }
 
+// The expected rows come from the two actual per-member grant/launcher
+// records retained by the prestart supervisor, in assignment member order.
+export function matchesObservedMemberGrants(assignment, observedMembers, memberGrants) {
+  if (assignment?.members?.length !== 2 || observedMembers?.length !== 2
+    || !Array.isArray(memberGrants) || memberGrants.length !== 2) return false;
+  const kernelIdentityFields = ['pid', 'uid', 'gid', 'start_seconds', 'start_micros'];
+  const launchers = new Set(), children = new Set(), grants = new Set();
+  for (const [i, observed] of observedMembers.entries()) {
+    const expected = memberGrants[i], assigned = assignment.members[i];
+    const launcher = observed.launcher_process, child = observed.child_process;
+    if (!launcher || !child || !expected?.launcher_process
+      || observed.member_id !== assigned.member_id || expected.member_id !== assigned.member_id
+      || expected.member_selector !== assigned.member_selector || expected.launch_id !== assigned.launch_id
+      || !SHA.test(observed.grant_sha256) || observed.grant_sha256 !== expected.grant_sha256
+      || kernelIdentityFields.some((field) => launcher[field] !== expected.launcher_process[field])
+      || launcher.uid !== assignment.runner_uid || launcher.gid !== assignment.runner_gid
+      || child.parent_pid !== launcher.pid || child.pid === launcher.pid
+      || child.start_seconds < launcher.start_seconds
+      || (child.start_seconds === launcher.start_seconds && child.start_micros < launcher.start_micros)) return false;
+    launchers.add(launcher.pid);
+    children.add(child.pid);
+    grants.add(observed.grant_sha256);
+  }
+  return launchers.size === 2 && grants.size === 2 && children.size === 2
+    && Array.from(children).every((pid) => !launchers.has(pid));
+}
+
 const BIND_SELECTORS = ['installation_id', 'start_id', 'plan_id', 'plan_digest', 'reservation_digest',
   'assignment_envelope_sha256', 'authority_envelope_sha256', 'member_selectors_sha256'];
 
@@ -111,7 +138,8 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
     const binding = await bound(request, connection, receipt, state);
     const observation = await provider.observe(binding);
     if (!active(connection, receipt, state) || !observation) refuse();
-    const { envelopeBytes, assignmentBytes, machinePublicKey, provisionalMappingSHA256 } = observation;
+    const { envelopeBytes, assignmentBytes, machinePublicKey, provisionalMappingSHA256,
+      memberGrants } = observation;
     const signed = (bytes, purpose) => verifyStage2aMachineEnvelope(bytes, machinePublicKey,
       `agent-bot/stage2a-member-set-${purpose}/v1`, { maxBytes: 16_384 });
     const assignment = signed(assignmentBytes, 'assignment');
@@ -131,7 +159,7 @@ export function createStage2aMemberArmExchange({ provider, current, boundStart, 
       || !Array.isArray(a.members) || a.members.length !== 2 || c.members.length !== 2
       || mapping.members.length !== 2 || a.members[0].member_id >= a.members[1].member_id
       || c.members[0].runtime_id === c.members[1].runtime_id
-      || c.members[0].child_process.pid === c.members[1].child_process.pid) refuse();
+      || !matchesObservedMemberGrants(a, c.members, memberGrants)) refuse();
     for (const [i, member] of a.members.entries()) {
       const observed = c.members[i], mapped = mapping.members[i], p = observed.child_process;
       if (['member_id', 'member_selector'].some((k) => observed[k] !== member[k] || mapped[k] !== member[k])

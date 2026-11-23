@@ -9,7 +9,7 @@ import { observePeerPid } from './owner-control.mjs';
 import { listenSocket, takeover } from './socket.mjs';
 import { canonicalBytes, canonicalDigest } from '../sdk/wire/canonical-json.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
-import { verifyStage2aBridgeMemberAuthority } from './stage2a-relay-peer.mjs';
+import { matchesObservedMemberGrants, verifyStage2aBridgeMemberAuthority } from './stage2a-relay-peer.mjs';
 import { verifyStage2aMachineEnvelope } from './stage2a-stop.mjs';
 
 const ROOT = '/Library/Application Support/ai.true-line.agent-bot-hq';
@@ -90,7 +90,8 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
       || !matches(r.bridge_process, bridge, ['uid', 'gid'])
       || !input.boundBridgeProcess || canonicalDigest(r.bridge_process) !== canonicalDigest(input.boundBridgeProcess)
       || [a, c, r].some((p) => !Array.isArray(p.members) || p.members.length !== 2)
-      || c.provisional_hq_mapping.members?.length !== 2) refuse();
+      || c.provisional_hq_mapping.members?.length !== 2
+      || !matchesObservedMemberGrants(a, c.members, input.memberGrants)) refuse();
     const member = a.members.find((row) => row.member_id === runtime.member_id);
     const memberIndex = a.members.indexOf(member);
     if (!member || spent.has(member.launch_id)) refuse();
@@ -110,7 +111,6 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
     if (!(Date.parse(a.issued_at) <= Date.parse(c.provisional_hq_mapping.issued_at)
       && Date.parse(c.provisional_hq_mapping.issued_at) <= Date.parse(c.issued_at)
       && Date.parse(c.issued_at) <= Date.parse(r.issued_at) && Date.parse(r.issued_at) <= now())
-      || c.members[0].child_process.pid === c.members[1].child_process.pid
       || c.members[0].runtime_id === c.members[1].runtime_id
       || a.members[0].launch_id === a.members[1].launch_id) refuse();
     const expires = Math.min(now() + ATTACH_TTL_MS, runtime.lease_expires_at,
