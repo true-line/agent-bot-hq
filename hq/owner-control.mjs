@@ -125,12 +125,12 @@ export function authenticatePeerUid(socket, uid) {
 // Observe the connecting PID from the accepted descriptor, with the same
 // kernel UID check. This is an HQ-local role gate; Machine must authenticate
 // a protected Hello independently before publishing managed provenance.
-export function observePeerPid(socket, uid) {
+function observeSocketPeer(socket, uid, operation, maxBytes) {
   return new Promise((resolve) => {
     if (!Number.isSafeInteger(uid) || uid < 1) { resolve(null); return; }
     let probe;
     try {
-      probe = spawn(interpreter, [...helper, 'peer-pid', String(uid)], {
+      probe = spawn(interpreter, [...helper, operation, String(uid)], {
         ...helperOptions, stdio: ['ignore', 'pipe', 'ignore', socket],
       });
     } catch { resolve(null); return; }
@@ -138,15 +138,30 @@ export function observePeerPid(socket, uid) {
     let overflow = false;
     probe.stdout.on('data', (chunk) => {
       output += chunk.toString('ascii');
-      if (output.length > 32) { overflow = true; probe.kill('SIGKILL'); }
+      if (output.length > maxBytes) { overflow = true; probe.kill('SIGKILL'); }
     });
     probe.once('error', () => resolve(null));
-    probe.once('close', (code) => {
-      if (code !== 0 || overflow || !/^[1-9][0-9]{0,9}\n$/.test(output)) { resolve(null); return; }
-      const pid = Number(output.trim());
-      resolve(Number.isSafeInteger(pid) && pid > 1 ? pid : null);
-    });
+    probe.once('close', (code) => resolve(code === 0 && !overflow ? output : null));
   });
+}
+
+export async function observePeerPid(socket, uid) {
+  const output = await observeSocketPeer(socket, uid, 'peer-pid', 32);
+  if (!/^[1-9][0-9]{0,9}\n$/.test(output ?? '')) return null;
+  const pid = Number(output.trim());
+  return Number.isSafeInteger(pid) && pid > 1 ? pid : null;
+}
+
+export async function observeDarwinPeerIdentity(socket, expectedUid) {
+  if (!darwin) return null;
+  const output = await observeSocketPeer(socket, expectedUid, 'peer-audit', 96);
+  if (!/^\d+(?: \d+){5}\n$/.test(output ?? '')) return null;
+  const values = output.trim().split(' ').map(Number);
+  const [uid, gid, pid, pid_version, start_seconds, start_micros] = values;
+  if (!values.every(Number.isSafeInteger) || uid !== expectedUid || gid < 1 || pid < 2
+    || pid_version < 1 || pid_version > 0xffffffff || start_seconds < 1
+    || start_micros < 0 || start_micros >= 1e6) return null;
+  return Object.freeze({ uid, gid, pid, pid_version, start_seconds, start_micros });
 }
 
 export { authenticatePeerUid as authenticateOwner };

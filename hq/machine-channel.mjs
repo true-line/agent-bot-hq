@@ -97,6 +97,9 @@ function validStage2aCaptureRequest(verb, value) {
 const DIRECT_Q_VERBS = new Set(['stage2a-cooperative-q-begin-v3', 'stage2a-cooperative-q-finish-v3']);
 const COOPERATIVE_STATES = new Map([
   ['stage2a-cooperative-live-v3', 'cooperative-live'],
+  ['stage2a-cooperative-b-exec-v3', 'cooperative-b-granted'],
+  ['stage2a-cooperative-b-verify-v3', 'cooperative-b-verified'],
+  ['stage2a-cooperative-b-observe-v3', 'cooperative-b-observed'],
   ['stage2a-cooperative-q-begin-v3', 'cooperative-q-pre'],
   ['stage2a-cooperative-q-finish-v3', 'cooperative-q-captured'],
   ['stage2a-cooperative-q-witness-begin-v3', 'cooperative-q-witness-challenge'],

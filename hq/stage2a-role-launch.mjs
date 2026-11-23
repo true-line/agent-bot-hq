@@ -127,12 +127,12 @@ function firstLine(child, parse, timeoutMs, limit, resume = false, rejectRemaind
   });
 }
 
-function bridgeReadyFrom(line) {
+function bridgeReadyFrom(line, cooperative = false) {
   if (line.length > 1024) throw new Error('Soul bridge readiness is too large');
   const ready = parseStrict(line.toString('utf8'));
   const socket = ready?.relay_socket;
   if (!ready || typeof ready !== 'object' || Array.isArray(ready)
-    || Object.keys(ready).length !== 2
+    || Object.keys(ready).length !== (cooperative ? 6 : 2)
     || !Object.hasOwn(ready, 'bind_receipt_sha256') || !Object.hasOwn(ready, 'relay_socket')
     || !DIGEST.test(ready.bind_receipt_sha256)
     || !socket || typeof socket !== 'object' || Array.isArray(socket)
@@ -143,8 +143,16 @@ function bridgeReadyFrom(line) {
     || socket.inode === 0 || socket.mode !== 0o660) {
     throw new Error('invalid Soul bridge readiness');
   }
+  const extra = cooperative ? ['bridge_pid', 'bridge_start_seconds', 'bridge_start_micros', 'grant_nonce'] : [];
+  if (cooperative && (!Number.isSafeInteger(ready.bridge_pid) || ready.bridge_pid < 2
+    || !Number.isSafeInteger(ready.bridge_start_seconds) || ready.bridge_start_seconds <= 0
+    || !Number.isSafeInteger(ready.bridge_start_micros) || ready.bridge_start_micros < 0 || ready.bridge_start_micros >= 1e6
+    || !NONCE.test(ready.grant_nonce ?? '')
+    || Buffer.from(ready.grant_nonce, 'base64url').toString('base64url') !== ready.grant_nonce)) {
+    throw new Error('invalid cooperative B readiness process');
+  }
   return Object.freeze({ bind_receipt_sha256: ready.bind_receipt_sha256,
-    relay_socket: Object.freeze({ ...socket }) });
+    relay_socket: Object.freeze({ ...socket }), ...Object.fromEntries(extra.map((key) => [key, ready[key]])) });
 }
 
 function runnerActivationFrom(line) {
@@ -271,17 +279,18 @@ function childProgress(child) {
 // bind the reservation to an authenticated live start and obtain Machine's
 // signed stop/completion before releasing any installation occupancy.
 export async function startStage2aRole({ account, role, reservationSHA256,
-  machineExec = machineRoleStage2aExec, spawnProcess = spawn, timeoutMs = 12000 } = {}) {
+  machineExec = machineRoleStage2aExec, spawnProcess = spawn, timeoutMs = 12000, cooperativeBridge = false } = {}) {
   if (typeof account !== 'string'
     || !(role === 'runner' && RUNNER_ACCOUNT.test(account)
       || role === 'bridge' && BRIDGE_ACCOUNT.test(account)
       || role === 'child' && RUNNER_ACCOUNT.test(account))
+    || (cooperativeBridge && role !== 'bridge')
     || !DIGEST.test(reservationSHA256 ?? '')
     || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 14000) {
     throw new Error('invalid Soul launcher assignment');
   }
   const command = role === 'runner' ? 'soul-run'
-    : role === 'bridge' ? 'soul-bridge' : 'soul-child';
+    : role === 'bridge' ? (cooperativeBridge ? 'cooperative-soul-bridge' : 'soul-bridge') : 'soul-child';
   const child = spawnProcess('/usr/bin/sudo', ['-n', '-u', account, '--', STAGE2A_LAUNCHER, command], {
     stdio: ['pipe', 'pipe', role === 'child' ? 'pipe' : 'ignore'], shell: false,
     env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C' },
@@ -293,7 +302,7 @@ export async function startStage2aRole({ account, role, reservationSHA256,
   child.stdin.on('error', () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); });
   child.stdout.on('error', () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); });
   try {
-    const challenge = await firstLine(child, (line) => challengeFrom(line, role), timeoutMs, 512);
+    const challenge = await firstLine(child, (line) => challengeFrom(line, cooperativeBridge ? 'cooperative-bridge' : role), timeoutMs, 512);
     const grant = await bounded(machineExec({ reservation_sha256: reservationSHA256,
       role, nonce: challenge.nonce, pid: challenge.pid }), timeoutMs, 'Machine role grant');
     await writeGrant(child, grant?.grantLine);
@@ -402,7 +411,7 @@ export async function startStage2aRole({ account, role, reservationSHA256,
         }
         readinessAttempted = true;
         try {
-          const ready = await firstLine(child, bridgeReadyFrom, 5000, 1024, true);
+          const ready = await firstLine(child, (line) => bridgeReadyFrom(line, cooperativeBridge), 5000, 1024, true);
           const verified = await bounded(Promise.resolve().then(() => verify(ready)), 5000,
             'Soul bridge readiness verification');
           if (verified !== true || child.exitCode !== null || child.signalCode !== null) {

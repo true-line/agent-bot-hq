@@ -49,7 +49,7 @@ import { createStandaloneSigner } from './standalone-signer.mjs';
 import { createEnrollment, DEFAULT_IDENTITY_SERVICE, validateEnrollmentConfig } from './enrollment.mjs';
 import { createLauncher, LAUNCH_OPERATIONS } from './launch.mjs';
 import { createSoulStarter } from './soul-start.mjs';
-import { bindBridgeAuthority, listenBridgeEndpoint, memberBrokerDispatch, planBridgeEndpoints } from './bridge-endpoints.mjs';
+import { bindBridgeAuthority, listenBridgeEndpoint, memberBrokerDispatch, planBridgeEndpoints, readCooperativeBridgePeer } from './bridge-endpoints.mjs';
 import { loadPlugins } from './plugins.mjs';
 import { authenticatePeerUid, checkOwnerControlSupport, OWNER_CONTROL_PATH, OWNER_PEER_CHECK } from './owner-control.mjs';
 import { checkSocketPath, listenSocket } from './socket.mjs';
@@ -195,6 +195,7 @@ export function createHQ({
   bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
   qualificationAuthorizer,       // trusted one-use installed test-provider operation; never owner config
   relayIngressAuthorizer,        // trusted one-use B test-provider; absent until A finalization is wired
+  cooperativeBBindProvider,      // trusted cooperative B bind state; absent in production
   cooperativeBPolicyProvider,    // trusted same-bound A policy delivery; absent in production
   memberArmProvider,             // trusted paired A observation/arm provider; absent in production
   relayPeerAuthority,            // trusted v3 bound B + paired A live CLI verifier; absent in production
@@ -398,6 +399,7 @@ export function createHQ({
       relayPeerAuthority,
       memberArmProvider,
       cooperativeBPolicyProvider,
+      cooperativeBBindProvider,
       protectedAdmission,
       cooperativeAdmission: cooperativeGuard?.client,
     });
@@ -510,6 +512,7 @@ export function createHQ({
         const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
           enableBridgeQualification: typeof qualificationAuthorizer === 'function',
           enableBridgeRelayIngress: typeof relayIngressAuthorizer === 'function',
+          enableCooperativeBBind: host.provided('hq-admission')?.stage2aCooperativeBBindEnabledV3?.() === true,
           enableCooperativeBPolicy: typeof cooperativeBPolicyProvider === 'function',
           enableMemberArmExchange: host.provided('hq-admission')?.stage2aMemberArmExchangeEnabledV3?.() === true,
           enableRelayPeerChallenge: typeof bridgeAuthority?.verifyLiveStartV3 === 'function'
@@ -659,6 +662,10 @@ export function createHQ({
     qualifyDirectProtectedClaim: (startId) => {
       if (!running) fail('host.launch_unavailable', 'HQ direct qualification is unavailable');
       return soulStarter.qualifyDirectProtectedClaim(startId);
+    },
+    cooperativeBridgeKernelPeer: (connection, expected) => {
+      if (!running) fail('host.launch_unavailable', 'cooperative B broker is unavailable');
+      return readCooperativeBridgePeer(bridgePeers, connection, expected);
     },
     bridgeBrokerIdentity: (installationId) => {
       if (!running || typeof installationId !== 'string') fail('host.launch_unavailable', 'HQ bridge broker is unavailable');

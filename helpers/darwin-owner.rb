@@ -213,6 +213,31 @@ when 'peer-pid'
   pid = socket.getsockopt(0, 0x002).int
   exit 1 unless pid > 1
   STDOUT.write("#{pid}\n")
+when 'peer-audit'
+  exit 1 unless ARGV.length == 1 && /\A[0-9]+\z/.match?(ARGV.first)
+  socket = UNIXSocket.for_fd(3)
+  expected_uid = Integer(ARGV.first, 10)
+  exit 1 unless socket.local_address.unix? &&
+                socket.getsockopt(Socket::SOL_SOCKET, Socket::SO_TYPE).int == Socket::SOCK_STREAM &&
+                socket.remote_address.unix? && socket.getpeereid.first == expected_uid
+  # Darwin LOCAL_PEERTOKEN returns the eight native uint32_t audit_token_t words.
+  token = socket.getsockopt(0, 0x006).data
+  exit 1 unless token.bytesize == 32
+  words = token.unpack('L8')
+  uid, gid, pid, version = words.values_at(1, 2, 5, 7)
+  exit 1 unless uid == expected_uid && pid > 1 && version.positive?
+  # Darwin PROC_PIDTBSDINFO (flavor 3) has a fixed 136-byte proc_bsdinfo
+  # on the supported 64-bit ABI. Check identity before taking the start time.
+  proc_info = Fiddle::Function.new(Fiddle::Handle.new('/usr/lib/libproc.dylib')['proc_pidinfo'],
+    [Fiddle::TYPE_INT, Fiddle::TYPE_INT, Fiddle::TYPE_LONG_LONG, Fiddle::TYPE_VOIDP, Fiddle::TYPE_INT],
+    Fiddle::TYPE_INT)
+  process = "\x00" * 136
+  exit 1 unless proc_info.call(pid, 3, 0, process, process.bytesize) == process.bytesize
+  process_pid, process_uid, process_gid = [12, 20, 24].map { |offset| process.byteslice(offset, 4).unpack1('L') }
+  seconds, micros = process.byteslice(120, 16).unpack('Q2')
+  exit 1 unless [process_pid, process_uid, process_gid] == [pid, uid, gid] && seconds.positive? && micros < 1_000_000
+  exit 1 unless socket.getsockopt(0, 0x006).data == token
+  STDOUT.write([uid, gid, pid, version, seconds, micros].join(' ') + "\n")
 else
   exit 1
 end

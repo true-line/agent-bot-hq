@@ -7,7 +7,7 @@ import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
 import { verifyStage2aBridgeMemberAuthority } from './stage2a-relay-peer.mjs';
 import { fail } from '../sdk/errors.mjs';
 import { checkDarwinACL, DARWIN_HARNESS_DIR } from './darwin-harness-accounts.mjs';
-import { authenticatePeerUid } from './owner-control.mjs';
+import { authenticatePeerUid, observeDarwinPeerIdentity } from './owner-control.mjs';
 import { listenSocket } from './socket.mjs';
 
 const ROLE_UID = (uid) => Number.isInteger(uid) && uid >= 300 && uid <= 399;
@@ -15,6 +15,7 @@ const INSTALLATION = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const BRIDGE_QUALIFICATION_MESSAGES = 'bridge.qualification.messages.v1';
 const BRIDGE_RELAY_INGRESS = 'bridge.relay.ingress.v1';
 const RELAY_PEER_CHALLENGE = 'stage2a-relay-peer-challenge';
+const COOPERATIVE_B_BIND = 'bridge.bind.cooperative.v3';
 const COOPERATIVE_MEMBER_POLICY = 'bridge.member-policy.v3';
 const memberArmKind = (kind) => kind === 'bridge.member.observe.v3' || kind === 'bridge.member.arm.v3';
 const protectedBridgeKind = (kind) => kind === 'bridge.bind.v2.challenge' || kind === 'bridge.bind.v2'
@@ -23,7 +24,7 @@ const refuse = () => fail('host.launch_unavailable', 'bridge bind requires the d
 
 export function memberBrokerDispatch(host, kind, payload, connection) {
   if (protectedBridgeKind(kind) || kind === BRIDGE_QUALIFICATION_MESSAGES || kind === BRIDGE_RELAY_INGRESS
-    || kind === RELAY_PEER_CHALLENGE || kind === COOPERATIVE_MEMBER_POLICY || memberArmKind(kind)) refuse();
+    || kind === RELAY_PEER_CHALLENGE || kind === COOPERATIVE_B_BIND || kind === COOPERATIVE_MEMBER_POLICY || memberArmKind(kind)) refuse();
   return host.brokerAccept(kind, payload, { connection });
 }
 
@@ -66,7 +67,7 @@ export function planBridgeEndpoints(assignments, { platform, account, hqUid, har
 
 export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
   enableBridgeQualification = false, enableBridgeRelayIngress = false,
-  enableRelayPeerChallenge = false, enableMemberArmExchange = false, enableCooperativeBPolicy = false,
+  enableRelayPeerChallenge = false, enableMemberArmExchange = false, enableCooperativeBPolicy = false, enableCooperativeBBind = false,
   lstat = (path) => lstatSync(path, { bigint: true }),
   checkACL = checkDarwinACL, authenticate = authenticatePeerUid, listen = listenSocket } = {}) {
   function checkDirectory() {
@@ -135,13 +136,15 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
       const livePeer = kind === RELAY_PEER_CHALLENGE;
       const memberArm = memberArmKind(kind);
       const policy = kind === COOPERATIVE_MEMBER_POLICY;
+      const cooperativeBind = kind === COOPERATIVE_B_BIND;
       const peer = peers.get(session);
       if (!peer || (!protectedBridgeKind(kind) && !(qualification && enableBridgeQualification === true)
         && !(relayIngress && enableBridgeRelayIngress === true)
         && !(livePeer && enableRelayPeerChallenge === true)
         && !(memberArm && enableMemberArmExchange === true)
-        && !(policy && enableCooperativeBPolicy === true))) refuse();
-      if ((qualification || relayIngress || livePeer || memberArm || policy || endpoint.parentIdentity)
+        && !(policy && enableCooperativeBPolicy === true)
+        && !(cooperativeBind && enableCooperativeBBind === true))) refuse();
+      if ((qualification || relayIngress || livePeer || memberArm || policy || cooperativeBind || endpoint.parentIdentity)
         && (peer.socket.destroyed || !peer.checkCurrent())) refuse();
       return host.brokerAccept(kind, payload, { connection: session });
     },
@@ -170,6 +173,21 @@ export async function listenBridgeEndpoint(endpoint, { hqUid, host, core, peers,
       directory_identity: projection(dir), socket_identity: projection(socket) });
   };
   return Object.freeze({ ...listener, brokerIdentity });
+}
+
+export async function readCooperativeBridgePeer(peers, connection, expected) {
+  const peer = peers.get(connection);
+  const current = () => peers.get(connection) === peer && !peer.socket.destroyed && peer.checkCurrent() === true;
+  if (!peer || peer.endpoint.uid !== expected.uid || peer.endpoint.gid !== expected.gid
+    || peer.endpoint.path !== expected.path || !current()) refuse();
+  const readKernelBridge = async () => {
+    if (!current()) refuse();
+    const identity = await observeDarwinPeerIdentity(peer.socket, expected.uid);
+    if (!identity || identity.gid !== expected.gid || !current()) refuse();
+    return identity;
+  };
+  await readKernelBridge();
+  return Object.freeze({ isCurrent: current, readKernelBridge });
 }
 
 function matchesMemberEndpoint(member, endpoint, startId) {

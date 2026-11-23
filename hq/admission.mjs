@@ -135,7 +135,7 @@ const unboundOf = (tx) => tx.list('runtimes').map(([, rt]) => rt).filter((rt) =>
 // the account a broker connection arrived from ({ account, uid }), or
 // undefined on the shared socket. HQ core supplies all three; an agent never
 // does.
-export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, qualificationAuthorizer, relayIngressAuthorizer, relayPeerAuthority, memberArmProvider, cooperativeBPolicyProvider, protectedAdmission, cooperativeAdmission } = {}) {
+export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, qualificationAuthorizer, relayIngressAuthorizer, relayPeerAuthority, memberArmProvider, cooperativeBPolicyProvider, cooperativeBBindProvider, protectedAdmission, cooperativeAdmission } = {}) {
   for (const n of SCHEMA_NAMES) if (!schemas?.[n]) throw new TypeError(`admission needs the pinned hq/v1 ${n} schema`);
   if (protectedAdmission && (typeof protectedAdmission.acceptPeer !== 'function'
     || typeof protectedAdmission.verifyHelloStart !== 'function'
@@ -934,6 +934,18 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           && typeof relayPeerAuthority?.boundStart === 'function'
           && typeof relayPeerAuthority?.attest === 'function',
         stage2aRelayPeerChallenge: relayPeerChallenge,
+        stage2aCooperativeBBindEnabledV3: () => typeof cooperativeBBindProvider?.begin === 'function'
+          && typeof cooperativeBBindProvider?.finish === 'function',
+        stage2aCooperativeBBindChallengeV3: (request, meta) => {
+          if (typeof cooperativeBBindProvider?.begin !== 'function')
+            fail('host.launch_unavailable', 'cooperative B binding is unavailable');
+          return cooperativeBBindProvider.begin(request, meta);
+        },
+        stage2aCooperativeBBindV3: (request, meta) => {
+          if (typeof cooperativeBBindProvider?.finish !== 'function')
+            fail('host.launch_unavailable', 'cooperative B binding is unavailable');
+          return cooperativeBBindProvider.finish(request, meta);
+        },
         stage2aCooperativeBPolicyEnabledV3: () => typeof cooperativeBPolicyProvider === 'function',
         stage2aCooperativeBPolicyV3: (request, meta, receipt) => {
           if (typeof cooperativeBPolicyProvider !== 'function')
@@ -947,7 +959,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         forgetBridgeConnection: (connection, ...args) => {
           relayPeerChallenge.forgetConnection(connection);
           memberArmExchange.forgetConnection(connection);
-          return bridge.forgetBridgeConnection(connection, ...args);
+          return Promise.all([bridge.forgetBridgeConnection(connection, ...args),
+            cooperativeBBindProvider?.stop?.(connection)]);
         },
         boundBridge: bridge.boundBridge,
         bridgeStatus: bridge.bridgeStatus,

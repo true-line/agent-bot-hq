@@ -7,6 +7,8 @@ import { DARWIN_HARNESS_DIR } from './darwin-harness-accounts.mjs';
 import { planBridgeEndpoints } from './bridge-endpoints.mjs';
 import { verifyStage2aBridgeMemberAuthority } from './stage2a-relay-peer.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
+import { verifyCooperativeProof } from './stage2a-cooperative-proof.mjs';
+import { startStage2aRole } from './stage2a-role-launch.mjs';
 import { verifyStage2aMachineEnvelope } from './stage2a-stop.mjs';
 
 const PURPOSE = 'agent-bot/soul-cooperative-bridge-assignment/v3';
@@ -80,7 +82,7 @@ export function verifyCooperativeBridgeAssignment(raw, { machinePublicKey, reser
     || !same(member, r.endpoints.member) || !same(relay, r.endpoints.relay)) refuse();
 
   return Object.freeze({
-    assignmentSHA256: checked.envelope_sha256, reservationSHA256: reservation.sha256,
+    assignmentSHA256: checked.envelope_sha256, reservationSHA256: reservation.sha256, account: b.account,
     expires,
     selectors: Object.freeze(Object.fromEntries(SELECTORS.map((field) => [field, a[field]]))),
     soulArtifactSHA256: `sha256:${a.soul_artifact_sha256}`,
@@ -142,21 +144,282 @@ export function createCooperativeBridgeAuthority({ assignment, reservationBytes,
 }
 
 
+const PROCESS_IDENTITY = ['pid', 'uid', 'gid', 'start_seconds', 'start_micros'];
+const KERNEL_B_IDENTITY = [...PROCESS_IDENTITY, 'pid_version'];
+const OBSERVE_FIELDS = ['contract', 'kind', 'schema_version', 'reservation_sha256',
+  'bridge_assignment_sha256', 'bind_receipt_sha256', ...SELECTORS, 'grant_nonce',
+  'launcher', 'bridge', 'relay_socket', 'observed_at', 'expires_at'];
+const matchFields = (left, right, fields) => fields.every((key) => left?.[key] === right?.[key]);
+const exactly = (value, keys) => value && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
+
+export function createCooperativeBRoleClient({ reservation, bridgeAssignment, machinePublicKey,
+  exchange, now = Date.now } = {}) {
+  const a = reservation?.payload?.assignment;
+  if (!a || reservation.payload.adapter_transport !== 'brokered-b'
+    || bridgeAssignment?.reservationSHA256 !== reservation.sha256
+    || typeof exchange !== 'function' || !Buffer.isBuffer(machinePublicKey) || machinePublicKey.length !== 32) refuse();
+  const key = Buffer.from(machinePublicKey);
+  const call = async (operation, request) => {
+    const response = await exchange(`stage2a-cooperative-b-${operation}-v3`, request);
+    if (!Buffer.isBuffer(response?.machineKey) || !response.machineKey.equals(key)) refuse();
+    return response.body;
+  };
+  return Object.freeze({
+    async exec({ nonce, pid }) {
+      if (!Number.isSafeInteger(pid) || pid < 2 || typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(nonce)
+        || Buffer.from(nonce, 'base64url').toString('base64url') !== nonce) refuse();
+      const body = await call('exec', { reservation_sha256: reservation.sha256,
+        installation_id: a.installation_id, start_id: a.start_id, launch_id: a.launch_id, nonce, pid });
+      if (!exactly(body, ['envelope_base64url', 'sha256', 'reservation_envelope_base64url', 'bridge_assignment_envelope_base64url'])
+        || body.reservation_envelope_base64url !== reservation.envelope_base64url
+        || body.bridge_assignment_envelope_base64url !== reservation.bridge_assignment_envelope_base64url) refuse();
+      const grant = verifyCooperativeProof({ envelope_base64url: body.envelope_base64url, sha256: body.sha256 },
+        key, 'b-exec');
+      if (!matchFields(grant, a, ['installation_id', 'start_id', 'launch_id', 'hq_epoch', 'machine_uid'])
+        || grant.reservation_sha256 !== reservation.sha256 || grant.bridge_assignment_sha256 !== bridgeAssignment.assignmentSHA256
+        || grant.bridge_uid !== bridgeAssignment.endpoint.uid || grant.bridge_gid !== bridgeAssignment.endpoint.gid
+        || grant.pid !== pid || grant.nonce !== nonce || !DIGEST.test(grant.proof_sha256)
+        || !(Date.parse(grant.issued_at) <= now() && now() < Date.parse(grant.expires_at)
+          && Date.parse(grant.expires_at) <= Date.parse(reservation.payload.expires_at))) refuse();
+      if (!Number.isSafeInteger(grant.pid_start_sec) || grant.pid_start_sec <= 0
+        || !Number.isSafeInteger(grant.pid_start_usec) || grant.pid_start_usec < 0 || grant.pid_start_usec >= 1e6) refuse();
+      return Object.freeze({ sha256: body.sha256, grantLine: Buffer.from(JSON.stringify(body) + '\n'),
+        launcherProcess: Object.freeze({ pid, uid: grant.bridge_uid, gid: grant.bridge_gid,
+          start_seconds: grant.pid_start_sec, start_micros: grant.pid_start_usec }) });
+    },
+    async verifyHMAC({ nonce, proof }) {
+      if (!/^[0-9a-f]{64}$/.test(nonce ?? '') || !/^[0-9a-f]{64}$/.test(proof ?? '')) refuse();
+      const body = await call('verify', { ...bridgeAssignment.selectors,
+        reservation_sha256: reservation.sha256, bridge_assignment_sha256: bridgeAssignment.assignmentSHA256,
+        nonce, proof });
+      return exactly(body, ['verified']) && body.verified === true;
+    },
+  });
+}
+
+export const COOPERATIVE_B_BIND_CONTEXT = 'agent-bot-stage2a-cooperative-bridge-bind-v3';
+
+export function createCooperativeBBind({ reservation, bridgeAssignment, schema, schemaReferences, machine,
+  kernelPeer, random, contain, now = Date.now } = {}) {
+  if (!schema || !bridgeAssignment || bridgeAssignment.reservationSHA256 !== reservation?.sha256
+    || reservation.payload?.adapter_transport !== 'brokered-b'
+    || [machine?.verifyHMAC, kernelPeer, random, contain, now].some((fn) => typeof fn !== 'function')) refuse();
+  const { selectors, endpoint } = bridgeAssignment;
+  let challenge;
+  let claimed = false;
+  let bound;
+  let stopped = false;
+  const check = (value) => { if (validate(schema, value, { schemas: schemaReferences }).length) refuse(); };
+  const live = (record) => !stopped && record?.peer.isCurrent() === true && record.expires > now();
+  const readPeer = async (record) => {
+    const actual = await record.peer.readKernelBridge();
+    if (!live(record) || !matchFields(actual, record.identity, KERNEL_B_IDENTITY)) refuse();
+    return actual;
+  };
+  async function stop(connection) {
+    if (connection !== challenge?.connection && connection !== bound?.connection) return;
+    if (stopped) return;
+    stopped = true;
+    await contain(selectors);
+  }
+  async function begin(request, { connection } = {}) {
+    if (!exactly(request, []) || typeof connection !== 'string' || !connection || claimed || stopped) refuse();
+    check(request);
+    claimed = true;
+    const peer = await kernelPeer(connection, endpoint);
+    const identity = await peer?.readKernelBridge?.();
+    if (stopped || peer?.isCurrent() !== true || identity?.uid !== endpoint.uid || identity?.gid !== endpoint.gid
+      || !Number.isSafeInteger(identity.pid) || identity.pid < 2 || !Number.isSafeInteger(identity.pid_version)
+      || identity.pid_version < 1 || identity.pid_version > 0xffffffff || !Number.isSafeInteger(identity.start_seconds)
+      || identity.start_seconds <= 0 || !Number.isSafeInteger(identity.start_micros)
+      || identity.start_micros < 0 || identity.start_micros >= 1e6) refuse();
+    const nonce = random(32);
+    const expires = Math.min(now() + 30_000, Date.parse(reservation.payload.expires_at), bridgeAssignment.expires);
+    if (!/^[0-9a-f]{64}$/.test(nonce ?? '') || !(expires > now())) refuse();
+    const first = { connection, peer, identity: Object.freeze(Object.fromEntries(KERNEL_B_IDENTITY.map((key) => [key, identity[key]]))),
+      nonce, expires };
+    challenge = first;
+    const result = { nonce, algorithm: 'hmac-sha256', context: COOPERATIVE_B_BIND_CONTEXT,
+      hq_epoch: selectors.hq_epoch, expires_at: new Date(expires).toISOString() };
+    check(result);
+    return Object.freeze(result);
+  }
+  async function finish(request, { connection } = {}) {
+    const first = challenge;
+    if (!first || first.connection !== connection || first.spent || !live(first)) refuse();
+    first.spent = true;
+    try {
+      check(request);
+      const expected = { ...selectors, nonce: first.nonce, reservation_sha256: reservation.sha256,
+        bridge_assignment_envelope_sha256: bridgeAssignment.assignmentSHA256, bridge_uid: endpoint.uid,
+        broker_socket_path: endpoint.path };
+      if (!exactly(request, [...Object.keys(expected), 'proof_hex'])
+        || !matchFields(request, expected, Object.keys(expected)) || !/^[0-9a-f]{64}$/.test(request.proof_hex)) refuse();
+      await readPeer(first);
+      if (await machine.verifyHMAC({ nonce: request.nonce, proof: request.proof_hex }) !== true) refuse();
+      const identity = await readPeer(first);
+      const receipt = random(32);
+      if (!/^[0-9a-f]{64}$/.test(receipt ?? '')) refuse();
+      const record = { contract: 'hq/v1', kind: 'stage2a-cooperative-bridge-bind-receipt', schema_version: 1,
+        ...selectors, reservation_sha256: reservation.sha256,
+        bridge_assignment_envelope_sha256: bridgeAssignment.assignmentSHA256,
+        bridge_uid: endpoint.uid, broker_socket_path: endpoint.path,
+        challenge_nonce: first.nonce, expires_at: new Date(first.expires).toISOString(),
+        bridge_peer: Object.fromEntries(KERNEL_B_IDENTITY.map((key) => [key, identity[key]])) };
+      const receiptSHA256 = canonicalDigest(record);
+      bound = { ...first, receipt, receiptSHA256 };
+      return Object.freeze({ bind_receipt: receipt, bind_receipt_sha256: receiptSHA256 });
+    } catch (error) { await stop(connection); throw error; }
+  }
+  async function binding(connection, receipt) {
+    const record = bound;
+    if (!record || connection !== record.connection || receipt !== record.receipt) refuse();
+    const identity = await readPeer(record);
+    return Object.freeze({ connection, receipt, receiptSHA256: record.receiptSHA256, kernelBridge: identity,
+      readKernelBridge: () => readPeer(record), isCurrent: () => live(record),
+      brokerPath: endpoint.path, reservationSHA256: reservation.sha256,
+      bridgeAssignmentSHA256: bridgeAssignment.assignmentSHA256 });
+  }
+  return Object.freeze({ begin, finish, binding, stop,
+    byReceiptSHA256(sha256) {
+      if (!bound || bound.receiptSHA256 !== sha256) refuse();
+      return binding(bound.connection, bound.receipt);
+    },
+  });
+}
+
+// Construct this only from the verified reserve result, detached assignment
+// and wrapper grant. H never receives the FD4 proof key.
+export function createCooperativeBObservation({ reservation, bridgeAssignment, machinePublicKey,
+  observationSchema, schemaReferences, grantNonce, launcherProcess, exchange, now = Date.now } = {}) {
+  const a = reservation?.payload?.assignment;
+  if (!a || !observationSchema || !Buffer.isBuffer(machinePublicKey) || machinePublicKey.length !== 32
+    || reservation.payload.adapter_transport !== 'brokered-b'
+    || !DIGEST.test(reservation.member_set_assignment_sha256)
+    || bridgeAssignment?.reservationSHA256 !== reservation.sha256
+    || typeof exchange !== 'function' || !exactly(launcherProcess, PROCESS_IDENTITY)
+    || !Number.isSafeInteger(launcherProcess.pid) || launcherProcess.pid < 2
+    || typeof grantNonce !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(grantNonce)
+    || Buffer.from(grantNonce, 'base64url').toString('base64url') !== grantNonce) refuse();
+  const key = Buffer.from(machinePublicKey);
+  let pending;
+  let observed;
+  return async function observeAfterFD5(binding) {
+    const fd5 = binding?.fd5;
+    const peer = binding?.kernelBridge && Object.freeze({ ...binding.kernelBridge });
+    const socket = fd5?.relay_socket;
+    const live = () => typeof binding?.isCurrent === 'function' && binding.isCurrent() === true;
+    if (!live() || typeof binding.readKernelBridge !== 'function' || !exactly(fd5, ['bind_receipt_sha256', 'relay_socket',
+      'bridge_pid', 'bridge_start_seconds', 'bridge_start_micros', 'grant_nonce'])
+      || fd5.grant_nonce !== grantNonce || fd5.bridge_pid !== peer?.pid
+      || fd5.bridge_start_seconds !== peer?.start_seconds || fd5.bridge_start_micros !== peer?.start_micros
+      || !DIGEST.test(fd5.bind_receipt_sha256) || fd5.bind_receipt_sha256 !== binding.receiptSHA256
+      || binding.bridgeAssignmentSHA256 !== bridgeAssignment.assignmentSHA256
+      || binding.reservationSHA256 !== reservation.sha256 || binding.brokerPath !== bridgeAssignment.endpoint.path
+      || !exactly(socket, ['uid', 'gid', 'device', 'inode', 'mode'])
+      || socket.uid !== bridgeAssignment.relay.owner_uid || socket.gid !== bridgeAssignment.relay.group_gid
+      || socket.mode !== bridgeAssignment.relay.socket_mode
+      || !Number.isSafeInteger(socket.device) || socket.device <= 0
+      || !Number.isSafeInteger(socket.inode) || socket.inode <= 0
+      || peer?.uid !== bridgeAssignment.endpoint.uid || peer.gid !== bridgeAssignment.endpoint.gid
+      || !Number.isSafeInteger(peer.pid) || peer.pid < 2 || peer.pid === launcherProcess.pid
+      || !Number.isSafeInteger(peer.pid_version) || peer.pid_version < 1 || peer.pid_version > 0xffffffff
+      || !Number.isSafeInteger(peer.start_seconds) || peer.start_seconds <= 0
+      || !Number.isSafeInteger(peer.start_micros) || peer.start_micros < 0 || peer.start_micros >= 1e6) refuse();
+    const recheckPeer = async () => matchFields(await binding.readKernelBridge(), peer, KERNEL_B_IDENTITY) && live();
+    if (!await recheckPeer()) refuse();
+    const relay = { path: bridgeAssignment.relay.socket_path,
+      socket: { ...socket, device: String(socket.device), inode: String(socket.inode) } };
+    const request = { ...bridgeAssignment.selectors, reservation_sha256: reservation.sha256,
+      bridge_assignment_sha256: bridgeAssignment.assignmentSHA256, bind_receipt_sha256: fd5.bind_receipt_sha256,
+      grant_nonce: grantNonce, bridge_pid: peer.pid, bridge_start_seconds: peer.start_seconds,
+      bridge_start_micros: peer.start_micros, relay_socket: relay };
+    const bindingSHA256 = canonicalDigest({ connection: binding.connection, request, pid_version: peer.pid_version });
+    if (observed) {
+      if (observed.bindingSHA256 !== bindingSHA256 || Date.parse(observed.expiresAt) <= now() || !live()) refuse();
+      return observed;
+    }
+    if (pending) refuse();
+    pending = true;
+    try {
+      const response = await exchange('stage2a-cooperative-b-observe-v3', request);
+      if (!Buffer.isBuffer(response?.machineKey) || !response.machineKey.equals(key) || !await recheckPeer()) refuse();
+      const value = verifyCooperativeProof(response.body, key, 'b-observed');
+      const at = Date.parse(value.observed_at), expires = Date.parse(value.expires_at);
+      if (!exactly(value, OBSERVE_FIELDS) || validate(observationSchema, value, { schemas: schemaReferences }).length
+        || !matchFields(value, request, ['reservation_sha256', 'bridge_assignment_sha256',
+          'bind_receipt_sha256', 'grant_nonce', ...SELECTORS])
+        || !exactly(value.launcher, PROCESS_IDENTITY) || !exactly(value.bridge, PROCESS_IDENTITY)
+        || !matchFields(value.bridge, peer, PROCESS_IDENTITY)
+        || !matchFields(value.launcher, launcherProcess, PROCESS_IDENTITY)
+        || value.launcher.uid !== peer.uid || value.launcher.gid !== peer.gid
+        || !(value.launcher.start_seconds > 0) || !Number.isSafeInteger(value.launcher.start_micros)
+        || value.launcher.start_micros < 0 || value.launcher.start_micros >= 1e6
+        || canonicalDigest(value.relay_socket) !== canonicalDigest(relay)
+        || !(Date.parse(reservation.payload.issued_at) <= at && at <= now() && now() < expires
+          && expires <= Date.parse(reservation.payload.expires_at)) || !live()) refuse();
+      // PIDVersion and the #85 assignment digest were independently retained
+      // by H from the kernel peer and verified reserve adjunct respectively.
+      observed = Object.freeze({ bindingSHA256, ...bridgeAssignment.selectors,
+        receiptSHA256: value.bind_receipt_sha256, reservationSHA256: value.reservation_sha256,
+        bridgeAssignmentSHA256: value.bridge_assignment_sha256, brokerPath: bridgeAssignment.endpoint.path,
+        bridgeProcess: Object.freeze({ ...value.bridge, pid_version: peer.pid_version }),
+        memberSetAssignmentSHA256: reservation.member_set_assignment_sha256, expiresAt: value.expires_at,
+        envelopeSHA256: response.body.sha256, envelopeBase64url: response.body.envelope_base64url });
+      return observed;
+    } finally { pending = false; }
+  };
+}
+
+// A narrow opener for the fixed installed cooperative B wrapper. The
+// binding lookup resolves the digest emitted on FD5 on the existing broker.
+export async function startCooperativeBRole({ reservation, bridgeAssignment, machinePublicKey,
+  observationSchema, schemaReferences, exchange, boundByReceiptSHA256, startRole = startStage2aRole,
+  now = Date.now } = {}) {
+  if (!observationSchema || typeof boundByReceiptSHA256 !== 'function') refuse();
+  const machine = createCooperativeBRoleClient({ reservation, bridgeAssignment, machinePublicKey, exchange, now });
+  let grantNonce;
+  let launcherProcess;
+  const wrapper = await startRole({ role: 'bridge', cooperativeBridge: true,
+    account: bridgeAssignment.account,
+    reservationSHA256: reservation.sha256,
+    machineExec: async ({ nonce, pid }) => {
+      const grant = await machine.exec({ nonce, pid });
+      grantNonce = nonce;
+      launcherProcess = grant.launcherProcess;
+      return grant;
+    },
+  });
+  try {
+    const observeWrapperBind = createCooperativeBObservation({ reservation, bridgeAssignment, machinePublicKey,
+      observationSchema, schemaReferences, grantNonce, launcherProcess, exchange, now });
+    const fd5 = await wrapper.waitBridgeReady(async (status) => {
+      const binding = await boundByReceiptSHA256(status.bind_receipt_sha256);
+      await observeWrapperBind({ ...binding, fd5: status });
+      return true;
+    });
+    return Object.freeze({ wrapper, observeWrapperBind: (binding) => observeWrapperBind({ ...binding, fd5 }) });
+  } catch (error) {
+    await wrapper.stop();
+    throw error;
+  }
+}
+
 // B policy is read once on the bootstrap connection that supplied the
 // verified HMAC. The wrapper proof verifier is separately pinned by the
 // trusted entry point. Until A exposes that proof, no policy can be read.
 export function createCooperativeBPolicyDelivery({ reservation, bridgeAssignment, machinePublicKey,
   assignmentSchema, authoritySchema, requestSchema, resultSchema, schemaReferences, expected, boundConnection,
-  verifyWrapperBind, loadPolicy, now = Date.now } = {}) {
+  observeWrapperBind, loadPolicy, now = Date.now } = {}) {
   const a = reservation?.payload?.assignment;
   if (!a || reservation.payload.adapter_transport !== 'brokered-b'
     || bridgeAssignment?.reservationSHA256 !== reservation.sha256
     || !assignmentSchema || !authoritySchema || !requestSchema || !resultSchema
-    || [boundConnection, verifyWrapperBind, loadPolicy, now].some((fn) => typeof fn !== 'function')) refuse();
+    || [boundConnection, observeWrapperBind, loadPolicy, now].some((fn) => typeof fn !== 'function')) refuse();
   let pending = false;
   let delivered = false;
   const matches = (left, right, fields) => fields.every((key) => left?.[key] === right?.[key]);
-  const processFields = ['uid', 'gid', 'pid', 'pid_version', 'start_seconds', 'start_micros'];
+
 
   return async function readPolicy(request, { connection } = {}, receipt) {
     if (pending || delivered || typeof connection !== 'string' || !/^[0-9a-f]{64}$/.test(receipt ?? '')
@@ -166,8 +429,8 @@ export function createCooperativeBPolicyDelivery({ reservation, bridgeAssignment
     pending = true;
     try {
       const binding = await boundConnection(connection, receipt);
-      const peer = binding?.kernelBridge;
-      if (!binding || binding.connection !== connection || binding.receiptSHA256 !== digest(receipt)
+      const peer = binding?.kernelBridge && Object.freeze({ ...binding.kernelBridge });
+      if (!binding || binding.connection !== connection || binding.receipt !== receipt || !DIGEST.test(binding.receiptSHA256)
         || binding.reservationSHA256 !== reservation.sha256
         || binding.bridgeAssignmentSHA256 !== bridgeAssignment.assignmentSHA256
         || binding.brokerPath !== bridgeAssignment.endpoint.path
@@ -176,18 +439,20 @@ export function createCooperativeBPolicyDelivery({ reservation, bridgeAssignment
         || peer.pid_version < 1 || peer.pid_version > 0xffffffff
         || !Number.isSafeInteger(peer.start_seconds) || peer.start_seconds < 1
         || !Number.isSafeInteger(peer.start_micros) || peer.start_micros < 0 || peer.start_micros >= 1e6
-        || typeof binding.isCurrent !== 'function' || binding.isCurrent() !== true) refuse();
+        || typeof binding.isCurrent !== 'function' || binding.isCurrent() !== true
+        || typeof binding.readKernelBridge !== 'function') refuse();
 
-      const wrapper = await verifyWrapperBind(binding.wrapperBindBytes);
+      const wrapper = await observeWrapperBind(binding);
       const expires = Date.parse(wrapper?.expiresAt ?? '');
       if (!wrapper || wrapper.receiptSHA256 !== binding.receiptSHA256
         || wrapper.reservationSHA256 !== reservation.sha256
         || wrapper.bridgeAssignmentSHA256 !== bridgeAssignment.assignmentSHA256
         || wrapper.brokerPath !== bridgeAssignment.endpoint.path
-        || !matches(wrapper, a, SELECTORS) || !matches(wrapper.bridgeProcess, peer, processFields)
+        || !matches(wrapper, a, SELECTORS) || !matches(wrapper.bridgeProcess, peer, KERNEL_B_IDENTITY)
         || !Number.isFinite(expires) || expires <= now() || binding.isCurrent() !== true) refuse();
       const records = await loadPolicy(binding);
-      if (!records || binding.isCurrent() !== true || expires <= now()) refuse();
+      if (!records || !matches(await binding.readKernelBridge(), peer, KERNEL_B_IDENTITY)
+        || binding.isCurrent() !== true || expires <= now()) refuse();
       const proof = verifyStage2aBridgeMemberAuthority(records.authorityBytes, { machinePublicKey,
         schema: authoritySchema, assignmentSchema, schemas: schemaReferences,
         assignmentBytes: records.assignmentBytes, expected: { ...expected,
