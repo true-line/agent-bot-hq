@@ -23,9 +23,12 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
   protectedStart, mode, hqUid = process.getuid?.(), harnessUids = [], machineHqEpoch } = {}) {
   // Protected starts use Machine's current paired HQ epoch, not a local
   // process nonce. A pairing rotation invalidates every installed policy.
-  // Cooperative starts retain their local epoch when no Machine is wired.
+  // A Machine-backed cooperative start must use that same paired epoch.
   if (machineHqEpoch !== undefined && !/^[0-9a-f]{64}$/.test(machineHqEpoch)) {
     throw new Error('invalid signed Machine HQ pairing epoch');
+  }
+  if (machineLaunch && machineHqEpoch === undefined) {
+    throw new Error('Machine-backed Soul launch requires a signed HQ pairing epoch');
   }
   const hqEpoch = machineHqEpoch ?? core.random.hex(32);
   const excludedUids = new Set(harnessUids);
