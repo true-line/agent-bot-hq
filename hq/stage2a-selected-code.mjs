@@ -9,7 +9,7 @@ import { isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
-const ASCII_PATH = /^[\x20-\x7e]+$/;
+const RECORD_PATH = /^[A-Za-z0-9._+@/-]+$/;
 const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
 const refuse = () => { throw new Error('Machine selected HQ code is unavailable'); };
@@ -19,7 +19,7 @@ const BLOCKED_BUILTINS = new Set(['node:vm', 'node:module', 'node:worker_threads
 let activeDescriptorDigest;
 
 function checkedPath(path) {
-  if (typeof path !== 'string' || !ASCII_PATH.test(path) || path.includes('\\')
+  if (typeof path !== 'string' || path.length > 1024 || !RECORD_PATH.test(path) || path.includes('\\')
     || path.startsWith('/') || path.endsWith('/')
     || path.split('/').some((part) => !part || part === '.' || part === '..')) refuse();
   return path;
@@ -44,7 +44,7 @@ export function verifySelectedHQCode({ root, directories, records, uid, gid,
     || !Array.isArray(records) || records.length < 1 || !Number.isSafeInteger(uid) || uid < 1
     || !Number.isSafeInteger(gid) || gid < 1
     || rootMode !== 0o555
-    || !Number.isSafeInteger(maxFiles) || maxFiles < 1 || maxFiles > 1024
+    || !Number.isSafeInteger(maxFiles) || maxFiles < 1 || maxFiles > 512
     || records.length > maxFiles
     || !Number.isSafeInteger(maxFileBytes) || maxFileBytes < 1 || maxFileBytes > 384 * 1024 * 1024
     || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024 * 1024) refuse();

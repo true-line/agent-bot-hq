@@ -4,7 +4,6 @@
 import { createHash, createPublicKey, verify } from 'node:crypto';
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync,
   realpathSync } from 'node:fs';
-import { getgid, getgroups, getuid } from 'node:process';
 import { dirname, isAbsolute, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { canonicalize } from '../sdk/wire/canonical-json.mjs';
@@ -17,6 +16,12 @@ export const H_DESCRIPTOR = BASE + '/h-v3/descriptor.json';
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const refuse = () => { throw new Error('Machine selected HQ code is unavailable'); };
 const sha = (bytes) => 'sha256:' + createHash('sha256').update(bytes).digest('hex');
+export const hInventoryDigest = (bytes) => sha(Buffer.concat([
+  Buffer.from('agent-bot/stage2a-h-code-inventory/v3\0'), bytes,
+]));
+const getuid = () => process.getuid?.();
+const getgid = () => process.getgid?.();
+const getgroups = () => process.getgroups?.() ?? [];
 const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
 
@@ -180,7 +185,7 @@ export async function preloadSelectedHQCode() {
     || sidecar.stat.birthtimeNs.toString() !== ref.sidecar.birthtime_ns
     || sidecar.bytes.length !== ref.sidecar.size_bytes
     || sha(sidecar.bytes) !== ref.sidecar.sha256
-    || sha(sidecar.bytes) !== ref.inventory_digest) refuse();
+    || hInventoryDigest(sidecar.bytes) !== ref.inventory_digest) refuse();
   const inventory = parseCanonical(sidecar.bytes);
   if (!exact(inventory, ['contract', 'kind', 'schema_version', 'domain',
     'installation_id', 'limits', 'directories', 'files', 'total_bytes'])
@@ -213,6 +218,7 @@ export async function preloadSelectedHQCode() {
     maxFileBytes: inventory.limits.max_file_bytes,
     maxBytes: inventory.limits.max_total_bytes,
   });
+  if (selected.count !== ref.file_count || selected.bytes !== ref.total_bytes) refuse();
   registerSelectedHQCode(selected, descriptorDigest);
   return descriptorDigest;
 }

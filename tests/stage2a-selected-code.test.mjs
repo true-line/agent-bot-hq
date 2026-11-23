@@ -11,6 +11,7 @@ import { assertSelectedHQCodeDigest, selectedHQCodeHooks,
   verifySelectedHQCode } from '../hq/stage2a-selected-code.mjs';
 
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
+const unixOnly = { skip: process.platform === 'win32' };
 
 test('protected H binding refuses before a Machine-authenticated preload', () => {
   assert.throws(() => assertSelectedHQCodeDigest(`sha256:${'0'.repeat(64)}`), /unavailable/);
@@ -45,7 +46,7 @@ function fixture(fn) {
   }
 }
 
-test('selected H tree accepts exact files and refuses unlisted or changed modules', () => fixture(({ root, options }) => {
+test('selected H tree accepts exact files and refuses unlisted or changed modules', unixOnly, () => fixture(({ root, options }) => {
   const selected = verifySelectedHQCode(options);
   assert.equal(selected.count, 2);
   const hooks = selectedHQCodeHooks(selected);
@@ -68,7 +69,7 @@ test('selected H tree accepts exact files and refuses unlisted or changed module
   assert.throws(() => hooks.load(main, {}, () => ({})), /unavailable/);
 }));
 
-test('selected H load refuses a new inode even when bytes match', () => fixture(({ root, options }) => {
+test('selected H load refuses a new inode even when bytes match', unixOnly, () => fixture(({ root, options }) => {
   const selected = verifySelectedHQCode(options);
   const hooks = selectedHQCodeHooks(selected);
   const mainPath = join(root, 'main.mjs');
@@ -82,7 +83,7 @@ test('selected H load refuses a new inode even when bytes match', () => fixture(
   assert.throws(() => hooks.load(main, {}, () => ({})), /unavailable/);
 }));
 
-test('selected H executable mode follows its signed file row', () => fixture(({ root, options, records }) => {
+test('selected H executable mode follows its signed file row', unixOnly, () => fixture(({ root, options, records }) => {
   chmodSync(join(root, 'main.mjs'), 0o550);
   records[1] = { ...records[1], mode: '0550' };
   assert.equal(verifySelectedHQCode(options).count, 2);
@@ -90,7 +91,7 @@ test('selected H executable mode follows its signed file row', () => fixture(({ 
   assert.throws(() => verifySelectedHQCode(options), /unavailable/);
 }));
 
-test('selected H tree refuses extra files, directories, links, and mutated bytes', () => fixture(({ root, options }) => {
+test('selected H tree refuses extra files, directories, links, and mutated bytes', unixOnly, () => fixture(({ root, options }) => {
   chmodSync(root, 0o700);
   writeFileSync(join(root, 'late.mjs'), 'export default 2;\n');
   chmodSync(root, 0o555);
@@ -114,20 +115,23 @@ test('selected H tree refuses extra files, directories, links, and mutated bytes
   assert.throws(() => verifySelectedHQCode(options), /unavailable/);
 }));
 
-test('selected H tree refuses incomplete or aliased records', () => fixture(({ options, directories, records }) => {
+test('selected H tree refuses incomplete or aliased records', unixOnly, () => fixture(({ options, directories, records }) => {
   assert.throws(() => verifySelectedHQCode({ ...options, records: records.slice(0, 1) }), /unavailable/);
   assert.throws(() => verifySelectedHQCode({ ...options, directories: [] }), /unavailable/);
   assert.throws(() => verifySelectedHQCode({ ...options, directories: [...directories, directories[0]] }), /unavailable/);
   assert.throws(() => verifySelectedHQCode({ ...options, records: [...records, records[1]] }), /unavailable/);
   assert.throws(() => verifySelectedHQCode({ ...options, maxFiles: 1 }), /unavailable/);
+  assert.throws(() => verifySelectedHQCode({ ...options, maxFiles: 513 }), /unavailable/);
   assert.throws(() => verifySelectedHQCode({ ...options, maxBytes: 1 }), /unavailable/);
   assert.throws(() => verifySelectedHQCode({ ...options, maxFileBytes: 1 }), /unavailable/);
   assert.throws(() => verifySelectedHQCode({ ...options, rootMode: 0o550 }), /unavailable/);
   assert.throws(() => verifySelectedHQCode({ ...options, records: records.map((r) =>
     r.path === 'main.mjs' ? { ...r, mode: '0777' } : r) }), /unavailable/);
+  assert.throws(() => verifySelectedHQCode({ ...options, records: records.map((r) =>
+    r.path === 'main.mjs' ? { ...r, release_path: 'main script.mjs' } : r) }), /unavailable/);
 }));
 
-test('Node loads the selected graph and blocks a later outside import', () => fixture(({ root, options }) => {
+test('Node loads the selected graph and blocks a later outside import', unixOnly, () => fixture(({ root, options }) => {
   const guard = new URL('../hq/stage2a-selected-code.mjs', import.meta.url).href;
   const main = pathToFileURL(join(root, 'main.mjs')).href;
   const descriptorDigest = `sha256:${digest('signed H descriptor')}`;

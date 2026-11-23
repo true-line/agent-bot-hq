@@ -4,7 +4,7 @@ import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { canonicalize } from '../sdk/wire/canonical-json.mjs';
-import { verifyStage2aHEnvelope } from '../hq/stage2a-h-preloader.mjs';
+import { hInventoryDigest, verifyStage2aHEnvelope } from '../hq/stage2a-h-preloader.mjs';
 
 const purpose = 'agent-bot/stage2a-h-service-descriptor/v3';
 const sha = (bytes) => 'sha256:' + createHash('sha256').update(bytes).digest('hex');
@@ -13,6 +13,14 @@ const preloader = fileURLToPath(new URL('../hq/stage2a-h-preloader.mjs', import.
 const digest = 'sha256:' + 'a'.repeat(64);
 const { publicKey, privateKey } = generateKeyPairSync('ed25519');
 const pin = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
+const unixOnly = { skip: process.platform === 'win32' };
+
+test('H inventory digest uses the domain purpose, not the sidecar file hash', () => {
+  const bytes = Buffer.from('{"a":1}');
+  assert.equal(hInventoryDigest(bytes),
+    'sha256:b508b7a0cb8c85e19b756e6b87e5c7f476170686c0aba25b092ab2d31a362bf9');
+  assert.notEqual(hInventoryDigest(bytes), sha(bytes));
+});
 
 function fixture(change = () => {}) {
   const argv = [node, '--no-addons', '--disallow-code-generation-from-strings',
@@ -54,12 +62,12 @@ function fixture(change = () => {}) {
   return { raw: Buffer.from(canonicalize(envelope)), argv, descriptorDigest: sha(preimage) };
 }
 
-test('H preloader verifies the exact A-signed payload and purpose digest', () => {
+test('H preloader verifies the exact A-signed payload and purpose digest', unixOnly, () => {
   const { raw, argv, descriptorDigest } = fixture();
   assert.equal(verifyStage2aHEnvelope(raw, pin, argv).descriptorDigest, descriptorDigest);
 });
 
-test('H preloader refuses a forged key, changed argv, helper and plugin override', () => {
+test('H preloader refuses a forged key, changed argv, helper and plugin override', unixOnly, () => {
   const { raw, argv } = fixture();
   assert.throws(() => verifyStage2aHEnvelope(raw, Buffer.alloc(32), argv), /unavailable/);
   assert.throws(() => verifyStage2aHEnvelope(raw, pin, argv.slice(0, -1)), /unavailable/);
@@ -74,7 +82,7 @@ test('H preloader refuses a forged key, changed argv, helper and plugin override
   }
 });
 
-test('H preloader refuses noncanonical envelope bytes and changed signature', () => {
+test('H preloader refuses noncanonical envelope bytes and changed signature', unixOnly, () => {
   const { raw, argv } = fixture();
   assert.throws(() => verifyStage2aHEnvelope(Buffer.concat([raw, Buffer.from('\n')]), pin, argv), /unavailable/);
   const changed = JSON.parse(raw);
