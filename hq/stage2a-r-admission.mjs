@@ -31,6 +31,7 @@ const COOPERATIVE_MEMBER_LIVE_FIELDS = ['installation_id', 'start_id', 'launch_i
 const OWNER_ACP_TICKET = 'cooperative.owner-acp-ticket.v3';
 const ATTACH_TOKEN = /^[0-9a-f]{64}$/;
 const ATTACH_CAP = 128 * 1024;
+const COOPERATIVE_ATTACH_CAP = 32 * 1024;
 const ATTACH_TTL_MS = 30_000;
 const ATTACH_ENVELOPE_CAP = 16 * 1024;
 
@@ -182,6 +183,26 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
     }
     const { socket_path: memberSocket, ...protectedEndpoint } = ep;
     const memberEndpoint = cooperative ? ep : protectedEndpoint;
+    let cooperativeEvidence;
+    if (cooperative) {
+      const observed = input.bridgeObservedBase64url, arms = input.armRowsBase64url;
+      const decode = (bytes, max) => {
+        if (typeof bytes !== 'string' || bytes.length > Math.ceil(max * 4 / 3)) refuse();
+        const raw = Buffer.from(bytes, 'base64url');
+        if (raw.length < 1 || raw.length > max || raw.toString('base64url') !== bytes) refuse();
+        return raw;
+      };
+      const wrapper = verifyStage2aMachineEnvelope(decode(observed, ATTACH_ENVELOPE_CAP), machinePublicKey,
+        'agent-bot/soul-cooperative-b-observed/v3', { schemaVersion: 3, maxBytes: ATTACH_ENVELOPE_CAP });
+      if (wrapper.envelope_sha256 !== r.bridge_observed_sha256
+        || wrapper.payload.bridge_assignment_sha256 !== a.b_authority.envelope_sha256
+        || !matches(wrapper.payload, r, ['installation_id', 'start_id', 'hq_epoch', 'reservation_sha256'])
+        || Date.parse(wrapper.payload.expires_at) <= now() || !Array.isArray(arms) || arms.length !== 2
+        || arms.some((raw, i) => `sha256:${createHash('sha256').update(decode(raw, 4096)).digest('hex')}`
+          !== r.members[i].b_arm_receipt_sha256)) refuse();
+      cooperativeEvidence = { bridge_observed_envelope_base64url: observed,
+        bridge_arm_rows_base64url: Object.freeze([...arms]) };
+    }
     const reply = Object.freeze({ version: 'stage2a-member-attach/v1', installation_id: selectors.installation_id,
       start_id: selectors.start_id, member_id: member.member_id, member_selector: member.member_selector,
       runtime_id: runtimeId, launch_id: member.launch_id, attach, expires_at: new Date(expires).toISOString(),
@@ -192,8 +213,9 @@ export function createStage2aMemberAttach({ provider, withLiveRuntime, selectors
       child_observation_envelope_sha256: child.envelope_sha256,
       member_b_authority_envelope_base64url: authorityBytes.toString('base64url'),
       member_b_authority_envelope_sha256: authority.envelope_sha256,
-      ready_envelope_base64url: readyBytes.toString('base64url'), ready_envelope_sha256: ready.envelope_sha256 });
-    if (!ATTACH_TOKEN.test(attach) || canonicalBytes(reply).length > ATTACH_CAP) refuse();
+      ready_envelope_base64url: readyBytes.toString('base64url'), ready_envelope_sha256: ready.envelope_sha256,
+      ...cooperativeEvidence });
+    if (!ATTACH_TOKEN.test(attach) || canonicalBytes(reply).length > (cooperative ? COOPERATIVE_ATTACH_CAP : ATTACH_CAP)) refuse();
     checkSchema(provider.resultSchema, reply);
     await withLiveRuntime(runtimeId, session, (rt) => {
       if (!matches(rt, runtime, ['epoch', 'lease_generation', 'member_id', 'protected_start_id', 'cooperative_start_key'])
@@ -641,7 +663,7 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
           const p = meta.payload;
           const initial = p?.after_sequence === 0;
           const until = Date.parse(p?.prior_expires_at ?? '');
-          if (typeof renew !== 'function' || !attachedSession || memberBootstrap?.isCurrent() !== true
+          if (typeof renew !== 'function' || typeof memberAttachProvider.rememberWrapperLease !== 'function' || !attachedSession || memberBootstrap?.isCurrent() !== true
             || !p || typeof p !== 'object' || Array.isArray(p)
             || Object.keys(p).sort().join(',') !== [...COOPERATIVE_MEMBER_LIVE_FIELDS].sort().join(',')
             || canonicalBytes(p).length > 4096
@@ -683,6 +705,8 @@ export async function listenStage2aCooperativeAdmission({ reservation, verifyRes
           if (!await currentPeer() || !lease || !DIGEST.test(lease.lease_sha256 ?? '')
             || typeof lease.lease_envelope_base64url !== 'string'
             || lease.lease_sequence !== p.after_sequence + 1) refuseCooperative();
+          memberAttachProvider.rememberWrapperLease(lease, { request: p, kernelPeer: peer,
+            readyEnvelopeSHA256: finalizedReadySHA256 });
           return Object.freeze({ ready_envelope_base64url: initial ? finalizedReadyBytes.toString('base64url') : '',
             ready_sha256: initial ? finalizedReadySHA256 : '',
             lease_envelope_base64url: lease.lease_envelope_base64url,

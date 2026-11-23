@@ -106,6 +106,8 @@ const COOPERATIVE_STATES = new Map([
   ['stage2a-cooperative-child-observe-v3', 'cooperative-child-observed'],
   ['stage2a-cooperative-member-ready-v3', 'cooperative-member-ready'],
   ['stage2a-cooperative-b-live-v3', 'cooperative-b-live'],
+  ['stage2a-cooperative-member-live-v3', 'cooperative-member-live'],
+  ['stage2a-cooperative-relay-peer-v3', 'cooperative-relay-peer'],
   ['stage2a-cooperative-q-begin-v3', 'cooperative-q-pre'],
   ['stage2a-cooperative-q-finish-v3', 'cooperative-q-captured'],
   ['stage2a-cooperative-q-witness-begin-v3', 'cooperative-q-witness-challenge'],

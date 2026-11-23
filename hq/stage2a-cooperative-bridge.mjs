@@ -518,7 +518,7 @@ export function createCooperativeBPolicyDelivery({ reservation, bridgeAssignment
 
 function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bind, machinePublicKey, exchangeToMachine, finalizeMemberReady, recordArmEvidence, now }) {
   let policy, observation, lease, pendingLease = false;
-  const arms = new Map(), pendingArms = new Set();
+  const arms = new Map(), pendingArms = new Set(), memberLeases = new Map();
   let resolvePolicy, rejectPolicy, resolveReady, rejectReady;
   const policyResult = new Promise((resolve, reject) => { resolvePolicy = resolve; rejectPolicy = reject; });
   void policyResult.catch(() => {});
@@ -635,9 +635,83 @@ function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bi
         || !(issued <= now() && now() < expires && expires - issued <= 5000 && expires <= Date.parse(r.expires_at))
         || !matchFields((await bind.binding(connection, receipt)).kernelBridge, fresh, KERNEL_B_IDENTITY)
         || !current(connection, receipt) || expires <= now()) refuse();
-      lease = Object.freeze({ sequence: p.sequence, expiresAt: p.expires_at, readySHA256: b.ready_sha256 });
+      lease = Object.freeze({ sequence: p.sequence, sha256: b.lease_sha256,
+        expiresAt: p.expires_at, readySHA256: b.ready_sha256 });
       return initial ? Object.freeze(b) : Object.freeze(Object.fromEntries(leaseFields.map((key) => [key, b[key]])));
     } finally { pendingLease = false; }
+  }
+
+  function rememberMemberLease(body, { request, kernelPeer, readyEnvelopeSHA256 }) {
+    const bytes = Buffer.from(body?.lease_envelope_base64url ?? '', 'base64url');
+    if (bytes.toString('base64url') !== body.lease_envelope_base64url || bytes.length > 8192) refuse();
+    const proof = verifyStage2aMachineEnvelope(bytes, machinePublicKey,
+      'agent-bot/soul-cooperative-member-live-lease/v3', { schemaVersion: 3 });
+    const p = proof.payload, old = memberLeases.get(p.member_id);
+    const selected = policy?.proof.payload.members.find((row) => row.member_id === p.member_id);
+    if (!selected || p.member_selector !== selected.member_selector || p.member_launch_id !== selected.launch_id
+      || p.ready_envelope_sha256 !== readyEnvelopeSHA256 || p.challenge_nonce_base64url !== request.challenge_nonce_base64url
+      || p.grant_sha256 !== request.grant_sha256 || p.member_id !== request.member_id
+      || !matchFields(p.launcher_process, kernelPeer, PROCESS_IDENTITY)
+      || p.child_process?.pid !== request.child_pid || p.child_process?.start_seconds !== request.child_start_seconds
+      || p.child_process?.start_micros !== request.child_start_micros
+      || p.profile_in_force !== 'managed-cooperative' || p.reservation_sha256 !== reservation.sha256
+      || p.assignment_envelope_sha256 !== policy.wrapper.memberSetAssignmentSHA256
+      || proof.envelope_sha256 !== body.lease_sha256 || p.sequence !== body.lease_sequence
+      || p.sequence !== (old?.payload.sequence ?? 0) + 1 || Date.parse(p.expires_at) <= now()) refuse();
+    memberLeases.set(p.member_id, Object.freeze({ ...proof, encoded: body.lease_envelope_base64url }));
+  }
+
+  async function peerB(input, { connection }, receipt) {
+    const fields = ['member_id', 'member_launch_id', 'member_selector', 'ready_sha256', 'b_lease_sha256',
+      'b_lease_sequence', 'relay_socket', 'cli_path', 'cli_sha256', 'challenge_nonce_base64url', 'peer'];
+    const peerFields = ['uid', 'pid', 'pid_version', 'start_seconds', 'start_micros', 'parent_pid', 'parent_uid',
+      'parent_start_seconds', 'parent_start_micros'];
+    if (!current(connection, receipt) || !exactly(input, fields) || !exactly(input.peer, peerFields)
+      || !peerFields.every((key) => Number.isSafeInteger(input.peer[key]) && input.peer[key] >= 0)
+      || !lease || lease.readySHA256 !== input.ready_sha256 || lease.sha256 !== input.b_lease_sha256
+      || lease.sequence !== input.b_lease_sequence || Date.parse(lease.expiresAt) <= now()) refuse();
+    const nonce = input.challenge_nonce_base64url;
+    if (typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(nonce)
+      || Buffer.from(nonce, 'base64url').toString('base64url') !== nonce
+      || typeof input.cli_path !== 'string' || input.cli_path[0] !== '/' || !DIGEST.test(input.cli_sha256)
+      || !same(input.relay_socket, policy.wrapper.relaySocket)) refuse();
+    const member = memberLeases.get(input.member_id), bLease = lease;
+    if (!member || member.payload.ready_envelope_sha256 !== input.ready_sha256
+      || member.payload.member_launch_id !== input.member_launch_id || member.payload.member_selector !== input.member_selector
+      || Date.parse(member.payload.expires_at) <= now()) refuse();
+    const bridge = (await bind.binding(connection, receipt)).kernelBridge;
+    if (!matchFields(bridge, policy.wrapper.bridgeProcess, KERNEL_B_IDENTITY)) refuse();
+    const request = { ...input, ...Object.fromEntries(SELECTORS.map((key) => [key, reservation.payload.assignment[key]])),
+      reservation_sha256: reservation.sha256, bridge_observed_sha256: policy.wrapper.envelopeSHA256,
+      bridge_pid: bridge.pid, bridge_start_seconds: bridge.start_seconds, bridge_start_micros: bridge.start_micros,
+      member_lease_sha256: member.envelope_sha256, member_lease_sequence: member.payload.sequence };
+    const reply = await exchangeToMachine('stage2a-cooperative-relay-peer-v3', request);
+    const body = reply?.body;
+    if (!reply?.machineKey?.equals(machinePublicKey) || !exactly(body,
+      ['peer_envelope_base64url', 'peer_sha256', 'member_lease_envelope_base64url', 'member_lease_sha256'])
+      || body.member_lease_sha256 !== member.envelope_sha256 || body.member_lease_envelope_base64url !== member.encoded
+      || typeof body.peer_envelope_base64url !== 'string' || body.peer_envelope_base64url.length > 10_923) refuse();
+    const bytes = Buffer.from(body.peer_envelope_base64url, 'base64url');
+    if (bytes.toString('base64url') !== body.peer_envelope_base64url) refuse();
+    const warrant = verifyStage2aMachineEnvelope(bytes, machinePublicKey,
+      'agent-bot/soul-cooperative-relay-peer/v3', { schemaVersion: 3 });
+    const p = warrant.payload, expireAt = Date.parse(p.expires_at);
+    if (warrant.envelope_sha256 !== body.peer_sha256 || p.contract !== 'machine/v3' || p.schema_version !== 3
+      || p.kind !== 'soul-cooperative-relay-peer' || p.profile_in_force !== 'managed-cooperative'
+      || p.host_id !== reservation.payload.host_id
+      || p.assignment_envelope_sha256 !== policy.wrapper.memberSetAssignmentSHA256
+      || p.member_b_authority_envelope_sha256 !== policy.proof.envelope_sha256
+      || !matchFields(p, request, ['installation_id', 'start_id', 'launch_id', 'hq_epoch', 'reservation_sha256',
+        'bridge_observed_sha256', 'member_id', 'member_selector', 'member_launch_id', 'ready_sha256', 'b_lease_sha256',
+        'b_lease_sequence', 'member_lease_sha256', 'member_lease_sequence', 'challenge_nonce_base64url', 'cli_path', 'cli_sha256'])
+      || !matchFields(p.bridge_process, bridge, PROCESS_IDENTITY) || !same(p.adapter_process, member.payload.child_process)
+      || !same(p.peer, input.peer) || !same(p.relay_socket, input.relay_socket)
+      || !POSITIVE_DECIMAL.test(p.relay_socket_birthtime_ns ?? '')
+      || !matchFields((await bind.binding(connection, receipt)).kernelBridge, bridge, KERNEL_B_IDENTITY)
+      || !current(connection, receipt) || lease !== bLease || memberLeases.get(input.member_id) !== member
+      || !(Date.parse(p.issued_at) <= now() && now() < expireAt
+        && expireAt <= Math.min(Date.parse(bLease.expiresAt), Date.parse(member.payload.expires_at)))) refuse();
+    return Object.freeze(body);
   }
 
   return Object.freeze({
@@ -654,6 +728,7 @@ function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bi
       return policy;
     },
     observe: exchange.observe, arm: exchange.arm,
+    peer: peerB, rememberMemberLease,
     ready: (input, meta, receipt) => leaseB(input, meta, receipt, true),
     renew: (input, meta, receipt) => leaseB(input, meta, receipt, false),
     isLive: (sha256) => !!lease && lease.readySHA256 === sha256 && Date.parse(lease.expiresAt) > now()
@@ -698,7 +773,7 @@ export async function openCooperativeBStage({ reservation, bridgeAssignment, mac
       stage2aCooperativeBPolicyV3: policy,
       ...(armStage ? { stage2aCooperativeMemberObserveV3: armStage.observe,
         stage2aCooperativeMemberArmV3: armStage.arm,
-        stage2aCooperativeBridgeReadyV3: armStage.ready, stage2aCooperativeBridgeLiveV3: armStage.renew } : {}),
+        stage2aCooperativeBridgeReadyV3: armStage.ready, stage2aCooperativeBridgeLiveV3: armStage.renew, stage2aCooperativeBridgePeerV3: armStage.peer } : {}),
       async forgetBridgeConnection(connection) { armStage?.close(connection); await bind.stop(connection); },
     } });
     const role = await startCooperativeBRole({ reservation, bridgeAssignment, machinePublicKey,

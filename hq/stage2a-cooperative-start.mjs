@@ -173,6 +173,7 @@ export function createStage2aCooperativeStarter({ machine, core, readCommittedRe
           grantMemberChild: (input) => machine.grantMemberChild(item.reservation, input),
           observeChildren: (input) => machine.observeMemberChildren(item.reservation, input),
           finalizeMemberReady: (input) => machine.finalizeMemberReady(item.reservation, input),
+          renewWrapperLease: (input) => machine.renewMemberChild(item.reservation, input),
           recordArmEvidence: createCooperativeArmRecorder({ core, readCommittedReceipts, reservation: item.reservation }),
           recordHChildObservation: createCooperativeChildObservationRecorder({
             core, readCommittedReceipts, reservation: item.reservation,

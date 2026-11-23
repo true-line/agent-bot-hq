@@ -81,7 +81,7 @@ export function checkSocketPath(path, platform = process.platform) {
 // `mode` is the socket file's mode: 0600 for HQ's own sockets, 0660 for a
 // harness endpoint whose directory gives it the account's group (hq/harness-accounts.mjs).
 // `takeover` enables the hook above for this listener.
-export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false, activated, authenticatePeer, connectionContext, connectionClosed, replaceStale = true }) {
+export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false, activated, authenticatePeer, connectionContext, connectionClosed, replaceStale = true, maxResponseBytes }) {
   if (process.platform === 'win32') throw new Error('HQ on Windows needs a named pipe with an owner DACL, which is not built yet (#89)');
   const authenticate = activated ? activated.authenticate : authenticatePeer;
   if (activated && typeof authenticate !== 'function') throw new Error('an activated listener requires peer authentication');
@@ -194,7 +194,16 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     let lines = 0;
     let first = false; // the first request of a takeover listener is in flight
     let taken = false;
-    const send = (obj) => { if (!socket.destroyed) socket.write(`${JSON.stringify(obj)}\n`); };
+    const send = (obj) => {
+      if (socket.destroyed) return;
+      let line = `${JSON.stringify(obj)}\n`;
+      if (maxResponseBytes && Buffer.byteLength(line) > maxResponseBytes) {
+        line = `${JSON.stringify(respondError(new HostError('host.launch_unavailable',
+          'broker response exceeds its frame limit'), obj.id))}\n`;
+        if (Buffer.byteLength(line) > maxResponseBytes) { socket.destroy(); return; }
+      }
+      socket.write(line);
+    };
     const oversize = () => {
       send(respondError(new HostError('host.invalid_request', `request line exceeds ${MAX_LINE_BYTES} bytes`), null));
       socket.end();

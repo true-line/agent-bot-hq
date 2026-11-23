@@ -269,6 +269,23 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       if (bytes.toString('base64url') !== encoded || digest(bytes) !== body.sha256) invalid();
       return bytes;
     },
+    async renewMemberChild(reservation, { request, kernelPeer, readyEnvelopeSHA256, readyEnvelopeBytes }) {
+      if (!kernelPeer || request.launcher_pid !== kernelPeer.pid
+        || request.launcher_start_seconds !== kernelPeer.start_seconds
+        || request.launcher_start_micros !== kernelPeer.start_micros
+        || !SHA256.test(readyEnvelopeSHA256) || digest(readyEnvelopeBytes) !== readyEnvelopeSHA256) invalid();
+      const body = await memberCall(reservation, 'member-live', {
+        ...pick(request, ['assignment_envelope_sha256', 'member_b_authority_sha256', 'member_id', 'member_launch_id',
+          'member_selector', 'grant_sha256', 'launcher_pid', 'launcher_start_seconds', 'launcher_start_micros',
+          'child_pid', 'child_start_seconds', 'child_start_micros', 'challenge_nonce_base64url', 'after_sequence', 'prior_expires_at']),
+        ready_sha256: readyEnvelopeSHA256, peer_uid: kernelPeer.uid, peer_pid: kernelPeer.pid,
+      });
+      if (!body || body.lease_sequence !== request.after_sequence + 1
+        || (request.after_sequence === 0 ? body.ready_sha256 !== readyEnvelopeSHA256
+          || body.ready_envelope_base64url !== readyEnvelopeBytes.toString('base64url')
+          : Object.hasOwn(body, 'ready_sha256') || Object.hasOwn(body, 'ready_envelope_base64url'))) invalid();
+      return body;
+    },
     async projection(reservation) {
       const entry = owned(reservation);
       if (entry.revoked || now() >= entry.expires) invalid();

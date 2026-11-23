@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { bindBridgeAuthority, listenBridgeEndpoint, memberBrokerDispatch, planBridgeEndpoints } from '../hq/bridge-endpoints.mjs';
 import { DARWIN_HARNESS_DIR } from '../hq/darwin-harness-accounts.mjs';
-import { listenSocket } from '../hq/socket.mjs';
+import { connectSocket, listenSocket } from '../hq/socket.mjs';
 
 const hqUid = 310;
 const options = { platform: 'darwin', account: '_agent-bot-hq', hqUid, harnessUids: [320] };
@@ -193,6 +193,27 @@ test('closing the B listener frees its socket path for a clean HQ restart', asyn
       await assert.rejects(lstat(path), { code: 'ENOENT' });
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('the dedicated B response cap accepts an exact frame and refuses one byte more', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'b-frame-'));
+  const path = join(dir, 'broker.sock'), cap = 32 * 1024;
+  const room = cap - Buffer.byteLength(JSON.stringify({ id: 1, ok: true, result: '' }) + '\n');
+  const listener = await listenSocket({ path, maxResponseBytes: cap, auth: 'member',
+    core: { logs: [], tokens: new Map(), clock: { now: Date.now }, random: { hex: () => '1' } },
+    newSession: () => 'b', endSession: () => {}, dispatch: (op) => 'a'.repeat(room + Number(op === 'oversize')) });
+  let client;
+  try {
+    client = await connectSocket(path);
+    assert.equal((await client.request('exact')).result.length, room);
+    const oversize = await client.request('oversize');
+    assert.equal(oversize.ok, false);
+    assert.match((oversize.host_refusal ?? oversize.refusal).explanation, /broker response exceeds its frame limit/);
+  } finally {
+    await client?.close();
+    await listener.close();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('cooperative B challenge, proof and policy dispatch stay on one dedicated stream', async () => {
