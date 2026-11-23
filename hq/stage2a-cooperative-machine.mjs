@@ -1,10 +1,11 @@
-import { isAbsolute } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { fail } from '../sdk/errors.mjs';
 import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
 import { digest, match, SHA256, verifyCooperativeProof } from './stage2a-cooperative-proof.mjs';
 
 const HEX256 = /^[0-9a-f]{64}$/;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const REVIEWED_START_ID = /^st_[0-9a-f]{24}$/;
 const invalid = () => { throw new Error('Machine cooperative authority unavailable or mismatched'); };
 const idFields = ['installation_id', 'start_id', 'launch_id'];
 const selectionFields = [...idFields, 'plan_id', 'plan_digest', 'hq_epoch'];
@@ -97,6 +98,45 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
     return entry.refresh;
   }
 
+  function reservationRequest(installed, { startId, launchId, challenge }) {
+    if (installed.adapter_transport !== 'direct-comms' || startId !== installed.reviewed_start_id) invalid();
+    return Object.freeze({ profile: 'managed-cooperative', host_id: installed.host_id,
+      plan_digest: installed.plan_digest, installation_id: installed.installation_id,
+      start_id: startId, launch_id: launchId, hq_epoch: installed.hq_epoch,
+      package_path: installed.package_path, admission_challenge_sha256: digest(challenge),
+      admission_challenge_base64url: challenge.toString('base64url') });
+  }
+
+  function acceptReservation(response, installed, request, recovered = false) {
+    const payload = proof(response, 'reservation');
+    const a = payload.assignment, m = payload.measurement_binding;
+    const issued = instant(payload.issued_at), expires = instant(payload.expires_at);
+    if (!match(payload, pick(request, ['host_id', 'admission_challenge_sha256']))
+      || payload.adapter_transport !== installed.adapter_transport
+      || !Number.isFinite(issued) || !Number.isFinite(expires) || issued > now() || (!recovered && expires <= now())
+      || expires <= issued || expires - issued > 30000 || !SHA256.test(payload.installed_plan_receipt_sha256 ?? '')
+      || !a || !fieldsEqual(a, request, ['installation_id', 'start_id', 'launch_id', 'hq_epoch', 'plan_digest'])
+      || a.plan_id !== installed.plan_id || a.expires_at !== payload.expires_at
+      || a.runner_uid !== installed.runner_uid || a.runner_gid !== installed.runner_gid
+      || payload.endpoints?.admission?.directory !== installed.admission_directory
+      || payload.endpoints?.admission?.socket_path !== installed.admission_socket_path
+      || payload.endpoints?.broker?.socket_path !== installed.broker_socket_path
+      || a.hq_uid !== process.getuid?.() || !Number.isSafeInteger(a.runner_uid) || a.runner_uid < 300
+      || a.runner_uid === a.hq_uid || a.runner_uid === a.machine_uid || a.runner_gid !== a.runner_uid
+      || !/^agent_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(a.soul_id ?? '')
+      || !path(a.package_root) || !HEX256.test(a.package_sha256 ?? '') || !HEX256.test(a.soul_artifact_sha256 ?? '')
+      || !fieldsEqual(m, a, ['installation_id', 'start_id', 'launch_id', 'hq_epoch', 'plan_id',
+        'package_sha256', 'soul_artifact_sha256', 'soul_id'])
+      || !match(m, { contract: 'machine/v3', schema_version: 3, kind: 'stage2a-measurement-binding',
+        profile_in_force: 'managed-cooperative', host_id: payload.host_id, installed_plan_digest: a.plan_digest })
+      || !SHA256.test(m.launch_input_measurement ?? '') || m.h_service_descriptor_digest !== hDescriptorDigest
+      || !SHA256.test(m.claimed_definition_digest ?? '')) invalid();
+    const reservation = freezeJSON({ ...response.body, payload });
+    if (active.has(reservation.sha256)) invalid();
+    active.set(reservation.sha256, { reservation, machineKey: response.machineKey, expires, revoked: false });
+    return reservation;
+  }
+
   return Object.freeze({
     async lookup(packagePath) {
       const { body, machineKey } = await call('lookup', { package_path: packagePath });
@@ -114,42 +154,24 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
       if (installed.adapter_transport !== 'direct-comms') {
         fail('profile_insufficient', 'the installed Soul has no approved direct Comms adapter');
       }
+      if (typeof installed.reviewed_start_id !== 'string' || !REVIEWED_START_ID.test(installed.reviewed_start_id)) invalid();
+      const slot = digest(`agent-bot-soul-endpoint-start/v1\0${installed.installation_id}\0${installed.reviewed_start_id}`).slice(7, 27);
+      if (installed.admission_socket_path !== join(installed.admission_directory, `${slot}.sock`)) invalid();
       return Object.freeze(installed);
     },
-    async reserve(installed, { startId, launchId, challenge }) {
-      if (installed.adapter_transport !== 'direct-comms') invalid();
-      const request = { profile: 'managed-cooperative', host_id: installed.host_id,
-        plan_digest: installed.plan_digest, installation_id: installed.installation_id,
-        start_id: startId, launch_id: launchId, hq_epoch: installed.hq_epoch,
-        package_path: installed.package_path, admission_challenge_sha256: digest(challenge),
-        admission_challenge_base64url: challenge.toString('base64url') };
-      const response = await call('reserve', request, installed);
-      const payload = proof(response, 'reservation');
-      const a = payload.assignment, m = payload.measurement_binding;
-      const issued = instant(payload.issued_at), expires = instant(payload.expires_at);
-      if (!match(payload, pick(request, ['host_id', 'admission_challenge_sha256']))
-        || payload.adapter_transport !== installed.adapter_transport
-        || !Number.isFinite(issued) || !Number.isFinite(expires) || issued > now() || expires <= now()
-        || expires - issued > 30000 || !SHA256.test(payload.installed_plan_receipt_sha256 ?? '')
-        || !a || !fieldsEqual(a, request, ['installation_id', 'start_id', 'launch_id', 'hq_epoch', 'plan_digest'])
-        || a.plan_id !== installed.plan_id || a.expires_at !== payload.expires_at
-        || a.runner_uid !== installed.runner_uid || a.runner_gid !== installed.runner_gid
-        || payload.endpoints?.admission?.directory !== installed.admission_directory
-        || payload.endpoints?.broker?.socket_path !== installed.broker_socket_path
-        || a.hq_uid !== process.getuid?.() || !Number.isSafeInteger(a.runner_uid) || a.runner_uid < 300
-        || a.runner_uid === a.hq_uid || a.runner_uid === a.machine_uid || a.runner_gid !== a.runner_uid
-        || !/^agent_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(a.soul_id ?? '')
-        || !path(a.package_root) || !HEX256.test(a.package_sha256 ?? '') || !HEX256.test(a.soul_artifact_sha256 ?? '')
-        || !fieldsEqual(m, a, ['installation_id', 'start_id', 'launch_id', 'hq_epoch', 'plan_id',
-          'package_sha256', 'soul_artifact_sha256', 'soul_id'])
-        || !match(m, { contract: 'machine/v3', schema_version: 3, kind: 'stage2a-measurement-binding',
-          profile_in_force: 'managed-cooperative', host_id: payload.host_id, installed_plan_digest: a.plan_digest })
-        || !SHA256.test(m.launch_input_measurement ?? '') || m.h_service_descriptor_digest !== hDescriptorDigest
-        || !SHA256.test(m.claimed_definition_digest ?? '')) invalid();
-      const reservation = freezeJSON({ ...response.body, payload });
-      if (active.has(reservation.sha256)) invalid();
-      active.set(reservation.sha256, { reservation, machineKey: response.machineKey, expires, revoked: false });
-      return reservation;
+    async reserve(installed, selectors) {
+      const request = reservationRequest(installed, selectors);
+      try {
+        return acceptReservation(await call('reserve', request, installed), installed, request);
+      } catch {
+        // A may already have published the one-use start even when the
+        // reply is missing or cannot be authenticated. Only read it back.
+        return acceptReservation(await call('reserve-result', request, installed), installed, request, true);
+      }
+    },
+    async recoverReservation(installed, selectors) {
+      const request = reservationRequest(installed, selectors);
+      return acceptReservation(await call('reserve-result', request, installed), installed, request, true);
     },
     verifyReservation(reservation) {
       const entry = owned(reservation);
@@ -158,6 +180,7 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
     },
     async projection(reservation) {
       const entry = owned(reservation);
+      if (entry.revoked || now() >= entry.expires) invalid();
       const response = await call('launch-inputs', requestOf(reservation), entry);
       const payload = proof(response, 'launch-projection');
       if (entry.revoked || now() >= entry.expires || !match(payload, identityOf(reservation))

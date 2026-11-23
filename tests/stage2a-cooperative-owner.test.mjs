@@ -27,8 +27,13 @@ test('paired cooperative proof binds reservation, projection, R identity, provid
       signature_base64url: sign(null, Buffer.concat([Buffer.from(purpose + '\0'), payload]), privateKey).toString('base64url') });
     return { envelope_base64url: raw.toString('base64url'), sha256: digest(raw) };
   };
-  let ids, identity, attachment;
+  let ids, identity, attachment, reserveRequest, reserveResult;
+  let lostReserve = false, expiredResult = false, badResult = false;
+  let reserveCalls = 0, resultCalls = 0, projectionCalls = 0;
   let missingDirectAdapter = true;
+  let reviewedId, badLookupPath = false;
+  const admissionSocket = startId => `${installation.admission_directory}/${digest(
+    `agent-bot-soul-endpoint-start/v1\0${installation.installation_id}\0${startId}`).slice(7, 27)}.sock`;
   let badProjection = true;
   let badCutoff = true;
   let malformedProvider = true;
@@ -39,7 +44,9 @@ test('paired cooperative proof binds reservation, projection, R identity, provid
       let body;
       switch (verb) {
         case 'stage2a-cooperative-lookup-v3':
-          body = { ...installation, ...(missingDirectAdapter ? {} : { adapter_transport: 'direct-comms' }) };
+          body = { ...installation, reviewed_start_id: reviewedId,
+            admission_socket_path: badLookupPath ? '/other.sock' : admissionSocket(reviewedId),
+            ...(missingDirectAdapter ? {} : { adapter_transport: 'direct-comms' }) };
           break;
         case 'stage2a-cooperative-live-v3':
           watchCalls++;
@@ -47,25 +54,37 @@ test('paired cooperative proof binds reservation, projection, R identity, provid
             runner_pid: 101, observed_at: date(0), expires_at: date(5000) });
           break;
         case 'stage2a-cooperative-reserve-v3': {
+          reserveCalls++;
+          reserveRequest = request;
           const { installation_id, start_id, launch_id, hq_epoch, plan_digest } = request;
+          const expires = expiredResult ? date(0) : date(25000);
           ids = { installation_id, start_id, launch_id };
           const a = { ...ids, plan_id: 'plan', hq_epoch, plan_digest, package_root: '/installed/soul',
-            expires_at: date(25000), package_sha256: sha('3'), soul_artifact_sha256: sha('4'),
+            expires_at: expires, package_sha256: sha('3'), soul_artifact_sha256: sha('4'),
             soul_id: 'agent_01234567-89ab-cdef-0123-456789abcdef', runner_uid: 550, runner_gid: 550,
             hq_uid: process.getuid(), machine_uid: 551 };
           body = createProof('reservation', { adapter_transport: 'direct-comms', host_id: request.host_id, issued_at: date(-1000),
-            expires_at: date(25000), installed_plan_receipt_sha256: full('9'),
-            assignment: a, endpoints: { admission: { directory: installation.admission_directory },
-              broker: { socket_path: installation.broker_socket_path } }, admission_challenge_sha256: request.admission_challenge_sha256,
+            expires_at: expires, installed_plan_receipt_sha256: full('9'),
+            assignment: a, endpoints: { admission: { directory: installation.admission_directory,
+              socket_path: admissionSocket(start_id) },
+              broker: { socket_path: installation.broker_socket_path } }, admission_challenge_sha256: badResult ? full('0') : request.admission_challenge_sha256,
             measurement_binding: { ...a, installed_plan_digest: plan_digest, contract: 'machine/v3',
               kind: 'stage2a-measurement-binding', schema_version: 3, host_id: request.host_id,
               profile_in_force: 'managed-cooperative', launch_input_measurement: full('a'),
               h_service_descriptor_digest: full('b'), claimed_definition_digest: full('c') },
             qualification_provider: qualification });
           identity = { ...ids, reservation_sha256: body.sha256, h_service_descriptor_digest: full('b') };
+          reserveResult = body;
+          if (lostReserve) throw new Error('response lost after publication');
           break;
         }
+        case 'stage2a-cooperative-reserve-result-v3':
+          resultCalls++;
+          assert.deepEqual(request, reserveRequest);
+          body = reserveResult;
+          break;
         case 'stage2a-cooperative-launch-inputs-v3':
+          projectionCalls++;
           body = createProof('launch-projection', { ...identity, launch_input_measurement: full(badProjection ? 'd' : 'a'),
             selected_command: '/sealed/bin/node', argv: ['/sealed/bin/node'], environment: {}, effective_config: {},
             component_digests: {}, host_projection: { adapters: {}, installation: {} } });
@@ -104,9 +123,19 @@ test('paired cooperative proof binds reservation, projection, R identity, provid
   });
   await assert.rejects(machine.lookup('/owner/soul'), { code: 'profile_insufficient' });
   missingDirectAdapter = false;
-  const plan = await machine.lookup('/owner/soul');
+  await assert.rejects(machine.lookup('/owner/soul'), /mismatched/);
+  const reviewedPlan = async digit => {
+    reviewedId = `st_${digit.repeat(24)}`;
+    return machine.lookup('/owner/soul');
+  };
+  badLookupPath = true;
+  await assert.rejects(reviewedPlan('a'), /mismatched/);
+  badLookupPath = false;
+  const plan = await reviewedPlan('a');
   const challenge = randomBytes(32);
   const start = { startId: `st_${'a'.repeat(24)}`, launchId: `ln_${'b'.repeat(24)}`, challenge };
+  await assert.rejects(machine.reserve(plan, { ...start, startId: `st_${'f'.repeat(24)}` }), /mismatched/);
+  assert.equal(reserveCalls, 0);
   const reserved = await machine.reserve(plan, start);
   assert.equal(machine.verifyReservation(reserved), reserved);
   await assert.rejects(machine.projection(reserved), /mismatched/);
@@ -135,8 +164,27 @@ test('paired cooperative proof binds reservation, projection, R identity, provid
   await assert.rejects(machine.projectLaunch(context), /mismatched/);
   badCutoff = false;
   assert.match((await machine.stop(reserved)).sha256, /^sha256:/);
-  const preAttach = await machine.reserve(plan, { ...start, startId: `st_${'c'.repeat(24)}` });
+  lostReserve = true;
+  const recoveryPlan = await reviewedPlan('c');
+  const preAttach = await machine.reserve(recoveryPlan, { ...start, startId: recoveryPlan.reviewed_start_id });
+  assert.equal(reserveCalls, 2);
+  assert.equal(resultCalls, 1);
+  assert.equal(machine.verifyReservation(preAttach), preAttach);
+  await machine.projection(preAttach);
   assert.match((await machine.stop(preAttach)).sha256, /^sha256:/);
+
+  expiredResult = true;
+  const expiredPlan = await reviewedPlan('d');
+  const expired = await machine.reserve(expiredPlan, { ...start, startId: expiredPlan.reviewed_start_id });
+  assert.throws(() => machine.verifyReservation(expired), /mismatched/);
+  const before = projectionCalls;
+  await assert.rejects(machine.projection(expired), /mismatched/);
+  assert.equal(projectionCalls, before);
+  assert.match((await machine.stop(expired)).sha256, /^sha256:/);
+
+  badResult = true;
+  const badPlan = await reviewedPlan('e');
+  await assert.rejects(machine.reserve(badPlan, { ...start, startId: badPlan.reviewed_start_id }), /mismatched/);
 });
 
 test('owner takeover waits for ticketed ACP and stop fences channels before awaiting Machine', async () => {
@@ -147,13 +195,17 @@ test('owner takeover waits for ticketed ACP and stop fences channels before awai
   let openAcp, ready, confirm;
   const waiting = new Promise((resolve) => { ready = resolve; });
   const signedCutoff = new Promise((resolve) => { confirm = resolve; });
-  const installation = { installation_id: 'installation', runner_uid: 551, hq_epoch: '0'.repeat(64) };
+  const installation = { installation_id: 'installation', runner_uid: 551, hq_epoch: '0'.repeat(64),
+    reviewed_start_id: `st_${'a'.repeat(24)}` };
   const fakeReservation = { sha256: `sha256:${'0'.repeat(64)}`, payload: {
     assignment: { runner_uid: 551, runner_gid: 551 }, measurement_binding: { claimed_definition_digest: 'definition' },
   } };
   const client = {
     lookup: async () => installation,
-    reserve: async () => fakeReservation,
+    reserve: async (_installation, { startId }) => {
+      assert.equal(startId, installation.reviewed_start_id);
+      return fakeReservation;
+    },
     projection: async () => { events.push('projection'); return {}; },
     watch() {},
     markAcp: () => { events.push('ticketed'); },
@@ -178,6 +230,7 @@ test('owner takeover waits for ticketed ACP and stop fences channels before awai
   openAcp(acp, {});
   const response = await first;
   const token = response[Object.getOwnPropertySymbols(response)[0]];
+  assert.equal(token.result.start_id, installation.reviewed_start_id);
   const owner = socket();
   token.open()(owner);
   assert.equal(stage.report()[0].state, 'running');
@@ -191,4 +244,50 @@ test('owner takeover waits for ticketed ACP and stop fences channels before awai
   assert.deepEqual(await stop, { start_id: token.result.start_id, state: 'containment_unconfirmed', contained: false });
   assert.equal(stage.report()[0].state, 'containment_unconfirmed');
   assert.deepEqual(events.slice(-1), ['machine-stop']);
+});
+
+test('owner stop retries the original reservation result while keeping the start fenced', async () => {
+  const { createStage2aCooperativeStarter } = await import('../hq/stage2a-cooperative-start.mjs');
+  const installation = { installation_id: 'installation', runner_uid: 551, hq_epoch: '0'.repeat(64),
+    reviewed_start_id: `st_${'a'.repeat(24)}` };
+  const reservation = { sha256: 'reservation' };
+  let original, recovered, reserveCalls = 0, recoverCalls = 0;
+  let firstReadFinished;
+  const firstRead = new Promise(resolve => { firstReadFinished = resolve; });
+  const stage = createStage2aCooperativeStarter({
+    machine: {
+      lookup: async () => installation,
+      async reserve(_installation, selectors) {
+        reserveCalls++;
+        original = selectors;
+        throw new Error('reserve and immediate result replies lost');
+      },
+      async recoverReservation(actualInstallation, selectors) {
+        assert.equal(actualInstallation, installation);
+        assert.deepEqual(selectors, original);
+        if (++recoverCalls === 1) {
+          firstReadFinished();
+          throw new Error('read-only result unavailable');
+        }
+        recovered = reservation;
+        return recovered;
+      },
+      async stop(actualReservation) {
+        assert.equal(actualReservation, recovered);
+        return { sha256: 'cutoff' };
+      },
+    },
+    core: { random: { hex: n => randomBytes(n).toString('hex') }, clock: { now: Date.now }, receipts: [] },
+    openAdmission: () => assert.fail('an unresolved reserve cannot open admission'),
+  });
+
+  await assert.rejects(stage.start('/soul'), { code: 'host.launch_unavailable' });
+  await firstRead;
+  const item = stage.report()[0];
+  assert.equal(item.state, 'containment_unconfirmed');
+  await assert.rejects(stage.start('/soul'), { code: 'host.launch_busy' });
+  assert.deepEqual(await stage.stop(item.start_id), { start_id: item.start_id, state: 'stopped', contained: true });
+  assert.deepEqual(stage.report(), []);
+  assert.equal(reserveCalls, 1);
+  assert.equal(recoverCalls, 2);
 });

@@ -21,6 +21,7 @@ const COOPERATIVE_STATES = new Map([
   ['stage2a-cooperative-lookup-v3', 'cooperative-found'],
   ['stage2a-cooperative-provider-v3', 'cooperative-provided'],
   ['stage2a-cooperative-reserve-v3', 'cooperative-reserved'],
+  ['stage2a-cooperative-reserve-result-v3', 'cooperative-reserve-result'],
   ['stage2a-cooperative-attach-v3', 'cooperative-attached'],
   ['stage2a-cooperative-launch-inputs-v3', 'cooperative-launch-inputs'],
   ['stage2a-cooperative-abort-v3', 'cooperative-aborted'],

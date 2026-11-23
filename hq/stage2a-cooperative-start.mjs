@@ -41,11 +41,15 @@ export function createStage2aCooperativeStarter({ machine, core, openAdmission, 
       await closed.catch(() => {});
       await item.prepared;
       let proof;
+      if (!item.reservation && item.reserveSelectors) {
+        try { item.reservation = await machine.recoverReservation(item.installation, item.reserveSelectors); }
+        catch { /* No signed reservation is available for containment. */ }
+      }
       if (item.reservation) {
         try { proof = await machine.stop(item.reservation); }
         catch { /* A refused or could not confirm containment. */ }
       }
-      if (!proof && item.reserveAttempted) {
+      if (!proof && item.reserveSelectors) {
         item.state = 'containment_unconfirmed';
         return { start_id: item.id, state: item.state, contained: false };
       }
@@ -62,32 +66,42 @@ export function createStage2aCooperativeStarter({ machine, core, openAdmission, 
   async function start(path) {
     if (closing) unavailable('HQ is stopping cooperative Soul starts');
     if (paths.has(path)) fail('host.launch_busy', 'HQ has already reserved this Soul package');
-    const id = `st_${core.random.hex(12)}`;
+    paths.add(path);
+    let installation, id;
+    try {
+      installation = await machine.lookup(path);
+      if (closing) unavailable('HQ is stopping cooperative Soul starts');
+      // A reads this one-use identifier from the installed owner plan whose
+      // exact argv already binds the admission socket derived from it.
+      id = installation.reviewed_start_id;
+      if (starts.has(id)) fail('host.launch_busy', 'HQ has already reserved this reviewed Soul start');
+    } catch (error) {
+      paths.delete(path);
+      if (error instanceof HostError) throw error;
+      unavailable('Machine could not identify the reviewed cooperative Soul start');
+    }
     let settlePreparation;
     const prepared = new Promise((resolve) => { settlePreparation = resolve; });
-    const item = { id, path, state: 'starting', startedAt: new Date(core.clock.now()).toISOString(),
+    const item = { id, path, installation, state: 'starting', startedAt: new Date(core.clock.now()).toISOString(),
       abort: new AbortController(), prepared };
     starts.set(id, item);
-    paths.add(path);
     const running = () => !item.abort.signal.aborted && !closing;
     const checkRunning = () => { if (!running()) unavailable('cooperative Soul start was revoked'); };
     const lost = () => { void stop(item).catch(() => {}); };
 
     let stream;
     try {
-      item.installation = await machine.lookup(path);
-      checkRunning();
-      const { installation_id: installationId, runner_uid: runnerUid } = item.installation;
+      const { installation_id: installationId, runner_uid: runnerUid } = installation;
       if (installations.has(installationId) || runnerUids.has(runnerUid))
         fail('host.launch_busy', 'HQ has already reserved this Soul installation or runner account');
       installations.add(installationId);
       item.ownsInstallation = true;
       runnerUids.add(runnerUid);
       item.ownsRunnerUid = true;
-      item.reserveAttempted = true;
-      item.reservation = await machine.reserve(item.installation, {
+      item.reserveSelectors = Object.freeze({
         startId: id, launchId: `ln_${core.random.hex(12)}`, challenge: randomBytes(32),
       });
+      item.reservation = await machine.reserve(item.installation, item.reserveSelectors);
       machine.watch(item.reservation, lost);
       if (!running()) machine.revoke(item.reservation);
       checkRunning();

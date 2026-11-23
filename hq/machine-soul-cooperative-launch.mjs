@@ -15,14 +15,15 @@ export function validCooperativeInstallPlan(plan, roleUid, machineKey) {
       plan.purpose !== cooperativeInstallPurpose || !Array.isArray(plan.members) || plan.members.length !== 1 ||
       !Array.isArray(plan.steps) || plan.steps.length !== 1) return false;
   const p = plan.soul_cooperative_launch;
-  const policyFields = 'schema,purpose,profile_in_force,host_id,hq_installation_id,h_owner_plan_digest,hq_uid,machine_uid,machine_gid,hq_epoch,machine_public_key_base64url,source_package_path,definition_source,launch_inputs_source,definition,launch_inputs,definition_measurement,launch_input_measurement,state_root,runtime_root,runner,soul_artifact_sha256,definition_sha256,node_path,node_sha256,entry,launcher_path,launcher_sha256,approved_until,runtime_v3,adapter_release,hq_broker,adapter_transport,qualification_provider,adapter_code_inputs'.split(',');
+  const policyFields = 'schema,purpose,profile_in_force,host_id,hq_installation_id,h_owner_plan_digest,hq_uid,machine_uid,machine_gid,hq_epoch,machine_public_key_base64url,source_package_path,definition_source,launch_inputs_source,definition,launch_inputs,definition_measurement,launch_input_measurement,state_root,runtime_root,runner,soul_artifact_sha256,definition_sha256,node_path,node_sha256,entry,launcher_path,launcher_sha256,approved_until,runtime_v3,adapter_release,hq_broker,adapter_transport,reviewed_start_id,qualification_provider,adapter_code_inputs'.split(',');
   const present = object(p) ? Object.keys(p) : [];
   if (!object(p) || present.some((k, i) => !policyFields.includes(k) || (i && policyFields.indexOf(present[i - 1]) >= policyFields.indexOf(k))) ||
       policyFields.filter(k => k !== 'qualification_provider').some(k => !Object.hasOwn(p, k)) ||
       !object(p.runtime_v3) || !object(p.adapter_release) || !object(p.hq_broker) ||
       !object(p.launch_inputs) || !Array.isArray(p.definition) || !Array.isArray(p.adapter_code_inputs) ||
       !Number.isSafeInteger(p.machine_uid) || p.machine_uid < 400 || !Number.isSafeInteger(p.machine_gid) || p.machine_gid < 1 ||
-      p.adapter_transport !== 'direct-comms' || !id.test(p.hq_installation_id ?? '') || !hex.test(p.h_owner_plan_digest ?? '') ||
+      p.adapter_transport !== 'direct-comms' || typeof p.reviewed_start_id !== 'string' ||
+      !/^st_[0-9a-f]{24}$/.test(p.reviewed_start_id) || !id.test(p.hq_installation_id ?? '') || !hex.test(p.h_owner_plan_digest ?? '') ||
       !object(p) || p.schema !== 'agent-bot-machine/soul-cooperative-launch-install/v3' ||
       p.purpose !== cooperativeInstallPurpose || p.profile_in_force !== 'managed-cooperative' ||
       !Number.isSafeInteger(p.hq_uid) || p.hq_uid < 300 || p.hq_uid > 399 ||
