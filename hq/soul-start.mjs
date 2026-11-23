@@ -61,6 +61,12 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
 
   const report = () => [...reportLegacy(), ...(cooperativeStart?.report() ?? [])];
 
+  function requireProtectedProfile(path) {
+    if (typeof protectedStart?.start !== 'function' || cooperativeStart?.hasLivePackage?.(path)) {
+      fail('profile_insufficient', 'protected Soul launch is unavailable under the cooperative profile');
+    }
+  }
+
   async function dispatch(op, { auth, payload, takeover: canTakeOver }) {
     if (op === 'soul.starts') {
       if (auth !== 'owner') fail('host.auth_mismatch', 'Soul starts are owner-only');
@@ -79,9 +85,7 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
     if (!canTakeOver) fail('host.invalid_request', 'soul.start must be the first request on a new owner connection');
     if (shuttingDown || mode() !== 'running') fail('host.launch_unavailable', 'HQ is not running admissions');
     if (payload?.requested_profile === 'managed-protected') {
-      if (typeof protectedStart?.start !== 'function') {
-        fail('profile_insufficient', 'protected Soul launch is unavailable under the cooperative profile');
-      }
+      requireProtectedProfile(payload.package_path);
       return protectedStart.start(payload);
     }
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)
@@ -304,7 +308,13 @@ export function createSoulStarter({ core, home, machineLaunch, verifyMachineRese
     });
   }
 
-  return { dispatch, report, hqEpoch, stopAll: async () => {
+  function qualifyDirectProtectedClaim(startId) {
+    if (shuttingDown || mode() !== 'running' || typeof cooperativeStart?.qualifyDirectProtectedClaim !== 'function')
+      fail('host.launch_unavailable', 'direct qualification is unavailable');
+    return cooperativeStart.qualifyDirectProtectedClaim(startId, requireProtectedProfile);
+  }
+
+  return { dispatch, report, hqEpoch, qualifyDirectProtectedClaim, stopAll: async () => {
     shuttingDown = true;
     await Promise.all([protectedStart?.stopAll?.(), cooperativeStart?.stopAll(),
       ...[...starts.values()].map(stop)]);

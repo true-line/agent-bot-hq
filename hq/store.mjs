@@ -15,7 +15,7 @@
 // group and others (0700), and the file is written 0600. HQ refuses to start
 // on a wider directory or a store it cannot parse; it never overwrites a
 // store it could not read.
-import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const STORE_FORMAT = 'agent-bot-hq-store/1';
@@ -146,6 +146,35 @@ export function openStore(dir, { uid } = {}) {
           receiptSeq = previousSeq;
           throw error;
         }
+      });
+    },
+    readCommittedReceipts(seqs) {
+      if (!Array.isArray(seqs) || seqs.length !== 2
+        || seqs.some(seq => !Number.isSafeInteger(seq) || seq < 1) || seqs[0] >= seqs[1]) {
+        return Promise.reject(new StoreError('invalid committed receipt sequences'));
+      }
+      const selectors = [...seqs];
+      return enqueue(() => {
+        const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        try {
+          const st = fstatSync(fd);
+          if (!st.isFile() || st.nlink !== 1 || st.uid !== (uid ?? process.getuid?.())
+            || (st.mode & 0o7777) !== 0o600) throw new StoreError('invalid committed receipt store');
+          const data = JSON.parse(readFileSync(fd, 'utf8'));
+          const after = fstatSync(fd);
+          if (after.nlink !== 1 || after.size !== st.size || after.ctimeMs !== st.ctimeMs || after.mtimeMs !== st.mtimeMs
+            || data?.format !== STORE_FORMAT || !Array.isArray(data.receipts)) {
+            throw new StoreError('committed receipt store changed while reading');
+          }
+          const selected = new Map();
+          for (const row of data.receipts) {
+            if (!selectors.includes(row?.seq)) continue;
+            if (selected.has(row.seq)) throw new StoreError('ambiguous committed receipt sequence');
+            selected.set(row.seq, row);
+          }
+          if (selected.size !== selectors.length) throw new StoreError('committed receipt is missing');
+          return selectors.map(seq => selected.get(seq));
+        } finally { closeSync(fd); }
       });
     },
     persistReceipt(entry) {

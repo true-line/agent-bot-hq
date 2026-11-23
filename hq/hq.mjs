@@ -345,7 +345,7 @@ export function createHQ({
     });
     soulStarter = createSoulStarter({ core, home, machineLaunch: soulLaunch,
       verifyMachineReservation: soulVerifier, verifyMachineCompletion: soulCompletionVerifier,
-      protectedStart, cooperativeStart: createCooperativeStart?.(core),
+      protectedStart, cooperativeStart: createCooperativeStart?.(core, store.readCommittedReceipts),
       mode: () => host?.mode ?? 'starting', hqUid: uid,
       harnessUids: harnessPlan.endpoints.map((endpoint) => endpoint.uid), machineHqEpoch });
     // Whether the provisioner's rule lets HQ start each harness account;
@@ -641,6 +641,10 @@ export function createHQ({
         await admission?.close().catch(() => {});
         throw error;
       } finally { openingCooperativeListeners.delete(key); }
+    },
+    qualifyDirectProtectedClaim: (startId) => {
+      if (!running) fail('host.launch_unavailable', 'HQ direct qualification is unavailable');
+      return soulStarter.qualifyDirectProtectedClaim(startId);
     },
     bridgeBrokerIdentity: (installationId) => {
       if (!running || typeof installationId !== 'string') fail('host.launch_unavailable', 'HQ bridge broker is unavailable');

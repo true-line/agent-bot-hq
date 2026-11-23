@@ -258,8 +258,8 @@ async function main(argv) {
         exchange: machineRoleStage2aCooperative, hDescriptorDigest: selectedH.descriptorDigest,
         machinePublicKey: selectedH.machinePublicKey,
       }) : undefined;
-      const createCooperativeStart = cooperativeMachine ? (core) => createStage2aCooperativeStarter({
-        core, machine: cooperativeMachine, openAdmission: (options) => hq.openCooperativeAdmission(options),
+      const createCooperativeStart = cooperativeMachine ? (core, readCommittedReceipts) => createStage2aCooperativeStarter({
+        core, readCommittedReceipts, machine: cooperativeMachine, openAdmission: (options) => hq.openCooperativeAdmission(options),
       }) : undefined;
       const protectedAdmission = installed.length ? createStage2aProtectedAdmission({
         machinePublicKey, authority,

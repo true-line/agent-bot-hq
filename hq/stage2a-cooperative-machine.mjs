@@ -1,7 +1,7 @@
 import { isAbsolute, join } from 'node:path';
 import { fail } from '../sdk/errors.mjs';
 import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
-import { digest, match, SHA256, verifyCooperativeProof } from './stage2a-cooperative-proof.mjs';
+import { digest, match, SHA256, verifyCooperativeProof, verifyDirectQualificationCapture, verifyDirectQualificationPre } from './stage2a-cooperative-proof.mjs';
 
 const HEX256 = /^[0-9a-f]{64}$/;
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -281,6 +281,79 @@ export function createStage2aCooperativeMachine({ exchange, hDescriptorDigest, m
         || expires <= now() || expires - issued > 15000 || expires !== body.expires_at_ms) invalid();
       return Object.freeze({ model: body.model, stop_reason: 'end_turn', text: body.response_text,
         usage: Object.freeze({ input_tokens: 7, output_tokens: 3 }) });
+    },
+    async beginDirectQualification(reservation) {
+      const entry = owned(reservation);
+      if (!entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)) invalid();
+      const { body } = await call('q-begin', { ...requestOf(reservation), attach_sha256: entry.attach.sha256 }, entry);
+      return Object.freeze({ ...body });
+    },
+    async beginDirectQualificationWitness(reservation, preResult) {
+      const entry = owned(reservation);
+      if (!entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)) invalid();
+      const pre = verifyDirectQualificationPre(preResult, entry.machineKey);
+      const { body } = await call('q-witness-begin', { ...requestOf(reservation), attach_sha256: entry.attach.sha256,
+        pre_response_sha256: preResult.sha256 }, entry);
+      const matches = { ...pick(pre, [...idFields, 'hq_epoch', 'reservation_sha256', 'attach_sha256', 'session_id']),
+        pre_response_sha256: preResult.sha256 };
+      const challenge = body?.challenge_base64url;
+      if (!match(body, matches) || Object.keys(body).length !== Object.keys(matches).length + 1
+        || typeof challenge !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(challenge)
+        || Buffer.from(challenge, 'base64url').toString('base64url') !== challenge
+        || !watchHealthy(entry.acpContext) || entry.acp.destroyed || instant(pre.expires_at) <= now()) invalid();
+      return challenge;
+    },
+    async finishDirectQualificationWitness(reservation, preResult, challenge, rows) {
+      const entry = owned(reservation);
+      if (!entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)) invalid();
+      const { body } = await call('q-witness-finish', { ...requestOf(reservation), attach_sha256: entry.attach.sha256,
+        pre_response_sha256: preResult.sha256, challenge_base64url: challenge,
+        cooperative_start_receipt_base64url: rows.cooperative_start_receipt_base64url,
+        cooperative_start_receipt_sha256: rows.cooperative_start_receipt_sha256,
+        hq_refusal_receipt_base64url: rows.hq_refusal_receipt_base64url,
+        hq_refusal_receipt_sha256: rows.hq_refusal_receipt_sha256 }, entry);
+      if (!body || Object.keys(body).join(',') !== 'witness_sha256' || !SHA256.test(body.witness_sha256 ?? '')
+        || !watchHealthy(entry.acpContext) || entry.acp.destroyed) invalid();
+      return body.witness_sha256;
+    },
+    async finishDirectQualification(reservation, preResult, witnessSHA256, refusalSHA256) {
+      const entry = owned(reservation);
+      if (!entry.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)
+        || !SHA256.test(witnessSHA256 ?? '') || !SHA256.test(refusalSHA256 ?? '')) invalid();
+      const pre = verifyDirectQualificationPre(preResult, entry.machineKey);
+      const { body } = await call('q-finish', { ...requestOf(reservation), attach_sha256: entry.attach.sha256,
+        pre_response_sha256: preResult.sha256, witness_sha256: witnessSHA256 }, entry);
+      if (!watchHealthy(entry.acpContext) || entry.acp.destroyed) invalid();
+      const payload = verifyDirectQualificationCapture(body, entry.machineKey);
+      if (!match(payload, { ...pick(pre, [...idFields, 'hq_epoch', 'reservation_sha256', 'attach_sha256', 'session_id', 'test_plan_sha256']),
+        pre_response_sha256: preResult.sha256, witness_sha256: witnessSHA256, hq_refusal_receipt_sha256: refusalSHA256,
+        status: 'unqualified', host_credit: false, machine_protected_authority_absent: true,
+        runner_pid: entry.attach.runner_pid, dispatcher_pid: entry.attach.dispatcher_pid,
+        runner_start_seconds: entry.attach.runner_start_sec, runner_start_micros: entry.attach.runner_start_usec })
+        || !['post_observation_sha256', 'q_wire_sha256', 'q_index_sha256', 'q_eof_receipt_sha256'].every(key => SHA256.test(payload[key] ?? ''))
+        || !Number.isFinite(instant(payload.completed_at)) || instant(payload.completed_at) < instant(pre.issued_at)
+        || instant(payload.completed_at) > now() || instant(payload.completed_at) >= instant(pre.expires_at)) invalid();
+      return freezeJSON({ ...body, payload });
+    },
+    verifyDirectQualificationPre(result) {
+      const payload = verifyDirectQualificationPre(result, Buffer.from(machinePublicKey, 'hex'));
+      const fields = [...idFields, 'contract', 'kind', 'schema_version', 'hq_epoch', 'reservation_sha256',
+        'attach_sha256', 'session_id', 'q_challenge_sha256', 'test_plan_sha256', 'pre_observation_sha256',
+        'case_nonce_base64url', 'issued_at', 'expires_at'];
+      const entry = active.get(payload.reservation_sha256);
+      const issued = instant(payload.issued_at), expiry = instant(payload.expires_at);
+      const nonce = payload.case_nonce_base64url;
+      if (Object.keys(payload).sort().join(',') !== fields.sort().join(',')
+        || !entry?.acp || entry.acp.destroyed || !watchHealthy(entry.acpContext)
+        || !fieldsEqual(payload, entry.reservation.payload.assignment, [...idFields, 'hq_epoch'])
+        || payload.attach_sha256 !== entry.attach.sha256
+        || typeof payload.session_id !== 'string' || !/^[0-9a-f]{32}$/.test(payload.session_id)
+        || ![payload.q_challenge_sha256, payload.test_plan_sha256, payload.pre_observation_sha256].every(v => SHA256.test(v ?? ''))
+        || typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(nonce)
+        || Buffer.from(nonce, 'base64url').toString('base64url') !== nonce
+        || !Number.isFinite(issued) || !Number.isFinite(expiry) || issued > now()
+        || expiry <= now() || expiry - issued > 120000) invalid();
+      return Object.freeze(payload);
     },
     runnerPid: (reservation) => owned(reservation).attach?.runner_pid,
     async stop(reservation) {

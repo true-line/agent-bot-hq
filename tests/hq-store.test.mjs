@@ -486,3 +486,19 @@ test('a temporary file left by a crash mid-write is removed; the intact store lo
     assert.deepEqual(await b.services.store.tx((tx) => tx.get('rows', 'k')), { v: 1 });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('qualification witness reads only the two committed receipt sequences from disk', async (t) => {
+  const dir = tempHome(t);
+  const { store, core } = configureStore(dir);
+  store.load(core);
+  const first = await store.persistReceipt({ kind: 'hq.soul.started', evidence: 'durable' });
+  const second = await store.persistReceipt({ kind: 'hq.soul.protected-claim.refused' });
+  core.receipts[0].evidence = 'memory only';
+  assert.deepEqual(await store.readCommittedReceipts([first.seq, second.seq]), [
+    { ...first, evidence: 'durable' }, second,
+  ]);
+  await assert.rejects(store.readCommittedReceipts([first.seq, first.seq]), /invalid committed receipt/);
+  await assert.rejects(store.readCommittedReceipts([first.seq, second.seq + 1]), /committed receipt is missing/);
+  chmodSync(store.path, 0o644);
+  await assert.rejects(store.readCommittedReceipts([first.seq, second.seq]), /invalid committed receipt store/);
+});

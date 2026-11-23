@@ -94,8 +94,13 @@ function validStage2aCaptureRequest(verb, value) {
   return chunk.length > 0 && chunk.length <= 32768
     && captureDigest(chunk) === value.chunk_sha256;
 }
+const DIRECT_Q_VERBS = new Set(['stage2a-cooperative-q-begin-v3', 'stage2a-cooperative-q-finish-v3']);
 const COOPERATIVE_STATES = new Map([
   ['stage2a-cooperative-live-v3', 'cooperative-live'],
+  ['stage2a-cooperative-q-begin-v3', 'cooperative-q-pre'],
+  ['stage2a-cooperative-q-finish-v3', 'cooperative-q-captured'],
+  ['stage2a-cooperative-q-witness-begin-v3', 'cooperative-q-witness-challenge'],
+  ['stage2a-cooperative-q-witness-finish-v3', 'cooperative-q-witnessed'],
   ['stage2a-cooperative-lookup-v3', 'cooperative-found'],
   ['stage2a-cooperative-provider-v3', 'cooperative-provided'],
   ['stage2a-cooperative-reserve-v3', 'cooperative-reserved'],
@@ -274,7 +279,8 @@ function exchange(socketPath, request) {
     const chunks = [];
     let size = 0;
     let connected = false;
-    const timer = setTimeout(() => stream.destroy(new Error('Machine request timed out')), 10000);
+    const timer = setTimeout(() => stream.destroy(new Error('Machine request timed out')),
+      DIRECT_Q_VERBS.has(request.verb) ? 130000 : 10000);
     stream.once('connect', () => {
       connected = true;
       stream.write(JSON.stringify(request) + '\n');

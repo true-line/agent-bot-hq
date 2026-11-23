@@ -1,11 +1,13 @@
 import { randomBytes } from 'node:crypto';
 import { fail, HostError } from '../sdk/errors.mjs';
+import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
+import { digest } from './stage2a-cooperative-proof.mjs';
 import { pushReceipt } from '../sdk/services.mjs';
 import { takeover } from './socket.mjs';
 
 const unavailable = (message) => fail('host.launch_unavailable', message);
 
-export function createStage2aCooperativeStarter({ machine, core, openAdmission, timeoutMs = 30000 }) {
+export function createStage2aCooperativeStarter({ machine, core, readCommittedReceipts, openAdmission, timeoutMs = 30000 }) {
   const starts = new Map();
   const paths = new Set();
   const installations = new Set();
@@ -115,6 +117,7 @@ export function createStage2aCooperativeStarter({ machine, core, openAdmission, 
           if (!running()) { socket.destroy(); return; }
           machine.markAcp(item.reservation, context, socket);
           item.acp = socket;
+          item.acpContext = context;
           socket.pause();
           socket.on('error', lost);
           socket.once('close', lost);
@@ -138,8 +141,9 @@ export function createStage2aCooperativeStarter({ machine, core, openAdmission, 
       if (!Number.isSafeInteger(item.pid) || item.pid < 2) unavailable('cooperative R PID was not authenticated');
       const result = { ...view(item), definition_digest: item.reservation.payload.measurement_binding.claimed_definition_digest,
         profile: 'managed-cooperative', protected: false, state: 'running' };
-      await pushReceipt(core, { plugin: 'hq', kind: 'hq.soul.started', ...result,
-        reservation_sha256: item.reservation.sha256 });
+      item.startReceipt = Object.freeze({ ...await pushReceipt(core, {
+        plugin: 'hq', kind: 'hq.soul.started', ...result, reservation_sha256: item.reservation.sha256,
+      }) });
       checkRunning();
       return takeover(result, {
         open: () => {
@@ -162,8 +166,79 @@ export function createStage2aCooperativeStarter({ machine, core, openAdmission, 
     }
   }
 
+  const live = (item) => item.state === 'running' && !item.abort.signal.aborted && !closing
+    && item.owner && !item.owner.destroyed && machine.watchHealthy(item.acpContext);
+
+  async function captureProtectedClaimRefusal(preProof, requireProtectedProfile) {
+    const pre = machine.verifyDirectQualificationPre(preProof);
+    const preDigest = preProof.sha256;
+    const item = starts.get(pre.start_id);
+    const valid = () => live(item) && Date.parse(pre.expires_at) > core.clock.now();
+    if (core.profile !== 'managed-cooperative' || typeof core.persistReceipt !== 'function' || !item || !valid() || item.refusalSpent || item.reservation.sha256 !== pre.reservation_sha256
+      || !Number.isSafeInteger(item.startReceipt?.seq) || item.startReceipt.seq < 1) {
+      unavailable('the direct qualification start is unavailable or already used');
+    }
+    item.refusalSpent = true;
+    if (!await machine.assertLive(item.acpContext) || !valid()) unavailable('direct qualification start is no longer live');
+
+    let refused = false;
+    try { requireProtectedProfile(item.path); }
+    catch (error) {
+      if (!(error instanceof HostError) || error.code !== 'profile_insufficient') throw error;
+      refused = true;
+    }
+    if (!refused) unavailable('direct qualification did not observe the protected profile refusal');
+
+    const receipt = await pushReceipt(core, {
+      plugin: 'hq', kind: 'hq.soul.protected-claim.refused',
+      schema: 'agent-bot-hq/stage2a-direct-q-protected-claim-refusal/v1',
+      installation_id: pre.installation_id, start_id: pre.start_id, launch_id: pre.launch_id, hq_epoch: pre.hq_epoch,
+      reservation_sha256: pre.reservation_sha256, attach_sha256: pre.attach_sha256, session_id: pre.session_id,
+      q_challenge_sha256: pre.q_challenge_sha256, test_plan_sha256: pre.test_plan_sha256,
+      case_nonce_base64url: pre.case_nonce_base64url, pre_response_sha256: preDigest,
+      requested_profile: 'managed-protected', refusal_code: 'profile_insufficient',
+      cooperative_start_receipt_seq: item.startReceipt.seq,
+      cooperative_start_receipt_sha256: digest(canonicalBytes(item.startReceipt)),
+    });
+    if (!Number.isSafeInteger(receipt?.seq) || receipt.seq <= item.startReceipt.seq
+      || !valid() || !await machine.assertLive(item.acpContext) || !valid()) {
+      unavailable('the direct refusal could not be tied to a live start and committed receipt');
+    }
+    return Object.freeze({ ...receipt });
+  }
+
+  async function qualifyDirectProtectedClaim(startId, requireProtectedProfile) {
+    const item = starts.get(startId);
+    if (core.profile !== 'managed-cooperative' || typeof core.persistReceipt !== 'function'
+      || typeof readCommittedReceipts !== 'function' || !item || !live(item) || item.qualificationAttempted) {
+      unavailable('the direct qualification start is unavailable or already used');
+    }
+    item.qualificationAttempted = true;
+    const pre = await machine.beginDirectQualification(item.reservation);
+    const refusal = await captureProtectedClaimRefusal(pre, requireProtectedProfile);
+    // A challenges the exact measured H process. Reload the two rows from
+    // the committed snapshot after the challenge, never from caller input.
+    const challenge = await machine.beginDirectQualificationWitness(item.reservation, pre);
+    const [start, denied] = await readCommittedReceipts([item.startReceipt.seq, refusal.seq]);
+    const startBytes = canonicalBytes(start), refusalBytes = canonicalBytes(denied);
+    if (digest(startBytes) !== refusal.cooperative_start_receipt_sha256
+      || digest(refusalBytes) !== digest(canonicalBytes(refusal)) || !live(item)) {
+      unavailable('committed direct qualification receipts changed or the start stopped');
+    }
+    const receipt = Object.freeze({
+      cooperative_start_receipt_base64url: startBytes.toString('base64url'),
+      cooperative_start_receipt_sha256: digest(startBytes),
+      hq_refusal_receipt_base64url: refusalBytes.toString('base64url'),
+      hq_refusal_receipt_sha256: digest(refusalBytes),
+    });
+    const witness = await machine.finishDirectQualificationWitness(item.reservation, pre, challenge, receipt);
+    return machine.finishDirectQualification(item.reservation, pre, witness, receipt.hq_refusal_receipt_sha256);
+  }
+
   return Object.freeze({
     start, report: () => [...starts.values()].map(view),
+    hasLivePackage: (path) => paths.has(path) && [...starts.values()].some((item) => item.path === path && live(item)),
+    qualifyDirectProtectedClaim,
     stop(startId) {
       const item = starts.get(startId);
       if (!item) unavailable('no managed-cooperative Soul start with that ID');
