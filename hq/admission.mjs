@@ -171,8 +171,19 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
       const bridge = createBridgeBindAdmission({ authority: bridgeAuthority, qualificationAuthorizer,
         relayIngressAuthorizer, clock, random, receipts });
       const relayPeerChallenge = createStage2aRelayPeerChallenge({
-        current: relayPeerAuthority?.current,
-        boundStart: relayPeerAuthority?.boundStart,
+        current: bridge.currentBridgeConnectionV3,
+        boundStart: async (connection, receipt, member) => {
+          const binding = await bridge.finalizedBridgeConnectionV3(connection, receipt);
+          const state = await relayPeerAuthority?.boundStart?.(connection, receipt, member);
+          if (state?.reservation_sha256 !== binding.reservation_digest
+            || state?.assignment_envelope_sha256 !== binding.assignment_envelope_sha256
+            || state?.installation_id !== binding.installation_id || state?.start_id !== binding.start_id
+            || state?.hq_epoch !== binding.hq_epoch || state?.b_authority_sha256 !== binding.b_authority_sha256
+            || !state?.bridge_process
+            || canonicalDigest(state.bridge_process) !== canonicalDigest(binding.bridge_process))
+            fail('host.launch_unavailable', 'v3 relay state does not match the live B binding');
+          return state;
+        },
         attest: relayPeerAuthority?.attest,
         clock,
       });
@@ -851,6 +862,9 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         verifyBridgeBinding: bridge.verifyBridgeBinding,
         bridgeBindChallengeV2: bridge.bridgeBindChallengeV2,
         verifyBridgeBindingV2: bridge.verifyBridgeBindingV2,
+        bridgeBindChallengeV3: bridge.bridgeBindChallengeV3,
+        verifyBridgeBindingV3: bridge.verifyBridgeBindingV3,
+        boundBridgeV3: bridge.boundBridgeV3,
         boundBridgeV2: bridge.boundBridgeV2,
         boundBridgeConnectionV2: bridge.boundBridgeConnectionV2,
         // The packaged broker opts in to the route, but a live HQ must also
@@ -859,7 +873,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         qualifyBridgeMessagesV2: bridge.qualifyBridgeMessagesV2,
         bridgeRelayIngressEnabledV2: bridge.bridgeRelayIngressEnabledV2,
         relayBridgeIngressV2: bridge.relayBridgeIngressV2,
-        stage2aRelayPeerChallengeEnabled: () => typeof relayPeerAuthority?.current === 'function'
+        stage2aRelayPeerChallengeEnabled: () => typeof bridgeAuthority?.verifyLiveStartV3 === 'function'
           && typeof relayPeerAuthority?.boundStart === 'function'
           && typeof relayPeerAuthority?.attest === 'function',
         stage2aRelayPeerChallenge: relayPeerChallenge,

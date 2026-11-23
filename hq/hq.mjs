@@ -506,7 +506,7 @@ export function createHQ({
         const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
           enableBridgeQualification: typeof qualificationAuthorizer === 'function',
           enableBridgeRelayIngress: typeof relayIngressAuthorizer === 'function',
-          enableRelayPeerChallenge: typeof relayPeerAuthority?.current === 'function'
+          enableRelayPeerChallenge: typeof bridgeAuthority?.verifyLiveStartV3 === 'function'
             && typeof relayPeerAuthority?.boundStart === 'function'
             && typeof relayPeerAuthority?.attest === 'function' });
         bridgeListeners.set(endpoint.installationId, listener);

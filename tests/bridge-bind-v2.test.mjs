@@ -434,3 +434,45 @@ test('installed test-provider relay ingress contains an altered response without
   assert.equal(calls, 1);
   assert.equal(f.stops.length, 1);
 });
+
+test('v3 binds the exact member set and gates finalized state on the same B connection', async () => {
+  const { launch_id: _legacyLaunch, ...base } = selectors;
+  const v3 = { ...base, assignment_envelope_sha256: digest('assignment'),
+    authority_envelope_sha256: digest('authority'), member_selectors_sha256: digest('selectors') };
+  const process = { pid: 401, uid: context.bridge_uid, gid: context.bridge_uid,
+    start_seconds: 1234, start_micros: 56, executable_sha256: digest('bridge') };
+  let verified = { ...context, ...v3, b_authority_sha256: v3.reservation_digest, bridge_process: process };
+  let current = true;
+  let sequence = 0;
+  const label = 'agent-bot-stage2a-bridge-bind-v3';
+  const proofFor = (nonce) => createHmac('sha256', key).update([
+    label, nonce, context.hq_epoch, v3.installation_id, v3.start_id, v3.plan_id, v3.plan_digest,
+    v3.reservation_digest, v3.assignment_envelope_sha256, v3.authority_envelope_sha256,
+    v3.member_selectors_sha256, String(context.bridge_uid), context.broker_socket,
+  ].join('\0')).digest('hex');
+  const svc = createBridgeBindAdmission({ authority: {
+    verifyLiveStartV3: async () => verified,
+    verifyProofV3: async (request, id) => id === connection.connection
+      && request.proof === proofFor(request.challenge) && request.member_selectors_sha256 === v3.member_selectors_sha256,
+    matchesAssignmentV3: () => true,
+    isCurrentPeerV3: () => current,
+    onDisconnectV3: async () => true,
+  }, clock: { now: () => 1000 }, random: { hex: () => (++sequence).toString(16).padStart(64, '0') },
+  receipts: { append: async () => {} } });
+  try {
+    const challenge = await svc.bridgeBindChallengeV3(v3, connection);
+    assert.equal(challenge.context, label);
+    const proof = { ...v3, proof: proofFor(challenge.nonce) };
+    await assert.rejects(svc.verifyBridgeBindingV3(proof, { connection: 'bb_other' }), denied);
+    const { bind_receipt } = await svc.verifyBridgeBindingV3(proof, connection);
+    assert.equal(svc.currentBridgeConnectionV3(connection.connection, bind_receipt), true);
+    await assert.rejects(svc.finalizedBridgeConnectionV3(connection.connection, bind_receipt), denied);
+    verified = { ...verified, finalized_live_expires_at: 10_000 };
+    const finalized = await svc.finalizedBridgeConnectionV3(connection.connection, bind_receipt);
+    assert.equal(finalized.member_selectors_sha256, v3.member_selectors_sha256);
+    assert.deepEqual(finalized.bridge_process, process);
+    current = false;
+    assert.equal(svc.currentBridgeConnectionV3(connection.connection, bind_receipt), false);
+    await assert.rejects(svc.finalizedBridgeConnectionV3(connection.connection, bind_receipt), denied);
+  } finally { await svc.revokeAll(); }
+});

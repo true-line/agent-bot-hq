@@ -50,7 +50,8 @@ export function verifyStage2aBridgeMemberAuthority(bytes, { machinePublicKey, sc
   const proof = verifyStage2aMachineEnvelope(bytes, machinePublicKey,
     'agent-bot/stage2a-b-member-authority/v1', { maxBytes: 16_384 });
   const a = proof.payload;
-  if (validate(schema, a, { schemas }).length) refuse();
+  const references = assignmentSchema.$id ? [...(schemas ?? []), assignmentSchema] : schemas;
+  if (validate(schema, a, { schemas: references }).length) refuse();
   const shared = ['profile_in_force', 'host_id', 'installation_id', 'soul_id',
     'start_id', 'hq_epoch', 'plan_id', 'plan_digest', 'reservation_sha256',
     'owner_plan_member_set_sha256', 'runner_uid'];
