@@ -322,6 +322,8 @@ function protectedInstallPlan(machineKey, roleUid = 300, change = () => {}) {
   const snapshot = kind => ({ root_path: snapshotRoot + '/snap_' + createHash('sha256')
     .update('agent-bot-machine/stage2a-install-snapshot/v1\0' + kind + '\0' + installation).digest('hex').slice(0, 24),
   device: '', inode: '', generation: '', birthtime_ns: '', owner_uid: 450, owner_gid: 301, mode: '0555' });
+  const node = snapshot('inputs').root_path + '/runtime/bin/node';
+  const entry = snapshot('inputs').root_path + '/runtime/bin/agent-bot-souls.mjs';
   const soul = 'agent_11111111-1111-1111-1111-111111111111';
   const emptyDirectory = { path: '', device: 0, inode: '', birth_seconds: 0, birth_nanoseconds: 0 };
   const policy = {
@@ -349,13 +351,13 @@ function protectedInstallPlan(machineKey, roleUid = 300, change = () => {}) {
       { path: 'Contents/opt', kind: 'directory', mode: '0555' },
       { path: 'Contents/primitives', kind: 'directory', mode: '0555' },
     ],
-    launch_inputs: { files: ['bin/agent-bot-souls.mjs', 'bin/node', 'host/adapters.json', 'host/installation.json']
-      .map(path => ({ path, kind: 'regular', mode: '0444', size: 1, sha256: 'f'.repeat(64) })),
-      host_projection: { adapters: {}, installation: {} }, selected_command: '/reviewed/node', argv: [],
+    launch_inputs: { files: ['host/adapters.json', 'host/installation.json', 'runtime/bin/agent-bot-souls.mjs', 'runtime/bin/node']
+      .map(path => ({ path, kind: 'regular', mode: path === 'runtime/bin/node' ? '0555' : '0444', size: 1, sha256: 'f'.repeat(64) })),
+      host_projection: { adapters: {}, installation: {} }, selected_command: node, argv: [],
       environment: {}, effective_config: {}, system_images: { product_version: 'test', build_version: 'test',
         darwin_kernel: 'test', selected: [{ path: '/usr/bin/sandbox-exec', signing_requirement: 'test', cdhash: 'a'.repeat(40) }] },
       sandbox_policy_digest: 'sha256:' + '2'.repeat(64), component_digests: { bridge: 'sha256:' + '3'.repeat(64) } },
-    node: '/reviewed/node', entry: '/reviewed/entry', bridge_executable: { path: '/reviewed/bridge', sha256: '3'.repeat(64) },
+    node, entry, bridge_executable: { path: '/reviewed/bridge', sha256: '3'.repeat(64) },
     bridge_qualification: { model: 'test-model', request_sha256: 'sha256:' + '4'.repeat(64),
       headers_sha256: 'sha256:' + '5'.repeat(64), client_key_sha256: 'sha256:' + '6'.repeat(64),
       http_host: 'localhost', messages_query: '?fixture=1', response_text: 'pilot response' },

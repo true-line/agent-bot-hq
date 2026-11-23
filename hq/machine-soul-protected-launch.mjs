@@ -47,13 +47,14 @@ function snapshot(value, expectedPath, machineUid, runnerGid) {
 function validNested(policy, request) {
   const { definition, launch_inputs: inputs, bridge_executable: executable, bridge_qualification: qualification,
     measurement_binding: binding, runner } = policy;
+  if (!object(binding) || !object(runner)) return false;
   const requiredDefinition = { Contents: 'directory', 'Contents/SoulInfo.json': 'regular',
     'Contents/SoulLock.json': 'regular', 'Contents/opt': 'directory', 'Contents/primitives': 'directory' };
   if (!records(definition, 5) || !Object.entries(requiredDefinition).every(([path, kind]) =>
     definition.some(r => r.path === path && r.kind === kind))
     || !fields(inputs, 'files,host_projection,selected_command,argv,environment,effective_config,system_images,sandbox_policy_digest,component_digests')
     || !records(inputs.files, 4) || !inputs.files.every(r => r.kind === 'regular')
-    || !['bin/agent-bot-souls.mjs', 'bin/node', 'host/adapters.json', 'host/installation.json']
+    || !['host/adapters.json', 'host/installation.json']
       .every(path => inputs.files.some(r => r.path === path))
     || !fields(inputs.host_projection, 'adapters,installation')
     || !object(inputs.host_projection.adapters) || !object(inputs.host_projection.installation)
@@ -81,9 +82,19 @@ function validNested(policy, request) {
   const slot = prefix(installation, 'agent-bot-soul-endpoint-installation/v1\0');
   const base = `/private/var/db/managed-machine/soul-snapshots/${slot}`;
   const path = kind => `${base}/snap_${createHash('sha256').update(`agent-bot-machine/stage2a-install-snapshot/v1\0${kind}\0${installation}`).digest('hex').slice(0, 24)}`;
+  const runtime = (selected, suffix, executable) => {
+    const root = binding.snapshots?.launch_inputs?.root_path;
+    if (typeof root !== 'string' || !selected.startsWith(root + '/')) return false;
+    const relativePath = selected.slice(root.length + 1);
+    if (!relative(relativePath) || !relativePath.endsWith('/' + suffix)) return false;
+    const file = inputs.files.find(r => r.path === relativePath);
+    return !!file && (!executable || (Number.parseInt(file.mode, 8) & 0o010) !== 0);
+  };
   return fields(binding.snapshots, 'definition,launch_inputs')
     && snapshot(binding.snapshots.definition, path('definition'), policy.machine_uid, runner.gid)
     && snapshot(binding.snapshots.launch_inputs, path('inputs'), policy.machine_uid, runner.gid)
+    && runtime(policy.node, 'bin/node', true)
+    && runtime(policy.entry, 'bin/agent-bot-souls.mjs', false)
     && absolute(request.definition_source) && absolute(request.launch_inputs_source);
 }
 
