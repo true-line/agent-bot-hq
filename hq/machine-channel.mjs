@@ -110,6 +110,33 @@ const COOPERATIVE_STATES = new Map([
   ['stage2a-cooperative-abort-v3', 'cooperative-aborted'],
   ['stage2a-cooperative-stop-v3', 'cooperative-stopped'],
 ]);
+const MEMBER_FIELDS = Object.freeze({
+  'stage2a-member-finalization': ['reservation_sha256', 'installation_id', 'start_id',
+    'launch_id', 'plan_id', 'plan_digest', 'hq_epoch', 'finalization_base64url',
+    'finalization_sha256'],
+  'stage2a-member-runtime': ['reservation_sha256', 'installation_id', 'start_id',
+    'launch_id', 'plan_id', 'plan_digest', 'hq_epoch', 'member_id',
+    'member_selector', 'member_launch_id', 'grant_sha256',
+    'child_observation_envelope_sha256', 'launcher_pid', 'child_pid', 'peer_uid',
+    'peer_pid', 'challenge_nonce_base64url', 'after_sequence', 'prior_expires_at',
+    'ready_envelope_sha256', 'previous_lease_envelope_sha256',
+    'hq_finalization_base64url', 'hq_finalization_sha256'],
+});
+const MEMBER_STATES = Object.freeze({
+  'stage2a-member-finalization': 'member-finalized',
+  'stage2a-member-runtime': 'member-runtime',
+});
+const memberVerb = (verb) => Object.hasOwn(MEMBER_FIELDS, verb);
+function validMemberRecord(encoded, digest) {
+  if (typeof encoded !== 'string' || !/^[A-Za-z0-9_-]{1,10924}$/.test(encoded)
+    || typeof digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(digest)) return false;
+  const raw = Buffer.from(encoded, 'base64url');
+  if (!raw.length || raw.length > 8192 || !isUtf8(raw)
+    || raw.toString('base64url') !== encoded
+    || `sha256:${fingerprint(raw)}` !== digest) return false;
+  try { return canonicalBytes(parseStrict(raw.toString('utf8'))).equals(raw); }
+  catch { return false; }
+}
 const fingerprint = (raw) => createHash('sha256').update(raw).digest('hex');
 const disconnectedPairs = new WeakMap();
 const verifiedPairs = new WeakMap();
@@ -236,7 +263,7 @@ function responseFields(line) {
 function authenticatedResponse(line, nonce, pinned, verb, capture = false) {
   const { value: r, body } = responseFields(line);
   if ((isServiceHandoff(verb) || verb === 'hq-device' || COOPERATIVE_STATES.has(verb)
-    || isCaptureVerb(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)) && Object.keys(r).some((field) =>
+    || isCaptureVerb(verb) || memberVerb(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)) && Object.keys(r).some((field) =>
     !['ok', 'diagnostic', 'message', 'state', 'body', 'timestamp', 'nonce', 'request_nonce', 'signature'].includes(field))) {
     throw new Error('unexpected Machine ' + verb + ' response field');
   }
@@ -388,6 +415,8 @@ export const machineRoleStage2aHelloStart = (request) => machineRoleStage2a('sta
 export const machineRoleStage2aHelloFinalize = (request) => machineRoleStage2a('stage2a-hello-finalize', request);
 export const machineRoleStage2aHelloAbort = (request) => machineRoleStage2a('stage2a-hello-abort', request);
 export const machineRoleStage2aPeerRole = (request) => machineRoleStage2a('stage2a-peer-role', request);
+export const machineRoleStage2aMemberFinalization = (request) => machineRoleStage2a('stage2a-member-finalization', request);
+export const machineRoleStage2aMemberRuntime = (request) => machineRoleStage2a('stage2a-member-runtime', request);
 export const machineRoleStage2aCaptureBegin = (request) => machineRoleStage2a('stage2a-capture-begin', request);
 export const machineRoleStage2aCaptureAppend = (request) => machineRoleStage2a('stage2a-capture-append', request);
 export const machineRoleStage2aCaptureFinish = (request) => machineRoleStage2a('stage2a-capture-finish', request);
@@ -529,7 +558,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       planID = args[1];
       socket = args[3];
     }
-  } else if ((COOPERATIVE_STATES.has(verb) || isCaptureVerb(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb))
+  } else if ((COOPERATIVE_STATES.has(verb) || isCaptureVerb(verb) || memberVerb(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb))
     && args.length === 2 && args[0] === '--socket') {
     socket = args[1];
   }
@@ -614,7 +643,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     }
     if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))
       || Object.keys(deviceFields).length !== keys.length || !/^(legacy|[a-f0-9]{64})$/.test(deviceFields.hq_epoch)) throw new Error('invalid Machine device fields');
-  } else if (isCaptureVerb(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role', 'stage2a-stop', 'stage2a-finalize-b'].includes(verb)) {
+  } else if (isCaptureVerb(verb) || memberVerb(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role', 'stage2a-stop', 'stage2a-finalize-b'].includes(verb)) {
     const selectors = {
       'stage2a-lookup': ['package_path'],
       'stage2a-list': [],
@@ -643,6 +672,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         'plan_id', 'plan_digest', 'hq_epoch', 'peer_uid', 'peer_pid'],
       'stage2a-provider': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
         'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'model', 'prompt_sha256'],
+      ...MEMBER_FIELDS,
       ...CAPTURE_FIELDS,
     };
     const expected = selectors[verb];
@@ -673,7 +703,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       || (verb === 'stage2a-prepare-b' && !validStage2aPrepareB(deviceFields))
       || (['stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider',
         'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize',
-        'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)
+        'stage2a-hello-abort', 'stage2a-peer-role', ...Object.keys(MEMBER_FIELDS)].includes(verb)
         && (!reservation.test(deviceFields.reservation_sha256)
         || !id.test(deviceFields.installation_id) || !/^st_[0-9a-f]{24}$/.test(deviceFields.start_id)
         || !/^ln_[0-9a-f]{24}$/.test(deviceFields.launch_id) || !id.test(deviceFields.plan_id)
@@ -707,6 +737,29 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || Buffer.byteLength(JSON.stringify(deviceFields.expected)) > 4096))
       || (verb === 'stage2a-provider' && (!reservation.test(deviceFields.bind_receipt_sha256)
         || !id.test(deviceFields.model) || !reservation.test(deviceFields.prompt_sha256)))
+      || (memberVerb(verb) && (!validMemberRecord(deviceFields.finalization_base64url
+        ?? deviceFields.hq_finalization_base64url,
+      deviceFields.finalization_sha256 ?? deviceFields.hq_finalization_sha256)
+        || Buffer.byteLength(JSON.stringify(deviceFields)) > 16 * 1024))
+      || (verb === 'stage2a-member-runtime' && (!id.test(deviceFields.member_id)
+        || !id.test(deviceFields.member_selector)
+        || !/^ln_[0-9a-f]{24}$/.test(deviceFields.member_launch_id)
+        || !reservation.test(deviceFields.grant_sha256)
+        || !reservation.test(deviceFields.child_observation_envelope_sha256)
+        || !reservation.test(deviceFields.ready_envelope_sha256)
+        || !Number.isSafeInteger(deviceFields.launcher_pid) || deviceFields.launcher_pid < 2
+        || !Number.isSafeInteger(deviceFields.child_pid) || deviceFields.child_pid < 2
+        || !Number.isSafeInteger(deviceFields.peer_uid) || deviceFields.peer_uid < 1
+        || deviceFields.peer_pid !== deviceFields.launcher_pid
+        || !Number.isSafeInteger(deviceFields.after_sequence) || deviceFields.after_sequence < 0
+        || !/^[A-Za-z0-9_-]{43}$/.test(deviceFields.challenge_nonce_base64url ?? '')
+        || Buffer.from(deviceFields.challenge_nonce_base64url, 'base64url').length !== 32
+        || Buffer.from(deviceFields.challenge_nonce_base64url, 'base64url').toString('base64url')
+          !== deviceFields.challenge_nonce_base64url
+        || !Number.isFinite(Date.parse(deviceFields.prior_expires_at))
+        || (deviceFields.after_sequence === 0
+          ? deviceFields.previous_lease_envelope_sha256 !== null
+          : !reservation.test(deviceFields.previous_lease_envelope_sha256 ?? ''))))
       || (isCaptureVerb(verb) && (!validStage2aCaptureRequest(verb, deviceFields)
         || Buffer.byteLength(JSON.stringify(deviceFields)) > 48 * 1024))) {
       throw new Error('invalid Stage 2a Machine reservation selectors');
@@ -743,6 +796,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       'plan_id', 'plan_digest', 'hq_epoch', 'peer_uid', 'peer_pid'],
     'stage2a-provider': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
       'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'model', 'prompt_sha256'],
+    ...MEMBER_FIELDS,
     ...CAPTURE_FIELDS,
   }[verb];
   const stage2aRequest = stage2aFields
@@ -777,7 +831,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       'stage2a-live': 'live', 'stage2a-provider': 'provided',
       'stage2a-child-ready': 'child-ready', 'stage2a-hello-start': 'hello-started',
       'stage2a-hello-finalize': 'hello-finalized', 'stage2a-hello-abort': 'hello-aborted',
-      'stage2a-peer-role': 'peer-verified' }[verb];
+      'stage2a-peer-role': 'peer-verified', ...MEMBER_STATES }[verb];
     if (r.state !== expectedState) throw new Error('unexpected signed Machine Stage 2a state');
     const body = r.body;
     if (isCaptureVerb(verb)) {
@@ -888,6 +942,22 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       }
       return Object.freeze({ aborted: true, daemon_fingerprint: fingerprint(daemon) });
     }
+    if (verb === 'stage2a-member-runtime') {
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).sort().join(',') !== 'lease_envelope_base64url,lease_sequence,lease_sha256'
+        || typeof body.lease_envelope_base64url !== 'string'
+        || !/^[A-Za-z0-9_-]{1,10924}$/.test(body.lease_envelope_base64url)
+        || !/^sha256:[0-9a-f]{64}$/.test(body.lease_sha256 ?? '')
+        || !Number.isSafeInteger(body.lease_sequence) || body.lease_sequence < 1) {
+        throw new Error('invalid signed Machine member runtime body');
+      }
+      const raw = Buffer.from(body.lease_envelope_base64url, 'base64url');
+      if (!raw.length || raw.toString('base64url') !== body.lease_envelope_base64url
+        || `sha256:${fingerprint(raw)}` !== body.lease_sha256) {
+        throw new Error('Machine member runtime envelope digest mismatch');
+      }
+      return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
+    }
     if (verb === 'stage2a-finalize-b' || verb === 'stage2a-child-ready') {
       if (!body || typeof body !== 'object' || Array.isArray(body)
         || Object.keys(body).sort().join(',') !== (verb === 'stage2a-finalize-b'
@@ -919,7 +989,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     if (verb === 'stage2a-reserve' || verb === 'stage2a-stop'
       || verb === 'stage2a-finalize-b' || verb === 'stage2a-child-ready'
       || verb === 'stage2a-hello-start' || verb === 'stage2a-hello-finalize'
-      || verb === 'stage2a-peer-role') {
+      || verb === 'stage2a-peer-role' || verb === 'stage2a-member-finalization') {
       return Object.freeze({ envelope, sha256: body.sha256,
         ...(verb === 'stage2a-finalize-b' ? { finalized_live_expires_at: body.finalized_live_expires_at } : {}),
         ...(verb === 'stage2a-child-ready' ? { expires_at_ms: body.expires_at_ms } : {}),

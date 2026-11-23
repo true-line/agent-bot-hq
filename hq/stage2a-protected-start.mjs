@@ -200,7 +200,7 @@ export function createStage2aPrestartedMembers({ machinePublicKey, schemas, sche
             arm[`adapter_${field}`] !== observed.child_process[field])
           || canonicalDigest(arm) !== row.bridge_arm_receipt_sha256) refuse();
       }
-      return Object.freeze({ assignment, assignmentBytes, authorityBytes, observationBytes, readyBytes,
+      return Object.freeze({ assignment, observation, ready, assignmentBytes, authorityBytes, observationBytes, readyBytes,
         memberGrants: Object.freeze(memberGrants), children: Object.freeze(children), provisionalMappingSHA256: mapDigest });
     };
     try {

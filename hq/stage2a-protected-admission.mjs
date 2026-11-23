@@ -4,8 +4,10 @@
 import { createHash } from 'node:crypto';
 import { canonicalBytes, canonicalize } from '../sdk/wire/canonical-json.mjs';
 import { machineRoleStage2aPeerRole, machineRoleStage2aHelloStart,
-  machineRoleStage2aHelloFinalize, machineRoleStage2aHelloAbort } from './machine-channel.mjs';
+  machineRoleStage2aHelloFinalize, machineRoleStage2aHelloAbort,
+  machineRoleStage2aMemberFinalization, machineRoleStage2aMemberRuntime } from './machine-channel.mjs';
 import { verifyStage2aMachineEnvelope } from './stage2a-stop.mjs';
+import { prepareStage2aMemberFinalization } from './stage2a-member-finalization.mjs';
 
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const STOP_FIELDS = ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
@@ -13,6 +15,7 @@ const STOP_FIELDS = ['reservation_sha256', 'installation_id', 'start_id', 'launc
 const PEER_PURPOSE = 'agent-bot/stage2a-peer-role/v1';
 const START_PURPOSE = 'agent-bot/stage2a-hello-start/v1';
 const FINAL_PURPOSE = 'agent-bot/stage2a-hello-finalization/v1';
+const MEMBER_FINAL_PURPOSE = 'agent-bot/stage2a-member-finalization-ack/v1';
 const PEER_TOKEN = Symbol('stage2a-authenticated-peer');
 const refuse = () => { throw new Error('Machine protected Hello authority is unavailable'); };
 const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
@@ -37,11 +40,16 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
   machinePeerRole = machineRoleStage2aPeerRole,
   machineHelloStart = machineRoleStage2aHelloStart,
   machineHelloFinalize = machineRoleStage2aHelloFinalize,
+  machineMemberFinalization = machineRoleStage2aMemberFinalization,
+  machineMemberRuntime = machineRoleStage2aMemberRuntime,
   machineHelloAbort = machineRoleStage2aHelloAbort,
+  readCommittedMemberFinalization = async () => refuse(), verifyRelayProvenance = () => false,
   stopReservation, now = () => Date.now() } = {}) {
   if (!Buffer.isBuffer(machinePublicKey) || machinePublicKey.length !== 32
     || typeof authority?.currentLiveStart !== 'function'
-    || [machinePeerRole, machineHelloStart, machineHelloFinalize, machineHelloAbort,
+    || [machinePeerRole, machineHelloStart, machineHelloFinalize, machineMemberFinalization,
+      machineMemberRuntime,
+      readCommittedMemberFinalization, verifyRelayProvenance, machineHelloAbort,
       stopReservation, now].some((fn) => typeof fn !== 'function')) refuse();
   const starts = new Map();
   const contexts = new WeakMap();
@@ -84,7 +92,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
       || starts.has(selectors.reservation_sha256)) refuse();
     const record = { installed, assignment, selectors: Object.freeze({ ...selectors }),
       getBindReceiptSHA256, prestartMembers, prestarted: null, hello: null, finalized: false, lost: false,
-      lastLiveAt: now(), watch: null, timer: null };
+      lastLiveAt: now(), watch: null, timer: null, issuedMemberLeases: new Map() };
     starts.set(selectors.reservation_sha256, record);
     return Object.freeze({ close: () => {
       record.lost = true;
@@ -226,6 +234,176 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
     return record.prestarted;
   }
 
+  function hasPendingMemberSet(expected) {
+    const record = recordForExpected(expected);
+    return !!record.prestartMembers && !!record.prestarted && !record.finalized;
+  }
+
+  function prepareMemberFinalization(expected) {
+    const record = recordForExpected(expected);
+    if (!record.hello || !record.prestarted || record.finalized || record.memberFinalization
+      || expected.hello_payload_sha256 !== record.hello.binding.hello_payload_sha256) refuse();
+    const prepared = prepareStage2aMemberFinalization({
+      prestarted: record.prestarted, expected, primaryAssignment: record.assignment, now: now(),
+    });
+    record.preparedMemberFinalization = prepared;
+    return prepared;
+  }
+
+  async function commitMemberFinalization(expected, prepared) {
+    const record = recordForExpected(expected);
+    if (!record.prestarted || record.finalized || record.lost
+      || record.preparedMemberFinalization !== prepared
+      || !DIGEST.test(prepared?.sha256 ?? '')
+      || !Buffer.isBuffer(prepared?.bytes)
+      || sha(prepared.bytes) !== prepared.sha256) refuse();
+    const key = `${record.selectors.installation_id}\u0000${record.selectors.start_id}`;
+    const committed = await readCommittedMemberFinalization(key, prepared.sha256, { allowPending: true });
+    if (!Buffer.isBuffer(committed?.bytes) || !committed.bytes.equals(prepared.bytes)
+      || committed.row?.reservation_sha256 !== record.selectors.reservation_sha256
+      || committed.row?.state !== 'member-finalization-pending') refuse();
+    // H cannot traverse B's private relay directory. A must independently
+    // authenticate the native B/R relay provenance before this call can run.
+    if (await verifyRelayProvenance({ selectors: record.selectors, prepared }) !== true) refuse();
+    const reply = await machineMemberFinalization({ ...record.selectors,
+      finalization_base64url: prepared.bytes.toString('base64url'),
+      finalization_sha256: prepared.sha256 });
+    if (!Buffer.isBuffer(reply?.envelope) || sha(reply.envelope) !== reply.sha256) refuse();
+    const signed = verifyStage2aMachineEnvelope(reply.envelope, machinePublicKey,
+      MEMBER_FINAL_PURPOSE, { maxBytes: 8192 });
+    const ack = signed.payload;
+    if (signed.envelope_sha256 !== reply.sha256
+      || ack?.contract !== 'machine/v3' || ack.kind !== 'stage2a-member-finalization-ack'
+      || ack.schema_version !== 1 || ack.profile_in_force !== 'managed-protected'
+      || ack.host_id !== prepared.record.host_id
+      || ack.installation_id !== expected.installation_id
+      || ack.soul_id !== prepared.record.soul_id
+      || ack.start_id !== expected.start_id || ack.hq_epoch !== expected.hq_epoch
+      || ack.launch_id !== expected.launch_id
+      || ack.reservation_sha256 !== expected.reservation_sha256
+      || ack.plan_id !== record.selectors.plan_id
+      || ack.plan_digest !== record.selectors.plan_digest
+      || ack.hq_finalization_sha256 !== prepared.sha256
+      || ack.ready_envelope_sha256 !== prepared.record.ready_envelope_sha256
+      || ack.child_observation_envelope_sha256 !== prepared.record.child_observation_envelope_sha256
+      || !Number.isFinite(Date.parse(ack.issued_at))
+      || Date.parse(ack.issued_at) > now()
+      || now() - Date.parse(ack.issued_at) > 5000) refuse();
+    record.memberFinalization = Object.freeze({ prepared, ackEnvelope: Buffer.from(reply.envelope),
+      ackSHA256: reply.sha256 });
+    return Object.freeze({ sha256: prepared.sha256, ackSHA256: reply.sha256 });
+  }
+
+  function activateMemberFinalization(expected, finalizationSHA256) {
+    const record = recordForExpected(expected);
+    if (record.finalized || record.lost || !record.memberFinalization
+      || record.memberFinalization.prepared.sha256 !== finalizationSHA256) refuse();
+    record.finalized = true;
+    return true;
+  }
+
+  function memberFinalizationFor(selectors) {
+    const record = recordFor(selectors);
+    if (!record.finalized || !record.memberFinalization) refuse();
+    return record.memberFinalization;
+  }
+
+  async function renewMemberRuntime(request, connection) {
+    const peer = peerFor(connection);
+    const record = peer?.record;
+    const final = record?.memberFinalization;
+    if (!peer || peer.role !== 'child' || peer.socket?.destroyed || peer.expiresAt <= now()
+      || !record.finalized || record.lost || !final
+      || !stopMatches(request, record.selectors)
+      || request.hq_finalization_sha256 !== final.prepared.sha256
+      || request.ready_envelope_sha256 !== final.prepared.record.ready_envelope_sha256
+      || request.child_observation_envelope_sha256
+        !== final.prepared.record.child_observation_envelope_sha256
+      || request.launcher_pid !== peer.peerProcess.pid
+      || connection.peer_pid !== peer.peerProcess.pid
+      || connection.peer_uid !== record.installed.runner_uid
+      || !DIGEST.test(request.grant_sha256 ?? '')) refuse();
+    const member = final.prepared.record.members.find((row) => row.member_id === request.member_id);
+    if (!member || member.member_selector !== request.member_selector
+      || member.member_launch_id !== request.member_launch_id
+      || member.grant_sha256 !== request.grant_sha256
+      || member.launcher_process.pid !== request.launcher_pid
+      || member.child_process.pid !== request.child_pid) refuse();
+    const previous = record.issuedMemberLeases.get(request.member_id);
+    if (request.after_sequence === 0) {
+      if (previous || request.previous_lease_envelope_sha256 !== null
+        || Date.parse(request.prior_expires_at)
+          !== Date.parse(record.prestarted.ready.payload.expires_at)
+        || Date.parse(record.prestarted.ready.payload.expires_at) <= now()) refuse();
+    } else if (!previous || previous.sequence !== request.after_sequence
+      || previous.sha256 !== request.previous_lease_envelope_sha256
+      || previous.expiresAt !== Date.parse(request.prior_expires_at)
+      || previous.expiresAt <= now()) refuse();
+    const key = `${record.selectors.installation_id}\u0000${record.selectors.start_id}`;
+    const committed = await readCommittedMemberFinalization(key, final.prepared.sha256);
+    if (!Buffer.isBuffer(committed?.bytes)
+      || !committed.bytes.equals(final.prepared.bytes)
+      || committed.row?.state !== 'active'
+      || committed.row?.reservation_sha256 !== record.selectors.reservation_sha256) refuse();
+    if (await verifyRelayProvenance({ selectors: record.selectors,
+      prepared: final.prepared }) !== true) refuse();
+    const result = await machineMemberRuntime({ ...record.selectors,
+      member_id: request.member_id, member_selector: request.member_selector,
+      member_launch_id: request.member_launch_id, grant_sha256: request.grant_sha256,
+      child_observation_envelope_sha256: request.child_observation_envelope_sha256,
+      launcher_pid: request.launcher_pid, child_pid: request.child_pid,
+      peer_uid: connection.peer_uid, peer_pid: connection.peer_pid,
+      challenge_nonce_base64url: request.challenge_nonce_base64url,
+      after_sequence: request.after_sequence, prior_expires_at: request.prior_expires_at,
+      ready_envelope_sha256: request.ready_envelope_sha256,
+      previous_lease_envelope_sha256: request.previous_lease_envelope_sha256,
+      hq_finalization_base64url: committed.bytes.toString('base64url'),
+      hq_finalization_sha256: committed.sha256 });
+    const encoded = result?.lease_envelope_base64url;
+    if (typeof encoded !== 'string' || !/^[A-Za-z0-9_-]{1,10924}$/.test(encoded)
+      || Buffer.from(encoded, 'base64url').toString('base64url') !== encoded
+      || !DIGEST.test(result.lease_sha256 ?? '')
+      || result.lease_sequence !== request.after_sequence + 1) refuse();
+    const envelope = Buffer.from(encoded, 'base64url');
+    if (sha(envelope) !== result.lease_sha256) refuse();
+    const verified = verifyStage2aMachineEnvelope(envelope, machinePublicKey,
+      'agent-bot/stage2a-member-runtime-lease/v1', { maxBytes: 8192 });
+    const lease = verified.payload;
+    if (verified.envelope_sha256 !== result.lease_sha256
+      || lease?.contract !== 'machine/v3' || lease.kind !== 'stage2a-member-runtime-lease'
+      || lease.schema_version !== 1 || lease.profile_in_force !== 'managed-protected'
+      || lease.host_id !== final.prepared.record.host_id
+      || lease.installation_id !== record.selectors.installation_id
+      || lease.start_id !== record.selectors.start_id || lease.hq_epoch !== record.selectors.hq_epoch
+      || lease.reservation_sha256 !== record.selectors.reservation_sha256
+      || lease.member_id !== member.member_id || lease.member_selector !== member.member_selector
+      || lease.member_launch_id !== member.member_launch_id
+      || lease.grant_sha256 !== member.grant_sha256
+      || !same(lease.launcher_process, member.launcher_process)
+      || !same(lease.child_process, member.child_process)
+      || lease.assignment_envelope_sha256 !== final.prepared.record.assignment_envelope_sha256
+      || lease.child_observation_envelope_sha256 !== request.child_observation_envelope_sha256
+      || lease.ready_envelope_sha256 !== request.ready_envelope_sha256
+      || lease.member_b_authority_envelope_sha256
+        !== final.prepared.record.member_b_authority_envelope_sha256
+      || lease.bridge_arm_receipt_sha256 !== member.bridge_arm_receipt_sha256
+      || lease.bind_receipt_sha256 !== final.prepared.record.bind_receipt_sha256
+      || lease.hq_finalization_sha256 !== committed.sha256
+      || lease.challenge_nonce_base64url !== request.challenge_nonce_base64url
+      || lease.sequence !== result.lease_sequence
+      || lease.previous_lease_envelope_sha256 !== request.previous_lease_envelope_sha256
+      || !Number.isFinite(Date.parse(lease.issued_at))
+      || !Number.isFinite(Date.parse(lease.expires_at))
+      || !Number.isFinite(Date.parse(lease.approved_until))
+      || Date.parse(lease.issued_at) > now() || Date.parse(lease.expires_at) <= now()
+      || Date.parse(lease.expires_at) > Date.parse(lease.approved_until)
+      || Date.parse(lease.expires_at) - Date.parse(lease.issued_at) > 5000) refuse();
+    record.issuedMemberLeases.set(member.member_id, Object.freeze({ sequence: lease.sequence,
+      sha256: result.lease_sha256, expiresAt: Date.parse(lease.expires_at) }));
+    return Object.freeze({ lease_envelope_base64url: encoded,
+      lease_sha256: result.lease_sha256, lease_sequence: lease.sequence });
+  }
+
   async function finalize(expected) {
     const record = recordForExpected(expected);
     const hello = record.hello;
@@ -238,7 +416,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
       || expected.profile_in_force !== 'managed-protected'
       || !Number.isSafeInteger(expected.installation_epoch)
       || expected.installation_epoch < 1) refuse();
-    if (record.prestartMembers && !record.prestarted) refuse();
+    if (record.prestartMembers) refuse();
     const reply = await machineHelloFinalize({ ...record.selectors,
       start_envelope_sha256: hello.startSHA256, expected });
     const signed = checkedReply(reply, machinePublicKey, FINAL_PURPOSE,
@@ -345,6 +523,9 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
   }
 
   return Object.freeze({ registerStart, acceptPeer, refreshRunnerPeer, verifyHelloStart, prepareMemberSet, prestartedFor,
+    hasPendingMemberSet,
+    prepareMemberFinalization, commitMemberFinalization, activateMemberFinalization,
+    memberFinalizationFor, renewMemberRuntime,
     verifyDefinitionMapping, finalize, verifyFinalization, abort,
     finalizationFor, watchLiveness, assertLive, peerDisconnected, watchHealthy });
 }

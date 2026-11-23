@@ -491,16 +491,35 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             await live(protectedStart);
             await boundedMachineCall(() => protectedAdmission.prepareMemberSet?.(expected,
               Object.freeze(result.admitted_runtimes.map((row) => Object.freeze({ ...row })))), 21_000);
-            const finalization = await boundedMachineCall(() => protectedAdmission.finalize(expected));
-            if (await boundedMachineCall(() => protectedAdmission.verifyFinalization(finalization, expected)) !== true)
-              fail('host.launch_unavailable', 'Machine did not authenticate the exact post-Hello finalization');
+            const paired = protectedAdmission.hasPendingMemberSet?.(expected) === true;
+            let memberFinalization;
+            if (paired) {
+              memberFinalization = protectedAdmission.prepareMemberFinalization(expected);
+              await store.tx((tx) => {
+                const start = tx.get('protected_starts', startKey);
+                if (lostStarts.has(startKey) || start?.state !== 'pending'
+                  || start.reservation_sha256 !== protectedStart.reservation_sha256)
+                  fail('host.launch_unavailable', 'protected member finalization changed before commit');
+                tx.put('protected_starts', startKey, { ...start, state: 'member-finalization-pending',
+                  member_finalization_base64url: memberFinalization.bytes.toString('base64url'),
+                  member_finalization_sha256: memberFinalization.sha256 });
+              });
+              await boundedMachineCall(() => protectedAdmission.commitMemberFinalization(
+                expected, memberFinalization));
+            } else {
+              const finalization = await boundedMachineCall(() => protectedAdmission.finalize(expected));
+              if (await boundedMachineCall(() => protectedAdmission.verifyFinalization(finalization, expected)) !== true)
+                fail('host.launch_unavailable', 'Machine did not authenticate the exact post-Hello finalization');
+            }
             await live(protectedStart);
             unbound = await store.tx((tx) => {
               if (lostStarts.has(startKey)) fail('host.launch_unavailable', 'protected R or B disconnected');
               const entry = tx.get('hellos', payload.request_id);
               const start = tx.get('protected_starts', startKey);
               if (entry?.protected_state !== 'pending' || entry.caller !== caller || entry.digest !== digest
-                || start?.state !== 'pending' || start.reservation_sha256 !== protectedStart.reservation_sha256)
+                || start?.state !== (paired ? 'member-finalization-pending' : 'pending')
+                || start.reservation_sha256 !== protectedStart.reservation_sha256
+                || (paired && start.member_finalization_sha256 !== memberFinalization.sha256))
                 fail('host.launch_unavailable', 'protected admission changed during finalization');
               if (JSON.stringify(tx.get('souls', payload.soul_id) ?? null) !== JSON.stringify(soulBefore))
                 fail('host.launch_unavailable', 'Soul admission changed during Machine finalization');
@@ -523,6 +542,9 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
               receipts.appendIn(tx, { ...audit, kind: 'hq.admission' });
               return unboundOf(tx);
             });
+            if (paired && protectedAdmission.activateMemberFinalization(expected,
+              memberFinalization.sha256) !== true)
+              fail('host.launch_unavailable', 'committed member finalization is not active');
           } catch {
             fail('host.launch_unavailable', 'protected Hello finalization failed or is uncertain');
           }

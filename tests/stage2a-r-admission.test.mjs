@@ -8,7 +8,7 @@ const ROOT = '/Library/Application Support/ai.true-line.agent-bot-hq';
 const hash = (...parts) => createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 20);
 const sha = (raw) => `sha256:${createHash('sha256').update(raw).digest('hex')}`;
 
-function fixture({ invalidLease = false, protectedPeer = true } = {}) {
+function fixture({ invalidLease = false, protectedPeer = true, memberRuntime = false } = {}) {
   const installation_id = 'install-1', start_id = 'st_' + 'a'.repeat(24);
   const directory = join(ROOT, 'r', hash('agent-bot-soul-endpoint-installation/v1', installation_id));
   const socket_path = join(directory, hash('agent-bot-soul-endpoint-start/v1', installation_id, start_id) + '.sock');
@@ -39,8 +39,17 @@ function fixture({ invalidLease = false, protectedPeer = true } = {}) {
       lease_envelope_base64url: bytes.toString('base64url'),
       lease_sha256: invalidLease ? 'sha256:' + '0'.repeat(64) : sha(bytes), lease_sequence: calls };
   };
+  const renewMemberRuntime = memberRuntime ? async (request, context) => {
+    calls++;
+    assert.equal(request.plan_id, selectors.plan_id);
+    assert.equal(context.role, 'child');
+    const bytes = Buffer.from(JSON.stringify({ member_id: request.member_id }));
+    return { lease_envelope_base64url: bytes.toString('base64url'),
+      lease_sha256: sha(bytes), lease_sequence: request.after_sequence + 1 };
+  } : undefined;
   const open = () => listenStage2aRunnerAdmission({ installed, assignment, selectors,
-    hqUid: 309, core: { random: { hex: () => 'a'.repeat(24) } }, renewLive,
+    hqUid: 309, core: { random: { hex: () => 'a'.repeat(24) },
+      clock: { now: () => Date.now() } }, renewLive, renewMemberRuntime,
     onLost: () => { lost++; }, lstat, checkACL: () => {},
     protectedAdmission: protectedPeer ? {
       acceptPeer: async (socket, { peer_uid, peer_pid }) => ({ ...selectors,
@@ -86,6 +95,35 @@ test('signed per-start R listener accepts only the assigned peer and relays A le
   await listener.close();
   assert.equal(listener.checkCurrent(), false);
   assert.equal(f.closed, 1);
+});
+
+test('protected member renewal uses only the child peer on the existing admission socket', async () => {
+  const f = fixture({ memberRuntime: true });
+  await f.open();
+  const payload = { installation_id: f.selectors.installation_id,
+    start_id: f.selectors.start_id, launch_id: f.selectors.launch_id,
+    reservation_sha256: f.selectors.reservation_sha256,
+    member_id: 'member-1', member_selector: 'selector-1',
+    member_launch_id: 'ln_' + '1'.repeat(24), grant_sha256: 'sha256:' + '1'.repeat(64),
+    child_observation_envelope_sha256: 'sha256:' + '2'.repeat(64),
+    launcher_pid: 403, child_pid: 404,
+    challenge_nonce_base64url: randomBytes(32).toString('base64url'),
+    after_sequence: 0, prior_expires_at: new Date(Date.now() + 3000).toISOString(),
+    ready_envelope_sha256: 'sha256:' + '3'.repeat(64),
+    hq_finalization_sha256: 'sha256:' + '4'.repeat(64),
+    previous_lease_envelope_sha256: null };
+  const runner = await f.peer('runner', 403);
+  await assert.rejects(f.listening.dispatch('launch.member.runtime',
+    { payload, protectedStart: runner.context }), /protected R admission/);
+  const child = await f.peer('child', 403);
+  const reply = await f.listening.dispatch('launch.member.runtime',
+    { payload, protectedStart: child.context });
+  assert.equal(reply.lease_sequence, 1);
+  assert.equal(f.calls, 1);
+  await assert.rejects(f.listening.dispatch('launch.member.runtime',
+    { payload: { ...payload, launcher_pid: 405 }, protectedStart: child.context }),
+  /protected R admission/);
+  assert.equal(f.calls, 1);
 });
 
 test('a changed assigned R endpoint is refused before listen', async () => {

@@ -267,6 +267,8 @@ async function main(argv) {
       }) : undefined;
       const protectedAdmission = installed.length ? createStage2aProtectedAdmission({
         machinePublicKey, authority,
+        readCommittedMemberFinalization: (key, digest, options) =>
+          hq.readCommittedMemberFinalization(key, digest, options),
         stopReservation: (reservationSHA256) => protectedStart.stopReservation(reservationSHA256),
       }) : undefined;
       const protectedStart = installed.length ? createStage2aProtectedStarter({
@@ -280,6 +282,8 @@ async function main(argv) {
           try {
             const listener = await hq.openProtectedAdmission({ installed: plan, assignment,
               selectors, renewLive: (request) => protectedStart.renewLive(request),
+              renewMemberRuntime: (request, context) =>
+                protectedAdmission.renewMemberRuntime(request, context),
               onLost: () => protectedStart.stopReservation(selectors.reservation_sha256) });
             return Object.freeze({ path: listener.path,
               helloFinalization: () => protectedAdmission.finalizationFor(selectors),

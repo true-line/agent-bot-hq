@@ -17,6 +17,7 @@
 // store it could not read.
 import { chmodSync, closeSync, constants, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
 export const STORE_FORMAT = 'agent-bot-hq-store/1';
 
@@ -174,6 +175,44 @@ export function openStore(dir, { uid } = {}) {
           }
           if (selected.size !== selectors.length) throw new StoreError('committed receipt is missing');
           return selectors.map(seq => selected.get(seq));
+        } finally { closeSync(fd); }
+      });
+    },
+    readCommittedMemberFinalization(key, digest, { allowPending = false } = {}) {
+      if (typeof key !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\u0000st_[0-9a-f]{24}$/.test(key)
+        || typeof digest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(digest)) {
+        return Promise.reject(new StoreError('invalid member finalization selector'));
+      }
+      return enqueue(() => {
+        const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        try {
+          const st = fstatSync(fd);
+          if (!st.isFile() || st.nlink !== 1 || st.uid !== (uid ?? process.getuid?.())
+            || (st.mode & 0o7777) !== 0o600) throw new StoreError('invalid committed member store');
+          const data = JSON.parse(readFileSync(fd, 'utf8'));
+          const after = fstatSync(fd);
+          if (after.nlink !== 1 || after.size !== st.size || after.ctimeMs !== st.ctimeMs
+            || after.mtimeMs !== st.mtimeMs || data?.format !== STORE_FORMAT
+            || !Array.isArray(data.tables)) throw new StoreError('committed member store changed');
+          const table = data.tables.filter(([name]) => name === 'hq-admission\u0000protected_starts');
+          if (table.length !== 1 || !Array.isArray(table[0][1])) throw new StoreError('member table missing');
+          const matches = table[0][1].filter(([name]) => name === key);
+          if (matches.length !== 1) throw new StoreError('member finalization missing or ambiguous');
+          const row = matches[0][1];
+          if (row?.state !== 'active' && !(allowPending && row?.state === 'member-finalization-pending')) {
+            throw new StoreError('member finalization is not active');
+          }
+          const encoded = row.member_finalization_base64url;
+          if (row.member_finalization_sha256 !== digest || typeof encoded !== 'string'
+            || !/^[A-Za-z0-9_-]{1,21846}$/.test(encoded)) {
+            throw new StoreError('member finalization digest differs');
+          }
+          const raw = Buffer.from(encoded, 'base64url');
+          if (!raw.length || raw.length > 16384 || raw.toString('base64url') !== encoded
+            || `sha256:${createHash('sha256').update(raw).digest('hex')}` !== digest) {
+            throw new StoreError('member finalization bytes differ');
+          }
+          return Object.freeze({ bytes: raw, sha256: digest, row: Object.freeze({ ...row }) });
         } finally { closeSync(fd); }
       });
     },

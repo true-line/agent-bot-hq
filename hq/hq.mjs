@@ -574,14 +574,15 @@ export function createHQ({
     stop,
     paths,
     status: () => host.status(),
-    openProtectedAdmission: async ({ installed, assignment, selectors, renewLive, onLost, memberAttachProvider }) => {
+    openProtectedAdmission: async ({ installed, assignment, selectors, renewLive, renewMemberRuntime,
+      onLost, memberAttachProvider }) => {
       const key = selectors?.reservation_sha256;
       if (!running || !key || runnerAdmissions.has(key) || openingRunnerAdmissions.has(key))
         fail('host.launch_unavailable', 'protected R admission is unavailable');
       openingRunnerAdmissions.add(key);
       try {
         const listener = await listenStage2aRunnerAdmission({ installed, assignment, selectors,
-          hqUid: uid, core, renewLive, onLost, protectedAdmission, memberAttachProvider,
+          hqUid: uid, core, renewLive, renewMemberRuntime, onLost, protectedAdmission, memberAttachProvider,
           withLiveRuntime: host.provided('hq-admission')?.withLiveRuntime,
           admissionDispatch: (op, meta) => host.dispatch(op, meta) });
         if (!running) { await listener.close(); fail('host.launch_unavailable', 'HQ stopped during protected R admission'); }
@@ -593,6 +594,8 @@ export function createHQ({
         } });
       } finally { openingRunnerAdmissions.delete(key); }
     },
+    readCommittedMemberFinalization: (key, digest, options) =>
+      store.readCommittedMemberFinalization(key, digest, options),
     openCooperativeAdmission: async ({ reservation, openAcpStream, onLost }) => {
       const key = reservation?.sha256;
       if (!running || !key || cooperativeGuard?.isRevoked(key)

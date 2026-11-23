@@ -216,7 +216,8 @@ function checkedEndpoint(installed, assignment, selectors, hqUid) {
 // `renewLive` is HQ's paired Machine channel. It must return the exact
 // A-signed lease envelope; an HQ-generated expiry never reaches R.
 export async function listenStage2aRunnerAdmission({ installed, assignment, selectors,
-  hqUid, core, renewLive, onLost, protectedAdmission, admissionDispatch, memberAttachProvider, withLiveRuntime,
+  hqUid, core, renewLive, renewMemberRuntime, onLost, protectedAdmission, admissionDispatch,
+  memberAttachProvider, withLiveRuntime,
   lstat = (path) => lstatSync(path, { bigint: true }),
   checkACL = checkDarwinACL, observePeer = observePeerPid,
   listen = listenSocket } = {}) {
@@ -316,6 +317,56 @@ export async function listenStage2aRunnerAdmission({ installed, assignment, sele
           || meta.protectedStart.role !== 'runner') refuse();
         if (op === 'Hello') helloConnections.add(meta.protectedStart);
         return admissionDispatch(op, meta);
+      }
+      if (op === 'launch.member.runtime') {
+        const p = meta.payload;
+        const fields = ['installation_id', 'start_id', 'launch_id', 'reservation_sha256',
+          'member_id', 'member_selector', 'member_launch_id', 'grant_sha256',
+          'child_observation_envelope_sha256', 'launcher_pid', 'child_pid',
+          'challenge_nonce_base64url', 'after_sequence', 'prior_expires_at',
+          'ready_envelope_sha256', 'hq_finalization_sha256',
+          'previous_lease_envelope_sha256'];
+        if (typeof renewMemberRuntime !== 'function' || meta.protectedStart.role !== 'child'
+          || !p || typeof p !== 'object' || Array.isArray(p)
+          || Object.keys(p).sort().join(',') !== fields.sort().join(',')
+          || p.installation_id !== selectors.installation_id
+          || p.start_id !== selectors.start_id || p.launch_id !== selectors.launch_id
+          || p.reservation_sha256 !== selectors.reservation_sha256
+          || !DIGEST.test(p.grant_sha256 ?? '')
+          || !DIGEST.test(p.child_observation_envelope_sha256 ?? '')
+          || !DIGEST.test(p.ready_envelope_sha256 ?? '')
+          || !DIGEST.test(p.hq_finalization_sha256 ?? '')
+          || !Number.isSafeInteger(p.launcher_pid) || p.launcher_pid !== meta.protectedStart.peer_pid
+          || !Number.isSafeInteger(p.child_pid) || p.child_pid < 2 || p.child_pid === p.launcher_pid
+          || !Number.isSafeInteger(p.after_sequence) || p.after_sequence < 0
+          || p.after_sequence >= (1 << 30)
+          || (p.after_sequence === 0 && p.previous_lease_envelope_sha256 !== null)
+          || (p.after_sequence > 0 && !DIGEST.test(p.previous_lease_envelope_sha256 ?? ''))
+          || !CHALLENGE.test(p.challenge_nonce_base64url ?? '')
+          || Buffer.from(p.challenge_nonce_base64url, 'base64url').length !== 32
+          || Buffer.from(p.challenge_nonce_base64url, 'base64url').toString('base64url')
+            !== p.challenge_nonce_base64url
+          || !Number.isFinite(Date.parse(p.prior_expires_at))
+          || Date.parse(p.prior_expires_at) <= core.clock.now()) refuse();
+        try {
+          let timer;
+          const lease = await Promise.race([
+            Promise.resolve().then(() => renewMemberRuntime({ ...selectors, ...p }, meta.protectedStart)),
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(new Error('Machine member runtime timed out')), LIVE_DEADLINE_MS);
+              timer.unref?.();
+            }),
+          ]).finally(() => clearTimeout(timer));
+          if (!lease || !DIGEST.test(lease.lease_sha256 ?? '')
+            || !Number.isSafeInteger(lease.lease_sequence)
+            || lease.lease_sequence !== p.after_sequence + 1
+            || typeof lease.lease_envelope_base64url !== 'string'
+            || !/^[A-Za-z0-9_-]{1,10924}$/.test(lease.lease_envelope_base64url)
+            || `sha256:${createHash('sha256').update(Buffer.from(lease.lease_envelope_base64url, 'base64url')).digest('hex')}`
+              !== lease.lease_sha256 || !current()) refuse();
+          return Object.freeze({ lease_envelope_base64url: lease.lease_envelope_base64url,
+            lease_sha256: lease.lease_sha256, lease_sequence: lease.lease_sequence });
+        } catch (error) { lose(); throw error; }
       }
       if (op !== 'launch.live') refuse();
       if (!['runner', 'child'].includes(meta.protectedStart.role)) refuse();
