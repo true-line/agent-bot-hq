@@ -27,8 +27,8 @@ const H_V0102 = Object.freeze({
   commit: 'b216ae9f5889ba00d38ef9b3e3bc9f60f54e90bd',
   digest: 'sha256:baafaeab591c30480c5d172b7ac3db39ffd01f0c0d420e338ffce71b839c58e2',
   files: 469,
-  runtimeDigest: 'sha256:54be96221e034b0878bee9aaaa42595c5d81d452162db84ff15f1a0354850012',
-  runtimeFiles: 418,
+  runtimeDigest: 'sha256:94a60ddc910e1f30bdf380c384efd8a7952665d41789daa7ead973cd8c95b6d1',
+  runtimeFiles: 417,
 });
 const VENDOR_PREFIX = 'vendor/soul-contracts/';
 export const H_V0102_EXCLUDED = Object.freeze([
@@ -76,6 +76,7 @@ export const H_V0102_EXCLUDED = Object.freeze([
   'fixtures/positive/stage2a-reservation-payload.v3-synthetic.json',
   'fixtures/positive/stage2a-signed-reservation.v3-synthetic.json',
   'fixtures/qualification/v3/q-presign-argv-synthetic.json',
+  'fixtures/reservation/v1/machine-658-synthetic.json',
   'fixtures/reservation/v3/machine-qualification-candidate-invalid-bytes.json',
   'fixtures/reservation/v3/machine-qualification-candidate-synthetic.json',
   'fixtures/reservation/v3/soul-cooperative-launch-inputs.brokered-b.synthetic.json',
