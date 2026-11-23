@@ -416,6 +416,7 @@ test('paired protected Soul install rejects altered scope before issuing a chall
     p => { p.soul_protected_launch.policy.bridge_qualification = {}; },
     p => { delete p.soul_protected_launch.policy.measurement_binding.snapshots; },
     p => { p.soul_protected_launch.policy.launch_inputs.files.at(-1).size = 512 * 1024 * 1024 + 1; },
+    p => { p.soul_protected_launch.policy.definition[1].size = 256 * 1024 * 1024 + 1; },
     p => { for (const file of p.soul_protected_launch.policy.launch_inputs.files.slice(0, 3)) file.size = 400 * 1024 * 1024; },
     p => { p.steps[0].detail = 'install a different policy'; },
     p => { p.steps.push({ kind: 'file', target: '/tmp/extra', action: 'write' }); },

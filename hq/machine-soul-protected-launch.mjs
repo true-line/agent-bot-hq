@@ -11,7 +11,10 @@ const account = /^[a-z_][a-z0-9_-]{0,31}$/;
 const hex = /^[0-9a-f]{64}$/;
 const digest = /^sha256:[0-9a-f]{64}$/;
 const soul = /^agent_[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
-const maxFileBytes = 512 * 1024 * 1024;
+const maxDefinitionFileBytes = 256 * 1024 * 1024;
+// Proposed external launch-input allowance; Platform's versioned rule must
+// approve it before this review path can be merged or used for protected launch.
+const maxLaunchFileBytes = 512 * 1024 * 1024;
 const maxTotalBytes = 1024 * 1024 * 1024;
 const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value)
   && Object.keys(value).join(',') === names;
@@ -27,7 +30,7 @@ const relative = value => typeof value === 'string' && value.length > 0 && value
   && /^[\x20-\x7e]+$/.test(value) && !value.startsWith('/') && !value.endsWith('/')
   && !value.includes('//') && !value.includes('\\')
   && value.split('/').every(part => part !== '.' && part !== '..');
-function record(value) {
+function record(value, maxFileBytes) {
   if (!object(value) || !relative(value.path) || !/^0[0-7]{3}$/.test(value.mode ?? '')) return false;
   const mode = Number.parseInt(value.mode, 8);
   if (mode & 0o222) return false;
@@ -36,11 +39,11 @@ function record(value) {
       && Number.isSafeInteger(value.size) && value.size >= 0 && value.size <= maxFileBytes
       && hex.test(value.sha256);
 }
-function records(value, minimum, maximum = 512) {
+function records(value, minimum, maximum, maxFileBytes) {
   let total = 0;
   return Array.isArray(value) && value.length >= minimum && value.length <= maximum
     && value.every((r, i) => {
-      if (!record(r) || (i !== 0 && r.path <= value[i - 1].path)) return false;
+      if (!record(r, maxFileBytes) || (i !== 0 && r.path <= value[i - 1].path)) return false;
       total += r.kind === 'regular' ? r.size : 0;
       return total <= maxTotalBytes;
     });
@@ -57,10 +60,10 @@ function validNested(policy, request) {
   if (!object(binding) || !object(runner)) return false;
   const requiredDefinition = { Contents: 'directory', 'Contents/SoulInfo.json': 'regular',
     'Contents/SoulLock.json': 'regular', 'Contents/opt': 'directory', 'Contents/primitives': 'directory' };
-  if (!records(definition, 5) || !Object.entries(requiredDefinition).every(([path, kind]) =>
+  if (!records(definition, 5, 512, maxDefinitionFileBytes) || !Object.entries(requiredDefinition).every(([path, kind]) =>
     definition.some(r => r.path === path && r.kind === kind))
     || !fields(inputs, 'files,host_projection,selected_command,argv,environment,effective_config,system_images,sandbox_policy_digest,component_digests')
-    || !records(inputs.files, 4, 64) || !inputs.files.every(r => r.kind === 'regular')
+    || !records(inputs.files, 4, 64, maxLaunchFileBytes) || !inputs.files.every(r => r.kind === 'regular')
     || !['host/adapters.json', 'host/installation.json']
       .every(path => inputs.files.some(r => r.path === path))
     || !fields(inputs.host_projection, 'adapters,installation')
