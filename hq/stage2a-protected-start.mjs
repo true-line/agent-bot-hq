@@ -224,14 +224,22 @@ export function createStage2aPrestartedMembers({ machinePublicKey, schemas, sche
         provisionalMappingSHA256: mapDigest });
       if (cancelled) refuse();
       if (profile === 'managed-cooperative') {
-        const { readyBytes, armReceiptSHA256s } = readiness ?? {};
+        const { readyBytes, armReceiptSHA256s, armRowsBase64url, bridgeObservedBase64url } = readiness ?? {};
         const readyEvidence = Object.freeze({ observation, authoritySHA256: authority.envelope_sha256,
           bridgeObservedSHA256: expectedAuthority.bridgeObservedSHA256,
           hObservationSHA256s: Object.freeze(hObservations.map(({ sha256 }) => sha256)),
           armReceiptSHA256s: Object.freeze([...(armReceiptSHA256s ?? [])]) });
         verifyCooperativeMemberReady(readyBytes, machinePublicKey, { ...readyEvidence, now: now() });
+        const rawMatches = (encoded, expected) => {
+          if (typeof encoded !== 'string' || encoded.length > 21_846) return false;
+          const bytes = Buffer.from(encoded, 'base64url');
+          return bytes.toString('base64url') === encoded && digest(bytes) === expected;
+        };
+        if (!rawMatches(bridgeObservedBase64url, readyEvidence.bridgeObservedSHA256)
+          || !Array.isArray(armRowsBase64url) || armRowsBase64url.length !== 2
+          || !armRowsBase64url.every((raw, i) => rawMatches(raw, readyEvidence.armReceiptSHA256s[i]))) refuse();
         return Object.freeze({ assignment, assignmentBytes, authorityBytes, observationBytes, readyBytes, readyEvidence,
-          memberGrants: Object.freeze(memberGrants), children: Object.freeze(children), provisionalMappingSHA256: mapDigest });
+          armRowsBase64url: Object.freeze([...armRowsBase64url]), bridgeObservedBase64url, memberGrants: Object.freeze(memberGrants), children: Object.freeze(children), provisionalMappingSHA256: mapDigest });
       }
       const readyBytes = readiness;
       const ready = signed(readyBytes, 'ready', schemas.ready);

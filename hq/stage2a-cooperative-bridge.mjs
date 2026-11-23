@@ -516,9 +516,9 @@ export function createCooperativeBPolicyDelivery({ reservation, bridgeAssignment
 }
 
 
-function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bind, finalizeMemberReady, now }) {
+function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bind, finalizeMemberReady, recordArmEvidence, now }) {
   let policy, observation;
-  const arms = new Map();
+  const arms = new Map(), pendingArms = new Set();
   let resolvePolicy, rejectPolicy, resolveReady, rejectReady;
   const policyResult = new Promise((resolve, reject) => { resolvePolicy = resolve; rejectPolicy = reject; });
   void policyResult.catch(() => {});
@@ -532,9 +532,16 @@ function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bi
       schema: schemas.armExchange, childObservationSchema: schemas.childObservation, schemaReferences,
       observe: () => observation,
       async recordArm(binding, bytes, sha256, arm_request, arm_result) {
-        if (!current(binding.connection, binding.receipt) || arms.has(arm_request.member_id)
-          || arms.size >= 2 || digest(bytes) !== sha256) refuse();
-        arms.set(arm_request.member_id, { arm_request, arm_result, bytes, sha256 });
+        const id = arm_request.member_id;
+        if (!current(binding.connection, binding.receipt) || arms.has(id) || pendingArms.has(id)
+          || arms.size + pendingArms.size >= 2 || digest(bytes) !== sha256) refuse();
+        pendingArms.add(id);
+        try {
+          const committed = await recordArmEvidence({ arm_request, arm_result });
+          if (!current(binding.connection, binding.receipt)
+            || !same(arm_request, committed.arm_request) || !same(arm_result, committed.arm_result)) refuse();
+          arms.set(id, { ...committed, bytes, sha256 });
+        } finally { pendingArms.delete(id); }
         if (arms.size === 2) {
           const ordered = [...arms.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([, row]) => row);
           // Defer signing so the second pending ACK can return before the aggregate Ready.
@@ -599,14 +606,14 @@ function createCooperativeBArmStage({ schemas, schemaReferences, reservation, bi
 // wrapper can complete its HMAC challenge on the same listener it will use
 // for policy. The role promise releases policy only after signed FD5 proof.
 export async function openCooperativeBStage({ reservation, bridgeAssignment, machinePublicKey,
-  schemas, schemaReferences, expected, openEndpoint, kernelPeer, exchange, random, contain, finalizeMemberReady,
+  schemas, schemaReferences, expected, openEndpoint, kernelPeer, exchange, random, contain, finalizeMemberReady, recordArmEvidence,
   now = Date.now } = {}) {
   if (!schemas || typeof openEndpoint !== 'function') refuse();
   const machine = createCooperativeBRoleClient({ reservation, bridgeAssignment, machinePublicKey, exchange, now });
   const bind = createCooperativeBBind({ reservation, bridgeAssignment, schema: schemas.bind,
     schemaReferences, machine, kernelPeer, random, contain, now });
-  const armStage = schemas.armExchange && schemas.childObservation && typeof finalizeMemberReady === 'function'
-    ? createCooperativeBArmStage({ schemas, schemaReferences, reservation, bind, finalizeMemberReady, now }) : undefined;
+  const armStage = schemas.armExchange && schemas.childObservation && typeof finalizeMemberReady === 'function' && typeof recordArmEvidence === 'function'
+    ? createCooperativeBArmStage({ schemas, schemaReferences, reservation, bind, finalizeMemberReady, recordArmEvidence, now }) : undefined;
   let resolveRole, rejectRole;
   const roleReady = new Promise((resolve, reject) => { resolveRole = resolve; rejectRole = reject; });
   void roleReady.catch(() => {});

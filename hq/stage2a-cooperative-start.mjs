@@ -43,6 +43,22 @@ export function createCooperativeChildObservationRecorder({ core, readCommittedR
   };
 }
 
+function createCooperativeArmRecorder({ core, readCommittedReceipts, reservation }) {
+  return async ({ arm_request, arm_result }) => {
+    const receipt = await pushReceipt(core, {
+      plugin: 'hq', kind: 'hq.soul.member.arm.recorded',
+      schema: 'agent-bot-hq/stage2a-cooperative-member-arm-recorded/v1',
+      reservation_sha256: reservation.sha256, start_id: reservation.payload.assignment.start_id,
+      hq_epoch: reservation.payload.assignment.hq_epoch, arm_request, arm_result,
+    });
+    if (!Number.isSafeInteger(receipt?.seq) || receipt.seq < 1) unavailable('cooperative B arm was not recorded');
+    const [committed] = await readCommittedReceipts([receipt.seq]);
+    if (!committed || !canonicalBytes(committed).equals(canonicalBytes(receipt)))
+      unavailable('committed cooperative B arm changed');
+    return Object.freeze({ arm_request: committed.arm_request, arm_result: committed.arm_result });
+  };
+}
+
 export function createStage2aCooperativeStarter({ machine, core, readCommittedReceipts, openAdmission, brokeredMemberProvider, timeoutMs = 30000 }) {
   const starts = new Map();
   const paths = new Set();
@@ -157,6 +173,7 @@ export function createStage2aCooperativeStarter({ machine, core, readCommittedRe
           grantMemberChild: (input) => machine.grantMemberChild(item.reservation, input),
           observeChildren: (input) => machine.observeMemberChildren(item.reservation, input),
           finalizeMemberReady: (input) => machine.finalizeMemberReady(item.reservation, input),
+          recordArmEvidence: createCooperativeArmRecorder({ core, readCommittedReceipts, reservation: item.reservation }),
           recordHChildObservation: createCooperativeChildObservationRecorder({
             core, readCommittedReceipts, reservation: item.reservation,
           }),
