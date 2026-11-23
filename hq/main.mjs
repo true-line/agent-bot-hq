@@ -300,7 +300,10 @@ async function main(argv) {
         pluginsDir, devPlugins: args.devPlugins, bridgeAssignments: installed,
         bridgeAuthority: authority, machineHqEpoch: epochs.values().next().value,
         protectedStart, protectedAdmission, createCooperativeStart, cooperativeAdmission: cooperativeMachine,
-        qualificationAuthorizer: installed.length ? ({ request, observation }) => {
+        // Production B uses its dedicated v2 relay ingress. The synthetic
+        // bridge qualification route stays disabled so it cannot consume the
+        // installed one-use Machine provider response.
+        relayIngressAuthorizer: installed.length ? ({ request, observation }) => {
           const provider = providers.get(observation?.reservation_digest);
           if (!provider) throw new Error('Machine protected provider start is unavailable');
           return provider({ request, observation });
