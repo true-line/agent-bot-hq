@@ -3,6 +3,36 @@ require 'stringio'
 require 'tmpdir'
 require_relative '../helpers/darwin-owner'
 
+# The protected launchd argv must preserve the complete signed Node prefix
+# before the helper replaces itself. Reject partial flags and plugin overrides.
+protected = ['/selected/node', '--no-addons', '--disallow-code-generation-from-strings',
+             '--import', '/selected/preloader.mjs', '/selected/main.mjs', 'run', '--config', '/private/config']
+raise 'protected argv changed' unless launch_arguments(protected, '_agent-bot-hq') ==
+  ['/selected/node', '/selected/main.mjs', ['run', '--config', '/private/config'],
+   ['--no-addons', '--disallow-code-generation-from-strings', '--import', '/selected/preloader.mjs']]
+raise 'base argv changed' unless launch_arguments(['/selected/node', '/selected/main.mjs', 'run'], '_agent-bot-hq') ==
+  ['/selected/node', '/selected/main.mjs', ['run'], []]
+[
+  protected[0..5],
+  protected.reject { |arg| arg == '--no-addons' },
+  protected.reject { |arg| arg == '--import' },
+  protected + ['--plugins', '/owner/plugins'],
+  protected + ['--dev-plugins', '/owner/plugins'],
+].each do |argv|
+  begin
+    launch_arguments(argv, '_agent-bot-hq')
+    raise 'unsafe launch argv accepted'
+  rescue ArgumentError
+    nil
+  end
+end
+begin
+  launch_arguments(protected, 'ordinary-user')
+  raise 'ordinary account accepted'
+rescue ArgumentError
+  nil
+end
+
 def expect_exit(code)
   saved = $stderr
   $stderr = StringIO.new
