@@ -4,6 +4,10 @@
 import { lstatSync, realpathSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { pipeline } from 'node:stream';
+import { canonicalBytes, canonicalDigest } from '../sdk/wire/canonical-json.mjs';
+import { validate } from '../sdk/wire/schema.mjs';
+import { matchesObservedMemberGrants, verifyStage2aBridgeMemberAuthority } from './stage2a-relay-peer.mjs';
+import { verifyStage2aMachineEnvelope } from './stage2a-stop.mjs';
 import { takeover } from './socket.mjs';
 import { machineRoleStage2aLookup, machineRoleStage2aReserve,
   machineRoleStage2aFinalizeB, machineRoleStage2aChildReady } from './machine-channel.mjs';
@@ -72,6 +76,141 @@ function activateRunner(runner, assignment, reservationSHA256, live, finalizatio
     try { runner.stdin.write(line, finish); }
     catch (error) { finish(error); }
   });
+}
+
+// One protected start owns both wrappers. This is invoked from the pending
+// Hello transaction boundary. Only the later selector-bound attach owns ACP.
+export function createStage2aPrestartedMembers({ machinePublicKey, schemas, schemaReferences = [],
+  submitMap, startMember, observeChildren, deliverObservation, waitForReady, stop,
+  now = Date.now } = {}) {
+  if (!schemas?.assignment || !schemas.mapping || !schemas.authority || !schemas.observation || !schemas.ready
+    || [submitMap, startMember, observeChildren, deliverObservation, waitForReady, stop, now]
+      .some((method) => typeof method !== 'function')) refuse();
+  const digest = (bytes) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+  const names = Object.values(schemas);
+  const refs = (schema) => [...new Map([...schemaReferences, ...names].filter((entry) =>
+    entry?.$id && entry.$id !== schema.$id).map((entry) => [entry.$id, entry])).values()];
+  const validatePayload = (schema, payload) => {
+    if (validate(schema, payload, { schemas: refs(schema) }).length) refuse();
+    return payload;
+  };
+  const signed = (bytes, kind, schema) => {
+    const envelope = verifyStage2aMachineEnvelope(bytes, machinePublicKey,
+      `agent-bot/stage2a-member-set-${kind}/v1`, { maxBytes: 16_384 });
+    validatePayload(schema, envelope.payload);
+    return envelope;
+  };
+  let started = false;
+  return async function prepare({ selectors, expectedAuthority, assignmentBytes, authorityBytes, pendingRuntimes }) {
+    if (started) refuse();
+    started = true;
+    const handles = [];
+    let cancelled = false;
+    let timer;
+    const contain = async () => {
+      cancelled = true;
+      await Promise.allSettled(handles.map((handle) => Promise.resolve().then(() => handle.stop())));
+      await stop();
+    };
+    const work = async () => {
+      const assignment = signed(assignmentBytes, 'assignment', schemas.assignment);
+      const a = assignment.payload;
+      const authority = verifyStage2aBridgeMemberAuthority(authorityBytes, { machinePublicKey,
+        schema: schemas.authority, assignmentSchema: schemas.assignment,
+        schemas: refs(schemas.assignment).filter((schema) => schema.$id !== schemas.authority.$id),
+        expected: { ...expectedAuthority, ...selectors, profile_in_force: 'managed-protected' },
+        assignmentBytes, now: now() });
+      const match = (left, right, fields) => fields.every((field) => left?.[field] === right?.[field]);
+      const scope = ['profile_in_force', 'host_id', 'installation_id', 'soul_id', 'start_id', 'hq_epoch'];
+      const runtime = new Map(pendingRuntimes.map((row) => [row.member_id, row]));
+      if (pendingRuntimes.length !== 2 || runtime.size !== 2 || cancelled) refuse();
+      const map = validatePayload(schemas.mapping, {
+        contract: 'hq/v1', kind: 'stage2a-provisional-member-map', schema_version: 1,
+        ...Object.fromEntries(scope.map((field) => [field, a[field]])),
+        assignment_envelope_sha256: assignment.envelope_sha256,
+        runtime_state: 'provisional', acp_authority: 'withheld',
+        members: a.members.map((member) => {
+          const rt = runtime.get(member.member_id);
+          if (!rt || rt.role !== member.role) refuse();
+          return { member_id: member.member_id, member_selector: member.member_selector,
+            runtime_id: rt.runtime_id, channel_binding: rt.channel_binding };
+        }), issued_at: new Date(now()).toISOString().replace('.000Z', 'Z'), expires_at: a.expires_at,
+      });
+      const mapBytes = canonicalBytes(map), mapDigest = digest(mapBytes);
+      const ack = await submitMap({ ...selectors,
+        provisional_hq_mapping_base64url: mapBytes.toString('base64url'), provisional_hq_mapping_sha256: mapDigest });
+      if (ack?.accepted !== true || ack.sha256 !== mapDigest || cancelled) refuse();
+      const children = await Promise.all(a.members.map(async (member) => {
+        const child = await startMember(selectors, Object.freeze({ ...member }));
+        if (typeof child?.stop !== 'function') refuse();
+        if (cancelled) { await child.stop(); refuse(); }
+        handles.push(child);
+        const status = await child.waitChildStarted();
+        if (cancelled || status.child_launcher_pid !== child.pid || status.grant_sha256 !== child.grantSHA256
+          || !DIGEST.test(child.grantSHA256) || !Number.isSafeInteger(status.child_pid)
+          || status.child_pid < 2 || status.child_pid === child.pid) refuse();
+        return { child, member, status };
+      }));
+      const evidence = children.map(({ child, member, status }) => ({
+        member_id: member.member_id, member_selector: member.member_selector,
+        member_launch_id: member.launch_id, child_launcher_pid: child.pid, child_pid: status.child_pid,
+        grant_sha256: child.grantSHA256,
+      }));
+      const observationBytes = await observeChildren({ ...selectors, members: evidence });
+      const observation = signed(observationBytes, 'child-observation', schemas.observation);
+      const c = observation.payload;
+      if (cancelled || !match(c, a, [...scope, 'reservation_sha256'])
+        || c.assignment_envelope_sha256 !== assignment.envelope_sha256
+        || c.provisional_hq_mapping_sha256 !== mapDigest
+        || canonicalDigest(c.provisional_hq_mapping) !== mapDigest) refuse();
+      const memberGrants = c.members.map((row, i) => {
+        const observed = evidence[i];
+        if (row.launcher_process.pid !== observed.child_launcher_pid || row.child_process.pid !== observed.child_pid
+          || row.child_process.uid !== a.runner_uid || row.child_process.gid !== a.runner_gid
+          || row.child_process.executable_sha256 !== a.members[i].command_sha256
+          || row.runtime_id !== map.members[i].runtime_id) refuse();
+        return Object.freeze({ member_id: observed.member_id, member_selector: observed.member_selector,
+          launch_id: observed.member_launch_id, grant_sha256: observed.grant_sha256,
+          launcher_process: Object.freeze({ ...row.launcher_process }) });
+      });
+      if (!matchesObservedMemberGrants(a, c.members, memberGrants) || Date.parse(c.expires_at) <= now()) refuse();
+      await Promise.all(children.map(({ child, member }) =>
+        deliverObservation(child, member, observationBytes, observation.envelope_sha256)));
+      if (cancelled) refuse();
+      const readyBytes = await waitForReady({ selectors, observationBytes, memberGrants, children,
+        provisionalMappingSHA256: mapDigest });
+      const ready = signed(readyBytes, 'ready', schemas.ready);
+      const r = ready.payload;
+      if (cancelled || !match(r, a, [...scope, 'reservation_sha256'])
+        || r.assignment_envelope_sha256 !== assignment.envelope_sha256
+        || r.child_observation_envelope_sha256 !== observation.envelope_sha256
+        || r.member_b_authority_envelope_sha256 !== authority.envelope_sha256
+        || r.b_authority_sha256 !== a.b_authority.envelope_sha256 || r.provisional_hq_mapping_sha256 !== mapDigest
+        || !match(r.bridge_process, a.bridge, ['uid', 'gid'])
+        || !expectedAuthority.bridge_process
+        || canonicalDigest(r.bridge_process) !== canonicalDigest(expectedAuthority.bridge_process)
+        || !(Date.parse(r.issued_at) <= now() && now() < Date.parse(r.expires_at))) refuse();
+      for (const [i, row] of r.members.entries()) {
+        const observed = c.members[i], arm = row.bridge_arm;
+        if (!match(row, observed, ['member_id', 'member_selector', 'launch_id', 'runtime_id'])
+          || !match(row, arm, ['member_id', 'member_selector', 'runtime_id'])
+          || arm.bridge_uid !== r.bridge_process.uid || arm.state !== 'armed'
+          || arm.child_observation_envelope_sha256 !== observation.envelope_sha256
+          || ['pid', 'uid', 'gid', 'start_seconds', 'start_micros'].some((field) =>
+            arm[`adapter_${field}`] !== observed.child_process[field])
+          || canonicalDigest(arm) !== row.bridge_arm_receipt_sha256) refuse();
+      }
+      return Object.freeze({ assignment, assignmentBytes, authorityBytes, observationBytes, readyBytes,
+        memberGrants: Object.freeze(memberGrants), children: Object.freeze(children), provisionalMappingSHA256: mapDigest });
+    };
+    try {
+      return await Promise.race([work(), new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Stage 2a member-set prestart timed out')), 20_000);
+        timer.unref?.();
+      })]);
+    } catch (error) { await contain(); throw error; }
+    finally { clearTimeout(timer); }
+  };
 }
 
 export function createStage2aProtectedStarter({ installations, authority, verifyReservation,

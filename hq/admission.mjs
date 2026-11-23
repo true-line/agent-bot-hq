@@ -91,12 +91,12 @@ function checkedProtectedStart(binding, payload, helloDigest) {
   return Object.freeze({ ...binding });
 }
 
-function boundedMachineCall(call) {
+function boundedMachineCall(call, timeoutMs = PROTECTED_MACHINE_DEADLINE_MS) {
   let timer;
   return Promise.race([
     Promise.resolve().then(call),
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('protected Machine call timed out')), PROTECTED_MACHINE_DEADLINE_MS);
+      timer = setTimeout(() => reject(new Error('protected Machine call timed out')), timeoutMs);
       timer.unref?.();
     }),
   ]).finally(() => clearTimeout(timer));
@@ -489,6 +489,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           });
           try {
             await live(protectedStart);
+            await boundedMachineCall(() => protectedAdmission.prepareMemberSet?.(expected,
+              Object.freeze(result.admitted_runtimes.map((row) => Object.freeze({ ...row })))), 21_000);
             const finalization = await boundedMachineCall(() => protectedAdmission.finalize(expected));
             if (await boundedMachineCall(() => protectedAdmission.verifyFinalization(finalization, expected)) !== true)
               fail('host.launch_unavailable', 'Machine did not authenticate the exact post-Hello finalization');

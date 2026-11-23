@@ -72,7 +72,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
     return record;
   }
 
-  function registerStart({ installed, assignment, selectors, getBindReceiptSHA256 } = {}) {
+  function registerStart({ installed, assignment, selectors, getBindReceiptSHA256, prestartMembers } = {}) {
     if (!installed || !assignment || !exact(selectors, STOP_FIELDS)
       || !DIGEST.test(selectors.reservation_sha256)
       || !assignmentMatches(assignment, selectors)
@@ -80,9 +80,10 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
       || installed.plan_id !== selectors.plan_id || installed.plan_digest !== selectors.plan_digest
       || installed.hq_epoch !== selectors.hq_epoch
       || typeof getBindReceiptSHA256 !== 'function'
+      || (prestartMembers !== undefined && typeof prestartMembers !== 'function')
       || starts.has(selectors.reservation_sha256)) refuse();
     const record = { installed, assignment, selectors: Object.freeze({ ...selectors }),
-      getBindReceiptSHA256, hello: null, finalized: false, lost: false,
+      getBindReceiptSHA256, prestartMembers, prestarted: null, hello: null, finalized: false, lost: false,
       lastLiveAt: now(), watch: null, timer: null };
     starts.set(selectors.reservation_sha256, record);
     return Object.freeze({ close: () => {
@@ -210,6 +211,21 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
     return true;
   }
 
+  async function prepareMemberSet(expected, pendingRuntimes) {
+    const record = recordForExpected(expected);
+    if (!record.prestartMembers) return;
+    if (!record.hello || record.finalized || record.prestarted
+      || expected.hello_payload_sha256 !== record.hello.binding.hello_payload_sha256) refuse();
+    record.prestarted = await record.prestartMembers({ selectors: record.selectors, pendingRuntimes });
+    if (!record.prestarted || record.lost) refuse();
+  }
+
+  function prestartedFor(selectors) {
+    const record = recordFor(selectors);
+    if (!record.finalized || !record.prestarted) refuse();
+    return record.prestarted;
+  }
+
   async function finalize(expected) {
     const record = recordForExpected(expected);
     const hello = record.hello;
@@ -222,6 +238,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
       || expected.profile_in_force !== 'managed-protected'
       || !Number.isSafeInteger(expected.installation_epoch)
       || expected.installation_epoch < 1) refuse();
+    if (record.prestartMembers && !record.prestarted) refuse();
     const reply = await machineHelloFinalize({ ...record.selectors,
       start_envelope_sha256: hello.startSHA256, expected });
     const signed = checkedReply(reply, machinePublicKey, FINAL_PURPOSE,
@@ -327,7 +344,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
     await abort(context);
   }
 
-  return Object.freeze({ registerStart, acceptPeer, refreshRunnerPeer, verifyHelloStart,
+  return Object.freeze({ registerStart, acceptPeer, refreshRunnerPeer, verifyHelloStart, prepareMemberSet, prestartedFor,
     verifyDefinitionMapping, finalize, verifyFinalization, abort,
     finalizationFor, watchLiveness, assertLive, peerDisconnected, watchHealthy });
 }
