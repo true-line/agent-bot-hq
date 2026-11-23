@@ -37,7 +37,7 @@
 //
 // Equip carries no credentials yet: grants and credential references arrive
 // with §9 PRs 18 and 21. It hands out one opaque grant handle per member.
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { definePlugin } from '../sdk/plugin.mjs';
 import { fail, HostError } from '../sdk/errors.mjs';
 import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
@@ -62,6 +62,8 @@ const CHALLENGE_TTL_MS = 60_000;
 const MAX_CHALLENGES = 4096;
 const PROTECTED_MACHINE_DEADLINE_MS = 5_000;
 const SHA256 = /^sha256:[0-9a-f]{64}$/;
+const GRANT_HANDLE = /^gh_[0-9a-f]{32}$/;
+const grantHandleDigest = (handle) => 'sha256:' + createHash('sha256').update(handle, 'ascii').digest('hex');
 const START_ID = /^st_[0-9a-f]{24}$/;
 const LAUNCH_ID = /^ln_[0-9a-f]{24}$/;
 
@@ -586,7 +588,9 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             budget_sub_allocations: { working: 0, maintenance: 0 },
           };
           check('equip', result, false);
-          const audit = { kind: 'hq.equip', runtime_id: payload.runtime_id, credential_references: 0, caller };
+          const audit = { kind: 'hq.equip', runtime_id: payload.runtime_id, credential_references: 0, caller,
+            ...(rt.protected_start_id ? { start_id: rt.protected_start_id, installation_id: rt.installation_id,
+              member_id: rt.member_id, grant_handle_sha256: grantHandleDigest(handle) } : {}) };
           if (atomicAudit) receipts.appendIn(tx, audit);
           return { record: result, audit };
         });
@@ -756,6 +760,43 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         if (!rt) fail('host.invalid_request', `unknown runtime ${runtimeId}`);
         return fn(Object.freeze(current(rt, runtimeId, clock.now())));
       });
+      // A trusted protected-operation consumer supplies the authenticated
+      // runtime ID and digest of its validated request. No caller-supplied
+      // runtime selector is accepted here. The operation still applies its
+      // own authorization before using protected resources.
+      async function withProtectedGrant(boundRuntimeId, handle, requestSHA256, effect) {
+        if (!atomicAudit) fail('host.launch_unavailable', 'protected grant checks need atomic receipts');
+        if (typeof boundRuntimeId !== 'string' || !RUNTIME_ID.test(boundRuntimeId)
+          || typeof requestSHA256 !== 'string' || requestSHA256.length !== 71 || !SHA256.test(requestSHA256)
+          || typeof handle !== 'string' || handle.length !== 35 || !GRANT_HANDLE.test(handle)
+          || typeof effect !== 'function') fail('host.invalid_request', 'invalid protected grant use');
+
+        const result = await store.tx(async (tx) => {
+          const rt = tx.get('runtimes', boundRuntimeId);
+          try {
+            if (rt && !rt.protected_start_key) fail('profile_insufficient', 'grant use requires a protected runtime');
+            if (!rt?.handle || !sameBinding(rt.handle, handle))
+              fail('caller_mismatch', 'grant handle does not belong to this runtime');
+            current(rt, boundRuntimeId, clock.now());
+            await live(watchedStarts.get(rt.protected_start_key));
+            current(rt, boundRuntimeId, clock.now());
+          } catch (error) {
+            if (!(error instanceof HostError)) throw error;
+            receipts.appendIn(tx, { kind: 'hq.protected.grant.refused',
+              code: error.code, runtime_id: boundRuntimeId, request_sha256: requestSHA256,
+              grant_handle_sha256: grantHandleDigest(handle), effect_invoked: false,
+              ...(rt?.protected_start_id ? { start_id: rt.protected_start_id, installation_id: rt.installation_id,
+                member_id: rt.member_id, installation_epoch: rt.epoch, lease_generation: rt.lease_generation } : {}) });
+            return { error };
+          }
+          return { value: await effect(Object.freeze({ runtime_id: boundRuntimeId,
+            member_id: rt.member_id, soul_id: rt.soul_id, installation_id: rt.installation_id,
+            start_id: rt.protected_start_id, installation_epoch: rt.epoch,
+            lease_generation: rt.lease_generation })) };
+        });
+        if (result.error) throw result.error;
+        return result.value;
+      }
       // Trusted broker consumers pass the bound runtime id, never a payload
       // runtime selector. Keep liveness, assignment and mailbox effect in the
       // same admission queue used by Hello/Lease and task commits.
@@ -800,7 +841,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         boundBridge: bridge.boundBridge,
         bridgeStatus: bridge.bridgeStatus,
         revokeBridges: bridge.revokeAll,
-        withBoundRuntime, withNoticeScope, unboundRuntimes } };
+        withBoundRuntime, withProtectedGrant, withNoticeScope, unboundRuntimes } };
     },
     async start(ctx) { await normalizeScopes.get(ctx)(); },
     async stop(ctx) { await bridgeStates.get(ctx)?.revokeAll(); },

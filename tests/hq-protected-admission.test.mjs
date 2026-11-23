@@ -14,7 +14,7 @@ const next = () => {
 
 // Synthetic trusted-client fixture: it exercises HQ sequencing only. It is
 // not a Machine signature or qualification proof and cannot enable production.
-function machine({ finalized, entered, aborts, cooperativePeers = 0 }) {
+function machine({ finalized, entered, aborts, cooperativePeers = 0, startByte = '1' }) {
   return {
     async acceptPeer() { return cooperativePeers-- > 0 ? null : { machine_peer: 'fixture-live-R' }; },
     async peerDisconnected(_socket, context) { if (context) this.onLoss?.(); },
@@ -23,9 +23,9 @@ function machine({ finalized, entered, aborts, cooperativePeers = 0 }) {
     watchHealthy() { return true; },
     async verifyHelloStart({ connection, payload, hello_payload_sha256: digest }) {
       assert.equal(connection.machine_peer, 'fixture-live-R');
-      return { reservation_sha256: sha('a'), definition_measurement: sha('b'),
+      return { reservation_sha256: sha(startByte === '1' ? 'a' : '9'), definition_measurement: sha('b'),
         launch_input_measurement: sha('c'), broker_bind_receipt_sha256: sha('d'),
-        start_id: `st_${'1'.repeat(24)}`, launch_id: `ln_${'2'.repeat(24)}`,
+        start_id: `st_${startByte.repeat(24)}`, launch_id: `ln_${'2'.repeat(24)}`,
         hq_epoch: '3'.repeat(64), soul_id: payload.soul_id,
         installation_id: payload.installation_id, definition_digest: payload.definition_digest,
         hello_payload_sha256: digest, profile_in_force: 'managed-protected' };
@@ -415,5 +415,84 @@ test('failed Machine watcher transport closes active runtime and lease authority
     const held = await t.hq.host.provided('hq-admission').withLeases((hasLease) => hasLease(SOUL, 1));
     assert.equal(held, false);
     assert.ok(aborts.includes(expected.start_id));
+  } finally { await t.done(); }
+});
+
+test('a protected grant belongs to its bound runtime before and after HQ restart', async () => {
+  let home;
+  let priorHandle;
+  for (const [index, startByte] of ['1', '2'].entries()) {
+    const finalized = next();
+    const entered = next();
+    const t = await startProtectedHQ({ home, protectedAdmission: machine({ finalized, entered, aborts: [], startByte }) });
+    home = t.home;
+    try {
+      const entry = await t.entry();
+      const pending = entry.request('Hello', hello({ request_id: `req_grant_${index}` }));
+      const expected = await Promise.race([entered.promise, pending.then((response) => {
+        throw new Error(`Hello returned before grant test finalization: ${JSON.stringify(response)}`);
+      })]);
+      finalized.resolve(expected);
+      const admission = await pending;
+      assert.equal(admission.ok, true, JSON.stringify(admission));
+      const [a, b] = admission.result.admitted_runtimes;
+      const equips = await Promise.all([a, b].map(({runtime_id}) => entry.request('Equip', { runtime_id })));
+      assert.ok(equips.every(({ok}) => ok));
+      const [handleA, handleB] = equips.map(({result}) => result.grant_handles[0].handle);
+      assert.notEqual(handleA, handleB);
+
+      let effects = 0;
+      const effect = (scope) => {
+        effects++;
+        assert.equal(scope.start_id, `st_${startByte.repeat(24)}`);
+        assert.equal(scope.grant_handle, undefined);
+        return scope.member_id;
+      };
+      const { withProtectedGrant } = t.hq.host.provided('hq-admission');
+      await assert.rejects(withProtectedGrant(a.runtime_id, handleA + '\n', sha('c'), effect),
+        (error) => error.code === 'host.invalid_request');
+      await assert.rejects(withProtectedGrant(a.runtime_id, handleA, sha('c') + '\n', effect),
+        (error) => error.code === 'host.invalid_request');
+      assert.equal(await withProtectedGrant(a.runtime_id, handleA, sha('c'), effect), a.member_id);
+      assert.equal(await withProtectedGrant(b.runtime_id, handleB, sha('d'), effect), b.member_id);
+      await assert.rejects(withProtectedGrant(b.runtime_id, handleA, sha('e'), effect),
+        (error) => error.code === 'caller_mismatch');
+      if (priorHandle) {
+        assert.notEqual(priorHandle, handleA);
+        await assert.rejects(withProtectedGrant(b.runtime_id, priorHandle, sha('f'), effect),
+          (error) => error.code === 'caller_mismatch');
+      }
+      assert.equal(effects, 2);
+      priorHandle = handleA;
+
+      const { receipts } = JSON.parse(readFileSync(join(home, 'store.json'), 'utf8'));
+      const issued = receipts.find(({kind, runtime_id}) => kind === 'hq.equip' && runtime_id === a.runtime_id);
+      const denied = receipts.find(({kind, runtime_id}) => kind === 'hq.protected.grant.refused' && runtime_id === b.runtime_id);
+      assert.equal(denied.grant_handle_sha256, issued.grant_handle_sha256);
+      assert.equal(denied.start_id, issued.start_id);
+      assert.equal(denied.member_id, b.member_id);
+      assert.equal(denied.request_sha256, sha('e'));
+      assert.equal(denied.effect_invoked, false);
+      assert.equal(JSON.stringify(receipts).includes(handleA), false);
+      assert.equal(JSON.stringify(receipts).includes(handleB), false);
+      if (index === 1) assert.equal(receipts.filter(({kind}) => kind === 'hq.protected.grant.refused').length, 3);
+    } finally {
+      await t.done({ keep: index === 0 });
+    }
+  }
+});
+
+test('a cooperative runtime cannot use a protected grant even with its own equipped handle', async () => {
+  const t = await startHQ();
+  try {
+    const entry = await t.entry();
+    const admitted = await entry.request('Hello', hello());
+    assert.equal(admitted.result.profile, 'managed-cooperative');
+    const { runtime_id } = admitted.result.admitted_runtimes[0];
+    const equipped = await entry.request('Equip', { runtime_id });
+    const { handle } = equipped.result.grant_handles[0];
+    const { withProtectedGrant } = t.hq.host.provided('hq-admission');
+    await assert.rejects(withProtectedGrant(runtime_id, handle, sha('a'), () => assert.fail('protected effect')),
+      (error) => error.code === 'profile_insufficient');
   } finally { await t.done(); }
 });
