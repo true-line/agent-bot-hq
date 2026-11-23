@@ -1,9 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync, rmSync, chmodSync, truncateSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { copyFileSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync, realpathSync, rmSync, chmodSync, truncateSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { manifestDigest, verifyVendored } from '../scripts/soul-contracts.mjs';
+import { dirname, join } from 'node:path';
+import { H_V09_EXCLUDED, hRuntimeSelection, manifestDigest, readPin, verify,
+  verifySelectedVendoredTree, verifyVendored } from '../scripts/soul-contracts.mjs';
 
 test('vendored contracts verify exact content and refuse tampering and symlinks', () => {
   const dir = mkdtempSync(join(realpathSync(tmpdir()), 'hq-contracts-'));
@@ -56,12 +59,12 @@ test('importing the verifier from stdin, eval or print leaves CLI execution to t
 });
 
 test('interim mode verifies offline and missing payload never falls back to git', async () => {
-  const { copyFileSync } = await import('node:fs');
-  const { spawnSync } = await import('node:child_process');
   const { fileURLToPath } = await import('node:url');
   const dir = mkdtempSync(join(realpathSync(tmpdir()), 'hq-interim-'));
   try {
-    for (const path of ['scripts', 'governance', 'vendor/soul-contracts/schemas']) mkdirSync(join(dir, path), {recursive:true});
+    for (const path of ['scripts', 'hq', 'governance', 'vendor/soul-contracts/schemas']) mkdirSync(join(dir, path), {recursive:true});
+    writeFileSync(join(dir, 'hq/stage2a-h-preloader.mjs'),
+      'export function authenticatedSelectedH() { return null; }\n');
     copyFileSync(fileURLToPath(new URL('../scripts/soul-contracts.mjs', import.meta.url)), join(dir,'scripts/soul-contracts.mjs'));
     const bytes = Buffer.from('{}\n');
     const digest = manifestDigest([{path:'schemas/one.json', mode:'100644', bytes}]);
@@ -86,4 +89,70 @@ test('interim mode verifies offline and missing payload never falls back to git'
       assert.doesNotMatch(refused.stderr, /spawnSync git/);
     }
   } finally { rmSync(dir,{recursive:true,force:true}); }
+});
+
+test('selected H Contracts verifies exactly the A-bound v0.9 runtime subset', () => {
+  const pin = readPin();
+  const full = verify(pin);
+  const runtime = hRuntimeSelection(pin, full.manifest);
+  assert.equal(runtime.files, 420);
+  assert.equal(runtime.digest, 'sha256:25486824df6e2fc2df87c8cfa0721384f9e5650a6519dc87c53ece8377d7447e');
+  const changedFull = { ...full.manifest,
+    [H_V09_EXCLUDED[0]]: { ...full.manifest[H_V09_EXCLUDED[0]], size: 1 } };
+  assert.throws(() => hRuntimeSelection(pin, changedFull), /full source/);
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'hq-selected-contracts-'));
+  const dir = join(root, 'vendor/soul-contracts');
+  try {
+    mkdirSync(dir, { recursive: true });
+    for (const path of Object.keys(full.manifest)) {
+      const dest = join(dir, path);
+      mkdirSync(dirname(dest), { recursive: true });
+      copyFileSync(join(full.dir, path), dest);
+    }
+    for (const path of H_V09_EXCLUDED) rmSync(join(dir, path));
+    const rows = Object.entries(full.manifest)
+      .filter(([path]) => !H_V09_EXCLUDED.includes(path))
+      .map(([path, item]) => ({ path: `vendor/soul-contracts/${path}`,
+        sha256: `sha256:${item.sha256}`, size_bytes: item.size, mode: '0440' }));
+    const metadata = { schema_version: 1, target_platform: 'darwin',
+      contracts_commit: pin.commit, contracts_digest: pin.digest, contracts_runtime: runtime };
+    const check = (m = metadata, r = rows) => verifySelectedVendoredTree(dir, pin, m, r);
+    assert.equal(check().digest, runtime.digest);
+    for (const path of ['scripts', 'hq', 'governance']) mkdirSync(join(root, path));
+    const metadataBytes = Buffer.from(JSON.stringify(metadata) + '\n');
+    writeFileSync(join(root, 'governance/interim-release.json'), metadataBytes);
+    writeFileSync(join(root, 'governance/soul-contracts.json'), JSON.stringify(pin));
+    copyFileSync(new URL('../scripts/soul-contracts.mjs', import.meta.url), join(root, 'scripts/soul-contracts.mjs'));
+    const selection = { root,
+      metadataSha256: 'sha256:' + createHash('sha256').update(metadataBytes).digest('hex'),
+      metadataSize: metadataBytes.length, vendorRows: rows };
+    // Only this disposable fixture has an env switch; production's getter is
+    // set solely by the completed Machine-authenticated preloader.
+    writeFileSync(join(root, 'hq/stage2a-h-preloader.mjs'),
+      `const selected = ${JSON.stringify(selection)};\nexport function authenticatedSelectedH() { return process.env.TEST_AUTHENTICATED_H === '1' ? selected : null; }\n`);
+    const entry = join(root, 'scripts/soul-contracts.mjs');
+    const run = (authenticated) => spawnSync(process.execPath, [entry, 'verify'], {
+      encoding: 'utf8', env: { ...process.env, PATH: '/nonexistent',
+        HQ_INTERIM_OFFLINE: '1', TEST_AUTHENTICATED_H: authenticated ? '1' : '0' } });
+    assert.equal(run(true).status, 0);
+    const envOnly = run(false);
+    assert.equal(envOnly.status, 1);
+    assert.match(envOnly.stderr, /does not match/);
+    const changedMetadata = JSON.parse(JSON.stringify(metadata));
+    changedMetadata.contracts_runtime.excluded_hq_release_paths.pop();
+    assert.throws(() => check(changedMetadata), /metadata/);
+    const changedRows = rows.map((row) => ({ ...row }));
+    changedRows[0].sha256 = 'sha256:' + '0'.repeat(64);
+    assert.throws(() => check(metadata, changedRows), /row/);
+    const omitted = H_V09_EXCLUDED[0];
+    copyFileSync(join(full.dir, omitted), join(dir, omitted));
+    assert.throws(() => check(), /subset/);
+    rmSync(join(dir, omitted));
+    const schema = Object.keys(full.manifest).find((path) => path.startsWith('schemas/'));
+    rmSync(join(dir, schema));
+    assert.throws(() => check(), /subset/);
+    copyFileSync(join(full.dir, schema), join(dir, schema));
+    writeFileSync(join(dir, schema), '{}\n');
+    assert.throws(() => check(), /subset/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

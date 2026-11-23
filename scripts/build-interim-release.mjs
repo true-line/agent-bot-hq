@@ -7,7 +7,7 @@ import { cpSync, linkSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, real
 import { tmpdir } from 'node:os';
 import { resolve, join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { readPin, verifyVendored } from './soul-contracts.mjs';
+import { hRuntimeSelection, readPin, verifyVendored } from './soul-contracts.mjs';
 
 const [commit, contracts, output, ...options] = process.argv.slice(2);
 const darwinTarget = options.length === 2 && options[0] === '--target' && options[1] === 'darwin';
@@ -52,9 +52,11 @@ try {
   const vendor = join(tree, 'vendor/soul-contracts');
   mkdirSync(vendor, { recursive: true });
   for (const path of pin.paths) cpSync(join(resolve(contracts), path), join(vendor, path), { recursive: true, dereference: false, preserveTimestamps: false });
-  verifyVendored(vendor, pin);
+  const fullContracts = verifyVendored(vendor, pin);
+  const contractsRuntime = darwinTarget && pin.tag === 'v0.9.0'
+    ? hRuntimeSelection(pin, fullContracts.manifest) : undefined;
   const broker = darwinTarget ? (await import('./darwin-broker.mjs')).stageDarwinBroker(tree, work) : undefined;
-  writeFileSync(join(tree, 'governance/interim-release.json'), `${JSON.stringify({ schema_version: 1, hq_commit: commit, contracts_commit: pin.commit, contracts_digest: pin.digest, ...(darwinTarget ? { target_platform: target, owner_control_capability: 'darwin-owner-control/v2', broker } : {}) }, null, 2)}\n`);
+  writeFileSync(join(tree, 'governance/interim-release.json'), `${JSON.stringify({ schema_version: 1, hq_commit: commit, contracts_commit: pin.commit, contracts_digest: pin.digest, ...(darwinTarget ? { target_platform: target, owner_control_capability: 'darwin-owner-control/v2', broker, ...(contractsRuntime ? { contracts_runtime: contractsRuntime } : {}) } : {}) }, null, 2)}\n`);
   renameSync(join(tree, 'hq/main.mjs'), join(tree, 'hq/interim-core.mjs'));
   writeFileSync(join(tree, 'hq/main.mjs'), `// Interim artifact entrypoint: verify vendored contracts without network fallback.\nif (process.platform !== '${target}') throw new Error('interim artifact runs on ${darwinTarget ? 'macOS' : 'Linux'} only');\nprocess.env.HQ_INTERIM_OFFLINE = '1';\nawait import('./interim-core.mjs');\n`);
   const temporaryTar = join(outputWork, 'artifact.tar');
