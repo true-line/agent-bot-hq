@@ -80,6 +80,17 @@ the slot as uncontained unless the supervisor confirms group closure or an
 explicit refusal before spawn. Per-launch member authentication and retirement
 remain under Souls and Machine respectively.
 
+## macOS Soul runner account review
+
+Machine's `soul-runner-provision` plan names a separate untrusted role per
+Soul installation, with its exact UID/GID and private home. HQ validates the
+canonical Machine plan and transfers the paired owner proof. It rejects a plan
+that reuses the HQ UID, duplicates a runner UID, chooses an account name, or
+mixes purposes. The owner approves the exact digest before Machine applies it.
+
+This account handoff does not authorize a launch or install a harness. A
+reviewed launch rule and protected start have separate requirements.
+
 ## Linux owner control under the dedicated account
 
 The service manager can pass a Unix stream listener to `hq/main.mjs run

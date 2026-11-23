@@ -1,6 +1,7 @@
 // Read-only responses for Machine's members-plans verb. The digest covers the
 // original Go Plan.Canonical() bytes, including its final LF.
 import { accountsPurpose, validHarnessAccounts } from './machine-harness-accounts.mjs';
+import { soulRunnerAccountsPurpose, validSoulRunnerAccounts } from './machine-soul-runner-accounts.mjs';
 import { qualificationPurpose, validHarnessQualification } from './machine-harness-qualification.mjs';
 import { protectedInstallPurpose, validProtectedInstallPlan } from './machine-soul-protected-launch.mjs';
 import { createHash } from 'node:crypto';
@@ -51,17 +52,20 @@ export function validatedMembersPlan(id, response) {
   }
   const p = parseStrict(plan_canonical, { maxDepth: 32 });
   const accounts = p?.purpose === accountsPurpose;
+  const soulRunners = p?.purpose === soulRunnerAccountsPurpose;
   const qualification = p?.purpose === qualificationPurpose;
   const protectedInstall = p?.purpose === protectedInstallPurpose;
   // The installation policy includes nested binding snapshots. Preserve the
   // previous depth limit for every other members-plan shape.
   if (!protectedInstall) parseStrict(plan_canonical, { maxDepth: 6 });
-  const fields = protectedInstall ? 'version,hq_account,dir,members,steps,purpose,soul_protected_launch'
+  const fields = soulRunners ? 'version,hq_account,dir,members,steps,purpose,soul_runners'
+    : protectedInstall ? 'version,hq_account,dir,members,steps,purpose,soul_protected_launch'
     : accounts || qualification ? 'version,hq_account,dir,members,steps,purpose' : 'version,hq_account,dir,members,steps';
   if (!object(p) || Object.keys(p).join(',') !== fields ||
       p.version !== 3 || !isAccount(p.hq_account) || typeof p.dir !== 'string' || !p.dir ||
       !Array.isArray(p.steps) || !p.steps.length || !validMembers(p) ||
-      (accounts ? Buffer.byteLength(plan_canonical) > 32768 || !validHarnessAccounts(p)
+      (soulRunners ? Buffer.byteLength(plan_canonical) > 32768 || !validSoulRunnerAccounts(p)
+        : accounts ? Buffer.byteLength(plan_canonical) > 32768 || !validHarnessAccounts(p)
         : qualification ? !validHarnessQualification(p, Buffer.byteLength(plan_canonical))
           : protectedInstall ? Buffer.byteLength(plan_canonical) > 48 * 1024 || !validProtectedInstallPlan(p)
           : !p.steps.every(validStep))) {
