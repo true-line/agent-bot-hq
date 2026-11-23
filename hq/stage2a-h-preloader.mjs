@@ -233,6 +233,7 @@ export async function preloadSelectedHQCode() {
     .map((row) => Object.freeze({ path: row.path, sha256: row.sha256,
       size_bytes: row.size_bytes, mode: row.mode }));
   completedSelection = Object.freeze({ root: ref.snapshot.path, descriptorDigest,
+    machinePublicKey: pin.toString('hex'),
     metadataSha256: releaseMetadata.sha256, metadataSize: releaseMetadata.size_bytes,
     vendorRows: Object.freeze(vendorRows) });
   return descriptorDigest;

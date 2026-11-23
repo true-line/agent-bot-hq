@@ -27,7 +27,7 @@
 // (scripts/soul-contracts.mjs verifies the digest; a development checkout
 // fetches it into .cache/ on first use). A release will vendor the pinned
 // tree with the plugins (§4.5) instead.
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { connect as netConnect } from 'node:net';
 import { homedir } from 'node:os';
@@ -42,23 +42,29 @@ import { createHQ } from './hq.mjs';
 import { productionPluginsDir, readPins } from './plugins.mjs';
 import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { connectSocket } from './socket.mjs';
-import { machineRoleCommand, machineRoleStage2aList } from './machine-channel.mjs';
+import { machineRoleCommand, machineRoleStage2aCooperative, machineRoleStage2aList } from './machine-channel.mjs';
 import { relaySoulAcp } from './soul-acp-relay.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
 import { inspectStage2aReservationV2 } from './stage2a-reservation.mjs';
 import { createStage2aMachineBridgeAuthority } from './stage2a-machine-bridge-authority.mjs';
 import { createStage2aProtectedStarter } from './stage2a-protected-start.mjs';
 import { createStage2aProtectedAdmission } from './stage2a-protected-admission.mjs';
+import { authenticatedSelectedH } from './stage2a-h-preloader.mjs';
+import { createStage2aCooperativeMachine } from './stage2a-cooperative-machine.mjs';
+import { createStage2aCooperativeStarter } from './stage2a-cooperative-start.mjs';
 import { createStage2aQualificationProvider } from './stage2a-qualification-provider.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
   const args = { cmd: argv[0], home: process.env.AGENT_BOT_HQ_HOME || join(homedir(), '.agent-bot-hq'), json: false };
   if (args.cmd === 'signer' || args.cmd === 'soul') args.sub = argv[1];
   for (let i = args.sub ? 2 : 1; i < argv.length; i++) {
-    if (argv[i] === '--home') args.home = argv[++i];
+    if (argv[i] === '--home') {
+      args.home = argv[++i];
+      args.explicitHome = true;
+    }
     else if (argv[i] === '--owner-account') {
       args.ownerAccount = argv[++i];
       if (!args.ownerAccount || args.cmd !== 'run') throw new Error('--owner-account NAME is only for the systemd HQ service');
@@ -68,6 +74,11 @@ function parse(argv) {
     } else if (argv[i] === '--soul') {
       args.soul = argv[++i];
       if (!args.soul || args.cmd !== 'soul' || args.sub !== 'start') throw new Error('--soul DIR is only for soul start');
+    } else if (argv[i] === '--start-id') {
+      args.startId = argv[++i];
+      if (!/^st_[0-9a-f]{24}$/.test(args.startId ?? '') || args.cmd !== 'soul' || args.sub !== 'stop') {
+        throw new Error('--start-id needs a valid start ID and is only for soul stop');
+      }
     } else if (argv[i] === '--profile') {
       args.profile = argv[++i];
       if (args.cmd !== 'soul' || args.sub !== 'start' || args.profile !== 'managed-protected') {
@@ -103,17 +114,19 @@ function loadStage2aSchemas() {
   return (payload) => validate(schemas[2], payload, { schemas: schemas.slice(0, 2) }).length === 0;
 }
 
-async function ask(controlPath, op) {
+async function ask(controlPath, op, payload) {
   const client = await connectSocket(controlPath);
-  try { return await client.request(op); } finally { await client.close(); }
+  try { return await client.request(op, payload); } finally { await client.close(); }
 }
 
 async function startSoul(controlPath, path, profile) {
   if (!path) throw new Error('soul start needs --soul DIR');
+  const packagePath = realpathSync(path);
+  if (!statSync(packagePath).isDirectory()) throw new Error('soul start needs a package directory');
   const socket = netConnect(controlPath);
   await new Promise((resolve, reject) => { socket.once('connect', resolve); socket.once('error', reject); });
   try {
-    socket.write(`${JSON.stringify({ id: 1, op: 'soul.start', payload: { package_path: path,
+    socket.write(`${JSON.stringify({ id: 1, op: 'soul.start', payload: { package_path: packagePath,
       ...(profile ? { requested_profile: profile } : {}) } })}\n`);
     let buf = Buffer.alloc(0);
     const response = await new Promise((resolve, reject) => {
@@ -193,8 +206,10 @@ async function main(argv) {
     console.log(JSON.stringify(report));
     return;
   }
-  const controlPath = args.ownerControl ? OWNER_CONTROL_PATH : join(args.home, 'control.sock');
-  if (args.ownerControl) checkOwnerSocketPath(process.getuid?.());
+  const useOwnerControl = args.ownerControl || (args.cmd === 'soul' && !args.explicitHome
+    && !process.env.AGENT_BOT_HQ_HOME && existsSync(OWNER_CONTROL_PATH));
+  const controlPath = useOwnerControl ? OWNER_CONTROL_PATH : join(args.home, 'control.sock');
+  if (useOwnerControl) checkOwnerSocketPath(process.getuid?.());
   if (args.cmd === 'run') {
     if ([process.env.LISTEN_PID, process.env.HQ_LAUNCHD_OWNER_PID].includes(String(process.pid)) && !args.ownerAccount) throw new Error('socket activation requires --owner-account NAME');
     let ownerControl;
@@ -213,8 +228,9 @@ async function main(argv) {
       const pluginsDir = productionPluginsDir(args, fileURLToPath(import.meta.url), pins);
       let installed = [];
       let machinePublicKey;
-      if (process.platform === 'darwin' && process.arch === 'arm64'
-        && userInfo().username === '_agent-bot-hq') {
+      const managedHq = process.platform === 'darwin' && process.arch === 'arm64'
+        && userInfo().username === '_agent-bot-hq';
+      if (managedHq) {
         try {
           const list = await machineRoleStage2aList();
           installed = list.installations;
@@ -233,6 +249,14 @@ async function main(argv) {
         machinePublicKey, verifyReservation }) : undefined;
       const providers = new Map();
       let hq;
+      const selectedH = authenticatedSelectedH();
+      const cooperativeMachine = managedHq && selectedH ? createStage2aCooperativeMachine({
+        exchange: machineRoleStage2aCooperative, hDescriptorDigest: selectedH.descriptorDigest,
+        machinePublicKey: selectedH.machinePublicKey,
+      }) : undefined;
+      const createCooperativeStart = cooperativeMachine ? (core) => createStage2aCooperativeStarter({
+        core, machine: cooperativeMachine, openAdmission: (options) => hq.openCooperativeAdmission(options),
+      }) : undefined;
       const protectedAdmission = installed.length ? createStage2aProtectedAdmission({
         machinePublicKey, authority,
         stopReservation: (reservationSHA256) => protectedStart.stopReservation(reservationSHA256),
@@ -271,7 +295,7 @@ async function main(argv) {
       hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins,
         pluginsDir, devPlugins: args.devPlugins, bridgeAssignments: installed,
         bridgeAuthority: authority, machineHqEpoch: epochs.values().next().value,
-        protectedStart, protectedAdmission,
+        protectedStart, protectedAdmission, createCooperativeStart, cooperativeAdmission: cooperativeMachine,
         qualificationAuthorizer: installed.length ? ({ request, observation }) => {
           const provider = providers.get(observation?.reservation_digest);
           if (!provider) throw new Error('Machine protected provider start is unavailable');
@@ -319,8 +343,17 @@ async function main(argv) {
     } finally { await client.close(); }
   }
   if (args.cmd === 'soul') {
-    if (args.sub !== 'start') throw new Error(USAGE);
-    await startSoul(controlPath, args.soul, args.profile);
+    if (args.sub === 'start') {
+      await startSoul(controlPath, args.soul, args.profile);
+      return;
+    }
+    if (args.sub !== 'stop' && args.sub !== 'starts') throw new Error(USAGE);
+    if (args.sub === 'stop' && !args.startId) throw new Error('soul stop needs --start-id ID');
+    const result = await ask(controlPath, `soul.${args.sub}`,
+      args.sub === 'stop' ? { start_id: args.startId } : undefined);
+    if (!result.ok) throw new Error(JSON.stringify(result.refusal ?? result.host_refusal ?? result));
+    console.log(JSON.stringify(result.result, null, 2));
+    if (result.result.state === 'containment_unconfirmed') process.exitCode = 1;
     return;
   }
   if (args.cmd === 'signer') {

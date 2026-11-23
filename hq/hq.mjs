@@ -147,6 +147,18 @@ export function cooperativeLivenessGuard(machine) {
         && await machine.assertLive(binding) === true && live(binding),
       watchHealthy: (binding) => live(binding) && machine.watchHealthy(binding) === true,
       abort: (binding) => machine.abort(binding),
+      ...(machine.projectLaunch ? { projectLaunch: async (binding) => {
+        if (!live(binding)) fail('host.launch_unavailable', 'cooperative launch was revoked');
+        const proof = await machine.projectLaunch(binding);
+        if (!live(binding)) fail('host.launch_unavailable', 'cooperative launch was revoked');
+        return proof;
+      } } : {}),
+      ...(machine.provide ? { provide: async ({ context, request }) => {
+        if (!live(context)) fail('host.launch_unavailable', 'cooperative provider was revoked');
+        const reply = await machine.provide({ context, request });
+        if (!live(context)) fail('host.launch_unavailable', 'cooperative provider was revoked');
+        return reply;
+      } } : {}),
     }),
   });
 }
@@ -183,6 +195,7 @@ export function createHQ({
   bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
   qualificationAuthorizer,       // trusted one-use installed test-provider operation; never owner config
   protectedAdmission,            // future pinned Machine verifier; absent in production until signed contracts ship
+  createCooperativeStart,        // owner lifecycle for a paired cooperative launch
   cooperativeAdmission,          // paired A reservation/attach/watch client; never owner config
   plugins = [],                  // plugin objects (tests); installed ones come from pluginsDir
   pluginsDir,                    // installed plugins, each checked against `pins` (§4.5)
@@ -331,7 +344,7 @@ export function createHQ({
     });
     soulStarter = createSoulStarter({ core, home, machineLaunch: soulLaunch,
       verifyMachineReservation: soulVerifier, verifyMachineCompletion: soulCompletionVerifier,
-      protectedStart,
+      protectedStart, cooperativeStart: createCooperativeStart?.(core),
       mode: () => host?.mode ?? 'starting', hqUid: uid,
       harnessUids: harnessPlan.endpoints.map((endpoint) => endpoint.uid), machineHqEpoch });
     // Whether the provisioner's rule lets HQ start each harness account;
@@ -441,7 +454,7 @@ export function createHQ({
         ).finally(() => { checkingPair = undefined; });
         await checkingPair;
       }
-      return op === 'soul.start' || op === 'soul.starts' ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta);
+      return ['soul.start', 'soul.starts', 'soul.stop'].includes(op) ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta);
     }
 
     try {
@@ -452,7 +465,7 @@ export function createHQ({
         await listenSocket({
           path: paths.admission, auth: 'entry-point', core, takeover: true,
           dispatch: (op, meta) => (LAUNCH_OPERATIONS.includes(op) ? launcher.dispatch(op, meta)
-            : op === 'soul.start' || op === 'soul.starts' ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta)),
+            : ['soul.start', 'soul.starts', 'soul.stop'].includes(op) ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta)),
           newSession: () => `ep_${random.hex(12)}`, endSession: () => {},
         }),
         // Each frame goes to the plugin serving the broker; `op` is the kind.
@@ -522,10 +535,12 @@ export function createHQ({
     // credentials while one of those callbacks is blocked.
     core.identity.close?.();
     dropTokens(core);
+    const soulStop = soulStarter.stopAll();
+    soulStop.catch(() => {}); // checked after the legacy probe
     await firstTick;
     // Agents first, while their connections are still open: each launch's
     // process group is stopped (hq/launch.mjs).
-    await soulStarter.stopAll();
+    await soulStop;
     await launcher.stopAll();
     const admissionsToClose = [...runnerAdmissions.values()];
     runnerAdmissions.clear();
@@ -592,7 +607,13 @@ export function createHQ({
           hqUid: uid, core, machineAttach: (value) => cooperativeAdmission.attach(value),
           verifyAttachReceipt: (receipt, expected) => cooperativeAdmission.verifyAttachReceipt(receipt, expected),
           isLive: (value) => cooperativeGuard.client.watchHealthy(value), openAcpStream, onLost: lost,
-          admissionDispatch: (op, meta) => host.dispatch(op, meta) });
+          admissionDispatch: (op, meta) => {
+            if (op !== 'launch' && op !== 'launch.stop') return host.dispatch(op, meta);
+            const service = host.provided('hq-admission');
+            if (!service?.cooperativeMemberLaunch)
+              fail('host.launch_unavailable', 'cooperative member launch is unavailable');
+            return service.cooperativeMemberLaunch(op, meta);
+          } });
         if (admission.brokerPin.reservation_sha256 !== key)
           fail('host.launch_unavailable', 'cooperative reservation digest changed after verification');
         broker = await listenStage2aCooperativeBroker({ admission, hqUid: uid, core,

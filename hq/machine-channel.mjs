@@ -16,6 +16,16 @@ const PKCS8 = Buffer.from('302e020100300506032b657004220420', 'hex');
 const SPKI = Buffer.from('302a300506032b6570032100', 'hex');
 const HEX_KEY = /^[0-9a-f]{64}$/i;
 const MAX_MESSAGE = 64 * 1024;
+const COOPERATIVE_STATES = new Map([
+  ['stage2a-cooperative-live-v3', 'cooperative-live'],
+  ['stage2a-cooperative-lookup-v3', 'cooperative-found'],
+  ['stage2a-cooperative-provider-v3', 'cooperative-provided'],
+  ['stage2a-cooperative-reserve-v3', 'cooperative-reserved'],
+  ['stage2a-cooperative-attach-v3', 'cooperative-attached'],
+  ['stage2a-cooperative-launch-inputs-v3', 'cooperative-launch-inputs'],
+  ['stage2a-cooperative-abort-v3', 'cooperative-aborted'],
+  ['stage2a-cooperative-stop-v3', 'cooperative-stopped'],
+]);
 const fingerprint = (raw) => createHash('sha256').update(raw).digest('hex');
 const disconnectedPairs = new WeakMap();
 export const disconnectedMachinePair = (error) => disconnectedPairs.get(error);
@@ -138,7 +148,7 @@ function responseFields(line) {
 
 function authenticatedResponse(line, nonce, pinned, verb) {
   const { value: r, body } = responseFields(line);
-  if ((isServiceHandoff(verb) || verb === 'hq-device'
+  if ((isServiceHandoff(verb) || verb === 'hq-device' || COOPERATIVE_STATES.has(verb)
     || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)) && Object.keys(r).some((field) =>
     !['ok', 'diagnostic', 'message', 'state', 'body', 'timestamp', 'nonce', 'request_nonce', 'signature'].includes(field))) {
     throw new Error('unexpected Machine ' + verb + ' response field');
@@ -254,6 +264,11 @@ function machineRoleStage2a(verb, request) {
     [verb, '--socket', join(prefix, 'var/agent-machine/daemon.sock')],
     account.homedir, account.uid, request,
   );
+}
+
+export function machineRoleStage2aCooperative(verb, request) {
+  if (!COOPERATIVE_STATES.has(verb)) throw new Error('unknown cooperative Machine command');
+  return machineRoleStage2a(verb, request);
 }
 
 export const machineRoleStage2aReserve = (request) => machineRoleStage2a('stage2a-reserve', request);
@@ -409,7 +424,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       planID = args[1];
       socket = args[3];
     }
-  } else if (['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)
+  } else if ((COOPERATIVE_STATES.has(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb))
     && args.length === 2 && args[0] === '--socket') {
     socket = args[1];
   }
@@ -567,6 +582,9 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || !id.test(deviceFields.model) || !reservation.test(deviceFields.prompt_sha256)))) {
       throw new Error('invalid Stage 2a Machine reservation selectors');
     }
+  } else if (COOPERATIVE_STATES.has(verb)) {
+    if (!deviceFields || typeof deviceFields !== 'object' || Array.isArray(deviceFields)
+      || Buffer.byteLength(JSON.stringify(deviceFields)) > 8192) throw new Error('invalid cooperative Machine selectors');
   } else if (deviceFields !== undefined) throw new Error('unexpected Machine device fields');
   const stage2aFields = {
     'stage2a-lookup': ['package_path'],
@@ -599,7 +617,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   }[verb];
   const stage2aRequest = stage2aFields
     ? Buffer.from(JSON.stringify(Object.fromEntries(stage2aFields.map((key) => [key, deviceFields[key]])))).toString('base64url')
-    : undefined;
+    : COOPERATIVE_STATES.has(verb) ? Buffer.from(JSON.stringify(deviceFields)).toString('base64url') : undefined;
   const fields = { verb, ...(verb === 'hq-device' ? deviceFields : {}),
     ...(stage2aRequest && { stage2a_request: stage2aRequest }),
     ...(option && { option }), ...(planID && { plan_id: planID }) };
@@ -612,6 +630,10 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   });
   const result = { client: 'agent-daemon', channel: 'signed', state: r.state, daemon_fingerprint: fingerprint(daemon) };
   if (verb === 'hq-device') return r;
+  if (COOPERATIVE_STATES.has(verb)) {
+    if (r.state !== COOPERATIVE_STATES.get(verb)) throw new Error('unexpected signed Machine cooperative state');
+    return Object.freeze({ body: r.body, machineKey: Buffer.from(daemon) });
+  }
   if (stage2aFields) {
     const expectedState = { 'stage2a-lookup': 'found', 'stage2a-list': 'listed',
       'stage2a-reserve': 'reserved', 'stage2a-exec': 'granted',
