@@ -321,11 +321,12 @@ function storeService(core, plugin, lease = { live: true }) {
     try { result = await fn(tx); }
     finally { receiptTransaction.active = false; }
     checkLive();
+    const publishedReceipts = [];
     if (wrote || stagedReceipts.length) await publish(({ appendReceipt }) => {
       const before = new Map([...staged.keys()].map((key) => [key, core.tables.get(key)]));
       try {
         for (const [key, rows] of staged) core.tables.set(key, rows);
-        for (const receipt of stagedReceipts) appendReceipt(receipt);
+        for (const { entry } of stagedReceipts) publishedReceipts.push(appendReceipt(entry));
       } catch (error) {
         for (const [key, rows] of before) {
           if (rows === undefined) core.tables.delete(key);
@@ -340,6 +341,9 @@ function storeService(core, plugin, lease = { live: true }) {
         }
       };
     });
+    for (const [index, stagedReceipt] of stagedReceipts.entries()) {
+      stagedReceipt.committed = publishedReceipts[index];
+    }
     return result;
   }
   return Object.freeze({
@@ -627,7 +631,10 @@ function receiptsService(core, plugin, atomicReceiptWrites = core.atomicReceiptW
       if (!transaction || transaction.core !== core || transaction.plugin !== plugin || !transaction.active) fail('host.invalid_request', 'appendIn needs this plugin\'s active store transaction');
       transaction.checkLive();
       if (!record || typeof record !== 'object' || Array.isArray(record)) fail('host.invalid_request', 'a receipt is an object');
-      transaction.receipts.push({ ...redact(core, record), plugin, at: core.clock.now(), profile: core.profile });
+      const staged = { entry: { ...redact(core, record), plugin, at: core.clock.now(), profile: core.profile } };
+    transaction.receipts.push(staged);
+    // The reader stays empty until this exact receipt is committed.
+    return () => clone(staged.committed);
   };
   return Object.freeze(service);
 }

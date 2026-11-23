@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs, { readFileSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
+import { PROTECTED_GRANT_REFUSAL_RECEIPT } from '../hq/admission.mjs';
 import { DIGEST, SOUL, hello, startHQ } from './hq-harness.mjs';
 
 const sha = (byte) => `sha256:${byte.repeat(64)}`;
@@ -455,8 +456,12 @@ test('a protected grant belongs to its bound runtime before and after HQ restart
         (error) => error.code === 'host.invalid_request');
       assert.equal(await withProtectedGrant(a.runtime_id, handleA, sha('c'), effect), a.member_id);
       assert.equal(await withProtectedGrant(b.runtime_id, handleB, sha('d'), effect), b.member_id);
+      let committedRefusal;
       await assert.rejects(withProtectedGrant(b.runtime_id, handleA, sha('e'), effect),
-        (error) => error.code === 'caller_mismatch');
+        (error) => {
+          committedRefusal = error[PROTECTED_GRANT_REFUSAL_RECEIPT];
+          return error.code === 'caller_mismatch';
+        });
       if (priorHandle) {
         assert.notEqual(priorHandle, handleA);
         await assert.rejects(withProtectedGrant(b.runtime_id, priorHandle, sha('f'), effect),
@@ -468,6 +473,8 @@ test('a protected grant belongs to its bound runtime before and after HQ restart
       const { receipts } = JSON.parse(readFileSync(join(home, 'store.json'), 'utf8'));
       const issued = receipts.find(({kind, runtime_id}) => kind === 'hq.equip' && runtime_id === a.runtime_id);
       const denied = receipts.find(({kind, runtime_id}) => kind === 'hq.protected.grant.refused' && runtime_id === b.runtime_id);
+      assert.deepEqual(committedRefusal, denied);
+      assert.ok(denied.seq > issued.seq);
       assert.equal(denied.grant_handle_sha256, issued.grant_handle_sha256);
       assert.equal(denied.start_id, issued.start_id);
       assert.equal(denied.member_id, b.member_id);

@@ -47,6 +47,8 @@ import { profileWarning } from './profile.mjs';
 import { createBridgeBindAdmission } from './bridge-bind.mjs';
 import { resolveNoticeScope, validNoticeScope, validNoticeRepository } from './notices-config.mjs';
 
+export const PROTECTED_GRANT_REFUSAL_RECEIPT = Symbol('committed protected grant refusal');
+
 export const CURRENT_VERSIONS = Object.freeze({ hq: 1, wire: 1, task: 1 });
 export const SCHEMA_NAMES = Object.freeze(['hello', 'admission-result', 'equip', 'ready-and-lease-renewal']);
 const DEFAULT_LEASE_TTL_MS = 60_000;
@@ -782,19 +784,24 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             current(rt, boundRuntimeId, clock.now());
           } catch (error) {
             if (!(error instanceof HostError)) throw error;
-            receipts.appendIn(tx, { kind: 'hq.protected.grant.refused',
+            const committed = receipts.appendIn(tx, { kind: 'hq.protected.grant.refused',
               code: error.code, runtime_id: boundRuntimeId, request_sha256: requestSHA256,
               grant_handle_sha256: grantHandleDigest(handle), effect_invoked: false,
               ...(rt?.protected_start_id ? { start_id: rt.protected_start_id, installation_id: rt.installation_id,
                 member_id: rt.member_id, installation_epoch: rt.epoch, lease_generation: rt.lease_generation } : {}) });
-            return { error };
+            return { error, committed };
           }
           return { value: await effect(Object.freeze({ runtime_id: boundRuntimeId,
             member_id: rt.member_id, soul_id: rt.soul_id, installation_id: rt.installation_id,
             start_id: rt.protected_start_id, installation_epoch: rt.epoch,
             lease_generation: rt.lease_generation })) };
         });
-        if (result.error) throw result.error;
+        if (result.error) {
+          const receipt = typeof result.committed === 'function' ? result.committed() : undefined;
+          if (receipt) Object.defineProperty(result.error, PROTECTED_GRANT_REFUSAL_RECEIPT,
+            { value: Object.freeze(receipt) });
+          throw result.error;
+        }
         return result.value;
       }
       // Trusted broker consumers pass the bound runtime id, never a payload

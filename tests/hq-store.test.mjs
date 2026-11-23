@@ -98,15 +98,25 @@ test('transactional audit rows share the plugin write and remain receipt-service
   try {
     const { core, services } = open(dir);
     core.tokens.set('fixture', { token: 'TX_CANARY_SECRET' });
-    await services.store.tx((tx) => {
+    const committed = await services.store.tx((tx) => {
       tx.put('rows', 'audited', true);
-      services.receipts.appendIn(tx, { kind: 'task.fixture', text: 'token TX_CANARY_SECRET', profile: 'incorrect' });
+      const read = services.receipts.appendIn(tx, { kind: 'task.fixture', text: 'token TX_CANARY_SECRET', profile: 'incorrect' });
+      assert.equal(read(), undefined);
+      return read;
     });
     const row = core.receipts.find((r) => r.kind === 'task.fixture');
     assert.deepEqual(row, {
       kind: 'task.fixture', text: 'token [redacted]', profile: 'managed-cooperative',
       plugin: 'p', at: core.clock.now(), seq: 1,
     });
+    assert.deepEqual(committed(), row);
+    assert.notEqual(committed(), row);
+    let aborted;
+    await assert.rejects(services.store.tx((tx) => {
+      aborted = services.receipts.appendIn(tx, { kind: 'task.aborted' });
+      throw new Error('abort');
+    }), /abort/);
+    assert.equal(aborted(), undefined);
     const reopened = open(dir);
     assert.deepEqual(reopened.core.receipts, [row]);
     assert.equal(await reopened.services.store.tx((tx) => tx.get('rows', 'audited')), true);
