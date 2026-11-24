@@ -74,3 +74,21 @@ jobs:
             xcrun swiftc scripts/check-macos-enclave.swift -o "$RUNNER_TEMP/hq-enclave-check"
             bash tests/darwin-artifact-service-account.sh "$archive" "$RUNNER_TEMP/hq-enclave-check"
           fi
+  socket-parents:
+    name: Socket parent comparison on macOS 27
+    runs-on: xcode-27
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check socket comparison refusals before account access
+        run: /bin/bash tests/darwin-socket-parent-guard.sh
+      - name: Compare launchd publication and the owner connection
+        run: |
+          [[ "$(uname -m)" == arm64 && "$(sw_vers -productVersion)" == 27.* ]] || exit 1
+          set -o pipefail
+          bash tests/darwin-artifact-service-account.sh --socket-parent-comparison 2>&1 |
+            awk '/^Socket parent comparison failed during fixture setup or cleanup[.]$/ ||
+                 /^System Integrity Protection: (enabled|disabled|custom|unknown)$/ ||
+                 /^(previous|candidate) parent: (passed|bootstrap refused|native-refusal -?[0-9]+|unexpected socket metadata|owner round trip failed|descriptor evidence missing|publication timed out)$/ {print; fflush()}'

@@ -8,6 +8,12 @@ set -euo pipefail
 source "$(dirname "$0")/fixtures/darwin-hosted.sh"
 require_hosted_darwin || exit 1
 archive="${1:?macOS target tar required}"
+if [[ "$archive" == --socket-parent-comparison ]]; then
+  if [[ "${GITHUB_REPOSITORY:-}" != true-line/agent-bot-hq || "$(uname -m)" != arm64 || "$(sw_vers -productVersion)" != 27.* ]]; then
+    echo 'requires the ordinary hosted macOS 27 arm64 socket comparison runner' >&2
+    exit 1
+  fi
+fi
 name=_agent-bot-hq
 account="/Users/$name"
 group="/Groups/$name"
@@ -46,6 +52,13 @@ sudo mkdir -m 0700 "$home"
 home_id="$(fixture_inode "$home")"
 sudo chown "$name:$name" "$home"
 sudo chmod 0755 "$stage"
+if [[ "$archive" == --socket-parent-comparison ]]; then
+  source "$(dirname "$0")/fixtures/darwin-socket-parent.sh"
+  trap cleanup_socket_parent_fixture EXIT
+  sudo install -m 0644 helpers/darwin-owner.rb tests/darwin-socket-parent-probe.rb "$stage/"
+  /usr/bin/python3 -I tests/darwin-socket-parents.py "$stage"
+  exit
+fi
 sudo tar -xf "$archive" -C "$stage"
 # Keep the installed executable next to its native runtime libraries.
 node_bin="$(node -p 'process.execPath')"
