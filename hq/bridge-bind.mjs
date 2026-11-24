@@ -96,6 +96,7 @@ export const bridgeBindProofV2 = (key, nonce, context) => proofFor(V2, key, nonc
 // projection. It returns true only after independently confirming the durable
 // containment request, and rejects on uncertainty.
 export function createBridgeBindAdmission({ authority, qualificationAuthorizer, relayIngressAuthorizer,
+  relayCompletionAuthorizer,
   clock, random, receipts, timers = { setTimeout, clearTimeout } } = {}) {
   if (typeof qualificationAuthorizer === 'function' && typeof relayIngressAuthorizer === 'function') {
     throw new TypeError('fixture qualification and production relay ingress cannot share a bridge');
@@ -181,10 +182,10 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
       bridge_process: context.bridge_process } : {}),
     ...(receipt ? { bind_receipt_sha256: digest(receipt) } : {}),
   });
-  const bounded = (operation, label) => {
+  const bounded = (operation, label, timeoutMs = CONTAINMENT_DEADLINE_MS) => {
     let timeout;
     return new Promise((resolve, reject) => {
-      timeout = timers.setTimeout(() => reject(new Error(label)), CONTAINMENT_DEADLINE_MS);
+      timeout = timers.setTimeout(() => reject(new Error(label)), timeoutMs);
       Promise.resolve(operation).then(resolve, reject);
     }).finally(() => timers.clearTimeout(timeout));
   };
@@ -513,9 +514,57 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
         usage: { input_tokens: result.usage.input_tokens, output_tokens: result.usage.output_tokens } };
       await boundBridgeConnectionV2(connection, receipt);
       if (!binding.finalized) refuse();
+      binding.relayIngress = Object.freeze({ request, response: Object.freeze(response) });
       return response;
     } catch {
       await forgetBridgeConnection(connection, receipt, 'bridge-relay-ingress-failed');
+      refuse();
+    }
+  }
+
+  // B reports a completed Messages write on the same authenticated v2
+  // connection. A owns the durable positive claim; HQ only joins B's write
+  // observation with this binding and its one spent provider invocation.
+  async function completeBridgeIngressV2(input, { connection } = {}, receipt) {
+    const keys = ['selectors', 'bind_receipt_sha256', 'request_sha256', 'prompt_sha256', 'model',
+      'http_status', 'response_wire_sha256', 'response_wire_bytes',
+      'write_started_at', 'write_completed_at'];
+    if (typeof relayCompletionAuthorizer !== 'function' || !available(V2)
+      || !record(input) || Object.keys(input).length !== keys.length
+      || !keys.every((key) => Object.hasOwn(input, key))
+      || !record(input.selectors) || Object.keys(input.selectors).length !== V2.fields.length
+      || input.http_status !== 200 || !matches(DIGEST, input.prompt_sha256)
+      || !matches(DIGEST, input.response_wire_sha256)
+      || !Number.isSafeInteger(input.response_wire_bytes)
+      || input.response_wire_bytes < 1 || input.response_wire_bytes > 65_536
+      || typeof input.write_started_at !== 'string' || typeof input.write_completed_at !== 'string'
+      || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(input.write_started_at)
+      || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(input.write_completed_at)
+      || !Number.isFinite(Date.parse(input.write_started_at))
+      || !Number.isFinite(Date.parse(input.write_completed_at))
+      || Date.parse(input.write_started_at) > Date.parse(input.write_completed_at)
+      || Date.parse(input.write_completed_at) - Date.parse(input.write_started_at) > 30_000) refuse();
+    const binding = live.get(connection);
+    if (binding?.context.protocol !== V2 || binding.receipt !== receipt
+      || !binding.relayIngress || binding.relayCompletionAttempted) refuse();
+    const { request, response } = binding.relayIngress;
+    const selectors = V2.fields.map(([key]) => key);
+    const previous = binding.observation;
+    if (selectors.some((key) => input.selectors[key] !== previous[key])
+      || input.bind_receipt_sha256 !== previous.bind_receipt_sha256
+      || input.request_sha256 !== request.prompt_sha256 || input.model !== request.model) refuse();
+    binding.relayCompletionAttempted = true;
+    try {
+      const observation = await boundBridgeConnectionV2(connection, receipt);
+      if (!binding.finalized || live.get(connection) !== binding) refuse();
+      const accepted = await bounded(Promise.resolve().then(() => relayCompletionAuthorizer({
+        completion: Object.freeze({ ...input }), observation: Object.freeze(observation),
+        ingress: Object.freeze({ request, response }),
+      })), 'Machine positive completion deadline exceeded', 12_000);
+      if (accepted !== true || live.get(connection) !== binding) refuse();
+      return { accepted: true };
+    } catch {
+      await forgetBridgeConnection(connection, receipt, 'bridge-relay-completion-failed');
       refuse();
     }
   }
@@ -563,6 +612,8 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     qualifyBridgeMessagesV2: (...args) => track(qualifyBridgeMessagesV2(...args)),
     bridgeRelayIngressEnabledV2: () => typeof relayIngressAuthorizer === 'function' && available(V2),
     relayBridgeIngressV2: (...args) => track(relayBridgeIngressV2(...args)),
+    bridgeRelayCompletionEnabledV2: () => typeof relayCompletionAuthorizer === 'function' && available(V2),
+    completeBridgeIngressV2: (...args) => track(completeBridgeIngressV2(...args)),
     forgetBridgeConnection, revokeAll,
   });
 }

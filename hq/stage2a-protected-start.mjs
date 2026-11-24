@@ -283,7 +283,8 @@ export function createStage2aProtectedStarter({ installations, authority, verify
   openProtectedAdmission,
   prepareBridge = prepareStage2aBridge, startRole = startStage2aRole,
   verifyHQCodeReady = () => false,
-  onFinalized, onStopped, random = (bytes) => randomBytes(bytes).toString('hex') } = {}) {
+  onFinalized, onStopped, onT03Event,
+  random = (bytes) => randomBytes(bytes).toString('hex') } = {}) {
   if (!Array.isArray(installations) || typeof authority?.register !== 'function'
     || typeof authority.stopStart !== 'function' || typeof authority.currentLiveStart !== 'function'
     || typeof verifyReservation !== 'function'
@@ -396,6 +397,7 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         observation.bind_receipt_sha256);
         if (!bound || bound.bind_receipt_sha256 !== observation.bind_receipt_sha256) refuse();
         const relay_socket = stage2aRelayClaim(installed, startId, observation);
+        slot.relaySocket = relay_socket;
         const finalized = await machineFinalize({ ...selectors,
           bind_receipt_sha256: observation.bind_receipt_sha256, relay_socket });
         authority.markFinalized(reserved.sha256, { envelope: finalized.envelope,
@@ -439,7 +441,9 @@ export function createStage2aProtectedStarter({ installations, authority, verify
       // The stock ACP child has its own one-use Machine grant and process
       // group. R remains an admission supervisor and never carries ACP bytes.
       slot.child = await startRole({ account: installed.runner_account, role: 'child',
-        reservationSHA256: reserved.sha256 });
+        reservationSHA256: reserved.sha256,
+        onT03Event: onT03Event && ((event) => onT03Event({ event, installed, assignment, selectors,
+          childReceiptSHA256: slot.childReceiptSHA256, stop: () => stop(slot) })) });
       slot.child.done?.then(() => { void stop(slot).catch(() => {}); });
       const childStarted = await slot.child.waitChildStarted();
       if (childStarted.child_launcher_pid !== slot.child.pid
@@ -453,6 +457,7 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         || !Number.isSafeInteger(childReceipt?.expires_at_ms)
         || childReceipt.expires_at_ms <= Date.now()) refuse();
       await slot.child.sendChildReceipt(childReceipt);
+      slot.childReceiptSHA256 = childReceipt.sha256;
       await slot.child.waitChildAccepted(childReceipt.sha256);
       await slot.runner.waitRunnerChildReady({ reservationSHA256: reserved.sha256,
         startId, launchId, childStartSHA256: childReceipt.sha256,
@@ -463,7 +468,10 @@ export function createStage2aProtectedStarter({ installations, authority, verify
       // Do not expose the one-use provider before R and the stock child have
       // both acknowledged A's signed current start and child receipts.
       await onFinalized?.({ installed, assignment, selectors,
-        bindReceiptSHA256: live.bind_receipt_sha256 });
+        bindReceiptSHA256: live.bind_receipt_sha256,
+        finalizationSHA256: live.finalization_sha256,
+        childReceiptSHA256: childReceipt.sha256,
+        relaySocket: slot.relaySocket });
       const result = { start_id: startId, launch_id: launchId, installation_id: installed.installation_id,
         soul_id: installed.soul_id, package_path: source, pid: childStarted.child_pid,
         runner_uid: installed.runner_uid, runner_gid: installed.runner_gid,

@@ -36,7 +36,22 @@ export function openLocalProviderService(plan) {
   let invocations = 0;
   let lastRequestSHA256 = '';
   let lastResponseSHA256 = '';
-  const server = createServer({ maxHeaderSize: 8192 }, async (request, response) => {
+  let invocationReceipt;
+  const traffic = {
+    ipv4: { tcp_accepted: 0, http_requests: 0, observation_gets: 0, provider_posts: 0, other_http_requests: 0 },
+    ipv6: { tcp_accepted: 0, http_requests: 0, observation_gets: 0, provider_posts: 0, other_http_requests: 0 },
+  };
+  const trafficSnapshot = () => ({ ipv4: { ...traffic.ipv4 }, ipv6: { ...traffic.ipv6 } });
+  const handle = async (request, response) => {
+    const family = request.socket.remoteAddress === '127.0.0.1' ? 'ipv4'
+      : request.socket.remoteAddress === '::1' ? 'ipv6' : undefined;
+    if (family) {
+      const counter = traffic[family];
+      counter.http_requests++;
+      if (request.method === 'GET' && request.url === observationPath) counter.observation_gets++;
+      else if (request.method === 'POST' && request.url === providerPath) counter.provider_posts++;
+      else counter.other_http_requests++;
+    }
     request.setTimeout(serviceTimeout, () => request.destroy());
     const reply = (status, value) => {
       if (response.destroyed || response.writableEnded) return;
@@ -45,12 +60,12 @@ export function openLocalProviderService(plan) {
         'content-length': String(body.length), connection: 'close' });
       response.end(body);
     };
-    if (request.socket.remoteAddress !== '127.0.0.1') {
+    if (!['127.0.0.1', '::1'].includes(request.socket.remoteAddress)) {
       reply(403, { error: 'wrong_peer' }); return;
     }
     if (request.method === 'GET' && request.url === observationPath) {
       reply(200, { invocations, last_request_sha256: lastRequestSHA256,
-        last_response_sha256: lastResponseSHA256 }); return;
+        last_response_sha256: lastResponseSHA256, traffic: trafficSnapshot() }); return;
     }
     if (request.method !== 'POST' || request.url !== providerPath
       || request.headers['content-type'] !== 'application/json'
@@ -83,27 +98,103 @@ export function openLocalProviderService(plan) {
     } catch {
       reply(400, { error: 'invalid_request' });
     }
-  });
-  server.headersTimeout = serviceTimeout;
-  server.requestTimeout = serviceTimeout;
-  server.keepAliveTimeout = 1000;
-  server.maxRequestsPerSocket = 1;
-  server.maxConnections = 16;
-  const ready = new Promise((resolve, reject) => {
+  };
+  const servers = [createServer({ maxHeaderSize: 8192 }, handle),
+    createServer({ maxHeaderSize: 8192 }, handle)];
+  for (const [index, server] of servers.entries()) {
+    const family = index === 0 ? 'ipv4' : 'ipv6';
+    server.on('connection', () => { traffic[family].tcp_accepted++; });
+    server.headersTimeout = serviceTimeout;
+    server.requestTimeout = serviceTimeout;
+    server.keepAliveTimeout = 1000;
+    server.maxRequestsPerSocket = 1;
+    server.maxConnections = 16;
+  }
+  const closeServer = async (server) => {
+    if (!server.listening) return;
+    server.closeAllConnections();
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  };
+  const listen = (server, host, ipv6Only = false) => new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen({ host: '127.0.0.1', port, exclusive: true }, () => {
+    server.listen({ host, port, exclusive: true, ipv6Only }, () => {
       server.off('error', reject);
       resolve();
     });
   });
+  const ready = (async () => {
+    await listen(servers[0], '127.0.0.1');
+    try { await listen(servers[1], '::1', true); }
+    catch (error) { await closeServer(servers[0]); throw error; }
+  })();
+  const observe = async (host) => {
+    await ready;
+    const body = await new Promise((resolve, reject) => {
+      const request = httpRequest({ host, port, method: 'GET', path: observationPath,
+        agent: false, timeout: serviceTimeout, headers: { connection: 'close' } }, (response) => {
+        if (response.statusCode !== 200 || response.headers['content-type'] !== 'application/json'
+          || !/^[1-9][0-9]{0,3}$/.test(response.headers['content-length'] ?? '')
+          || Number(response.headers['content-length']) > maxHTTPBytes) {
+          response.resume(); reject(new Error('local provider observation refused')); return;
+        }
+        const chunks = [];
+        let size = 0;
+        response.on('data', (chunk) => {
+          size += chunk.length;
+          if (size > maxHTTPBytes) { request.destroy(new Error('local provider observation too large')); return; }
+          chunks.push(chunk);
+        });
+        response.once('end', () => {
+          if (size !== Number(response.headers['content-length'])) {
+            reject(new Error('local provider observation length mismatch')); return;
+          }
+          resolve(Buffer.concat(chunks));
+        });
+        response.once('error', reject);
+      });
+      request.once('timeout', () => request.destroy(new Error('local provider observation timed out')));
+      request.once('error', reject);
+      request.end();
+    });
+    const observed = parseStrict(new TextDecoder('utf-8', { fatal: true }).decode(body));
+    if (!exact(observed, ['invocations', 'last_request_sha256', 'last_response_sha256', 'traffic'])
+      || !Buffer.from(canonicalize(observed)).equals(body)
+      || observed.invocations !== invocations || observed.last_request_sha256 !== lastRequestSHA256
+      || observed.last_response_sha256 !== lastResponseSHA256
+      || !exact(observed.traffic, ['ipv4', 'ipv6'])
+      || !['ipv4', 'ipv6'].every((family) => {
+        const row = observed.traffic[family];
+        return exact(row, ['tcp_accepted', 'http_requests', 'observation_gets', 'provider_posts', 'other_http_requests'])
+          && Object.values(row).every((value) => Number.isSafeInteger(value) && value >= 0)
+          && Object.keys(row).every((key) => row[key] === traffic[family][key]);
+      })) {
+      throw new Error('local provider observation differs from its live state');
+    }
+    return Object.freeze({ url: `http://${host === '::1' ? '[::1]' : host}:${port}${observationPath}`,
+      body_sha256: digest(body), observed_at_ms: Date.now(), ...observed });
+  };
   return Object.freeze({
     port, ready,
+    invocationReceipt: () => invocationReceipt,
+    async probeReachability() {
+      const ipv4 = await observe('127.0.0.1');
+      const ipv6 = await observe('::1');
+      if (ipv4.invocations !== ipv6.invocations
+        || ipv4.last_request_sha256 !== ipv6.last_request_sha256
+        || ipv4.last_response_sha256 !== ipv6.last_response_sha256) {
+        throw new Error('local provider loopback families returned different observations');
+      }
+      return Object.freeze({ ipv4, ipv6 });
+    },
     async invoke(approved) {
       await ready;
       config = Object.freeze({ ...approved });
       if (invocations !== 0) throw new Error('local provider was already invoked');
       const body = Buffer.from(canonicalize({ model: config.model,
         request_sha256: config.request_sha256 }));
+      const requestedAtMS = Date.now();
+      let responseBytes;
+      let respondedAtMS;
       const result = await new Promise((resolve, reject) => {
         const request = httpRequest({ host: '127.0.0.1', port, method: 'POST', path: providerPath,
           agent: false, timeout: serviceTimeout, headers: { 'content-type': 'application/json',
@@ -124,8 +215,9 @@ export function openLocalProviderService(plan) {
           response.once('end', () => {
             try {
               if (size !== Number(responseLength)) throw new Error('local provider response length mismatch');
-              resolve(parseStrict(new TextDecoder('utf-8', { fatal: true })
-                .decode(Buffer.concat(chunks))));
+              responseBytes = Buffer.concat(chunks);
+              respondedAtMS = Date.now();
+              resolve(parseStrict(new TextDecoder('utf-8', { fatal: true }).decode(responseBytes)));
             } catch (error) { reject(error); }
           });
           response.once('error', reject);
@@ -139,16 +231,22 @@ export function openLocalProviderService(plan) {
         || result.request_sha256 !== config.request_sha256
         || result.response_text !== config.response_text
         || result.response_sha256 !== digest(Buffer.from(config.response_text))
-        || result.invocation !== 1 || invocations !== 1) {
+        || result.invocation !== 1 || invocations !== 1
+        || !Buffer.from(canonicalize(result)).equals(responseBytes)) {
         throw new Error('local provider invocation differs from the signed plan');
       }
+      invocationReceipt = Object.freeze({
+        url: `http://127.0.0.1:${port}${providerPath}`, method: 'POST', status: 200,
+        request_body_sha256: digest(body), response_body_sha256: digest(responseBytes),
+        response_body_bytes: responseBytes.length,
+        requested_at_ms: requestedAtMS, responded_at_ms: respondedAtMS,
+        provider_config_sha256: sha(Buffer.from(canonicalize(config))),
+      });
       return result;
     },
     async close() {
       await ready.catch(() => {});
-      if (!server.listening) return;
-      server.closeAllConnections();
-      await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      await Promise.all(servers.map(closeServer));
     },
   });
 }
@@ -217,5 +315,7 @@ export function createStage2aQualificationProvider({ plan, machineProvide = mach
   provide.ready = service.ready;
   provide.close = () => service.close();
   provide.port = service.port;
+  provide.probeReachability = () => service.probeReachability();
+  provide.invocationReceipt = () => service.invocationReceipt();
   return provide;
 }

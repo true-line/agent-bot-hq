@@ -198,6 +198,7 @@ export function createHQ({
   bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
   qualificationAuthorizer,       // trusted one-use installed test-provider operation; never owner config
   relayIngressAuthorizer,        // trusted one-use B test-provider; absent until A finalization is wired
+  relayCompletionAuthorizer,     // trusted post-write completion on the bound B connection
   cooperativeBBindProvider,      // trusted cooperative B bind state; absent in production
   cooperativeBPolicyProvider,    // trusted same-bound A policy delivery; absent in production
   memberArmProvider,             // trusted paired A observation/arm provider; absent in production
@@ -406,6 +407,7 @@ export function createHQ({
           onDisconnect: bridgeAuthority?.onDisconnect?.bind(bridgeAuthority) },
       qualificationAuthorizer,
       relayIngressAuthorizer,
+      relayCompletionAuthorizer,
       relayPeerAuthority,
       memberArmProvider,
       cooperativeBPolicyProvider,
@@ -523,6 +525,7 @@ export function createHQ({
         const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
           enableBridgeQualification: typeof qualificationAuthorizer === 'function',
           enableBridgeRelayIngress: typeof relayIngressAuthorizer === 'function',
+          enableBridgeRelayCompletion: typeof relayCompletionAuthorizer === 'function',
           enableCooperativeBBind: host.provided('hq-admission')?.stage2aCooperativeBBindEnabledV3?.() === true,
           enableCooperativeBPolicy: typeof cooperativeBPolicyProvider === 'function',
           enableMemberArmExchange: host.provided('hq-admission')?.stage2aMemberArmExchangeEnabledV3?.() === true,

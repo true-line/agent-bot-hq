@@ -212,7 +212,7 @@ function bounded(promise, timeoutMs, label) {
 
 // Machine writes child lifecycle receipts to the fixed wrapper's stderr.
 // ACP stdout remains reserved for the stock protocol stream.
-function childProgress(child, cooperative) {
+function childProgress(child, cooperative, onT03Event) {
   if (!child.stderr || typeof child.stderr.on !== 'function') {
     throw new Error('protected child status pipe is unavailable');
   }
@@ -222,6 +222,7 @@ function childProgress(child, cooperative) {
   let phase = 0;
   let failure;
   let waiter;
+  let t03Chain = Promise.resolve();
   const fail = (error) => {
     if (failure) return;
     failure = error;
@@ -233,18 +234,34 @@ function childProgress(child, cooperative) {
     else queue.push(value);
   };
   child.stderr.on('data', (chunk) => {
-    if (failure || phase === kinds.length) return;
+    if (failure || (phase === kinds.length && !onT03Event)) return;
     buffer = Buffer.concat([buffer, chunk]);
-    while (phase < kinds.length) {
+    while (true) {
       const end = buffer.indexOf(0x0a);
       if (end < 0) {
-        if (buffer.length > 1024) fail(new Error('protected child status is too large'));
+        if (buffer.length > (phase === kinds.length ? 8192 : 1024)) fail(new Error('protected child status is too large'));
         break;
       }
-      if (end > 1024) { fail(new Error('protected child status is too large')); return; }
+      if (end > (phase === kinds.length ? 8192 : 1024)) {
+        fail(new Error('protected child status is too large')); return;
+      }
       let event;
       try { event = parseStrict(buffer.subarray(0, end).toString('utf8')); }
       catch { fail(new Error('invalid protected child status')); return; }
+      if (phase === kinds.length) {
+        if (!event || typeof event !== 'object' || Array.isArray(event)
+          || !['t03-probe-ready', 't03-probe-result'].includes(event.kind)
+          || Object.keys(event).sort().join(',') !== (event.kind === 't03-probe-ready' ? 'kind,ready' : 'kind,result')
+          || typeof event[event.kind === 't03-probe-ready' ? 'ready' : 'result'] !== 'object') {
+          fail(new Error('unexpected protected T03 child status')); return;
+        }
+        t03Chain = t03Chain.then(() => {
+          if (failure) return;
+          return onT03Event(event);
+        }).catch(fail);
+        buffer = buffer.subarray(end + 1);
+        continue;
+      }
       if (!event || typeof event !== 'object' || Array.isArray(event)
         || event.kind !== kinds[phase]) {
         fail(new Error('unexpected protected child status')); return;
@@ -260,7 +277,7 @@ function childProgress(child, cooperative) {
       phase += 1;
       deliver(Object.freeze(event));
     }
-    if (phase === kinds.length) buffer = Buffer.alloc(0);
+    if (phase === kinds.length && !onT03Event) buffer = Buffer.alloc(0);
   });
   child.stderr.once('error', () => fail(new Error('protected child status pipe failed')));
   child.once('close', () => {
@@ -280,7 +297,8 @@ function childProgress(child, cooperative) {
 // bind the reservation to an authenticated live start and obtain Machine's
 // signed stop/completion before releasing any installation occupancy.
 export async function startStage2aRole({ account, role, reservationSHA256,
-  machineExec = machineRoleStage2aExec, spawnProcess = spawn, timeoutMs = 12000, cooperativeBridge = false, cooperativeChild = false } = {}) {
+  machineExec = machineRoleStage2aExec, spawnProcess = spawn, timeoutMs = 12000,
+  cooperativeBridge = false, cooperativeChild = false, onT03Event } = {}) {
   if (typeof account !== 'string'
     || !(role === 'runner' && RUNNER_ACCOUNT.test(account)
       || role === 'bridge' && BRIDGE_ACCOUNT.test(account)
@@ -296,7 +314,7 @@ export async function startStage2aRole({ account, role, reservationSHA256,
     stdio: ['pipe', 'pipe', role === 'child' ? 'pipe' : 'ignore'], shell: false,
     env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C' },
   });
-  const progress = role === 'child' ? childProgress(child, cooperativeChild) : undefined;
+  const progress = role === 'child' ? childProgress(child, cooperativeChild, onT03Event) : undefined;
   const done = new Promise((resolve) => {
     child.once('close', (exit_code, signal) => resolve({ exit_code, signal, contained: false }));
   });

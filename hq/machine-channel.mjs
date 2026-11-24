@@ -122,6 +122,18 @@ const COOPERATIVE_STATES = new Map([
   ['stage2a-cooperative-abort-v3', 'cooperative-aborted'],
   ['stage2a-cooperative-stop-v3', 'cooperative-stopped'],
 ]);
+const T03_STATES = new Map([
+  ['stage2a-t03-positive', 't03-positive-recorded'],
+  ['stage2a-t03-ready', 't03-ready-observed'],
+  ['stage2a-t03-complete', 't03-completion-recorded'],
+]);
+const T03_BASE = ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+  'plan_id', 'plan_digest', 'hq_epoch'];
+const T03_FIELDS = {
+  'stage2a-t03-positive': [...T03_BASE, 'receipt'],
+  'stage2a-t03-ready': [...T03_BASE, 'ready'],
+  'stage2a-t03-complete': [...T03_BASE, 'result', 'network'],
+};
 const fingerprint = (raw) => createHash('sha256').update(raw).digest('hex');
 const disconnectedPairs = new WeakMap();
 const verifiedPairs = new WeakMap();
@@ -248,7 +260,7 @@ function responseFields(line) {
 function authenticatedResponse(line, nonce, pinned, verb, capture = false) {
   const { value: r, body } = responseFields(line);
   if ((isServiceHandoff(verb) || verb === 'hq-device' || COOPERATIVE_STATES.has(verb)
-    || isCaptureVerb(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)) && Object.keys(r).some((field) =>
+    || isCaptureVerb(verb) || T03_STATES.has(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)) && Object.keys(r).some((field) =>
     !['ok', 'diagnostic', 'message', 'state', 'body', 'timestamp', 'nonce', 'request_nonce', 'signature'].includes(field))) {
     throw new Error('unexpected Machine ' + verb + ' response field');
   }
@@ -395,6 +407,9 @@ export const machineRoleStage2aStop = (request) => machineRoleStage2a('stage2a-s
 export const machineRoleStage2aFinalizeB = (request) => machineRoleStage2a('stage2a-finalize-b', request);
 export const machineRoleStage2aLive = (request) => machineRoleStage2a('stage2a-live', request);
 export const machineRoleStage2aProvider = (request) => machineRoleStage2a('stage2a-provider', request);
+export const machineRoleStage2aT03Positive = (request) => machineRoleStage2a('stage2a-t03-positive', request);
+export const machineRoleStage2aT03Ready = (request) => machineRoleStage2a('stage2a-t03-ready', request);
+export const machineRoleStage2aT03Complete = (request) => machineRoleStage2a('stage2a-t03-complete', request);
 export const machineRoleStage2aChildReady = (request) => machineRoleStage2a('stage2a-child-ready', request);
 export const machineRoleStage2aHelloStart = (request) => machineRoleStage2a('stage2a-hello-start', request);
 export const machineRoleStage2aHelloFinalize = (request) => machineRoleStage2a('stage2a-hello-finalize', request);
@@ -541,7 +556,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       planID = args[1];
       socket = args[3];
     }
-  } else if ((COOPERATIVE_STATES.has(verb) || isCaptureVerb(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb))
+  } else if ((COOPERATIVE_STATES.has(verb) || isCaptureVerb(verb) || T03_STATES.has(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb))
     && args.length === 2 && args[0] === '--socket') {
     socket = args[1];
   }
@@ -626,7 +641,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     }
     if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))
       || Object.keys(deviceFields).length !== keys.length || !/^(legacy|[a-f0-9]{64})$/.test(deviceFields.hq_epoch)) throw new Error('invalid Machine device fields');
-  } else if (isCaptureVerb(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role', 'stage2a-stop', 'stage2a-finalize-b'].includes(verb)) {
+  } else if (isCaptureVerb(verb) || T03_STATES.has(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role', 'stage2a-stop', 'stage2a-finalize-b'].includes(verb)) {
     const selectors = {
       'stage2a-lookup': ['package_path'],
       'stage2a-list': [],
@@ -655,6 +670,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         'plan_id', 'plan_digest', 'hq_epoch', 'peer_uid', 'peer_pid'],
       'stage2a-provider': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
         'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'model', 'prompt_sha256'],
+      ...T03_FIELDS,
       ...CAPTURE_FIELDS,
     };
     const expected = selectors[verb];
@@ -685,7 +701,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       || (verb === 'stage2a-prepare-b' && !validStage2aPrepareB(deviceFields))
       || (['stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider',
         'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize',
-        'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)
+        'stage2a-hello-abort', 'stage2a-peer-role', ...T03_STATES.keys()].includes(verb)
         && (!reservation.test(deviceFields.reservation_sha256)
         || !id.test(deviceFields.installation_id) || !/^st_[0-9a-f]{24}$/.test(deviceFields.start_id)
         || !/^ln_[0-9a-f]{24}$/.test(deviceFields.launch_id) || !id.test(deviceFields.plan_id)
@@ -719,6 +735,12 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || Buffer.byteLength(JSON.stringify(deviceFields.expected)) > 4096))
       || (verb === 'stage2a-provider' && (!reservation.test(deviceFields.bind_receipt_sha256)
         || !id.test(deviceFields.model) || !reservation.test(deviceFields.prompt_sha256)))
+      || (T03_STATES.has(verb) && (!deviceFields[T03_FIELDS[verb].at(-1)]
+        || typeof deviceFields[T03_FIELDS[verb].at(-1)] !== 'object'
+        || Array.isArray(deviceFields[T03_FIELDS[verb].at(-1)])
+        || (verb === 'stage2a-t03-complete' && (!deviceFields.result
+          || typeof deviceFields.result !== 'object' || Array.isArray(deviceFields.result)))
+        || Buffer.byteLength(JSON.stringify(deviceFields)) > 8192))
       || (isCaptureVerb(verb) && (!validStage2aCaptureRequest(verb, deviceFields)
         || Buffer.byteLength(JSON.stringify(deviceFields)) > 48 * 1024))) {
       throw new Error('invalid Stage 2a Machine reservation selectors');
@@ -755,6 +777,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       'plan_id', 'plan_digest', 'hq_epoch', 'peer_uid', 'peer_pid'],
     'stage2a-provider': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
       'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'model', 'prompt_sha256'],
+    ...T03_FIELDS,
     ...CAPTURE_FIELDS,
   }[verb];
   const stage2aRequest = stage2aFields
@@ -787,6 +810,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       'stage2a-verify-b': 'verified', 'stage2a-prepare-b': 'prepared',
       'stage2a-stop': 'stopped', 'stage2a-finalize-b': 'finalized',
       'stage2a-live': 'live', 'stage2a-provider': 'provided',
+      ...Object.fromEntries(T03_STATES),
       'stage2a-child-ready': 'child-ready', 'stage2a-hello-start': 'hello-started',
       'stage2a-hello-finalize': 'hello-finalized', 'stage2a-hello-abort': 'hello-aborted',
       'stage2a-peer-role': 'peer-verified' }[verb];
@@ -828,6 +852,16 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       }
       return Object.freeze({ capture_id: body.capture_id, receipt_envelope: envelope,
         receipt_sha256: body.receipt_sha256, daemon_fingerprint: fingerprint(daemon) });
+    }
+    if (T03_STATES.has(verb)) {
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).length !== 1
+        || (verb === 'stage2a-t03-ready'
+          ? body.accepted !== true
+          : !/^sha256:[0-9a-f]{64}$/.test(body.sha256 ?? ''))) {
+        throw new Error('invalid signed Machine T03 response');
+      }
+      return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
     }
     if (verb === 'stage2a-list') return stage2aListResult(body, daemon, uid);
     if (verb === 'stage2a-lookup') {
