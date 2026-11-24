@@ -261,6 +261,41 @@ test('paired service upgrade accepts the Machine v3 H launch and rejects changed
   }
 });
 
+test('paired v3 upgrade accepts the installed Darwin release path with its fixed space', arm, async (t) => {
+  const f = await fixture(t, 'hq-service-upgrade');
+  await f.pin();
+  const previousRoot = '/Library/Application Support/ai.true-line.agent-bot-hq/releases/daf7c958';
+  const previousNode = `${previousRoot}/node`;
+  const withInstalledRelease = (change = () => {}) => stage2aUpgradePlan((c, step) => {
+    const oldRelease = c.previous.service.release_dir;
+    const oldNode = c.previous.service.node;
+    c.previous.service.release_dir = `${previousRoot}/hq`;
+    c.previous.service.archive = `${previousRoot}/h-daf7-darwin-source.tar`;
+    c.previous.service.node = previousNode;
+    c.previous.plist = c.previous.plist.replaceAll(oldRelease, c.previous.service.release_dir)
+      .replaceAll(oldNode, previousNode);
+    c.next.service.node = previousNode;
+    change(c, step);
+  });
+  f.state.saved = withInstalledRelease();
+  assert.equal(await f.issue(), f.state.raw);
+  for (const change of [
+    (c) => {
+      const oldNode = c.previous.service.node;
+      const otherNode = oldNode.replace('Application Support', 'Other Support');
+      c.previous.service.node = otherNode;
+      c.previous.plist = c.previous.plist.replaceAll(oldNode, otherNode);
+      c.next.service.node = otherNode;
+    },
+    (c) => { c.previous.service.archive = c.previous.service.archive.replace('releases/', 'releases/../'); },
+  ]) {
+    f.state.saved = withInstalledRelease(change);
+    const before = f.requests.length;
+    await assert.rejects(f.issue());
+    assert.deepEqual(f.requests.slice(before).map((r) => r.verb), ['members-plans']);
+  }
+});
+
 test('paired service upgrade verifies both signed releases and requires its own owner consent', arm, async (t) => {
   const purpose = 'hq-service-upgrade';
   const f = await fixture(t, purpose);

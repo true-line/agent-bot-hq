@@ -12,7 +12,10 @@ const fieldsAre = (o, names) => o && typeof o === 'object' && !Array.isArray(o) 
   Object.keys(o).length === names.length && names.every((name) => Object.hasOwn(o, name));
 const digest = (s) => typeof s === 'string' && /^[0-9a-f]{64}$/.test(s);
 const prefixedDigest = (s) => typeof s === 'string' && /^sha256:[0-9a-f]{64}$/.test(s);
-const cleanPath = (s) => typeof s === 'string' && /^\/[a-zA-Z0-9._/+:-]+$/.test(s) &&
+const releasePrefix = `${directory}/releases/`;
+const cleanPath = (s) => typeof s === 'string' &&
+  (/^\/[a-zA-Z0-9._/+:-]+$/.test(s) ||
+    (s.startsWith(releasePrefix) && /^[a-zA-Z0-9._/+:-]+$/.test(s.slice(releasePrefix.length)))) &&
   !s.endsWith('/') && posix.normalize(s) === s;
 
 function expectedPlist(s, uid, owner) {
