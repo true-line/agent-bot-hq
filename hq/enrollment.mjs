@@ -63,7 +63,7 @@ export function validateServiceUrl(raw) {
 export function validateEnrollmentConfig(e) {
   if (!e || typeof e !== 'object' || Array.isArray(e)) throw new Error('HQ config: enrollment is an object');
   for (const k of Object.keys(e)) if (!['source', 'server'].includes(k)) throw new Error(`HQ config: unknown key enrollment.${k}`);
-  if (e.source !== undefined && !['legacy', 'hq'].includes(e.source)) throw new Error('HQ config: enrollment.source is legacy or hq');
+  if (e.source !== undefined && !['legacy', 'hq', 'local-only'].includes(e.source)) throw new Error('HQ config: enrollment.source is legacy, hq or local-only');
   if (e.server !== undefined) {
     if (e.source !== 'hq') throw new Error('HQ config: enrollment.server is only for the hq source');
     validateServiceUrl(e.server);

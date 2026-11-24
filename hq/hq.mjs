@@ -5,10 +5,9 @@
 // RISK-008 in the platform's register); hq/legacy.mjs is the bridge.
 //
 // Bootstrap follows §4.4 through the SDK host: HQ core reads device status
-// first (here from the legacy enrollment, through the HQ signer), an
-// unenrolled device or an unavailable signer is safe mode, a revoked one is
-// device_revoked, and plugins start only after that. The sockets open in every mode, so the owner
-// can always ask for status.
+// first through the HQ signer. An unavailable signer or missing required
+// enrollment puts HQ in safe mode. A revoked device runs in device_revoked.
+// The sockets open in every mode, so the owner can always ask for status.
 //
 // Layout of the state directory (0700; HQ's account):
 //   config.json     owner-written settings, read-only to HQ (optional)
@@ -127,6 +126,10 @@ export function validateConfig(c) {
     if (c.legacy.supervise !== undefined && typeof c.legacy.supervise !== 'boolean') throw new Error('HQ config: legacy.supervise is a boolean');
     if (c.legacy.probeIntervalMs !== undefined && !(Number.isSafeInteger(c.legacy.probeIntervalMs) && c.legacy.probeIntervalMs >= 1000)) throw new Error('HQ config: legacy.probeIntervalMs is an integer of at least 1000');
   }
+  if (c.enrollment?.source === 'local-only') {
+    if (c.signer?.backend === 'secure-enclave') throw new Error('HQ config: local-only enrollment requires the paired Machine backend');
+    if (c.legacy?.supervise) throw new Error('HQ config: local-only enrollment cannot supervise the legacy daemon');
+  }
   return c;
 }
 
@@ -167,7 +170,7 @@ export function createHQ({
   home,
   schemas,                       // pinned schemas by name: hq/v1 (admission.mjs SCHEMA_NAMES), task/v1 and wire/v1 (tasks.mjs TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES)
   config,                        // defaults to <home>/config.json
-  signer,                        // explicit signer for isolated component tests
+  signer: injectedSigner,        // explicit signer for isolated component tests
   createDeviceSigner = createMachineSigner,
   createStandaloneDeviceSigner = createStandaloneSigner,
   enrollment,                    // where device status and enrollment come from: the config's source by
@@ -214,7 +217,7 @@ export function createHQ({
   let sockets = [];
   let timer;
   let profileInfo;
-  let legacyRunner = legacy;
+  let legacyRunner;
   let running = false;
   let firstTick = Promise.resolve();
   let pluginLoad = [];
@@ -258,7 +261,7 @@ export function createHQ({
     try { await legacyRunner.tick(); } catch (e) { core.logs.push({ level: 'warn', plugin: 'hq', at: clock.now(), message: `legacy probe failed: ${e.message}` }); }
     if (host.mode === 'running') {
       try {
-        if ((await signer.deviceStatus()) === 'revoked') revokeDevice(core, 'the enrollment reports the device revoked');
+        if ((await core.signer.deviceStatus()) === 'revoked') revokeDevice(core, 'the enrollment reports the device revoked');
       } catch { /* an unreadable signer at runtime changes nothing; status shows the last probe */ }
     }
   }
@@ -278,11 +281,13 @@ export function createHQ({
     if (running) throw new Error('HQ is already running');
     ensurePrivateDir(home, { uid });
     const cfg = validateConfig(config ?? readConfig(home, { uid }));
+    const localOnly = cfg.enrollment?.source === 'local-only';
     // Enrollment events become receipts (an enrollment only starts once HQ is up).
     const onEnrollmentEvent = (e) => { if (core) pushReceipt(core, { plugin: 'hq', ...e }).catch(() => {}); };
-    enrollment ??= (s) => createEnrollment({ home, signer: s, server: cfg.enrollment?.server, uid, clock, onEvent: onEnrollmentEvent });
+    const deviceEnrollment = localOnly ? undefined : enrollment
+      ?? ((s) => createEnrollment({ home, signer: s, server: cfg.enrollment?.server, uid, clock, onEvent: onEnrollmentEvent }));
     const factory = cfg.signer?.backend === 'secure-enclave' ? createStandaloneDeviceSigner : createDeviceSigner;
-    signer ??= factory({ home, enrollment, clock });
+    const signer = injectedSigner ?? factory({ home, enrollment: deviceEnrollment, localOnly, clock });
     let restartRequired = false;
     const signerReport = () => {
       const report = typeof signer.report === 'function' ? signer.report() : undefined;
@@ -300,7 +305,7 @@ export function createHQ({
       });
     };
     profileInfo = hostProfile();
-    legacyRunner ??= legacyDaemon({ supervise: cfg.legacy?.supervise === true, clock });
+    legacyRunner = legacy ?? legacyDaemon({ supervise: cfg.legacy?.supervise === true, clock });
 
     harnessPlan = cfg.harnesses
       ? planHarnessEndpoints(cfg.harnesses, { hqUid: uid, hqAccount: account, platform, ...(accounts ? { resolve: accounts } : {}), ...(harnessLstat ? { lstat: harnessLstat } : {}) })
@@ -312,12 +317,16 @@ export function createHQ({
     if (platform === 'darwin' && (harnessPlan.endpoints.length || bridgeEndpoints.length)) checkOwnerControlSupport();
     if (platform !== 'win32') for (const p of [paths.control, paths.admission, paths.broker, ...harnessPlan.endpoints.map((e) => e.path)]) checkSocketPath(p, platform);
     store = openStore(home, { uid });
+    let identityService = unlinkedIdentity();
+    if (!localOnly) {
+      identityService = identity ?? (signer.custody || cfg.enrollment?.source === 'hq'
+        ? createIdentityService({ server: cfg.enrollment?.server ?? DEFAULT_IDENTITY_SERVICE, enrollment: signer.enrollment, custody: signer.custody, keySet: serverKeys, clock })
+        : identityService);
+    }
     core = createCore({
       clock, random, signer,
       profile: profileInfo.profile,
-      identity: identity ?? (signer.custody || cfg.enrollment?.source === 'hq'
-        ? createIdentityService({ server: cfg.enrollment?.server ?? DEFAULT_IDENTITY_SERVICE, enrollment: signer.enrollment, custody: signer.custody, keySet: serverKeys, clock })
-        : unlinkedIdentity()),
+      identity: identityService,
       persist: () => store.persist(),
       persistReceipt: (entry) => store.persistReceipt(entry),
       persistPluginWrite: (change) => store.persistPluginWrite(change),
@@ -416,6 +425,7 @@ export function createHQ({
     host = createHost({
       plugins: [...builtIn, ...accepted],
       core,
+      localOnly,
       ...(initTimeoutMs ? { initTimeoutMs } : {}),
       ...(stopDeadlineMs ? { stopDeadlineMs } : {}),
       extraStatus: () => ({
@@ -451,7 +461,7 @@ export function createHQ({
       // status can verify the original pairing and guide the explicit restart.
       if (op === 'status' && disconnectedPair && host.mode === 'safe') {
         checkingPair ??= signer.recheckPair(disconnectedPair).then(
-          state => { restartRequired = state === 'enrolled'; },
+          state => { restartRequired = state === 'enrolled' || (localOnly && state === 'unenrolled'); },
           () => { restartRequired = false; },
         ).finally(() => { checkingPair = undefined; });
         await checkingPair;

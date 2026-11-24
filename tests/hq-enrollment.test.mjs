@@ -221,12 +221,16 @@ test('receipt polling stops at expiry or an explicit refusal; ordinary grants do
   });
 });
 
-test('enrollment config: legacy by default, hq with an https origin', () => {
+test('enrollment config: legacy, linked HQ or explicit local-only', () => {
   assert.doesNotThrow(() => validateConfig({ enrollment: { source: 'hq' } }));
   assert.doesNotThrow(() => validateConfig({ enrollment: { source: 'hq', server: 'https://id.example' } }));
   assert.doesNotThrow(() => validateConfig({ enrollment: { source: 'legacy' } }));
-  assert.throws(() => validateConfig({ enrollment: { source: 'cloud' } }), /legacy or hq/);
+  assert.doesNotThrow(() => validateConfig({ enrollment: { source: 'local-only' } }));
+  assert.throws(() => validateConfig({ enrollment: { source: 'cloud' } }), /legacy, hq or local-only/);
   assert.throws(() => validateConfig({ enrollment: { server: 'https://id.example' } }), /only for the hq source/);
+  assert.throws(() => validateConfig({ enrollment: { source: 'local-only', server: 'https://id.example' } }), /only for the hq source/);
+  assert.throws(() => validateConfig({ enrollment: { source: 'local-only' }, legacy: { supervise: true } }), /cannot supervise the legacy daemon/);
+  assert.throws(() => validateConfig({ enrollment: { source: 'local-only' }, standalone: true, signer: { backend: 'secure-enclave' } }), /requires the paired Machine backend/);
   assert.throws(() => validateConfig({ enrollment: { source: 'hq', token: 'x' } }), /unknown key enrollment\.token/);
   assert.throws(() => validateServiceUrl('http://id.example'), /https/);
   assert.throws(() => validateServiceUrl('https://id.example/'), /bare origin/);
