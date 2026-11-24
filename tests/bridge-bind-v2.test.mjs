@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
+import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
 import { bridgeBindProofV2, createBridgeBindAdmission } from '../hq/bridge-bind.mjs';
 
 const key = Buffer.alloc(32, 0x41);
@@ -15,6 +16,9 @@ const context = Object.freeze({ ...selectors, hq_epoch: 'd'.repeat(64), bridge_u
   soul_artifact_sha256: `sha256:${'f'.repeat(64)}` });
 const connection = { connection: 'bb_1' };
 const denied = { code: 'host.launch_unavailable' };
+const relayPeer = { uid: 321, pid: 700, pid_version: 1, start_seconds: 1795520001,
+  start_micros: 120000, parent_pid: 600, parent_uid: 321,
+  parent_start_seconds: 1795520000, parent_start_micros: 110000 };
 
 function fixture({ timers, qualificationAuthorizer, relayIngressAuthorizer,
   relayCompletionAuthorizer } = {}) {
@@ -311,6 +315,7 @@ test('a finalized receipt refuses if Machine subsequently loses finalized live a
 });
 
 const qualificationRequest = { model: 'fixture-model', prompt_sha256: `sha256:${'a'.repeat(64)}` };
+const relayRequest = { ...qualificationRequest, peer: relayPeer };
 const qualificationResult = { model: qualificationRequest.model, text: 'fixture', stop_reason: 'end_turn',
   usage: { input_tokens: 1, output_tokens: 1 } };
 
@@ -370,7 +375,7 @@ test('a synthetic qualification callback cannot enable installed test-provider r
   assert.equal(f.service.bridgeRelayIngressEnabledV2(), false);
   const { bind_receipt } = await f.bind();
   f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
-  await assert.rejects(f.service.relayBridgeIngressV2(qualificationRequest, connection, bind_receipt), denied);
+  await assert.rejects(f.service.relayBridgeIngressV2(relayRequest, connection, bind_receipt), denied);
   assert.throws(() => fixture({ qualificationAuthorizer: async () => qualificationResult,
     relayIngressAuthorizer: async () => qualificationResult }), /cannot share a bridge/);
   await f.service.revokeAll();
@@ -385,18 +390,18 @@ test('installed test-provider relay ingress needs the exact finalized B connecti
   assert.equal(f.service.bridgeRelayIngressEnabledV2(), true);
   const { bind_receipt } = await f.bind();
   f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
-  const relay = (input = qualificationRequest, peer = connection, receipt = bind_receipt) =>
+  const relay = (input = relayRequest, peer = connection, receipt = bind_receipt) =>
     f.service.relayBridgeIngressV2(input, peer, receipt);
-  await assert.rejects(relay(qualificationRequest, { connection: 'bb_other' }), denied);
-  await assert.rejects(relay(qualificationRequest, connection, '0'.repeat(64)), denied);
+  await assert.rejects(relay(relayRequest, { connection: 'bb_other' }), denied);
+  await assert.rejects(relay(relayRequest, connection, '0'.repeat(64)), denied);
   for (const field of ['reservation_sha256', 'bind_receipt_sha256', 'path', 'credential']) {
-    await assert.rejects(relay({ ...qualificationRequest, [field]: 'caller-claim' }), denied);
+    await assert.rejects(relay({ ...relayRequest, [field]: 'caller-claim' }), denied);
   }
   assert.deepEqual(authorizations, []);
   assert.deepEqual(await relay(), qualificationResult);
   await assert.rejects(relay(), denied);
   assert.equal(authorizations.length, 1);
-  assert.deepEqual(authorizations[0].request, qualificationRequest);
+  assert.deepEqual(authorizations[0].request, relayRequest);
   assert.equal(authorizations[0].observation.reservation_digest, selectors.reservation_digest);
   assert.equal(authorizations[0].observation.bind_receipt_sha256, digest(bind_receipt));
   assert.equal(Object.hasOwn(authorizations[0].observation, 'proof_key'), false);
@@ -406,7 +411,7 @@ test('installed test-provider relay ingress needs the exact finalized B connecti
 test('installed test-provider relay ingress refuses unfinalized B and a disconnected in-flight result', async () => {
   const unfinalized = fixture({ relayIngressAuthorizer: async () => assert.fail('unfinalized B dispatched') });
   const first = await unfinalized.bind();
-  await assert.rejects(unfinalized.service.relayBridgeIngressV2(qualificationRequest, connection, first.bind_receipt), denied);
+  await assert.rejects(unfinalized.service.relayBridgeIngressV2(relayRequest, connection, first.bind_receipt), denied);
   assert.equal(unfinalized.stops.length, 1);
 
   const entered = Promise.withResolvers();
@@ -414,9 +419,9 @@ test('installed test-provider relay ingress refuses unfinalized B and a disconne
   const raced = fixture({ relayIngressAuthorizer: () => { entered.resolve(); return answer.promise; } });
   const second = await raced.bind();
   raced.setVerified({ ...context, finalized_live_expires_at: 90_000 });
-  const pending = assert.rejects(raced.service.relayBridgeIngressV2(qualificationRequest, connection, second.bind_receipt), denied);
+  const pending = assert.rejects(raced.service.relayBridgeIngressV2(relayRequest, connection, second.bind_receipt), denied);
   await entered.promise;
-  await assert.rejects(raced.service.relayBridgeIngressV2(qualificationRequest, connection, second.bind_receipt), denied);
+  await assert.rejects(raced.service.relayBridgeIngressV2(relayRequest, connection, second.bind_receipt), denied);
   await raced.service.forgetBridgeConnection(connection.connection, second.bind_receipt);
   answer.resolve(qualificationResult);
   await pending;
@@ -431,8 +436,8 @@ test('installed test-provider relay ingress contains an altered response without
   } });
   const { bind_receipt } = await f.bind();
   f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
-  await assert.rejects(f.service.relayBridgeIngressV2(qualificationRequest, connection, bind_receipt), denied);
-  await assert.rejects(f.service.relayBridgeIngressV2(qualificationRequest, connection, bind_receipt), denied);
+  await assert.rejects(f.service.relayBridgeIngressV2(relayRequest, connection, bind_receipt), denied);
+  await assert.rejects(f.service.relayBridgeIngressV2(relayRequest, connection, bind_receipt), denied);
   assert.equal(calls, 1);
   assert.equal(f.stops.length, 1);
 });
@@ -446,7 +451,7 @@ test('B completion needs the same finalized ingress and records one checked clie
   f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
   const completion = { selectors, bind_receipt_sha256: digest(bind_receipt),
     request_sha256: qualificationRequest.prompt_sha256, prompt_sha256: digest('stock prompt'),
-    model: qualificationRequest.model, http_status: 200,
+    model: qualificationRequest.model, peer: relayPeer, peer_sha256: canonicalDigest(relayPeer), http_status: 200,
     response_wire_sha256: digest('HTTP/1.1 200 OK\r\n'), response_wire_bytes: 19,
     write_started_at: '2026-11-24T01:02:03.123456789Z',
     write_completed_at: '2026-11-24T01:02:03.124456789Z' };
@@ -454,10 +459,13 @@ test('B completion needs the same finalized ingress and records one checked clie
     f.service.completeBridgeIngressV2(value, peer, receipt);
   await assert.rejects(report(), denied);
   await assert.rejects(report(completion, { connection: 'bb_other' }), denied);
-  await f.service.relayBridgeIngressV2(qualificationRequest, connection, bind_receipt);
+  await f.service.relayBridgeIngressV2(relayRequest, connection, bind_receipt);
   await assert.rejects(report({ ...completion, selectors: { ...selectors, start_id: `st_${'0'.repeat(24)}` } }), denied);
   await assert.rejects(report({ ...completion, request_sha256: digest('other request') }), denied);
   await assert.rejects(report({ ...completion, prompt_sha256: undefined }), denied);
+  await assert.rejects(report({ ...completion, peer_sha256: digest('wrong peer') }), denied);
+  await assert.rejects(report({ ...completion, peer: { ...relayPeer, pid_version: 2 },
+    peer_sha256: canonicalDigest({ ...relayPeer, pid_version: 2 }) }), denied);
   await assert.rejects(report({ ...completion, http_status: 503 }), denied);
   assert.equal(completed.length, 0);
   assert.deepEqual(await report(), { accepted: true });

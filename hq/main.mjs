@@ -44,7 +44,7 @@ import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, 
 import { connectSocket } from './socket.mjs';
 import { machineRoleCommand, machineRoleStage2aCooperative, machineRoleStage2aList,
   machineRoleStage2aT03Positive, machineRoleStage2aT03Ready,
-  machineRoleStage2aT03Complete } from './machine-channel.mjs';
+  machineRoleStage2aT03SiblingWitness, machineRoleStage2aT03Complete } from './machine-channel.mjs';
 import { relaySoulAcp } from './soul-acp-relay.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
 import { verifyStage2aProtectedCandidateReservationV3 } from './stage2a-reservation.mjs';
@@ -55,6 +55,10 @@ import { authenticatedSelectedH } from './stage2a-h-preloader.mjs';
 import { createStage2aCooperativeMachine } from './stage2a-cooperative-machine.mjs';
 import { createStage2aCooperativeStarter, openInstalledCooperativeMemberProvider } from './stage2a-cooperative-start.mjs';
 import { createStage2aQualificationProvider } from './stage2a-qualification-provider.mjs';
+import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
+import { verifiedT03ChildStart, verifyT03RelayPeer } from './stage2a-t03-peer.mjs';
+import { checkedT03SiblingWitness, recordT03SiblingWitness,
+  waitForT03SiblingWitnesses, requireT03SiblingAfterAttempt } from './stage2a-t03-sibling.mjs';
 
 const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine soul-bridge-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
@@ -334,17 +338,38 @@ async function main(argv) {
           const reservationSHA256 = selectors.reservation_sha256;
           const start = providerStarts.get(reservationSHA256);
           const provider = providers.get(reservationSHA256);
-          if (!start || !provider || !start.positivePromise
+          if (!start || !provider
             || start.childReceiptSHA256 !== childReceiptSHA256
             || start.plan !== plan || start.assignment !== assignment) {
             throw new Error('protected T03 probe is not bound to the completed start');
           }
-          const positive = await start.positivePromise;
-          start.positiveReceiptSHA256 ??= positive.sha256;
           const base = { reservation_sha256: reservationSHA256,
             installation_id: plan.installation_id, start_id: assignment.start_id,
             launch_id: assignment.launch_id, hq_epoch: plan.hq_epoch,
             plan_id: plan.plan_id, plan_digest: plan.plan_digest };
+          if (event.kind === 't03-sibling-credential-witness') {
+            const witness = checkedT03SiblingWitness(event.witness, {
+              reservation_sha256: reservationSHA256,
+              installation_id: plan.installation_id, start_id: assignment.start_id,
+              child_receipt_sha256: childReceiptSHA256,
+            });
+            const primary = providerStarts.get(witness.primary_reservation_sha256);
+            if (!primary || primary === start || primary.t03Completed) {
+              throw new Error('protected T03 sibling witness lacks the current primary start');
+            }
+            const accepted = await machineRoleStage2aT03SiblingWitness({ ...base, witness });
+            if (accepted.accepted !== true || accepted.metadata_sha256 !== witness.metadata_sha256
+              || accepted.lease_sequence !== witness.lease_sequence) {
+              throw new Error('Machine refused protected T03 sibling witness');
+            }
+            recordT03SiblingWitness(primary, witness);
+            return;
+          }
+          if (!start.positivePromise) {
+            throw new Error('protected T03 probe has no accepted positive response');
+          }
+          const positive = await start.positivePromise;
+          start.positiveReceiptSHA256 ??= positive.sha256;
           if (event.kind === 't03-probe-ready') {
             const ready = event.ready;
             if (ready?.schema !== 'agent-bot-machine/stage2a-t03-probe-ready/v1'
@@ -379,6 +404,8 @@ async function main(argv) {
             || !Array.isArray(result.attempts) || result.attempts.length !== 3) {
             throw new Error('protected T03 result differs from the current child');
           }
+          const siblingWitnesses = await waitForT03SiblingWitnesses(start);
+          requireT03SiblingAfterAttempt(siblingWitnesses, result.credential_attempted_at_ms);
           const reachability = await provider.probeReachability();
           const baseline = start.positiveNetworkBaseline;
           const tcp = start.positiveTCPBaseline;
@@ -405,6 +432,7 @@ async function main(argv) {
               reachability.ipv6.observed_at_ms),
           };
           await machineRoleStage2aT03Complete({ ...base, result, network });
+          start.t03Completed = true;
         },
         openProtectedAdmission: async ({ installed: plan, assignment, selectors,
           getBindReceiptSHA256 }) => {
@@ -423,7 +451,17 @@ async function main(argv) {
           } catch (error) { registration.close(); throw error; }
         },
         onFinalized: async ({ installed: plan, assignment, selectors, bindReceiptSHA256,
-          finalizationSHA256, childReceiptSHA256, relaySocket }) => {
+          finalizationSHA256, childReceiptSHA256, childReceiptEnvelope,
+          childLauncherPID, childPID, relaySocket }) => {
+          const childStart = verifiedT03ChildStart(childReceiptEnvelope, childReceiptSHA256,
+            machinePublicKey, { reservation_sha256: selectors.reservation_sha256,
+              installation_id: plan.installation_id, start_id: assignment.start_id,
+              launch_id: assignment.launch_id, plan_id: plan.plan_id,
+              plan_digest: plan.plan_digest, hq_epoch: plan.hq_epoch,
+              runner_uid: plan.runner_uid, runner_gid: plan.runner_gid,
+              child_launcher_pid: childLauncherPID, child_pid: childPID,
+              bind_receipt_sha256: bindReceiptSHA256,
+              finalization_sha256: finalizationSHA256, relay_socket: relaySocket.path });
           const provider = createStage2aQualificationProvider({
             plan: { installation_id: plan.installation_id, start_id: assignment.start_id,
               launch_id: assignment.launch_id, hq_epoch: plan.hq_epoch, plan_id: plan.plan_id,
@@ -444,7 +482,7 @@ async function main(argv) {
             await provider.probeReachability();
             providerStarts.set(selectors.reservation_sha256, {
               plan, assignment, selectors, bindReceiptSHA256,
-              finalizationSHA256, childReceiptSHA256, relaySocket,
+              finalizationSHA256, childReceiptSHA256, childStart, relaySocket,
             });
           } catch (error) {
             if (providers.get(selectors.reservation_sha256) === provider) {
@@ -457,6 +495,8 @@ async function main(argv) {
         },
         onStopped: async (reservationSHA256) => {
           const provider = providers.get(reservationSHA256);
+          providerStarts.get(reservationSHA256)?.siblingWitnessWaiter?.reject(
+            new Error('protected T03 primary start stopped before sibling witness'));
           providers.delete(reservationSHA256);
           providerStarts.delete(reservationSHA256);
           await provider?.close();
@@ -469,10 +509,15 @@ async function main(argv) {
         // Production B uses its dedicated v2 relay ingress. The synthetic
         // bridge qualification route stays disabled so it cannot consume the
         // installed one-use Machine provider response.
-        relayIngressAuthorizer: installed.length ? ({ request, observation }) => {
+        relayIngressAuthorizer: installed.length ? async ({ request, observation }) => {
           const provider = providers.get(observation?.reservation_digest);
-          if (!provider) throw new Error('Machine protected provider start is unavailable');
-          return provider({ request, observation });
+          const start = providerStarts.get(observation?.reservation_digest);
+          if (!provider || !start || start.relayPeerSHA256) {
+            throw new Error('Machine protected provider start is unavailable');
+          }
+          await verifyT03RelayPeer(request.peer, start.childStart);
+          start.relayPeerSHA256 = canonicalDigest(request.peer);
+          return provider({ request: { model: request.model, prompt_sha256: request.prompt_sha256 }, observation });
         } : undefined,
         relayCompletionAuthorizer: installed.length ? async ({ completion, observation, ingress }) => {
           const reservationSHA256 = observation?.reservation_digest;
@@ -481,10 +526,13 @@ async function main(argv) {
           if (!provider || !start || start.positiveAttempted
             || completion.bind_receipt_sha256 !== start.bindReceiptSHA256
             || completion.request_sha256 !== ingress.request.prompt_sha256
-            || completion.model !== ingress.request.model) {
+            || completion.model !== ingress.request.model
+            || completion.peer_sha256 !== start.relayPeerSHA256
+            || canonicalDigest(completion.peer) !== start.relayPeerSHA256) {
             throw new Error('protected completion differs from the finalized start');
           }
           start.positiveAttempted = true;
+          await verifyT03RelayPeer(completion.peer, start.childStart);
           const invoked = provider.invocationReceipt();
           if (!invoked || invoked.method !== 'POST' || invoked.status !== 200
             || invoked.provider_config_sha256 !== start.plan.provider_config_sha256) {
@@ -517,6 +565,8 @@ async function main(argv) {
             provider_ipv4_url: base, provider_ipv6_url: base6,
             request_sha256: completion.request_sha256, model: completion.model,
             prompt_sha256: completion.prompt_sha256,
+            peer: completion.peer,
+            peer_sha256: completion.peer_sha256,
             provider_reply_sha256: invoked.response_body_sha256,
             response_wire_sha256: completion.response_wire_sha256,
             response_wire_bytes: completion.response_wire_bytes,

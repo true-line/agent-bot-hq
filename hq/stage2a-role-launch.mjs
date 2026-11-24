@@ -250,9 +250,13 @@ function childProgress(child, cooperative, onT03Event) {
       catch { fail(new Error('invalid protected child status')); return; }
       if (phase === kinds.length) {
         if (!event || typeof event !== 'object' || Array.isArray(event)
-          || !['t03-probe-ready', 't03-probe-result'].includes(event.kind)
-          || Object.keys(event).sort().join(',') !== (event.kind === 't03-probe-ready' ? 'kind,ready' : 'kind,result')
-          || typeof event[event.kind === 't03-probe-ready' ? 'ready' : 'result'] !== 'object') {
+          || !['t03-probe-ready', 't03-probe-result', 't03-sibling-credential-witness'].includes(event.kind)
+          || Object.keys(event).sort().join(',') !== (event.kind === 't03-probe-ready'
+            ? 'kind,ready' : event.kind === 't03-probe-result' ? 'kind,result' : 'kind,witness')
+          || !event[event.kind === 't03-probe-ready' ? 'ready'
+            : event.kind === 't03-probe-result' ? 'result' : 'witness']
+          || typeof event[event.kind === 't03-probe-ready' ? 'ready'
+            : event.kind === 't03-probe-result' ? 'result' : 'witness'] !== 'object') {
           fail(new Error('unexpected protected T03 child status')); return;
         }
         t03Chain = t03Chain.then(() => {

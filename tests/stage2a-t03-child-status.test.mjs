@@ -23,14 +23,17 @@ test('protected child status keeps T03 event kind separate from probe kind', asy
     { kind: 'child-started', child_pid: 703, child_launcher_pid: 702, grant_sha256: digest },
     { kind: 'child-accepted', receipt_sha256: digest, lease_sequence: 1 },
     { kind: 'started' },
+    { kind: 't03-sibling-credential-witness', witness: {
+      schema: 'agent-bot-machine/stage2a-t03-sibling-credential-witness/v1' } },
     { kind: 't03-probe-ready', ready: { schema: 'agent-bot-machine/stage2a-t03-probe-ready/v1', kind: 'ipv4' } },
     { kind: 't03-probe-result', result: { schema: 'agent-bot-machine/stage2a-t03-probe-result/v1' } },
   ].map((event) => JSON.stringify(event)).join('\n') + '\n');
   assert.equal((await role.waitChildStarted()).child_pid, 703);
   await role.waitChildAccepted(digest);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(received.map((event) => event.kind), ['t03-probe-ready', 't03-probe-result']);
-  assert.equal(received[0].ready.kind, 'ipv4');
+  assert.deepEqual(received.map((event) => event.kind), [
+    't03-sibling-credential-witness', 't03-probe-ready', 't03-probe-result']);
+  assert.equal(received[1].ready.kind, 'ipv4');
   assert.equal(child.signalCode, null);
   child.stdin.destroy();
   child.stdout.destroy();

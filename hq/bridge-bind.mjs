@@ -4,6 +4,8 @@
 // kernel B peer and exact endpoint, and supply the one-use FD secret.
 import { createHmac, createHash, timingSafeEqual } from 'node:crypto';
 import { fail } from '../sdk/errors.mjs';
+import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
+import { validT03PeerShape } from './stage2a-t03-peer.mjs';
 
 export const BRIDGE_BIND_CONTEXT = 'agent-bot-stage2a-bridge-bind-v1';
 export const BRIDGE_BIND_V3_CONTEXT = 'agent-bot-stage2a-bridge-bind-v3';
@@ -487,19 +489,21 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
   }
 
   // The Stage 2a installed test-provider relay has its own authorizer and
-  // one-use fence. B verifies the raw vendor request before sending this
-  // digest-only message; this is not a general provider-byte transport. The
+  // one-use fence. B verifies the raw vendor request before sending its
+  // normalized digest and kernel peer; this is not a provider-byte transport. The
   // synthetic qualification callback cannot enable or spend this route.
   async function relayBridgeIngressV2(input, { connection } = {}, receipt) {
     if (typeof relayIngressAuthorizer !== 'function' || !available(V2)
-      || !record(input) || Object.keys(input).length !== 2
+      || !record(input) || Object.keys(input).length !== 3
       || !Object.hasOwn(input, 'model') || !Object.hasOwn(input, 'prompt_sha256')
+      || !Object.hasOwn(input, 'peer') || !validT03PeerShape(input.peer)
       || !matches(ID, input.model) || !matches(DIGEST, input.prompt_sha256)) refuse();
     const binding = live.get(connection);
     if (binding?.context.protocol !== V2 || binding.receipt !== receipt
       || binding.relayIngressAttempted) refuse();
     binding.relayIngressAttempted = true;
-    const request = Object.freeze({ model: input.model, prompt_sha256: input.prompt_sha256 });
+    const request = Object.freeze({ model: input.model, prompt_sha256: input.prompt_sha256,
+      peer: Object.freeze({ ...input.peer }) });
     try {
       const observation = await boundBridgeConnectionV2(connection, receipt);
       if (!binding.finalized) refuse();
@@ -527,12 +531,15 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
   // observation with this binding and its one spent provider invocation.
   async function completeBridgeIngressV2(input, { connection } = {}, receipt) {
     const keys = ['selectors', 'bind_receipt_sha256', 'request_sha256', 'prompt_sha256', 'model',
+      'peer', 'peer_sha256',
       'http_status', 'response_wire_sha256', 'response_wire_bytes',
       'write_started_at', 'write_completed_at'];
     if (typeof relayCompletionAuthorizer !== 'function' || !available(V2)
       || !record(input) || Object.keys(input).length !== keys.length
       || !keys.every((key) => Object.hasOwn(input, key))
       || !record(input.selectors) || Object.keys(input.selectors).length !== V2.fields.length
+      || !validT03PeerShape(input.peer) || !matches(DIGEST, input.peer_sha256)
+      || canonicalDigest(input.peer) !== input.peer_sha256
       || input.http_status !== 200 || !matches(DIGEST, input.prompt_sha256)
       || !matches(DIGEST, input.response_wire_sha256)
       || !Number.isSafeInteger(input.response_wire_bytes)
@@ -552,13 +559,15 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     const previous = binding.observation;
     if (selectors.some((key) => input.selectors[key] !== previous[key])
       || input.bind_receipt_sha256 !== previous.bind_receipt_sha256
-      || input.request_sha256 !== request.prompt_sha256 || input.model !== request.model) refuse();
+      || input.request_sha256 !== request.prompt_sha256 || input.model !== request.model
+      || input.peer_sha256 !== canonicalDigest(request.peer)) refuse();
     binding.relayCompletionAttempted = true;
     try {
       const observation = await boundBridgeConnectionV2(connection, receipt);
       if (!binding.finalized || live.get(connection) !== binding) refuse();
       const accepted = await bounded(Promise.resolve().then(() => relayCompletionAuthorizer({
-        completion: Object.freeze({ ...input }), observation: Object.freeze(observation),
+        completion: Object.freeze({ ...input, peer: Object.freeze({ ...input.peer }) }),
+        observation: Object.freeze(observation),
         ingress: Object.freeze({ request, response }),
       })), 'Machine positive completion deadline exceeded', 12_000);
       if (accepted !== true || live.get(connection) !== binding) refuse();

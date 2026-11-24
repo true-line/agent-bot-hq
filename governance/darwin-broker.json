@@ -1,9 +1,7 @@
 {
   "name": "agent-comms",
   "version": "0.5.10",
-  "sha256": "sha256:0173785cf462171e8f7a1634dc6ecda5d5f01c5a6f171fd683648863cd4983a3",
+  "sha256": "sha256:0097ded59c835678ea60a4452db7bfd69432fb2e78ba3df65cf551bf65c25f0e",
   "source_repository": "https://github.com/true-line/agent-bot-comms.git",
-  "source_commit": "9820d07f029bdbb7e9e267836bf0cf4901e864a6",
-  "source_tag": "v0.5.10",
-  "release_asset_sha256": "sha256:7555565d11a13d7c5344dfbe87a8f753d77f793f0e24ce3e733378485323a150"
+  "source_commit": "7794750853211b9c7dd84b10f71271db089e632a"
 }

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { machineCommandInHome } from '../hq/machine-channel.mjs';
 
-test('T03 positive, ready and completion use the pinned signed Machine channel', async (t) => {
+test('T03 positive, ready, sibling witness and completion use the pinned signed Machine channel', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'hq-t03-channel-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const socket = join(home, 'machine.sock');
@@ -34,8 +34,12 @@ test('T03 positive, ready and completion use the pinned signed Machine channel',
         seen.push({ verb: request.verb, fields });
         const state = { 'stage2a-t03-positive': 't03-positive-recorded',
           'stage2a-t03-ready': 't03-ready-observed',
+          'stage2a-t03-sibling-credential-witness': 't03-sibling-credential-witnessed',
           'stage2a-t03-complete': 't03-completion-recorded' }[request.verb];
         const body = request.verb === 'stage2a-t03-ready' ? { accepted: true }
+          : request.verb === 'stage2a-t03-sibling-credential-witness'
+            ? { accepted: true, metadata_sha256: fields.witness.metadata_sha256,
+              lease_sequence: fields.witness.lease_sequence }
           : { sha256: `sha256:${'a'.repeat(64)}` };
         const response = { ok: true, state, body, timestamp: request.timestamp,
           nonce: randomBytes(16).toString('base64url'), request_nonce: request.nonce };
@@ -57,15 +61,21 @@ test('T03 positive, ready and completion use the pinned signed Machine channel',
     `sha256:${'a'.repeat(64)}`);
   assert.equal((await run('stage2a-t03-ready', { ...base, ready: { schema: 'ready' } })).accepted,
     true);
+  const witness = { metadata_sha256: `sha256:${'b'.repeat(64)}`, lease_sequence: 2 };
+  const sibling = await run('stage2a-t03-sibling-credential-witness', { ...base, witness });
+  assert.equal(sibling.accepted, true);
+  assert.equal(sibling.metadata_sha256, witness.metadata_sha256);
+  assert.equal(sibling.lease_sequence, 2);
   assert.equal((await run('stage2a-t03-complete', { ...base, result: { schema: 'result' },
     network: { schema: 'network' } })).sha256, `sha256:${'a'.repeat(64)}`);
   assert.deepEqual(seen.map(({ verb }) => verb), ['stage2a-t03-positive',
-    'stage2a-t03-ready', 'stage2a-t03-complete']);
+    'stage2a-t03-ready', 'stage2a-t03-sibling-credential-witness', 'stage2a-t03-complete']);
   assert.deepEqual(seen.map(({ fields }) => Object.keys(fields)), [
     [...Object.keys(base), 'receipt'], [...Object.keys(base), 'ready'],
+    [...Object.keys(base), 'witness'],
     [...Object.keys(base), 'result', 'network'],
   ]);
   await assert.rejects(run('stage2a-t03-positive', { ...base, receipt: 'untrusted' }),
     /invalid Stage 2a Machine reservation selectors/);
-  assert.equal(seen.length, 3);
+  assert.equal(seen.length, 4);
 });

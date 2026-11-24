@@ -125,6 +125,7 @@ const COOPERATIVE_STATES = new Map([
 const T03_STATES = new Map([
   ['stage2a-t03-positive', 't03-positive-recorded'],
   ['stage2a-t03-ready', 't03-ready-observed'],
+  ['stage2a-t03-sibling-credential-witness', 't03-sibling-credential-witnessed'],
   ['stage2a-t03-complete', 't03-completion-recorded'],
 ]);
 const T03_BASE = ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
@@ -132,6 +133,7 @@ const T03_BASE = ['reservation_sha256', 'installation_id', 'start_id', 'launch_i
 const T03_FIELDS = {
   'stage2a-t03-positive': [...T03_BASE, 'receipt'],
   'stage2a-t03-ready': [...T03_BASE, 'ready'],
+  'stage2a-t03-sibling-credential-witness': [...T03_BASE, 'witness'],
   'stage2a-t03-complete': [...T03_BASE, 'result', 'network'],
 };
 const fingerprint = (raw) => createHash('sha256').update(raw).digest('hex');
@@ -409,6 +411,8 @@ export const machineRoleStage2aLive = (request) => machineRoleStage2a('stage2a-l
 export const machineRoleStage2aProvider = (request) => machineRoleStage2a('stage2a-provider', request);
 export const machineRoleStage2aT03Positive = (request) => machineRoleStage2a('stage2a-t03-positive', request);
 export const machineRoleStage2aT03Ready = (request) => machineRoleStage2a('stage2a-t03-ready', request);
+export const machineRoleStage2aT03SiblingWitness = (request) =>
+  machineRoleStage2a('stage2a-t03-sibling-credential-witness', request);
 export const machineRoleStage2aT03Complete = (request) => machineRoleStage2a('stage2a-t03-complete', request);
 export const machineRoleStage2aChildReady = (request) => machineRoleStage2a('stage2a-child-ready', request);
 export const machineRoleStage2aHelloStart = (request) => machineRoleStage2a('stage2a-hello-start', request);
@@ -854,6 +858,18 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         receipt_sha256: body.receipt_sha256, daemon_fingerprint: fingerprint(daemon) });
     }
     if (T03_STATES.has(verb)) {
+      if (verb === 'stage2a-t03-sibling-credential-witness') {
+        if (!body || typeof body !== 'object' || Array.isArray(body)
+          || Object.keys(body).sort().join(',') !== 'accepted,lease_sequence,metadata_sha256'
+          || body.accepted !== true
+          || !/^sha256:[0-9a-f]{64}$/.test(body.metadata_sha256)
+          || !Number.isSafeInteger(body.lease_sequence) || body.lease_sequence < 1
+          || body.metadata_sha256 !== deviceFields.witness.metadata_sha256
+          || body.lease_sequence !== deviceFields.witness.lease_sequence) {
+          throw new Error('invalid signed Machine T03 sibling witness response');
+        }
+        return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
+      }
       if (!body || typeof body !== 'object' || Array.isArray(body)
         || Object.keys(body).length !== 1
         || (verb === 'stage2a-t03-ready'

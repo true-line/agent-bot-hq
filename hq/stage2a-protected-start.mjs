@@ -471,6 +471,9 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         bindReceiptSHA256: live.bind_receipt_sha256,
         finalizationSHA256: live.finalization_sha256,
         childReceiptSHA256: childReceipt.sha256,
+        childReceiptEnvelope: childReceipt.envelope,
+        childLauncherPID: childStarted.child_launcher_pid,
+        childPID: childStarted.child_pid,
         relaySocket: slot.relaySocket });
       const result = { start_id: startId, launch_id: launchId, installation_id: installed.installation_id,
         soul_id: installed.soul_id, package_path: source, pid: childStarted.child_pid,
