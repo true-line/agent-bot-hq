@@ -21,7 +21,7 @@ const relayPeer = { uid: 321, pid: 700, pid_version: 1, start_seconds: 179552000
   parent_start_seconds: 1795520000, parent_start_micros: 110000 };
 
 function fixture({ timers, qualificationAuthorizer, relayIngressAuthorizer,
-  relayCompletionAuthorizer } = {}) {
+  relayPrewriteAuthorizer, relayCompletionAuthorizer } = {}) {
   let now = 1_000;
   let sequence = 0;
   let verified = context;
@@ -37,6 +37,7 @@ function fixture({ timers, qualificationAuthorizer, relayIngressAuthorizer,
   const service = createBridgeBindAdmission({
     qualificationAuthorizer,
     relayIngressAuthorizer,
+    relayPrewriteAuthorizer,
     relayCompletionAuthorizer,
     authority: {
       async verifyLiveStartV2(scope, peer, phase) {
@@ -444,22 +445,40 @@ test('installed test-provider relay ingress contains an altered response without
 
 test('B completion needs the same finalized ingress and records one checked client write', async () => {
   const completed = [];
+  const prewrites = [];
   const f = fixture({ relayIngressAuthorizer: async () => qualificationResult,
+    relayPrewriteAuthorizer: async (value) => {
+      prewrites.push(value);
+      return { accepted: true, prewrite_receipt: 'a'.repeat(64) };
+    },
     relayCompletionAuthorizer: async (value) => { completed.push(value); return true; } });
+  assert.equal(f.service.bridgeRelayPrewriteEnabledV2(), true);
   assert.equal(f.service.bridgeRelayCompletionEnabledV2(), true);
   const { bind_receipt } = await f.bind();
   f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
-  const completion = { selectors, bind_receipt_sha256: digest(bind_receipt),
+  const prewrite = { selectors, bind_receipt_sha256: digest(bind_receipt),
     request_sha256: qualificationRequest.prompt_sha256, prompt_sha256: digest('stock prompt'),
     model: qualificationRequest.model, peer: relayPeer, peer_sha256: canonicalDigest(relayPeer), http_status: 200,
-    response_wire_sha256: digest('HTTP/1.1 200 OK\r\n'), response_wire_bytes: 19,
+    response_wire_sha256: digest('HTTP/1.1 200 OK\r\n'), response_wire_bytes: 19 };
+  const completion = { ...prewrite,
     write_started_at: '2026-11-24T01:02:03.123456789Z',
-    write_completed_at: '2026-11-24T01:02:03.124456789Z' };
+    write_completed_at: '2026-11-24T01:02:03.124456789Z',
+    prewrite_receipt: 'a'.repeat(64), completion_origin_mac: 'b'.repeat(64) };
   const report = (value = completion, peer = connection, receipt = bind_receipt) =>
     f.service.completeBridgeIngressV2(value, peer, receipt);
   await assert.rejects(report(), denied);
   await assert.rejects(report(completion, { connection: 'bb_other' }), denied);
   await f.service.relayBridgeIngressV2(relayRequest, connection, bind_receipt);
+  assert.notEqual(prewrite.request_sha256, prewrite.prompt_sha256);
+  await assert.rejects(report(), denied);
+  await assert.rejects(f.service.prewriteBridgeRelayV2({ ...prewrite, peer_sha256: digest('wrong') },
+    connection, bind_receipt), denied);
+  await assert.rejects(f.service.prewriteBridgeRelayV2(prewrite, { connection: 'bb_other' }, bind_receipt), denied);
+  assert.deepEqual(await f.service.prewriteBridgeRelayV2(prewrite, connection, bind_receipt),
+    { accepted: true, prewrite_receipt: 'a'.repeat(64) });
+  assert.equal(prewrites.length, 1);
+  assert.equal(prewrites[0].prewrite.prompt_sha256, prewrite.prompt_sha256);
+  await assert.rejects(f.service.prewriteBridgeRelayV2(prewrite, connection, bind_receipt), denied);
   await assert.rejects(report({ ...completion, selectors: { ...selectors, start_id: `st_${'0'.repeat(24)}` } }), denied);
   await assert.rejects(report({ ...completion, request_sha256: digest('other request') }), denied);
   await assert.rejects(report({ ...completion, prompt_sha256: undefined }), denied);
@@ -467,6 +486,9 @@ test('B completion needs the same finalized ingress and records one checked clie
   await assert.rejects(report({ ...completion, peer: { ...relayPeer, pid_version: 2 },
     peer_sha256: canonicalDigest({ ...relayPeer, pid_version: 2 }) }), denied);
   await assert.rejects(report({ ...completion, http_status: 503 }), denied);
+  await assert.rejects(report({ ...completion, prewrite_receipt: 'c'.repeat(64) }), denied);
+  await assert.rejects(report({ ...completion, response_wire_sha256: digest('different wire') }), denied);
+  await assert.rejects(report({ ...completion, completion_origin_mac: 'bad' }), denied);
   assert.equal(completed.length, 0);
   assert.deepEqual(await report(), { accepted: true });
   assert.equal(completed.length, 1);
@@ -474,6 +496,33 @@ test('B completion needs the same finalized ingress and records one checked clie
   assert.equal(completed[0].observation.bind_receipt_sha256, completion.bind_receipt_sha256);
   await assert.rejects(report(), denied);
   await f.service.revokeAll();
+});
+
+test('a late Machine prewrite response after B disconnect cannot authorize completion', async () => {
+  const entered = Promise.withResolvers();
+  const answer = Promise.withResolvers();
+  let completed = 0;
+  const f = fixture({ relayIngressAuthorizer: async () => qualificationResult,
+    relayPrewriteAuthorizer: () => { entered.resolve(); return answer.promise; },
+    relayCompletionAuthorizer: async () => { completed++; return true; } });
+  const { bind_receipt } = await f.bind();
+  f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
+  await f.service.relayBridgeIngressV2(relayRequest, connection, bind_receipt);
+  const prewrite = { selectors, bind_receipt_sha256: digest(bind_receipt),
+    request_sha256: qualificationRequest.prompt_sha256, prompt_sha256: digest('different prompt'),
+    model: qualificationRequest.model, peer: relayPeer, peer_sha256: canonicalDigest(relayPeer),
+    response_wire_sha256: digest('wire'), response_wire_bytes: 4, http_status: 200 };
+  const pending = assert.rejects(f.service.prewriteBridgeRelayV2(prewrite, connection, bind_receipt), denied);
+  await entered.promise;
+  await f.service.forgetBridgeConnection(connection.connection, bind_receipt);
+  answer.resolve({ accepted: true, prewrite_receipt: 'a'.repeat(64) });
+  await pending;
+  await assert.rejects(f.service.completeBridgeIngressV2({ ...prewrite,
+    write_started_at: '2026-11-24T01:02:03Z', write_completed_at: '2026-11-24T01:02:04Z',
+    prewrite_receipt: 'a'.repeat(64), completion_origin_mac: 'b'.repeat(64) },
+  connection, bind_receipt), denied);
+  assert.equal(completed, 0);
+  assert.equal(f.stops.length, 1);
 });
 
 test('v3 binds the exact member set and gates finalized state on the same B connection', async () => {

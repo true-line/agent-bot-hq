@@ -42,11 +42,12 @@ test('B transport checks UID and inode, refuses qualification by default, and re
 test('B transport forwards qualification only from the current dedicated peer when enabled', () => checkBridgeTransport(true));
 
 test('B transport forwards relay ingress only from the current dedicated peer when enabled', () => checkBridgeTransport(false, true));
+test('B transport forwards prewrite only from the current dedicated peer when enabled', () => checkBridgeTransport(false, false, false, false, true));
 test('B transport forwards completion only from the current dedicated peer when enabled', () => checkBridgeTransport(false, false, false, true));
 test('B transport forwards live peer challenge only from the current dedicated peer when enabled', () => checkBridgeTransport(false, false, true));
 
 async function checkBridgeTransport(enabled, relayEnabled = false, peerEnabled = false,
-  completionEnabled = false) {
+  completionEnabled = false, prewriteEnabled = false) {
   const [endpoint] = planBridgeEndpoints([assignment('soul-a')], options);
   const peers = new Map();
   const calls = [];
@@ -61,6 +62,7 @@ async function checkBridgeTransport(enabled, relayEnabled = false, peerEnabled =
   const listener = await listenBridgeEndpoint(endpoint, { hqUid, host, peers,
     ...(enabled ? { enableBridgeQualification: true } : {}),
     ...(relayEnabled ? { enableBridgeRelayIngress: true } : {}),
+    ...(prewriteEnabled ? { enableBridgeRelayPrewrite: true } : {}),
     ...(completionEnabled ? { enableBridgeRelayCompletion: true } : {}),
     ...(peerEnabled ? { enableRelayPeerChallenge: true } : {}),
     core: { random: { hex: () => 'test' } },
@@ -92,20 +94,25 @@ async function checkBridgeTransport(enabled, relayEnabled = false, peerEnabled =
   assert.throws(() => memberBrokerDispatch(host, 'bridge.bind.v2.challenge', {}, 'harness'), { code: 'host.launch_unavailable' });
   const qualification = 'bridge.qualification.messages.v1';
   const relayIngress = 'bridge.relay.ingress.v1';
+  const relayPrewrite = 'bridge.relay.prewrite.v1';
   const relayCompletion = 'bridge.relay.complete.v1';
   const livePeer = 'stage2a-relay-peer-challenge';
   assert.throws(() => memberBrokerDispatch(host, qualification, {}, 'harness'), { code: 'host.launch_unavailable' });
   assert.throws(() => memberBrokerDispatch(host, relayIngress, {}, 'harness'), { code: 'host.launch_unavailable' });
+  assert.throws(() => memberBrokerDispatch(host, relayPrewrite, {}, 'harness'), { code: 'host.launch_unavailable' });
   assert.throws(() => memberBrokerDispatch(host, relayCompletion, {}, 'harness'), { code: 'host.launch_unavailable' });
   assert.throws(() => memberBrokerDispatch(host, livePeer, {}, 'harness'), { code: 'host.launch_unavailable' });
   assert.throws(() => handler.dispatch(qualification, { payload: {}, session: 'unknown' }), { code: 'host.launch_unavailable' });
   assert.throws(() => handler.dispatch(relayIngress, { payload: {}, session: 'unknown' }), { code: 'host.launch_unavailable' });
+  assert.throws(() => handler.dispatch(relayPrewrite, { payload: {}, session: 'unknown' }), { code: 'host.launch_unavailable' });
   assert.throws(() => handler.dispatch(relayCompletion, { payload: {}, session: 'unknown' }), { code: 'host.launch_unavailable' });
   assert.throws(() => handler.dispatch(livePeer, { payload: {}, session: 'unknown' }), { code: 'host.launch_unavailable' });
   if (enabled) handler.dispatch(qualification, { payload: {}, session });
   else assert.throws(() => handler.dispatch(qualification, { payload: {}, session }), { code: 'host.launch_unavailable' });
   if (relayEnabled) handler.dispatch(relayIngress, { payload: {}, session });
   else assert.throws(() => handler.dispatch(relayIngress, { payload: {}, session }), { code: 'host.launch_unavailable' });
+  if (prewriteEnabled) handler.dispatch(relayPrewrite, { payload: {}, session });
+  else assert.throws(() => handler.dispatch(relayPrewrite, { payload: {}, session }), { code: 'host.launch_unavailable' });
   if (completionEnabled) handler.dispatch(relayCompletion, { payload: {}, session });
   else assert.throws(() => handler.dispatch(relayCompletion, { payload: {}, session }), { code: 'host.launch_unavailable' });
   if (peerEnabled) handler.dispatch(livePeer, { payload: {}, session });
@@ -165,6 +172,7 @@ async function checkBridgeTransport(enabled, relayEnabled = false, peerEnabled =
   assert.equal(authority.isCurrentPeerV2(session), false);
   assert.throws(() => handler.dispatch(qualification, { payload: {}, session }), denied);
   assert.throws(() => handler.dispatch(relayIngress, { payload: {}, session }), denied);
+  assert.throws(() => handler.dispatch(relayPrewrite, { payload: {}, session }), denied);
   assert.throws(() => handler.dispatch(relayCompletion, { payload: {}, session }), denied);
   assert.throws(() => handler.dispatch(livePeer, { payload: {}, session }), denied);
   await assert.rejects(authority.verifyLiveStartV2(selectors, session), denied);
@@ -175,6 +183,7 @@ async function checkBridgeTransport(enabled, relayEnabled = false, peerEnabled =
   assert.deepEqual(calls, [
     ...(enabled ? [['accepted', qualification, {}, { connection: session }]] : []),
     ...(relayEnabled ? [['accepted', relayIngress, {}, { connection: session }]] : []),
+    ...(prewriteEnabled ? [['accepted', relayPrewrite, {}, { connection: session }]] : []),
     ...(completionEnabled ? [['accepted', relayCompletion, {}, { connection: session }]] : []),
     ...(peerEnabled ? [['accepted', livePeer, {}, { connection: session }]] : []),
     ['accepted', 'bind', {}, { connection: 'member' }],

@@ -43,7 +43,7 @@ import { productionPluginsDir, readPins } from './plugins.mjs';
 import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { connectSocket } from './socket.mjs';
 import { machineRoleCommand, machineRoleStage2aCooperative, machineRoleStage2aList,
-  machineRoleStage2aT03Positive, machineRoleStage2aT03Ready,
+  machineRoleStage2aT03Positive, machineRoleStage2aT03PrewritePeer, machineRoleStage2aT03Ready,
   machineRoleStage2aT03SiblingWitness, machineRoleStage2aT03Complete } from './machine-channel.mjs';
 import { relaySoulAcp } from './soul-acp-relay.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
@@ -58,7 +58,7 @@ import { createStage2aQualificationProvider } from './stage2a-qualification-prov
 import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
 import { verifiedT03ChildStart, verifyT03RelayPeer } from './stage2a-t03-peer.mjs';
 import { checkedT03SiblingWitness, recordT03SiblingWitness,
-  waitForT03SiblingWitnesses, requireT03SiblingAfterAttempt } from './stage2a-t03-sibling.mjs';
+  waitForT03SiblingWitnesses } from './stage2a-t03-sibling.mjs';
 
 const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine soul-bridge-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
@@ -404,8 +404,7 @@ async function main(argv) {
             || !Array.isArray(result.attempts) || result.attempts.length !== 3) {
             throw new Error('protected T03 result differs from the current child');
           }
-          const siblingWitnesses = await waitForT03SiblingWitnesses(start);
-          requireT03SiblingAfterAttempt(siblingWitnesses, result.credential_attempted_at_ms);
+          await waitForT03SiblingWitnesses(start, result.credential_attempted_at_ms);
           const reachability = await provider.probeReachability();
           const baseline = start.positiveNetworkBaseline;
           const tcp = start.positiveTCPBaseline;
@@ -519,11 +518,44 @@ async function main(argv) {
           start.relayPeerSHA256 = canonicalDigest(request.peer);
           return provider({ request: { model: request.model, prompt_sha256: request.prompt_sha256 }, observation });
         } : undefined,
-        relayCompletionAuthorizer: installed.length ? async ({ completion, observation, ingress }) => {
+        relayPrewriteAuthorizer: installed.length ? async ({ prewrite, observation, ingress }) => {
+          const reservationSHA256 = observation?.reservation_digest;
+          const start = providerStarts.get(reservationSHA256);
+          if (!start || !providers.has(reservationSHA256) || start.prewriteAttempted
+            || prewrite.bind_receipt_sha256 !== start.bindReceiptSHA256
+            || prewrite.peer_sha256 !== start.relayPeerSHA256
+            || prewrite.request_sha256 !== ingress.request.prompt_sha256
+            || prewrite.model !== ingress.request.model) {
+            throw new Error('protected prewrite differs from the finalized start');
+          }
+          start.prewriteAttempted = true;
+          await verifyT03RelayPeer(prewrite.peer, start.childStart);
+          const base = {
+            installation_id: start.plan.installation_id,
+            start_id: start.assignment.start_id,
+            launch_id: start.assignment.launch_id,
+            hq_epoch: start.plan.hq_epoch,
+            plan_id: start.plan.plan_id,
+            plan_digest: start.plan.plan_digest,
+            reservation_sha256: reservationSHA256,
+          };
+          const response = await machineRoleStage2aT03PrewritePeer({ ...base,
+            child_receipt_sha256: start.childReceiptSHA256,
+            broker_prewrite: prewrite,
+          });
+          if (!/^[0-9a-f]{64}$/.test(response.prewrite_receipt)) {
+            throw new Error('Machine prewrite peer observation differs');
+          }
+          start.prewriteReceipt = response.prewrite_receipt;
+          return { accepted: true, prewrite_receipt: response.prewrite_receipt };
+        } : undefined,
+        relayCompletionAuthorizer: installed.length ? async ({ completion, observation, ingress, prewrite }) => {
           const reservationSHA256 = observation?.reservation_digest;
           const provider = providers.get(reservationSHA256);
           const start = providerStarts.get(reservationSHA256);
           if (!provider || !start || start.positiveAttempted
+            || !start.prewriteReceipt || completion.prewrite_receipt !== start.prewriteReceipt
+            || completion.prewrite_receipt !== prewrite.prewrite_receipt
             || completion.bind_receipt_sha256 !== start.bindReceiptSHA256
             || completion.request_sha256 !== ingress.request.prompt_sha256
             || completion.model !== ingress.request.model
@@ -532,7 +564,6 @@ async function main(argv) {
             throw new Error('protected completion differs from the finalized start');
           }
           start.positiveAttempted = true;
-          await verifyT03RelayPeer(completion.peer, start.childStart);
           const invoked = provider.invocationReceipt();
           if (!invoked || invoked.method !== 'POST' || invoked.status !== 200
             || invoked.provider_config_sha256 !== start.plan.provider_config_sha256) {
@@ -594,6 +625,7 @@ async function main(argv) {
             plan_id: start.plan.plan_id,
             plan_digest: start.plan.plan_digest,
             reservation_sha256: reservationSHA256, receipt,
+            broker_completion: completion,
           });
           const result = await start.positivePromise;
           start.positiveReceiptSHA256 = result.sha256;

@@ -50,21 +50,44 @@ export function checkedT03SiblingWitness(witness, expected) {
 export function recordT03SiblingWitness(primary, witness) {
   const accepted = primary.siblingWitnesses ??= [];
   const prior = accepted.at(-1);
-  if (accepted.length >= 2 || (prior && (witness.lease_sequence <= prior.lease_sequence
-    || witness.challenge_base64url === prior.challenge_base64url
+  if (prior && (witness.lease_sequence <= prior.lease_sequence
+    || witness.challenge_base64url !== prior.challenge_base64url
+    || witness.primary_reservation_sha256 !== prior.primary_reservation_sha256
     || witness.sibling_reservation_sha256 !== prior.sibling_reservation_sha256
-    || witness.metadata_sha256 !== prior.metadata_sha256))) refuse();
+    || witness.child_receipt_sha256 !== prior.child_receipt_sha256
+    || witness.credential_path !== prior.credential_path
+    || witness.metadata_sha256 !== prior.metadata_sha256)) refuse();
   accepted.push(witness);
-  if (accepted.length === 2 && primary.siblingWitnessWaiter) {
-    primary.siblingWitnessWaiter.resolve();
-    primary.siblingWitnessWaiter = undefined;
+  // Keep the first pre-arm ACK and a bounded recent tail while Live renews.
+  // A may acknowledge several pre-attempt leases before R reports its result.
+  if (accepted.length > 32) accepted.splice(1, accepted.length - 32);
+  const waiter = primary.siblingWitnessWaiter;
+  if (waiter) {
+    const pair = matchingT03SiblingAfterAttempt(accepted, waiter.attemptedAtMS);
+    if (pair) {
+      waiter.resolve(pair);
+      primary.siblingWitnessWaiter = undefined;
+    }
   }
 }
 
-export async function waitForT03SiblingWitnesses(primary, timeoutMS = 20_000) {
-  if (primary.siblingWitnesses?.length === 2) return primary.siblingWitnesses;
+function matchingT03SiblingAfterAttempt(witnesses, attemptedAtMS) {
+  const first = witnesses?.[0];
+  if (!first || first.observed_at_ms > attemptedAtMS) return undefined;
+  for (let index = witnesses.length - 1; index > 0; index--) {
+    const later = witnesses[index];
+    if (later.lease_sequence > first.lease_sequence
+      && later.observed_at_ms > attemptedAtMS) return [first, later];
+  }
+  return undefined;
+}
+
+export async function waitForT03SiblingWitnesses(primary, attemptedAtMS, timeoutMS = 20_000) {
+  if (!Number.isSafeInteger(attemptedAtMS) || attemptedAtMS < 1) refuse();
+  const ready = matchingT03SiblingAfterAttempt(primary.siblingWitnesses, attemptedAtMS);
+  if (ready) return ready;
   if (primary.siblingWitnessWaiter) refuse();
-  const pending = Promise.withResolvers();
+  const pending = { ...Promise.withResolvers(), attemptedAtMS };
   primary.siblingWitnessWaiter = pending;
   const timer = setTimeout(() => pending.reject(new Error('protected T03 sibling witness timed out')), timeoutMS);
   try { await pending.promise; }
@@ -72,12 +95,12 @@ export async function waitForT03SiblingWitnesses(primary, timeoutMS = 20_000) {
     clearTimeout(timer);
     if (primary.siblingWitnessWaiter === pending) primary.siblingWitnessWaiter = undefined;
   }
-  if (primary.siblingWitnesses?.length !== 2) refuse();
-  return primary.siblingWitnesses;
+  return requireT03SiblingAfterAttempt(primary.siblingWitnesses, attemptedAtMS);
 }
 
 export function requireT03SiblingAfterAttempt(witnesses, attemptedAtMS) {
-  if (!Array.isArray(witnesses) || witnesses.length !== 2
-    || !Number.isSafeInteger(attemptedAtMS) || attemptedAtMS < 1
-    || witnesses[1].observed_at_ms <= attemptedAtMS) refuse();
+  if (!Array.isArray(witnesses) || !Number.isSafeInteger(attemptedAtMS) || attemptedAtMS < 1) refuse();
+  const pair = matchingT03SiblingAfterAttempt(witnesses, attemptedAtMS);
+  if (!pair) refuse();
+  return pair;
 }

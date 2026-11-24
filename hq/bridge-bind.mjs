@@ -98,7 +98,7 @@ export const bridgeBindProofV2 = (key, nonce, context) => proofFor(V2, key, nonc
 // projection. It returns true only after independently confirming the durable
 // containment request, and rejects on uncertainty.
 export function createBridgeBindAdmission({ authority, qualificationAuthorizer, relayIngressAuthorizer,
-  relayCompletionAuthorizer,
+  relayPrewriteAuthorizer, relayCompletionAuthorizer,
   clock, random, receipts, timers = { setTimeout, clearTimeout } } = {}) {
   if (typeof qualificationAuthorizer === 'function' && typeof relayIngressAuthorizer === 'function') {
     throw new TypeError('fixture qualification and production relay ingress cannot share a bridge');
@@ -526,6 +526,53 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     }
   }
 
+  async function prewriteBridgeRelayV2(input, { connection } = {}, receipt) {
+    const keys = ['selectors', 'bind_receipt_sha256', 'peer', 'peer_sha256', 'request_sha256',
+      'prompt_sha256', 'model', 'response_wire_sha256', 'response_wire_bytes', 'http_status'];
+    if (typeof relayPrewriteAuthorizer !== 'function' || !available(V2)
+      || !record(input) || Object.keys(input).length !== keys.length
+      || !keys.every((key) => Object.hasOwn(input, key))
+      || !record(input.selectors) || Object.keys(input.selectors).length !== V2.fields.length
+      || !validT03PeerShape(input.peer) || !matches(DIGEST, input.peer_sha256)
+      || canonicalDigest(input.peer) !== input.peer_sha256
+      || !matches(DIGEST, input.request_sha256) || !matches(DIGEST, input.prompt_sha256)
+      || !matches(DIGEST, input.response_wire_sha256)
+      || !Number.isSafeInteger(input.response_wire_bytes)
+      || input.response_wire_bytes < 1 || input.response_wire_bytes > 65_536
+      || input.http_status !== 200) refuse();
+    const binding = live.get(connection);
+    if (binding?.context.protocol !== V2 || binding.receipt !== receipt
+      || !binding.relayIngress || binding.relayPrewriteAttempted) refuse();
+    const { request, response } = binding.relayIngress;
+    const previous = binding.observation;
+    if (V2.fields.some(([key]) => input.selectors[key] !== previous[key])
+      || input.bind_receipt_sha256 !== previous.bind_receipt_sha256
+      || input.request_sha256 !== request.prompt_sha256
+      || input.model !== request.model
+      || input.peer_sha256 !== canonicalDigest(request.peer)
+      || canonicalDigest(input.peer) !== canonicalDigest(request.peer)) refuse();
+    binding.relayPrewriteAttempted = true;
+    try {
+      const observation = await boundBridgeConnectionV2(connection, receipt);
+      if (!binding.finalized || live.get(connection) !== binding) refuse();
+      const accepted = await bounded(Promise.resolve().then(() => relayPrewriteAuthorizer({
+        prewrite: Object.freeze({ ...input, selectors: Object.freeze({ ...input.selectors }),
+          peer: Object.freeze({ ...input.peer }) }),
+        observation: Object.freeze(observation),
+        ingress: Object.freeze({ request, response }),
+      })), 'Machine prewrite peer observation deadline exceeded', 12_000);
+      if (!record(accepted) || Object.keys(accepted).sort().join(',') !== 'accepted,prewrite_receipt'
+        || accepted.accepted !== true || !matches(SHA, accepted.prewrite_receipt)
+        || live.get(connection) !== binding) refuse();
+      binding.relayPrewrite = Object.freeze({ ...input, selectors: Object.freeze({ ...input.selectors }),
+        peer: Object.freeze({ ...input.peer }), prewrite_receipt: accepted.prewrite_receipt });
+      return { accepted: true, prewrite_receipt: accepted.prewrite_receipt };
+    } catch {
+      await forgetBridgeConnection(connection, receipt, 'bridge-relay-prewrite-failed');
+      refuse();
+    }
+  }
+
   // B reports a completed Messages write on the same authenticated v2
   // connection. A owns the durable positive claim; HQ only joins B's write
   // observation with this binding and its one spent provider invocation.
@@ -533,7 +580,7 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     const keys = ['selectors', 'bind_receipt_sha256', 'request_sha256', 'prompt_sha256', 'model',
       'peer', 'peer_sha256',
       'http_status', 'response_wire_sha256', 'response_wire_bytes',
-      'write_started_at', 'write_completed_at'];
+      'write_started_at', 'write_completed_at', 'prewrite_receipt', 'completion_origin_mac'];
     if (typeof relayCompletionAuthorizer !== 'function' || !available(V2)
       || !record(input) || Object.keys(input).length !== keys.length
       || !keys.every((key) => Object.hasOwn(input, key))
@@ -542,6 +589,7 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
       || canonicalDigest(input.peer) !== input.peer_sha256
       || input.http_status !== 200 || !matches(DIGEST, input.prompt_sha256)
       || !matches(DIGEST, input.response_wire_sha256)
+      || !matches(SHA, input.prewrite_receipt) || !matches(SHA, input.completion_origin_mac)
       || !Number.isSafeInteger(input.response_wire_bytes)
       || input.response_wire_bytes < 1 || input.response_wire_bytes > 65_536
       || typeof input.write_started_at !== 'string' || typeof input.write_completed_at !== 'string'
@@ -553,22 +601,28 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
       || Date.parse(input.write_completed_at) - Date.parse(input.write_started_at) > 30_000) refuse();
     const binding = live.get(connection);
     if (binding?.context.protocol !== V2 || binding.receipt !== receipt
-      || !binding.relayIngress || binding.relayCompletionAttempted) refuse();
+      || !binding.relayIngress || !binding.relayPrewrite || binding.relayCompletionAttempted) refuse();
     const { request, response } = binding.relayIngress;
     const selectors = V2.fields.map(([key]) => key);
     const previous = binding.observation;
     if (selectors.some((key) => input.selectors[key] !== previous[key])
       || input.bind_receipt_sha256 !== previous.bind_receipt_sha256
       || input.request_sha256 !== request.prompt_sha256 || input.model !== request.model
-      || input.peer_sha256 !== canonicalDigest(request.peer)) refuse();
+      || input.peer_sha256 !== canonicalDigest(request.peer)
+      || ['bind_receipt_sha256', 'peer_sha256', 'request_sha256', 'prompt_sha256', 'model',
+        'response_wire_sha256', 'response_wire_bytes', 'http_status', 'prewrite_receipt']
+        .some((key) => input[key] !== binding.relayPrewrite[key])
+      || canonicalDigest(input.peer) !== canonicalDigest(binding.relayPrewrite.peer)) refuse();
     binding.relayCompletionAttempted = true;
     try {
       const observation = await boundBridgeConnectionV2(connection, receipt);
       if (!binding.finalized || live.get(connection) !== binding) refuse();
       const accepted = await bounded(Promise.resolve().then(() => relayCompletionAuthorizer({
-        completion: Object.freeze({ ...input, peer: Object.freeze({ ...input.peer }) }),
+        completion: Object.freeze({ ...input, selectors: Object.freeze({ ...input.selectors }),
+          peer: Object.freeze({ ...input.peer }) }),
         observation: Object.freeze(observation),
         ingress: Object.freeze({ request, response }),
+        prewrite: binding.relayPrewrite,
       })), 'Machine positive completion deadline exceeded', 12_000);
       if (accepted !== true || live.get(connection) !== binding) refuse();
       return { accepted: true };
@@ -621,6 +675,8 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     qualifyBridgeMessagesV2: (...args) => track(qualifyBridgeMessagesV2(...args)),
     bridgeRelayIngressEnabledV2: () => typeof relayIngressAuthorizer === 'function' && available(V2),
     relayBridgeIngressV2: (...args) => track(relayBridgeIngressV2(...args)),
+    bridgeRelayPrewriteEnabledV2: () => typeof relayPrewriteAuthorizer === 'function' && available(V2),
+    prewriteBridgeRelayV2: (...args) => track(prewriteBridgeRelayV2(...args)),
     bridgeRelayCompletionEnabledV2: () => typeof relayCompletionAuthorizer === 'function' && available(V2),
     completeBridgeIngressV2: (...args) => track(completeBridgeIngressV2(...args)),
     forgetBridgeConnection, revokeAll,

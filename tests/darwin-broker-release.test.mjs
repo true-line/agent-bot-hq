@@ -90,6 +90,7 @@ test('the pinned packaged broker forwards bound B ingress and completion to HQ',
         return { model: value.request.model, text: 'from provider', stop_reason: 'end_turn',
           usage: { input_tokens: 1, output_tokens: 1 } };
       },
+      relayPrewriteAuthorizer: async () => ({ accepted: true, prewrite_receipt: 'a'.repeat(64) }),
       relayCompletionAuthorizer: async (value) => { completed.push(value); return true; },
       clock: { now: () => 1_000 }, random: { hex: () => (++sequence).toString(16).padStart(64, '0') },
       receipts: { append: async () => {} },
@@ -124,7 +125,7 @@ test('the pinned packaged broker forwards bound B ingress and completion to HQ',
         `sha256:${createHash('sha256').update(bind_receipt).digest('hex')}`);
       await assert.rejects(host.brokerAccept('bridge.relay.ingress.v1', request, { connection: 'other_b' }),
         (error) => error.code === 'caller_mismatch');
-      const completion = {
+      const prewrite = {
         selectors: scope,
         bind_receipt_sha256: `sha256:${createHash('sha256').update(bind_receipt).digest('hex')}`,
         request_sha256: request.prompt_sha256,
@@ -134,9 +135,13 @@ test('the pinned packaged broker forwards bound B ingress and completion to HQ',
         response_wire_sha256: `sha256:${'2'.repeat(64)}`,
         response_wire_bytes: 123,
         http_status: 200,
+      };
+      assert.deepEqual(await host.brokerAccept('bridge.relay.prewrite.v1', prewrite, { connection }),
+        { accepted: true, prewrite_receipt: 'a'.repeat(64) });
+      const completion = { ...prewrite,
         write_started_at: '2026-11-24T12:00:00.000Z',
         write_completed_at: '2026-11-24T12:00:01.000Z',
-      };
+        prewrite_receipt: 'a'.repeat(64), completion_origin_mac: 'b'.repeat(64) };
       await assert.rejects(host.brokerAccept('bridge.relay.complete.v1', completion, { connection: 'other_b' }),
         (error) => error.code === 'caller_mismatch');
       assert.deepEqual(await host.brokerAccept('bridge.relay.complete.v1', completion, { connection }), { accepted: true });

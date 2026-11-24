@@ -135,7 +135,7 @@ const unboundOf = (tx) => tx.list('runtimes').map(([, rt]) => rt).filter((rt) =>
 // the account a broker connection arrived from ({ account, uid }), or
 // undefined on the shared socket. HQ core supplies all three; an agent never
 // does.
-export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, qualificationAuthorizer, relayIngressAuthorizer, relayCompletionAuthorizer, relayPeerAuthority, memberArmProvider, cooperativeBPolicyProvider, cooperativeBBindProvider, protectedAdmission, cooperativeAdmission } = {}) {
+export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, qualificationAuthorizer, relayIngressAuthorizer, relayPrewriteAuthorizer, relayCompletionAuthorizer, relayPeerAuthority, memberArmProvider, cooperativeBPolicyProvider, cooperativeBBindProvider, protectedAdmission, cooperativeAdmission } = {}) {
   for (const n of SCHEMA_NAMES) if (!schemas?.[n]) throw new TypeError(`admission needs the pinned hq/v1 ${n} schema`);
   if (protectedAdmission && (typeof protectedAdmission.acceptPeer !== 'function'
     || typeof protectedAdmission.verifyHelloStart !== 'function'
@@ -169,7 +169,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
     async init(ctx) {
       const { store, receipts, clock, random, config, profile } = ctx.services;
       const bridge = createBridgeBindAdmission({ authority: bridgeAuthority, qualificationAuthorizer,
-        relayIngressAuthorizer, relayCompletionAuthorizer, clock, random, receipts });
+        relayIngressAuthorizer, relayPrewriteAuthorizer, relayCompletionAuthorizer, clock, random, receipts });
       const memberArmExchange = createStage2aMemberArmExchange({
         provider: memberArmProvider, clock, current: bridge.currentBridgeConnectionV3,
         boundStart: bridge.boundBridgeConnectionV3,
@@ -930,6 +930,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         qualifyBridgeMessagesV2: bridge.qualifyBridgeMessagesV2,
         bridgeRelayIngressEnabledV2: bridge.bridgeRelayIngressEnabledV2,
         relayBridgeIngressV2: bridge.relayBridgeIngressV2,
+        bridgeRelayPrewriteEnabledV2: bridge.bridgeRelayPrewriteEnabledV2,
+        prewriteBridgeRelayV2: bridge.prewriteBridgeRelayV2,
         bridgeRelayCompletionEnabledV2: bridge.bridgeRelayCompletionEnabledV2,
         completeBridgeRelayV2: bridge.completeBridgeIngressV2,
         stage2aRelayPeerChallengeEnabled: () => typeof bridgeAuthority?.verifyLiveStartV3 === 'function'

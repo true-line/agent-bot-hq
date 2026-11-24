@@ -124,6 +124,7 @@ const COOPERATIVE_STATES = new Map([
 ]);
 const T03_STATES = new Map([
   ['stage2a-t03-positive', 't03-positive-recorded'],
+  ['stage2a-t03-prewrite-peer', 't03-prewrite-peer-observed'],
   ['stage2a-t03-ready', 't03-ready-observed'],
   ['stage2a-t03-sibling-credential-witness', 't03-sibling-credential-witnessed'],
   ['stage2a-t03-complete', 't03-completion-recorded'],
@@ -131,7 +132,8 @@ const T03_STATES = new Map([
 const T03_BASE = ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
   'plan_id', 'plan_digest', 'hq_epoch'];
 const T03_FIELDS = {
-  'stage2a-t03-positive': [...T03_BASE, 'receipt'],
+  'stage2a-t03-positive': [...T03_BASE, 'receipt', 'broker_completion'],
+  'stage2a-t03-prewrite-peer': [...T03_BASE, 'child_receipt_sha256', 'broker_prewrite'],
   'stage2a-t03-ready': [...T03_BASE, 'ready'],
   'stage2a-t03-sibling-credential-witness': [...T03_BASE, 'witness'],
   'stage2a-t03-complete': [...T03_BASE, 'result', 'network'],
@@ -410,6 +412,7 @@ export const machineRoleStage2aFinalizeB = (request) => machineRoleStage2a('stag
 export const machineRoleStage2aLive = (request) => machineRoleStage2a('stage2a-live', request);
 export const machineRoleStage2aProvider = (request) => machineRoleStage2a('stage2a-provider', request);
 export const machineRoleStage2aT03Positive = (request) => machineRoleStage2a('stage2a-t03-positive', request);
+export const machineRoleStage2aT03PrewritePeer = (request) => machineRoleStage2a('stage2a-t03-prewrite-peer', request);
 export const machineRoleStage2aT03Ready = (request) => machineRoleStage2a('stage2a-t03-ready', request);
 export const machineRoleStage2aT03SiblingWitness = (request) =>
   machineRoleStage2a('stage2a-t03-sibling-credential-witness', request);
@@ -739,6 +742,11 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || Buffer.byteLength(JSON.stringify(deviceFields.expected)) > 4096))
       || (verb === 'stage2a-provider' && (!reservation.test(deviceFields.bind_receipt_sha256)
         || !id.test(deviceFields.model) || !reservation.test(deviceFields.prompt_sha256)))
+      || (verb === 'stage2a-t03-prewrite-peer' && (!reservation.test(deviceFields.child_receipt_sha256)
+        || !deviceFields.broker_prewrite || typeof deviceFields.broker_prewrite !== 'object'
+        || Array.isArray(deviceFields.broker_prewrite)))
+      || (verb === 'stage2a-t03-positive' && (!deviceFields.receipt
+        || typeof deviceFields.receipt !== 'object' || Array.isArray(deviceFields.receipt)))
       || (T03_STATES.has(verb) && (!deviceFields[T03_FIELDS[verb].at(-1)]
         || typeof deviceFields[T03_FIELDS[verb].at(-1)] !== 'object'
         || Array.isArray(deviceFields[T03_FIELDS[verb].at(-1)])
@@ -858,6 +866,14 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         receipt_sha256: body.receipt_sha256, daemon_fingerprint: fingerprint(daemon) });
     }
     if (T03_STATES.has(verb)) {
+      if (verb === 'stage2a-t03-prewrite-peer') {
+        if (!body || typeof body !== 'object' || Array.isArray(body)
+          || Object.keys(body).join(',') !== 'prewrite_receipt'
+          || !/^[0-9a-f]{64}$/.test(body.prewrite_receipt)) {
+          throw new Error('invalid signed Machine T03 prewrite peer response');
+        }
+        return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
+      }
       if (verb === 'stage2a-t03-sibling-credential-witness') {
         if (!body || typeof body !== 'object' || Array.isArray(body)
           || Object.keys(body).sort().join(',') !== 'accepted,lease_sequence,metadata_sha256'

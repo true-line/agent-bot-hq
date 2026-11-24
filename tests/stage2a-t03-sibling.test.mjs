@@ -23,16 +23,18 @@ const witness = { schema: 'agent-bot-machine/stage2a-t03-sibling-credential-witn
 test('HQ forwards only exact sibling metadata and waits for two later-lease acknowledgments', async () => {
   const first = checkedT03SiblingWitness(witness, expected);
   const second = checkedT03SiblingWitness({ ...witness,
-    challenge_base64url: Buffer.alloc(32, 2).toString('base64url'),
     lease_sequence: 8, observed_at_ms: witness.observed_at_ms + 1 }, expected);
   const primary = {};
   recordT03SiblingWitness(primary, first);
-  const pending = waitForT03SiblingWitnesses(primary, 1000);
+  const pending = waitForT03SiblingWitnesses(primary, first.observed_at_ms, 1000);
   recordT03SiblingWitness(primary, second);
   const witnessed = await pending;
   assert.deepEqual(witnessed, [first, second]);
-  requireT03SiblingAfterAttempt(witnessed, first.observed_at_ms);
+  assert.deepEqual(requireT03SiblingAfterAttempt(witnessed, first.observed_at_ms), witnessed);
   assert.throws(() => recordT03SiblingWitness(primary, second));
+  assert.throws(() => recordT03SiblingWitness(primary, checkedT03SiblingWitness({ ...second,
+    challenge_base64url: Buffer.alloc(32, 2).toString('base64url'),
+    lease_sequence: 9 }, expected)));
   assert.throws(() => checkedT03SiblingWitness({ ...witness, metadata_sha256: sha('0') }, expected));
   assert.throws(() => checkedT03SiblingWitness({ ...witness,
     metadata: { ...metadata, extra: true } }, expected));
@@ -46,14 +48,13 @@ test('HQ refuses a second sibling witness from the same signed lease', async () 
   recordT03SiblingWitness(primary, checkedT03SiblingWitness(witness, expected));
   assert.throws(() => recordT03SiblingWitness(primary, checkedT03SiblingWitness({ ...witness,
     challenge_base64url: Buffer.alloc(32, 2).toString('base64url') }, expected)));
-  await assert.rejects(waitForT03SiblingWitnesses(primary, 5), /timed out/);
+  await assert.rejects(waitForT03SiblingWitnesses(primary, witness.observed_at_ms, 5), /timed out/);
 });
 
 test('delayed delivery of a pre-attempt witness cannot satisfy primary completion', async () => {
   const primary = {};
   const first = checkedT03SiblingWitness(witness, expected);
   const second = checkedT03SiblingWitness({ ...witness,
-    challenge_base64url: Buffer.alloc(32, 3).toString('base64url'),
     lease_sequence: witness.lease_sequence + 1,
     observed_at_ms: witness.observed_at_ms + 1 }, expected);
   recordT03SiblingWitness(primary, first);
@@ -61,6 +62,31 @@ test('delayed delivery of a pre-attempt witness cannot satisfy primary completio
   // but its signed observation time still predates the credential attempt.
   const primaryAttemptMS = second.observed_at_ms + 1;
   recordT03SiblingWitness(primary, second);
-  const witnessed = await waitForT03SiblingWitnesses(primary);
-  assert.throws(() => requireT03SiblingAfterAttempt(witnessed, primaryAttemptMS));
+  assert.throws(() => requireT03SiblingAfterAttempt(primary.siblingWitnesses, primaryAttemptMS));
+  await assert.rejects(waitForT03SiblingWitnesses(primary, primaryAttemptMS, 5), /timed out/);
+  const third = checkedT03SiblingWitness({ ...witness, lease_sequence: second.lease_sequence + 1,
+    observed_at_ms: primaryAttemptMS + 1 }, expected);
+  const pending = waitForT03SiblingWitnesses(primary, primaryAttemptMS, 1000);
+  recordT03SiblingWitness(primary, third);
+  assert.deepEqual(await pending, [first, third]);
+});
+
+test('several pre-attempt Live renewals retain the first ACK and accept a later witness', async () => {
+  const primary = {};
+  const first = checkedT03SiblingWitness(witness, expected);
+  recordT03SiblingWitness(primary, first);
+  for (let index = 1; index <= 40; index++) {
+    recordT03SiblingWitness(primary, checkedT03SiblingWitness({ ...witness,
+      lease_sequence: witness.lease_sequence + index,
+      observed_at_ms: witness.observed_at_ms + index }, expected));
+  }
+  assert.equal(primary.siblingWitnesses.length, 32);
+  assert.equal(primary.siblingWitnesses[0], first);
+  const attemptedAtMS = witness.observed_at_ms + 41;
+  const pending = waitForT03SiblingWitnesses(primary, attemptedAtMS, 1000);
+  const later = checkedT03SiblingWitness({ ...witness,
+    lease_sequence: witness.lease_sequence + 41,
+    observed_at_ms: attemptedAtMS + 1 }, expected);
+  recordT03SiblingWitness(primary, later);
+  assert.deepEqual(await pending, [first, later]);
 });
