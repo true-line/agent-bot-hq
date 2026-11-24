@@ -498,7 +498,7 @@ test('a temporary file left by a crash mid-write is removed; the intact store lo
 });
 
 test('qualification witness reads only the two committed receipt sequences from disk', async (t) => {
-  const dir = tempHome(t);
+  const dir = tempHome();
   const { store, core } = configureStore(dir);
   store.load(core);
   const first = await store.persistReceipt({ kind: 'hq.soul.started', evidence: 'durable' });
