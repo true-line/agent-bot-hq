@@ -98,15 +98,25 @@ test('transactional audit rows share the plugin write and remain receipt-service
   try {
     const { core, services } = open(dir);
     core.tokens.set('fixture', { token: 'TX_CANARY_SECRET' });
-    await services.store.tx((tx) => {
+    const committed = await services.store.tx((tx) => {
       tx.put('rows', 'audited', true);
-      services.receipts.appendIn(tx, { kind: 'task.fixture', text: 'token TX_CANARY_SECRET', profile: 'incorrect' });
+      const read = services.receipts.appendIn(tx, { kind: 'task.fixture', text: 'token TX_CANARY_SECRET', profile: 'incorrect' });
+      assert.equal(read(), undefined);
+      return read;
     });
     const row = core.receipts.find((r) => r.kind === 'task.fixture');
     assert.deepEqual(row, {
       kind: 'task.fixture', text: 'token [redacted]', profile: 'managed-cooperative',
       plugin: 'p', at: core.clock.now(), seq: 1,
     });
+    assert.deepEqual(committed(), row);
+    assert.notEqual(committed(), row);
+    let aborted;
+    await assert.rejects(services.store.tx((tx) => {
+      aborted = services.receipts.appendIn(tx, { kind: 'task.aborted' });
+      throw new Error('abort');
+    }), /abort/);
+    assert.equal(aborted(), undefined);
     const reopened = open(dir);
     assert.deepEqual(reopened.core.receipts, [row]);
     assert.equal(await reopened.services.store.tx((tx) => tx.get('rows', 'audited')), true);
@@ -485,4 +495,21 @@ test('a temporary file left by a crash mid-write is removed; the intact store lo
     assert.equal(existsSync(join(dir, 'store.json.tmp-999')), false);
     assert.deepEqual(await b.services.store.tx((tx) => tx.get('rows', 'k')), { v: 1 });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('qualification witness reads only the two committed receipt sequences from disk', async (t) => {
+  const dir = tempHome(t);
+  const { store, core } = configureStore(dir);
+  store.load(core);
+  const first = await store.persistReceipt({ kind: 'hq.soul.started', evidence: 'durable' });
+  const second = await store.persistReceipt({ kind: 'hq.soul.protected-claim.refused' });
+  core.receipts[0].evidence = 'memory only';
+  assert.deepEqual(await store.readCommittedReceipts([first.seq, second.seq]), [
+    { ...first, evidence: 'durable' }, second,
+  ]);
+  assert.deepEqual(await store.readCommittedReceipts([first.seq]), [{ ...first, evidence: 'durable' }]);
+  await assert.rejects(store.readCommittedReceipts([first.seq, first.seq]), /invalid committed receipt/);
+  await assert.rejects(store.readCommittedReceipts([first.seq, second.seq + 1]), /committed receipt is missing/);
+  chmodSync(store.path, 0o644);
+  await assert.rejects(store.readCommittedReceipts([first.seq, second.seq]), /invalid committed receipt store/);
 });

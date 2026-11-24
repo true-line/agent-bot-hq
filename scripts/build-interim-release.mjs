@@ -1,18 +1,20 @@
 #!/usr/bin/env node
 // Build an unpublished HQ source artifact from the clean, exact checked-out
-// commit. The caller supplies an already obtained public contracts tree; the
+// commit. The caller supplies an already obtained Contracts tree; the
 // pinned manifest is checked before any bytes enter the artifact.
 import { createHash } from 'node:crypto';
 import { cpSync, linkSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { hRuntimeSelection, readPin, verifyVendored } from './soul-contracts.mjs';
+import { H_PRIVATE_CONTRACTS_PIN, hRuntimeSelection, readPin, verifyVendored } from './soul-contracts.mjs';
 
 const [commit, contracts, output, ...options] = process.argv.slice(2);
-const darwinTarget = options.length === 2 && options[0] === '--target' && options[1] === 'darwin';
-if (!/^[0-9a-f]{40}$/.test(commit ?? '') || !contracts || !output || (options.length && !darwinTarget)) {
-  throw new Error('usage: node scripts/build-interim-release.mjs <full-commit> <verified-contracts-dir> <output.tar> [--target darwin]');
+const darwinTarget = options[0] === '--target' && options[1] === 'darwin';
+const privateCandidate = darwinTarget && options.length === 3 && options[2] === '--private-contracts-candidate';
+const validOptions = options.length === 0 || (darwinTarget && options.length === 2) || privateCandidate;
+if (!/^[0-9a-f]{40}$/.test(commit ?? '') || !contracts || !output || !validOptions) {
+  throw new Error('usage: node scripts/build-interim-release.mjs <full-commit> <verified-contracts-dir> <output.tar> [--target darwin [--private-contracts-candidate]]');
 }
 if (process.platform !== 'linux' && !(darwinTarget && process.platform === 'darwin')) {
   throw new Error('build the Linux target on Linux, or the Darwin target on Linux or macOS with GNU tar');
@@ -37,7 +39,7 @@ for (const row of git(['ls-tree', '-rz', '--full-tree', commit]).toString('utf8'
     throw new Error(`unsupported source tree entry: ${path}`);
   }
 }
-const pin = readPin();
+const pin = privateCandidate ? H_PRIVATE_CONTRACTS_PIN : readPin();
 verifyVendored(resolve(contracts), pin);
 const dest = resolve(output);
 try { lstatSync(dest); throw new Error('output already exists'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -53,7 +55,10 @@ try {
   mkdirSync(vendor, { recursive: true });
   for (const path of pin.paths) cpSync(join(resolve(contracts), path), join(vendor, path), { recursive: true, dereference: false, preserveTimestamps: false });
   const fullContracts = verifyVendored(vendor, pin);
-  const contractsRuntime = darwinTarget && pin.tag === 'v0.10.2'
+  if (privateCandidate) {
+    writeFileSync(join(tree, 'governance/soul-contracts.json'), `${JSON.stringify(pin, null, 2)}\n`);
+  }
+  const contractsRuntime = darwinTarget && (privateCandidate || pin.tag === 'v0.10.2')
     ? hRuntimeSelection(pin, fullContracts.manifest) : undefined;
   const broker = darwinTarget ? (await import('./darwin-broker.mjs')).stageDarwinBroker(tree, work) : undefined;
   writeFileSync(join(tree, 'governance/interim-release.json'), `${JSON.stringify({ schema_version: 1, hq_commit: commit, contracts_commit: pin.commit, contracts_digest: pin.digest, ...(darwinTarget ? { target_platform: target, owner_control_capability: 'darwin-owner-control/v2', broker, ...(contractsRuntime ? { contracts_runtime: contractsRuntime } : {}) } : {}) }, null, 2)}\n`);

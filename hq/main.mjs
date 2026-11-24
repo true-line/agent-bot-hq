@@ -36,7 +36,7 @@ import { fileURLToPath } from 'node:url';
 import { verify } from '../scripts/soul-contracts.mjs';
 import { HOST_CODES, REGISTRY_CODES } from '../sdk/errors.mjs';
 import { SCHEMA_NAMES } from './admission.mjs';
-import { NOTICE_SCHEMA_NAMES } from './notices.mjs';
+import { NOTICE_SCHEMA_NAMES, PROTECTED_NOTICE_PEEK_SCHEMA } from './notices.mjs';
 import { TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES } from './tasks.mjs';
 import { createHQ } from './hq.mjs';
 import { productionPluginsDir, readPins } from './plugins.mjs';
@@ -51,7 +51,7 @@ import { createStage2aProtectedStarter } from './stage2a-protected-start.mjs';
 import { createStage2aProtectedAdmission } from './stage2a-protected-admission.mjs';
 import { authenticatedSelectedH } from './stage2a-h-preloader.mjs';
 import { createStage2aCooperativeMachine } from './stage2a-cooperative-machine.mjs';
-import { createStage2aCooperativeStarter } from './stage2a-cooperative-start.mjs';
+import { createStage2aCooperativeStarter, openInstalledCooperativeMemberProvider } from './stage2a-cooperative-start.mjs';
 import { createStage2aQualificationProvider } from './stage2a-qualification-provider.mjs';
 
 const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine soul-bridge-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
@@ -76,8 +76,8 @@ function parse(argv) {
       if (!args.soul || args.cmd !== 'soul' || args.sub !== 'start') throw new Error('--soul DIR is only for soul start');
     } else if (argv[i] === '--start-id') {
       args.startId = argv[++i];
-      if (!/^st_[0-9a-f]{24}$/.test(args.startId ?? '') || args.cmd !== 'soul' || args.sub !== 'stop') {
-        throw new Error('--start-id needs a valid start ID and is only for soul stop');
+      if (!/^st_[0-9a-f]{24}$/.test(args.startId ?? '') || args.cmd !== 'soul' || !['stop', 'qualify-direct'].includes(args.sub)) {
+        throw new Error('--start-id needs a valid start ID and is only for soul stop or soul qualify-direct');
       }
     } else if (argv[i] === '--profile') {
       args.profile = argv[++i];
@@ -103,7 +103,11 @@ function parse(argv) {
 function loadSchemas() {
   const { dir } = verify();
   const load = (contract, names) => names.map((n) => [n, JSON.parse(readFileSync(join(dir, 'schemas', contract, `${n}.schema.json`), 'utf8'))]);
-  return Object.fromEntries([...load('hq/v1', [...SCHEMA_NAMES, ...NOTICE_SCHEMA_NAMES]), ...load('task/v1', TASK_SCHEMA_NAMES), ...load('wire/v1', TASK_WIRE_SCHEMA_NAMES)]);
+  const noticeSchemas = [...NOTICE_SCHEMA_NAMES];
+  if (existsSync(join(dir, 'schemas', 'hq/v1', `${PROTECTED_NOTICE_PEEK_SCHEMA}.schema.json`))) {
+    noticeSchemas.push(PROTECTED_NOTICE_PEEK_SCHEMA);
+  }
+  return Object.fromEntries([...load('hq/v1', [...SCHEMA_NAMES, ...noticeSchemas]), ...load('task/v1', TASK_SCHEMA_NAMES), ...load('wire/v1', TASK_WIRE_SCHEMA_NAMES)]);
 }
 
 function loadStage2aSchemas() {
@@ -113,6 +117,52 @@ function loadStage2aSchemas() {
     'machine/v3/stage2a-qualification-candidate-binding', 'machine/v3/stage2a-qualification-candidate-reservation-payload'];
   const schemas = paths.map((path) => JSON.parse(readFileSync(join(dir, 'schemas', `${path}.schema.json`), 'utf8')));
   return (payload) => validate(schemas.at(-1), payload, { schemas: schemas.slice(0, -1) }).length === 0;
+}
+
+function loadCooperativeMemberSchemas() {
+  const { dir } = verify();
+  const paths = {
+    assignment: 'machine/v3/stage2a-member-set-assignment-payload',
+    authority: 'machine/v3/stage2a-b-member-authority-payload',
+    childObservation: 'machine/v3/stage2a-member-set-child-observation-payload',
+    ready: 'machine/v3/soul-cooperative-member-ready-payload',
+    observation: 'machine/v3/soul-cooperative-b-observed-payload',
+    bridgeAssignment: 'machine/v3/soul-cooperative-bridge-assignment-payload',
+    bind: 'hq/v1/stage2a-cooperative-bridge-bind-exchange',
+    policyRequest: 'hq/v1/stage2a-cooperative-member-policy-exchange',
+    armExchange: 'hq/v1/soul-cooperative-b-member-arm-exchange',
+    mapping: 'hq/v1/stage2a-provisional-member-map',
+    memberAttach: 'hq/v1/stage2a-member-attach',
+  };
+  const pathFor = (path) => join(dir, 'schemas', `${path}.schema.json`);
+  if (!Object.values(paths).every((path) => existsSync(pathFor(path)))) return undefined;
+  const main = new Map();
+  const references = new Map();
+  const read = (path) => JSON.parse(readFileSync(pathFor(path), 'utf8'));
+  for (const [key, path] of Object.entries(paths)) main.set(key, read(path));
+  if (!main.get('observation').required?.includes('relay_socket_birthtime_ns')
+    || !main.get('memberAttach').properties?.bridge_arm_rows_base64url) return undefined;
+  const primary = new Map([...main.values()].map((schema) => [schema.$id, schema]));
+  const follow = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (typeof node.$ref === 'string' && !node.$ref.startsWith('#')) {
+      const id = node.$ref.split('#')[0];
+      const path = /^https:\/\/true-line\.ai\/soul-contracts\/([a-z0-9-]+\/v[0-9]+\/[a-z0-9-]+)\.schema\.json$/.exec(id)?.[1];
+      if (!path) throw new Error('invalid pinned cooperative schema reference');
+      if (!primary.has(id) && !references.has(id)) {
+        const schema = read(path);
+        if (schema.$id !== id) throw new Error('pinned cooperative schema ID differs from its reference');
+        references.set(id, schema);
+        follow(schema);
+      }
+    }
+    Object.values(node).forEach(follow);
+  };
+  main.forEach(follow);
+  const schemas = Object.fromEntries(main);
+  schemas.policyResult = schemas.policyRequest;
+  const refs = [...primary.values(), ...references.values()];
+  return Object.freeze({ schemas, schemaReferences: Object.freeze(refs) });
 }
 
 async function ask(controlPath, op, payload) {
@@ -254,12 +304,19 @@ async function main(argv) {
         machinePublicKey, verifyReservation }) : undefined;
       const providers = new Map();
       let hq;
+      const memberContracts = managedHq && selectedH ? loadCooperativeMemberSchemas() : undefined;
       const cooperativeMachine = managedHq && selectedH ? createStage2aCooperativeMachine({
         exchange: machineRoleStage2aCooperative, hDescriptorDigest: selectedH.descriptorDigest,
-        machinePublicKey: selectedH.machinePublicKey,
+        machinePublicKey: selectedH.machinePublicKey, enableBrokeredB: !!memberContracts,
       }) : undefined;
-      const createCooperativeStart = cooperativeMachine ? (core) => createStage2aCooperativeStarter({
-        core, machine: cooperativeMachine, openAdmission: (options) => hq.openCooperativeAdmission(options),
+      const createCooperativeStart = cooperativeMachine ? (core, readCommittedReceipts) => createStage2aCooperativeStarter({
+        core, readCommittedReceipts, machine: cooperativeMachine, openAdmission: (options) => hq.openCooperativeAdmission(options),
+        brokeredMemberProvider: memberContracts ? (reservation, inputs, operations) => openInstalledCooperativeMemberProvider({
+          ...memberContracts, core, reservation, inputs, operations, installedBridge: inputs.installedBridge,
+          account: userInfo().username, harnessUids: installed.flatMap((plan) => [plan.runner_uid, plan.bridge_uid]),
+          exchange: machineRoleStage2aCooperative, openEndpoint: (options) => hq.openCooperativeBridgeEndpoint(options),
+          kernelPeer: (connection, expected) => hq.cooperativeBridgeKernelPeer(connection, expected), contain: operations.contain,
+        }) : undefined,
       }) : undefined;
       const protectedAdmission = installed.length ? createStage2aProtectedAdmission({
         machinePublicKey, authority,
@@ -285,22 +342,44 @@ async function main(argv) {
             } });
           } catch (error) { registration.close(); throw error; }
         },
-        onFinalized: ({ installed: plan, assignment, selectors }) => {
-          providers.set(selectors.reservation_sha256, createStage2aQualificationProvider({
+        onFinalized: async ({ installed: plan, assignment, selectors }) => {
+          const provider = createStage2aQualificationProvider({
             plan: { installation_id: plan.installation_id, start_id: assignment.start_id,
               launch_id: assignment.launch_id, hq_epoch: plan.hq_epoch, plan_id: plan.plan_id,
               plan_digest: plan.plan_digest, reservation_sha256: selectors.reservation_sha256,
               soul_artifact_sha256: `sha256:${plan.soul_artifact_sha256}`,
               provider_config_sha256: plan.provider_config_sha256 },
-          }));
+          });
+          providers.set(selectors.reservation_sha256, provider);
+          try {
+            // The unprivileged HQ listener must be reachable before ACP is
+            // released. A port collision or bind error refuses the start.
+            await provider.ready;
+            if (providers.get(selectors.reservation_sha256) !== provider) {
+              throw new Error('local provider stopped during activation');
+            }
+          } catch (error) {
+            if (providers.get(selectors.reservation_sha256) === provider) {
+              providers.delete(selectors.reservation_sha256);
+            }
+            await provider.close();
+            throw error;
+          }
         },
-        onStopped: (reservationSHA256) => { providers.delete(reservationSHA256); },
+        onStopped: async (reservationSHA256) => {
+          const provider = providers.get(reservationSHA256);
+          providers.delete(reservationSHA256);
+          await provider?.close();
+        },
       }) : undefined;
       hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins,
         pluginsDir, devPlugins: args.devPlugins, bridgeAssignments: installed,
         bridgeAuthority: authority, machineHqEpoch: epochs.values().next().value,
         protectedStart, protectedAdmission, createCooperativeStart, cooperativeAdmission: cooperativeMachine,
-        qualificationAuthorizer: installed.length ? ({ request, observation }) => {
+        // Production B uses its dedicated v2 relay ingress. The synthetic
+        // bridge qualification route stays disabled so it cannot consume the
+        // installed one-use Machine provider response.
+        relayIngressAuthorizer: installed.length ? ({ request, observation }) => {
           const provider = providers.get(observation?.reservation_digest);
           if (!provider) throw new Error('Machine protected provider start is unavailable');
           return provider({ request, observation });
@@ -351,10 +430,10 @@ async function main(argv) {
       await startSoul(controlPath, args.soul, args.profile);
       return;
     }
-    if (args.sub !== 'stop' && args.sub !== 'starts') throw new Error(USAGE);
-    if (args.sub === 'stop' && !args.startId) throw new Error('soul stop needs --start-id ID');
+    if (!['stop', 'starts', 'qualify-direct'].includes(args.sub)) throw new Error(USAGE);
+    if (['stop', 'qualify-direct'].includes(args.sub) && !args.startId) throw new Error(`soul ${args.sub} needs --start-id ID`);
     const result = await ask(controlPath, `soul.${args.sub}`,
-      args.sub === 'stop' ? { start_id: args.startId } : undefined);
+      args.startId ? { start_id: args.startId } : undefined);
     if (!result.ok) throw new Error(JSON.stringify(result.refusal ?? result.host_refusal ?? result));
     console.log(JSON.stringify(result.result, null, 2));
     if (result.result.state === 'containment_unconfirmed') process.exitCode = 1;

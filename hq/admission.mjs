@@ -37,7 +37,7 @@
 //
 // Equip carries no credentials yet: grants and credential references arrive
 // with §9 PRs 18 and 21. It hands out one opaque grant handle per member.
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { definePlugin } from '../sdk/plugin.mjs';
 import { fail, HostError } from '../sdk/errors.mjs';
 import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
@@ -45,7 +45,10 @@ import { validate } from '../sdk/wire/schema.mjs';
 import { negotiateVersions, supportWindow } from '../sdk/wire/versions.mjs';
 import { profileWarning } from './profile.mjs';
 import { createBridgeBindAdmission } from './bridge-bind.mjs';
+import { createStage2aMemberArmExchange, createStage2aRelayPeerChallenge } from './stage2a-relay-peer.mjs';
 import { resolveNoticeScope, validNoticeScope, validNoticeRepository } from './notices-config.mjs';
+
+export const PROTECTED_GRANT_REFUSAL_RECEIPT = Symbol('committed protected grant refusal');
 
 export const CURRENT_VERSIONS = Object.freeze({ hq: 1, wire: 1, task: 1 });
 export const SCHEMA_NAMES = Object.freeze(['hello', 'admission-result', 'equip', 'ready-and-lease-renewal']);
@@ -62,6 +65,8 @@ const CHALLENGE_TTL_MS = 60_000;
 const MAX_CHALLENGES = 4096;
 const PROTECTED_MACHINE_DEADLINE_MS = 5_000;
 const SHA256 = /^sha256:[0-9a-f]{64}$/;
+const GRANT_HANDLE = /^gh_[0-9a-f]{32}$/;
+const grantHandleDigest = (handle) => 'sha256:' + createHash('sha256').update(handle, 'ascii').digest('hex');
 const START_ID = /^st_[0-9a-f]{24}$/;
 const LAUNCH_ID = /^ln_[0-9a-f]{24}$/;
 
@@ -86,12 +91,12 @@ function checkedProtectedStart(binding, payload, helloDigest) {
   return Object.freeze({ ...binding });
 }
 
-function boundedMachineCall(call) {
+function boundedMachineCall(call, timeoutMs = PROTECTED_MACHINE_DEADLINE_MS) {
   let timer;
   return Promise.race([
     Promise.resolve().then(call),
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('protected Machine call timed out')), PROTECTED_MACHINE_DEADLINE_MS);
+      timer = setTimeout(() => reject(new Error('protected Machine call timed out')), timeoutMs);
       timer.unref?.();
     }),
   ]).finally(() => clearTimeout(timer));
@@ -130,7 +135,7 @@ const unboundOf = (tx) => tx.list('runtimes').map(([, rt]) => rt).filter((rt) =>
 // the account a broker connection arrived from ({ account, uid }), or
 // undefined on the shared socket. HQ core supplies all three; an agent never
 // does.
-export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, qualificationAuthorizer, relayIngressAuthorizer, protectedAdmission, cooperativeAdmission } = {}) {
+export function admissionPlugin({ schemas, profileReasons = () => [], harnessAccount = () => undefined, callerOf: connectionAccount = () => undefined, allowsNoticeHarness = () => false, bridgeAuthority, qualificationAuthorizer, relayIngressAuthorizer, relayPeerAuthority, memberArmProvider, cooperativeBPolicyProvider, cooperativeBBindProvider, protectedAdmission, cooperativeAdmission } = {}) {
   for (const n of SCHEMA_NAMES) if (!schemas?.[n]) throw new TypeError(`admission needs the pinned hq/v1 ${n} schema`);
   if (protectedAdmission && (typeof protectedAdmission.acceptPeer !== 'function'
     || typeof protectedAdmission.verifyHelloStart !== 'function'
@@ -165,6 +170,28 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
       const { store, receipts, clock, random, config, profile } = ctx.services;
       const bridge = createBridgeBindAdmission({ authority: bridgeAuthority, qualificationAuthorizer,
         relayIngressAuthorizer, clock, random, receipts });
+      const memberArmExchange = createStage2aMemberArmExchange({
+        provider: memberArmProvider, clock, current: bridge.currentBridgeConnectionV3,
+        boundStart: bridge.boundBridgeConnectionV3,
+      });
+      const relayPeerChallenge = createStage2aRelayPeerChallenge({
+        current: bridge.currentBridgeConnectionV3,
+        boundStart: async (connection, receipt, member) => {
+          const binding = await bridge.finalizedBridgeConnectionV3(connection, receipt);
+          const state = await relayPeerAuthority?.boundStart?.(connection, receipt, member);
+          if (state?.reservation_sha256 !== binding.reservation_digest
+            || state?.assignment_envelope_sha256 !== binding.assignment_envelope_sha256
+            || state?.installation_id !== binding.installation_id || state?.start_id !== binding.start_id
+            || state?.hq_epoch !== binding.hq_epoch || state?.b_authority_sha256 !== binding.b_authority_sha256
+            || !state?.bridge_process
+            || canonicalDigest(state.bridge_process) !== canonicalDigest(binding.bridge_process))
+            fail('host.launch_unavailable', 'v3 relay state does not match the live B binding');
+          return Object.freeze({ ...state,
+            member_b_authority_envelope_sha256: binding.authority_envelope_sha256 });
+        },
+        attest: relayPeerAuthority?.attest,
+        clock,
+      });
       bridgeStates.set(ctx, bridge);
       const atomicAudit = typeof receipts.appendIn === 'function';
       const ttl = () => config.get('leaseTtlMs') ?? DEFAULT_LEASE_TTL_MS;
@@ -182,8 +209,12 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             tx.put('runtimes', rid, { ...rt, cooperative_state: 'revoked', superseded: true });
           else if (!Object.hasOwn(rt, 'notice_scope')) tx.put('runtimes', rid, { ...rt, notice_scope: null });
         }
-        for (const [requestId, entry] of tx.list('hellos')) if (entry.protected_state && entry.protected_state !== 'revoked')
-          tx.put('hellos', requestId, { ...entry, protected_state: 'revoked' });
+        for (const [requestId, entry] of tx.list('hellos')) {
+          if (entry.protected_state && entry.protected_state !== 'revoked')
+            tx.put('hellos', requestId, { ...entry, protected_state: 'revoked' });
+          else if (entry.cooperative_start_key && entry.cooperative_state !== 'revoked')
+            tx.put('hellos', requestId, { ...entry, cooperative_state: 'revoked' });
+        }
         for (const [key, entry] of tx.list('protected_starts')) if (entry.state !== 'spent')
           tx.put('protected_starts', key, { ...entry, state: 'spent' });
         for (const [key, entry] of tx.list('cooperative_starts')) if (entry.state !== 'spent')
@@ -291,6 +322,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         let digest;
         let protectedStart;
         let cooperativeStart;
+        let pendingCooperative = false;
+        let prepareCooperativeMemberSet;
         let startKey;
         try {
           caller = callerOf(meta);
@@ -314,8 +347,14 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
               || c.definition_digest !== payload.definition_digest
               || !/^[0-9a-f]{64}$/.test(c.hq_epoch ?? ''))
               fail('host.launch_unavailable', 'Machine did not authenticate the cooperative start');
-            cooperativeStart = Object.freeze({ ...c });
+            const { prepareMemberSet, ...binding } = c;
+            cooperativeStart = Object.freeze(binding);
+            prepareCooperativeMemberSet = prepareMemberSet;
             startKey = cooperativeKeyOf(c);
+            pendingCooperative = c.adapter_transport === 'brokered-b';
+            if (pendingCooperative && (payload.requested_roles.length !== 2
+              || typeof prepareCooperativeMemberSet !== 'function'))
+              fail('host.launch_unavailable', 'brokered cooperative Hello needs the paired two-member coordinator');
             if (await boundedMachineCall(() => cooperativeAdmission.assertLive(cooperativeStart)) !== true)
               fail('host.launch_unavailable', 'cooperative R is not live');
           }
@@ -336,6 +375,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             await live(protectedStart);
           }
         const now = clock.now();
+        const pendingMachine = !!protectedStart || pendingCooperative;
+        const cooperativeState = pendingCooperative ? 'pending' : 'active';
         // One transaction: the repeat check, the decision and its records, so
         // two Hellos with one request_id cannot both admit.
         const { result, repeat, audit, soulBefore, unbound: after } = await store.tx(async (tx) => {
@@ -344,12 +385,14 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             if (earlier.caller !== caller) fail('caller_mismatch', `request ${payload.request_id} belongs to another connection`);
             if (earlier.digest !== digest) fail('host.invalid_request', `request ${payload.request_id} was already used with different content`);
             if (protectedStart || cooperativeStart) fail('host.launch_unavailable', 'a verified start cannot reuse an earlier Hello');
-            if (earlier.protected_state === 'pending' || earlier.protected_state === 'revoked')
+            if ((earlier.protected_state && earlier.protected_state !== 'active')
+              || (earlier.cooperative_state && earlier.cooperative_state !== 'active'))
               fail('host.launch_unavailable', 'protected Hello is not finalized');
             return { result: earlier.result, repeat: true };
           }
-          if (tx.list('runtimes').some(([, rt]) => rt.soul_id === payload.soul_id && rt.protected_state === 'pending'))
-            fail('host.launch_unavailable', 'another protected Hello for this Soul is pending');
+          if (tx.list('runtimes').some(([, rt]) => rt.soul_id === payload.soul_id
+            && (rt.protected_state === 'pending' || rt.cooperative_state === 'pending')))
+            fail('host.launch_unavailable', 'another Machine-bound Hello for this Soul is pending');
           const negotiated = negotiateVersions(payload.supported_versions, supportWindow(CURRENT_VERSIONS), { required: ['hq', 'wire'] });
           if (!accepted(payload.soul_id, payload.definition_digest)) {
             fail('definition_not_accepted', `the owner has not accepted definition ${payload.definition_digest} for ${payload.soul_id}`);
@@ -367,7 +410,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
               || tx.list('cooperative_starts').some(([, spent]) =>
                 spent.reservation_sha256 === cooperativeStart.reservation_sha256))
               fail('host.launch_unavailable', 'cooperative reservation was spent or another Hello is pending');
-            tx.put('cooperative_starts', startKey, { state: 'active',
+            tx.put('cooperative_starts', startKey, { state: cooperativeState,
               start_id: cooperativeStart.start_id,
               installation_id: cooperativeStart.installation_id,
               reservation_sha256: cooperativeStart.reservation_sha256,
@@ -389,7 +432,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           const leaseGeneration = (soul?.lease_generation ?? 0) + 1;
           const leaseExpires = now + ttl();
           // A new admission supersedes the Soul's earlier runtimes.
-          if (!protectedStart) for (const [rid, rt] of tx.list('runtimes')) {
+          if (!pendingMachine) for (const [rid, rt] of tx.list('runtimes')) {
             if (rt.soul_id === payload.soul_id && !rt.superseded) tx.put('runtimes', rid, { ...rt, superseded: true });
           }
           const admitted = payload.requested_roles.map((r) => ({ member_id: r.member_id, role: r.role, runtime_id: id('rt', 8), channel_binding: id('cb', 16) }));
@@ -411,7 +454,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             ...(warning ? { warnings: [warning] } : {}),
           };
           check('admission-result', decision, false);
-          if (!protectedStart) tx.put('souls', payload.soul_id, { installation_id: payload.installation_id, epoch, lease_generation: leaseGeneration, decision_id: decision.decision_id, definition_digest: payload.definition_digest, admitted_at: now });
+          if (!pendingMachine) tx.put('souls', payload.soul_id, { installation_id: payload.installation_id, epoch, lease_generation: leaseGeneration, decision_id: decision.decision_id, definition_digest: payload.definition_digest, admitted_at: now });
           for (const [i, a] of admitted.entries()) {
             const adapterId = payload.requested_roles[i].adapter_id;
             const account = harnessAccount(adapterId);
@@ -422,7 +465,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
               channel_binding: a.channel_binding, caller, epoch, lease_generation: leaseGeneration,
               lease_expires_at: leaseExpires, renewal_sequence: 0, ready: false, superseded: false,
               ...(protectedStart ? { protected_state: 'pending', protected_start_id: protectedStart.start_id, protected_start_key: startKey } : {}),
-              ...(cooperativeStart ? { cooperative_state: 'active', cooperative_start_key: startKey,
+              ...(cooperativeStart ? { cooperative_state: cooperativeState, cooperative_start_key: startKey,
                 cooperative_runner_uid: cooperativeStart.peer_uid,
                 cooperative_runner_account: cooperativeStart.runner_account,
                 cooperative_reservation_sha256: cooperativeStart.reservation_sha256 } : {}),
@@ -433,8 +476,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           }
           tx.put('hellos', payload.request_id, { caller, digest, result: decision, at: now,
             ...(protectedStart ? { protected_state: 'pending', protected_start_id: protectedStart.start_id, protected_start_key: startKey } : {}),
-            ...(cooperativeStart ? { cooperative_state: 'active', cooperative_start_key: startKey } : {}) });
-          const audit = { kind: protectedStart ? 'hq.admission.pending' : 'hq.admission', request_id: decision.request_id, decision_id: decision.decision_id, soul_id: payload.soul_id, installation_id: payload.installation_id, installation_epoch: decision.installation_epoch, lease_generation: decision.lease_generation, profile_in_force: decision.profile, runtimes: decision.admitted_runtimes.length, caller };
+            ...(cooperativeStart ? { cooperative_state: cooperativeState, cooperative_start_key: startKey } : {}) });
+          const audit = { kind: pendingMachine ? 'hq.admission.pending' : 'hq.admission', request_id: decision.request_id, decision_id: decision.decision_id, soul_id: payload.soul_id, installation_id: payload.installation_id, installation_epoch: decision.installation_epoch, lease_generation: decision.lease_generation, profile_in_force: decision.profile, runtimes: decision.admitted_runtimes.length, caller };
           if (atomicAudit) receipts.appendIn(tx, audit);
           return { result: decision, repeat: false, audit, soulBefore: soul ?? null, unbound: unboundOf(tx) };
         });
@@ -443,6 +486,40 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           if (!cooperativeCurrent(startKey)
             || await boundedMachineCall(() => cooperativeAdmission.assertLive(cooperativeStart)) !== true)
             fail('host.launch_unavailable', 'cooperative R lost after Hello');
+        }
+        if (pendingCooperative) {
+          const readyDigest = await boundedMachineCall(() => prepareCooperativeMemberSet(
+            Object.freeze(result.admitted_runtimes.map((row) => Object.freeze({ ...row })))), 21_000);
+          if (!SHA256.test(readyDigest ?? '')) fail('host.launch_unavailable', 'cooperative member-set Ready is unavailable');
+          if (await boundedMachineCall(() => cooperativeAdmission.assertLive(cooperativeStart)) !== true)
+            fail('host.launch_unavailable', 'cooperative R lost during member-set finalization');
+          unbound = await store.tx((tx) => {
+            const entry = tx.get('hellos', payload.request_id);
+            const start = tx.get('cooperative_starts', startKey);
+            if (!cooperativeCurrent(startKey) || entry?.cooperative_state !== 'pending'
+              || entry.caller !== caller || entry.digest !== digest || start?.state !== 'pending'
+              || start.reservation_sha256 !== cooperativeStart.reservation_sha256
+              || JSON.stringify(tx.get('souls', payload.soul_id) ?? null) !== JSON.stringify(soulBefore))
+              fail('host.launch_unavailable', 'cooperative admission changed during member-set finalization');
+            for (const [rid, rt] of tx.list('runtimes')) {
+              if (rt.soul_id === payload.soul_id && rt.cooperative_start_key !== startKey && !rt.superseded)
+                tx.put('runtimes', rid, { ...rt, superseded: true });
+            }
+            for (const { runtime_id: rid } of result.admitted_runtimes) {
+              const rt = tx.get('runtimes', rid);
+              if (rt?.cooperative_state !== 'pending' || rt.superseded
+                || rt.cooperative_start_key !== startKey || rt.caller !== caller)
+                fail('host.launch_unavailable', 'cooperative runtime changed during member-set finalization');
+              tx.put('runtimes', rid, { ...rt, cooperative_state: 'active' });
+            }
+            tx.put('souls', payload.soul_id, { installation_id: payload.installation_id,
+              epoch: result.installation_epoch, lease_generation: result.lease_generation,
+              decision_id: result.decision_id, definition_digest: payload.definition_digest, admitted_at: now });
+            tx.put('hellos', payload.request_id, { ...entry, cooperative_state: 'active' });
+            tx.put('cooperative_starts', startKey, { ...start, state: 'active', member_set_ready_sha256: readyDigest });
+            receipts.appendIn(tx, { ...audit, kind: 'hq.admission', member_set_ready_sha256: readyDigest });
+            return unboundOf(tx);
+          });
         }
         if (protectedStart && !repeat) {
           // startKey was fixed before the transaction.
@@ -462,6 +539,8 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           });
           try {
             await live(protectedStart);
+            await boundedMachineCall(() => protectedAdmission.prepareMemberSet?.(expected,
+              Object.freeze(result.admitted_runtimes.map((row) => Object.freeze({ ...row })))), 21_000);
             const finalization = await boundedMachineCall(() => protectedAdmission.finalize(expected));
             if (await boundedMachineCall(() => protectedAdmission.verifyFinalization(finalization, expected)) !== true)
               fail('host.launch_unavailable', 'Machine did not authenticate the exact post-Hello finalization');
@@ -497,7 +576,7 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           } catch {
             fail('host.launch_unavailable', 'protected Hello finalization failed or is uncertain');
           }
-        } else if (after) unbound = after;
+        } else if (!pendingCooperative && after) unbound = after;
         if (!atomicAudit && !repeat) await receipts.append(audit);
         if (protectedStart) await live(protectedStart);
         if (cooperativeStart && !cooperativeCurrent(startKey))
@@ -586,7 +665,9 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
             budget_sub_allocations: { working: 0, maintenance: 0 },
           };
           check('equip', result, false);
-          const audit = { kind: 'hq.equip', runtime_id: payload.runtime_id, credential_references: 0, caller };
+          const audit = { kind: 'hq.equip', runtime_id: payload.runtime_id, credential_references: 0, caller,
+            ...(rt.protected_start_id ? { start_id: rt.protected_start_id, installation_id: rt.installation_id,
+              member_id: rt.member_id, grant_handle_sha256: grantHandleDigest(handle) } : {}) };
           if (atomicAudit) receipts.appendIn(tx, audit);
           return { record: result, audit };
         });
@@ -756,16 +837,60 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         if (!rt) fail('host.invalid_request', `unknown runtime ${runtimeId}`);
         return fn(Object.freeze(current(rt, runtimeId, clock.now())));
       });
+      // A trusted protected-operation consumer supplies the authenticated
+      // runtime ID and digest of its validated request. No caller-supplied
+      // runtime selector is accepted here. The operation still applies its
+      // own authorization before using protected resources.
+      async function withProtectedGrant(boundRuntimeId, handle, requestSHA256, effect, noticeContext) {
+        if (!atomicAudit) fail('host.launch_unavailable', 'protected grant checks need atomic receipts');
+        if (typeof boundRuntimeId !== 'string' || !RUNTIME_ID.test(boundRuntimeId)
+          || typeof requestSHA256 !== 'string' || requestSHA256.length !== 71 || !SHA256.test(requestSHA256)
+          || typeof handle !== 'string' || handle.length !== 35 || !GRANT_HANDLE.test(handle)
+          || typeof effect !== 'function') fail('host.invalid_request', 'invalid protected grant use');
+
+        const result = await store.tx(async (tx) => {
+          const rt = tx.get('runtimes', boundRuntimeId);
+          let scope;
+          try {
+            if (rt && !rt.protected_start_key) fail('profile_insufficient', 'grant use requires a protected runtime');
+            if (!rt?.handle || !sameBinding(rt.handle, handle))
+              fail('caller_mismatch', 'grant handle does not belong to this runtime');
+            current(rt, boundRuntimeId, clock.now());
+            await live(watchedStarts.get(rt.protected_start_key));
+            current(rt, boundRuntimeId, clock.now());
+            if (noticeContext !== undefined) scope = noticeScope(rt, noticeContext);
+          } catch (error) {
+            if (!(error instanceof HostError)) throw error;
+            const committed = receipts.appendIn(tx, { kind: 'hq.protected.grant.refused',
+              code: error.code, runtime_id: boundRuntimeId, request_sha256: requestSHA256,
+              grant_handle_sha256: grantHandleDigest(handle), effect_invoked: false,
+              ...(rt?.protected_start_id ? { start_id: rt.protected_start_id, installation_id: rt.installation_id,
+                member_id: rt.member_id, installation_epoch: rt.epoch, lease_generation: rt.lease_generation } : {}) });
+            return { error, committed };
+          }
+          return { value: await effect(scope ?? Object.freeze({ runtime_id: boundRuntimeId,
+            member_id: rt.member_id, soul_id: rt.soul_id, installation_id: rt.installation_id,
+            start_id: rt.protected_start_id, installation_epoch: rt.epoch,
+            lease_generation: rt.lease_generation })) };
+        });
+        if (result.error) {
+          const receipt = typeof result.committed === 'function' ? result.committed() : undefined;
+          if (receipt) Object.defineProperty(result.error, PROTECTED_GRANT_REFUSAL_RECEIPT,
+            { value: Object.freeze(receipt) });
+          throw result.error;
+        }
+        return result.value;
+      }
       // Trusted broker consumers pass the bound runtime id, never a payload
       // runtime selector. Keep liveness, assignment and mailbox effect in the
       // same admission queue used by Hello/Lease and task commits.
-      const withNoticeScope = (boundRuntimeId, context, effect) => withBoundRuntime(boundRuntimeId, (rt) => {
+      function noticeScope(rt, context) {
         if (!context || typeof context !== 'object' || Array.isArray(context)
           || Object.keys(context).some((key) => !['installation_epoch', 'lease_generation', 'expected_repository'].includes(key))
           || !Number.isSafeInteger(context.installation_epoch) || context.installation_epoch < 1
           || !Number.isSafeInteger(context.lease_generation) || context.lease_generation < 1
-          || (Object.hasOwn(context, 'expected_repository') && !validNoticeRepository(context.expected_repository))
-          || typeof effect !== 'function') fail('host.invalid_request', 'notice scope needs epoch/generation assertions and a trusted effect');
+          || (Object.hasOwn(context, 'expected_repository') && !validNoticeRepository(context.expected_repository)))
+          fail('host.invalid_request', 'notice scope needs epoch/generation assertions');
         if (context.installation_epoch !== rt.epoch) fail('stale_epoch', 'notice request epoch does not match the bound admission');
         if (context.lease_generation !== rt.lease_generation) fail('lease_expired', 'notice request generation does not match the bound admission');
         const frozen = rt.notice_scope;
@@ -774,8 +899,14 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
           || !accepted(rt.soul_id, rt.definition_digest) || !configured
           || configured.harness !== frozen.harness || configured.repo.toLowerCase() !== frozen.repo.toLowerCase()) fail('caller_mismatch', 'no current owner-authorized notice scope; send Hello again');
         if (Object.hasOwn(context, 'expected_repository') && context.expected_repository.toLowerCase() !== frozen.repo.toLowerCase()) fail('caller_mismatch', 'expected repository differs from the frozen notice scope');
-        return effect(Object.freeze({ harness: frozen.harness, repo: frozen.repo }));
+        return Object.freeze({ harness: frozen.harness, repo: frozen.repo });
+      }
+      const withNoticeScope = (boundRuntimeId, context, effect) => withBoundRuntime(boundRuntimeId, (rt) => {
+        if (typeof effect !== 'function') fail('host.invalid_request', 'notice scope needs a trusted effect');
+        return effect(noticeScope(rt, context));
       });
+      const withProtectedNoticePeek = (runtimeId, handle, requestSHA256, context, peek) =>
+        withProtectedGrant(runtimeId, handle, requestSHA256, peek, context);
       // For HQ core's profile reasons (§9 row 16b): the live runtimes with no
       // harness account, as { soul_id, member_id, adapter_id }. HQ core reads
       // them only through this, never this plugin's tables.
@@ -788,6 +919,9 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         verifyBridgeBinding: bridge.verifyBridgeBinding,
         bridgeBindChallengeV2: bridge.bridgeBindChallengeV2,
         verifyBridgeBindingV2: bridge.verifyBridgeBindingV2,
+        bridgeBindChallengeV3: bridge.bridgeBindChallengeV3,
+        verifyBridgeBindingV3: bridge.verifyBridgeBindingV3,
+        boundBridgeV3: bridge.boundBridgeV3,
         boundBridgeV2: bridge.boundBridgeV2,
         boundBridgeConnectionV2: bridge.boundBridgeConnectionV2,
         // The packaged broker opts in to the route, but a live HQ must also
@@ -796,11 +930,42 @@ export function admissionPlugin({ schemas, profileReasons = () => [], harnessAcc
         qualifyBridgeMessagesV2: bridge.qualifyBridgeMessagesV2,
         bridgeRelayIngressEnabledV2: bridge.bridgeRelayIngressEnabledV2,
         relayBridgeIngressV2: bridge.relayBridgeIngressV2,
-        forgetBridgeConnection: bridge.forgetBridgeConnection,
+        stage2aRelayPeerChallengeEnabled: () => typeof bridgeAuthority?.verifyLiveStartV3 === 'function'
+          && typeof relayPeerAuthority?.boundStart === 'function'
+          && typeof relayPeerAuthority?.attest === 'function',
+        stage2aRelayPeerChallenge: relayPeerChallenge,
+        stage2aCooperativeBBindEnabledV3: () => typeof cooperativeBBindProvider?.begin === 'function'
+          && typeof cooperativeBBindProvider?.finish === 'function',
+        stage2aCooperativeBBindChallengeV3: (request, meta) => {
+          if (typeof cooperativeBBindProvider?.begin !== 'function')
+            fail('host.launch_unavailable', 'cooperative B binding is unavailable');
+          return cooperativeBBindProvider.begin(request, meta);
+        },
+        stage2aCooperativeBBindV3: (request, meta) => {
+          if (typeof cooperativeBBindProvider?.finish !== 'function')
+            fail('host.launch_unavailable', 'cooperative B binding is unavailable');
+          return cooperativeBBindProvider.finish(request, meta);
+        },
+        stage2aCooperativeBPolicyEnabledV3: () => typeof cooperativeBPolicyProvider === 'function',
+        stage2aCooperativeBPolicyV3: (request, meta, receipt) => {
+          if (typeof cooperativeBPolicyProvider !== 'function')
+            fail('host.launch_unavailable', 'cooperative B signed policy is unavailable');
+          return cooperativeBPolicyProvider(request, meta, receipt);
+        },
+        stage2aMemberArmExchangeEnabledV3: () => memberArmExchange.enabled
+          && typeof bridgeAuthority?.verifyLiveStartV3 === 'function',
+        stage2aMemberObserveV3: memberArmExchange.observe,
+        stage2aMemberArmV3: memberArmExchange.arm,
+        forgetBridgeConnection: (connection, ...args) => {
+          relayPeerChallenge.forgetConnection(connection);
+          memberArmExchange.forgetConnection(connection);
+          return Promise.all([bridge.forgetBridgeConnection(connection, ...args),
+            cooperativeBBindProvider?.stop?.(connection)]);
+        },
         boundBridge: bridge.boundBridge,
         bridgeStatus: bridge.bridgeStatus,
         revokeBridges: bridge.revokeAll,
-        withBoundRuntime, withNoticeScope, unboundRuntimes } };
+        withBoundRuntime, withProtectedGrant, withNoticeScope, withProtectedNoticePeek, unboundRuntimes } };
     },
     async start(ctx) { await normalizeScopes.get(ctx)(); },
     async stop(ctx) { await bridgeStates.get(ctx)?.revokeAll(); },

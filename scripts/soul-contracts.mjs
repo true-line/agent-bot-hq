@@ -27,15 +27,70 @@ const H_V0102 = Object.freeze({
   commit: 'b216ae9f5889ba00d38ef9b3e3bc9f60f54e90bd',
   digest: 'sha256:baafaeab591c30480c5d172b7ac3db39ffd01f0c0d420e338ffce71b839c58e2',
   files: 469,
-  runtimeDigest: 'sha256:94a60ddc910e1f30bdf380c384efd8a7952665d41789daa7ead973cd8c95b6d1',
-  runtimeFiles: 417,
+  runtimeDigest: 'sha256:6cbab934ebed9248e4bff1d5bff14cdea9f7ac1f6be93d3eceb2ef8c2365c85b',
+  runtimeFiles: 362,
 });
 const VENDOR_PREFIX = 'vendor/soul-contracts/';
 export const H_V0102_EXCLUDED = Object.freeze([
+  'fixtures/negative/action-record.missing-idempotency-key.json',
+  'fixtures/negative/action-record.unknown-state.json',
+  'fixtures/negative/adapter-manifest.invalid-package-version.json',
+  'fixtures/negative/adapter-manifest.missing-qualification-list.json',
+  'fixtures/negative/adapter-manifest.undeclared-cost-bound.json',
+  'fixtures/negative/adapter-manifest.unsupported-qualification.json',
+  'fixtures/negative/admission-result.client-no-source.json',
+  'fixtures/negative/admission-result.client-unknown-source.json',
+  'fixtures/negative/admission-result.epoch-zero.json',
+  'fixtures/negative/admission-result.no-lease-generation.json',
+  'fixtures/negative/admission-result.short-binding.json',
+  'fixtures/negative/admission-result.unknown-profile.json',
+  'fixtures/negative/approval-record.expired.json',
+  'fixtures/negative/approval-record.malformed-digest.json',
+  'fixtures/negative/candidate-revision-record.change-without-provenance.json',
+  'fixtures/negative/candidate-revision-record.partial-accept-status.json',
+  'fixtures/negative/credential-issuance-record.embeds-token.json',
+  'fixtures/negative/credential-issuance-record.short-thumbprint.json',
+  'fixtures/negative/definition-records.stage2a-backslash-path.json',
+  'fixtures/negative/definition-records.stage2a-missing-size.json',
+  'fixtures/negative/definition-records.stage2a-symlink-kind.json',
+  'fixtures/negative/device-enrollment.additional-missing-presence.json',
+  'fixtures/negative/device-enrollment.bad-issuer-key.json',
+  'fixtures/negative/device-enrollment.first-device-linked.json',
+  'fixtures/negative/device-enrollment.first-device-missing-bootstrap.json',
+  'fixtures/negative/device-enrollment.first-device-wrong-local-owner.json',
+  'fixtures/negative/device-enrollment.missing-issuer.json',
+  'fixtures/negative/directive-or-query.from-peer-text.json',
   'fixtures/negative/domain-inventory.v3-synthetic.bad.json',
+  'fixtures/negative/dream-grant-record.traversal-into-primitives.json',
+  'fixtures/negative/dream-grant-record.writes-primitives.json',
+  'fixtures/negative/dream-grant-record.zero-wall-clock.json',
+  'fixtures/negative/equip.embeds-secret.json',
+  'fixtures/negative/equip.user-chosen-short-handle.json',
+  'fixtures/negative/error-response.carries-token.json',
+  'fixtures/negative/error-response.empty-explanation.json',
+  'fixtures/negative/error-response.no-correlation-id.json',
+  'fixtures/negative/error-response.unregistered-code.json',
+  'fixtures/negative/eval-plan-record.no-cells.json',
+  'fixtures/negative/grant-record.negative-budget.json',
+  'fixtures/negative/grant-record.unscoped.json',
   'fixtures/negative/h-service-descriptor-payload.v3-synthetic.bad.json',
   'fixtures/negative/h-service-descriptor-signed.v3-synthetic.bad.json',
+  'fixtures/negative/hello.bad-digest.json',
+  'fixtures/negative/hello.client-bad-app-id.json',
+  'fixtures/negative/hello.client-source-claimed.json',
+  'fixtures/negative/hello.missing-lead.json',
+  'fixtures/negative/hello.stale-epoch.json',
+  'fixtures/negative/hello.two-leads.json',
+  'fixtures/negative/hello.unaccepted-definition.json',
+  'fixtures/negative/hello.unknown-field.json',
+  'fixtures/negative/hello.unpinned-version.json',
+  'fixtures/negative/hello.unsupported-profile.json',
+  'fixtures/negative/hello.unsupported-version.json',
+  'fixtures/negative/hello.version-zero.json',
   'fixtures/negative/inventory-ref.v3-synthetic.bad.json',
+  'fixtures/negative/launch-input-records.stage2a-absolute-path.json',
+  'fixtures/negative/launch-input-records.stage2a-file-too-large.json',
+  'fixtures/negative/launch-input-records.stage2a-missing-comms-broker.json',
   'fixtures/negative/measurement-binding.v3-synthetic.bad.json',
   'fixtures/negative/soul-cooperative-bridge-assignment-payload.missing-reservation.json',
   'fixtures/negative/soul-cooperative-bridge-signed-assignment.wrong-purpose.json',
@@ -112,29 +167,250 @@ export function manifestDigest(entries) {
   return { manifest, digest: `sha256:${sha256(Buffer.from(canonicalize(manifest), 'utf8'))}`, files: entries.length };
 }
 
+// The private candidate is identified by its reviewed commit and manifests.
+export const H_PRIVATE_CONTRACTS_PIN = Object.freeze({
+  schema_version: 1,
+  repository: 'https://github.com/true-line/soul-contracts.git',
+  private_candidate: true,
+  commit: '7cd038f9bc2d814398ba1feb6b7d4b136fe349d0',
+  paths: Object.freeze(['errors', 'fixtures', 'schemas']),
+  digest_algorithm: ALGORITHM,
+  digest: 'sha256:24ab6136f4410661fca4b923380f3c3ba134397248f3a8ba00e17dce47341f48',
+  files: 584,
+});
+const H_PRIVATE_88 = Object.freeze({
+  runtimeDigest: 'sha256:752f8a8b364ef8f281c69aa55d6dbcdeadd0ad34420073a7979101dd7443b046',
+  runtimeFiles: 392,
+  excluded: Object.freeze([
+    'fixtures/negative/action-record.missing-idempotency-key.json',
+    'fixtures/negative/action-record.unknown-state.json',
+    'fixtures/negative/adapter-manifest.invalid-package-version.json',
+    'fixtures/negative/adapter-manifest.missing-qualification-list.json',
+    'fixtures/negative/adapter-manifest.undeclared-cost-bound.json',
+    'fixtures/negative/adapter-manifest.unsupported-qualification.json',
+    'fixtures/negative/admission-result.client-no-source.json',
+    'fixtures/negative/admission-result.client-unknown-source.json',
+    'fixtures/negative/admission-result.epoch-zero.json',
+    'fixtures/negative/admission-result.no-lease-generation.json',
+    'fixtures/negative/admission-result.short-binding.json',
+    'fixtures/negative/admission-result.unknown-profile.json',
+    'fixtures/negative/approval-record.expired.json',
+    'fixtures/negative/approval-record.malformed-digest.json',
+    'fixtures/negative/candidate-revision-record.change-without-provenance.json',
+    'fixtures/negative/candidate-revision-record.partial-accept-status.json',
+    'fixtures/negative/cooperative-member-set-attach.two-member-synthetic.json',
+    'fixtures/negative/cooperative-owner-acp-ticket.two-member-synthetic.json',
+    'fixtures/negative/credential-issuance-record.embeds-token.json',
+    'fixtures/negative/credential-issuance-record.short-thumbprint.json',
+    'fixtures/negative/definition-records.stage2a-backslash-path.json',
+    'fixtures/negative/definition-records.stage2a-missing-size.json',
+    'fixtures/negative/definition-records.stage2a-symlink-kind.json',
+    'fixtures/negative/device-enrollment.additional-missing-presence.json',
+    'fixtures/negative/device-enrollment.bad-issuer-key.json',
+    'fixtures/negative/device-enrollment.first-device-linked.json',
+    'fixtures/negative/device-enrollment.first-device-missing-bootstrap.json',
+    'fixtures/negative/device-enrollment.first-device-wrong-local-owner.json',
+    'fixtures/negative/device-enrollment.missing-issuer.json',
+    'fixtures/negative/directive-or-query.from-peer-text.json',
+    'fixtures/negative/domain-inventory.v3-synthetic.bad.json',
+    'fixtures/negative/dream-grant-record.traversal-into-primitives.json',
+    'fixtures/negative/dream-grant-record.writes-primitives.json',
+    'fixtures/negative/dream-grant-record.zero-wall-clock.json',
+    'fixtures/negative/equip.embeds-secret.json',
+    'fixtures/negative/equip.user-chosen-short-handle.json',
+    'fixtures/negative/error-response.carries-token.json',
+    'fixtures/negative/error-response.empty-explanation.json',
+    'fixtures/negative/error-response.no-correlation-id.json',
+    'fixtures/negative/error-response.unregistered-code.json',
+    'fixtures/negative/eval-plan-record.no-cells.json',
+    'fixtures/negative/grant-record.negative-budget.json',
+    'fixtures/negative/grant-record.unscoped.json',
+    'fixtures/negative/h-service-descriptor-payload.v3-synthetic.bad.json',
+    'fixtures/negative/h-service-descriptor-signed.v3-synthetic.bad.json',
+    'fixtures/negative/hello.bad-digest.json',
+    'fixtures/negative/hello.client-bad-app-id.json',
+    'fixtures/negative/hello.client-source-claimed.json',
+    'fixtures/negative/hello.missing-lead.json',
+    'fixtures/negative/hello.stale-epoch.json',
+    'fixtures/negative/hello.two-leads.json',
+    'fixtures/negative/hello.unaccepted-definition.json',
+    'fixtures/negative/hello.unknown-field.json',
+    'fixtures/negative/hello.unpinned-version.json',
+    'fixtures/negative/hello.unsupported-profile.json',
+    'fixtures/negative/hello.unsupported-version.json',
+    'fixtures/negative/hello.version-zero.json',
+    'fixtures/negative/inventory-ref.v3-synthetic.bad.json',
+    'fixtures/negative/launch-input-records.stage2a-absolute-path.json',
+    'fixtures/negative/launch-input-records.stage2a-file-too-large.json',
+    'fixtures/negative/launch-input-records.stage2a-missing-comms-broker.json',
+    'fixtures/negative/lifecycle-request.missing-owner-session.json',
+    'fixtures/negative/lifecycle-request.recovery-operation.json',
+    'fixtures/negative/link-record.rotation-missing-current-signature.json',
+    'fixtures/negative/measurement-binding.v3-synthetic.bad.json',
+    'fixtures/negative/soul-cooperative-b-member-arm-exchange.two-member-synthetic.json',
+    'fixtures/negative/soul-cooperative-b-observed-payload.attach-synthetic.json',
+    'fixtures/negative/soul-cooperative-b-signed-observed.attach-synthetic.json',
+    'fixtures/negative/soul-cooperative-bridge-assignment-payload.missing-reservation.json',
+    'fixtures/negative/soul-cooperative-bridge-signed-assignment.wrong-purpose.json',
+    'fixtures/negative/soul-cooperative-member-ready-payload.two-member-synthetic.json',
+    'fixtures/negative/soul-cooperative-member-ready-request.two-member-synthetic.json',
+    'fixtures/negative/soul-cooperative-member-signed-ready.two-member-synthetic.json',
+    'fixtures/negative/soul-cooperative-reservation-payload.bridge-claim.json',
+    'fixtures/negative/soul-cooperative-reservation-payload.missing-broker.json',
+    'fixtures/negative/soul-cooperative-signed-reservation.wrong-purpose.json',
+    'fixtures/negative/stage2a-b-member-arm-exchange.two-member-synthetic.json',
+    'fixtures/negative/stage2a-b-member-authority-payload.two-member-synthetic.json',
+    'fixtures/negative/stage2a-b-member-fd3.two-member-synthetic.json',
+    'fixtures/negative/stage2a-b-member-signed-authority.two-member-synthetic.json',
+    'fixtures/negative/stage2a-cooperative-b-fd3.two-member-synthetic.json',
+    'fixtures/negative/stage2a-cooperative-bridge-bind-exchange.two-member-synthetic.json',
+    'fixtures/negative/stage2a-cooperative-member-policy-exchange.two-member-synthetic.json',
+    'fixtures/negative/stage2a-member-attach.cooperative-two-member-synthetic.json',
+    'fixtures/negative/stage2a-member-attach.two-member-synthetic.json',
+    'fixtures/negative/stage2a-member-live-lease-payload.two-member-synthetic.json',
+    'fixtures/negative/stage2a-member-runtime-lease-payload.protected-synthetic.json',
+    'fixtures/negative/stage2a-member-set-assignment-payload.two-member-synthetic-refusal.json',
+    'fixtures/negative/stage2a-member-set-child-observation-payload.two-member-synthetic-refusal.json',
+    'fixtures/negative/stage2a-member-set-ready-payload.two-member-synthetic-refusal.json',
+    'fixtures/negative/stage2a-member-set-signed-assignment.two-member-synthetic-refusal.json',
+    'fixtures/negative/stage2a-member-set-signed-child-observation.two-member-synthetic-refusal.json',
+    'fixtures/negative/stage2a-member-set-signed-ready.two-member-synthetic-refusal.json',
+    'fixtures/negative/stage2a-member-signed-live-lease.two-member-synthetic.json',
+    'fixtures/negative/stage2a-member-signed-runtime-lease.protected-synthetic.json',
+    'fixtures/negative/stage2a-provisional-member-map.two-member-synthetic-refusal.json',
+    'fixtures/negative/stage2a-q-begin.synthetic.bad.json',
+    'fixtures/negative/stage2a-q-clean-eof.synthetic.bad.json',
+    'fixtures/negative/stage2a-q-framed-wire.synthetic.bad.json',
+    'fixtures/negative/stage2a-q-pre-sign-index.synthetic.bad.json',
+    'fixtures/negative/stage2a-q-ready.synthetic.bad.json',
+    'fixtures/negative/stage2a-q-signed-eof.synthetic.bad.json',
+    'fixtures/negative/stage2a-q-signed-index.synthetic.bad.json',
+    'fixtures/negative/stage2a-qualification-candidate-binding.v3-synthetic.bad.json',
+    'fixtures/negative/stage2a-qualification-candidate-reservation-payload.v3-synthetic.bad.json',
+    'fixtures/negative/stage2a-qualification-candidate-signed-reservation.v3-synthetic.bad.json',
+    'fixtures/negative/stage2a-relay-peer-attestation-payload.live-peer-synthetic-refusal.json',
+    'fixtures/negative/stage2a-relay-peer-challenge.live-peer-synthetic-refusal.json',
+    'fixtures/negative/stage2a-relay-peer-signed-attestation.live-peer-synthetic-refusal.json',
+    'fixtures/negative/stage2a-relay-peer-verified.live-peer-synthetic-refusal.json',
+    'fixtures/negative/stage2a-reservation-payload.v3-synthetic.bad.json',
+    'fixtures/negative/stage2a-runner-member-set-fd3.cooperative-two-member-synthetic.json',
+    'fixtures/negative/stage2a-runner-member-set-fd3.two-member-synthetic-refusal.json',
+    'fixtures/negative/stage2a-signed-reservation.v3-synthetic.bad.json',
+    'fixtures/positive/cooperative-member-set-attach.two-member-synthetic.json',
+    'fixtures/positive/cooperative-owner-acp-ticket.two-member-synthetic.json',
+    'fixtures/positive/domain-inventory.v3-synthetic.json',
+    'fixtures/positive/h-service-descriptor-payload.v3-synthetic.json',
+    'fixtures/positive/h-service-descriptor-signed.v3-synthetic.json',
+    'fixtures/positive/inventory-ref.v3-synthetic.json',
+    'fixtures/positive/measurement-binding.v3-synthetic.json',
+    'fixtures/positive/soul-cooperative-b-member-arm-exchange.two-member-synthetic.json',
+    'fixtures/positive/soul-cooperative-b-observed-payload.attach-synthetic.json',
+    'fixtures/positive/soul-cooperative-b-signed-observed.attach-synthetic.json',
+    'fixtures/positive/soul-cooperative-bridge-assignment-payload.v3-synthetic.json',
+    'fixtures/positive/soul-cooperative-bridge-signed-assignment.v3-synthetic.json',
+    'fixtures/positive/soul-cooperative-member-ready-payload.two-member-synthetic.json',
+    'fixtures/positive/soul-cooperative-member-ready-request.two-member-synthetic.json',
+    'fixtures/positive/soul-cooperative-member-signed-ready.two-member-synthetic.json',
+    'fixtures/positive/soul-cooperative-reservation-payload.v3-synthetic.json',
+    'fixtures/positive/soul-cooperative-signed-reservation.v3-synthetic.json',
+    'fixtures/positive/stage2a-b-member-arm-exchange.two-member-synthetic.json',
+    'fixtures/positive/stage2a-b-member-authority-payload.two-member-synthetic.json',
+    'fixtures/positive/stage2a-b-member-fd3.two-member-synthetic.json',
+    'fixtures/positive/stage2a-b-member-signed-authority.two-member-synthetic.json',
+    'fixtures/positive/stage2a-cooperative-b-fd3.two-member-synthetic.json',
+    'fixtures/positive/stage2a-cooperative-bridge-bind-exchange.two-member-synthetic.json',
+    'fixtures/positive/stage2a-cooperative-member-policy-exchange.two-member-synthetic.json',
+    'fixtures/positive/stage2a-member-attach.cooperative-two-member-synthetic.json',
+    'fixtures/positive/stage2a-member-attach.two-member-synthetic.json',
+    'fixtures/positive/stage2a-member-live-lease-payload.two-member-synthetic.json',
+    'fixtures/positive/stage2a-member-runtime-lease-payload.protected-synthetic.json',
+    'fixtures/positive/stage2a-member-set-assignment-payload.two-member-synthetic.json',
+    'fixtures/positive/stage2a-member-set-child-observation-payload.two-member-synthetic.json',
+    'fixtures/positive/stage2a-member-set-ready-payload.two-member-synthetic.json',
+    'fixtures/positive/stage2a-member-set-signed-assignment.two-member-synthetic.json',
+    'fixtures/positive/stage2a-member-set-signed-child-observation.two-member-synthetic.json',
+    'fixtures/positive/stage2a-member-set-signed-ready.two-member-synthetic.json',
+    'fixtures/positive/stage2a-member-signed-live-lease.two-member-synthetic.json',
+    'fixtures/positive/stage2a-member-signed-runtime-lease.protected-synthetic.json',
+    'fixtures/positive/stage2a-provisional-member-map.two-member-synthetic.json',
+    'fixtures/positive/stage2a-q-begin.synthetic.json',
+    'fixtures/positive/stage2a-q-clean-eof.synthetic.json',
+    'fixtures/positive/stage2a-q-framed-wire.synthetic.json',
+    'fixtures/positive/stage2a-q-pre-sign-index.synthetic.json',
+    'fixtures/positive/stage2a-q-ready.synthetic.json',
+    'fixtures/positive/stage2a-q-signed-eof.synthetic.json',
+    'fixtures/positive/stage2a-q-signed-index.synthetic.json',
+    'fixtures/positive/stage2a-qualification-candidate-binding.v3-synthetic.json',
+    'fixtures/positive/stage2a-qualification-candidate-reservation-payload.v3-synthetic.json',
+    'fixtures/positive/stage2a-qualification-candidate-signed-reservation.v3-synthetic.json',
+    'fixtures/positive/stage2a-relay-peer-attestation-payload.live-peer-synthetic.json',
+    'fixtures/positive/stage2a-relay-peer-challenge.live-peer-synthetic.json',
+    'fixtures/positive/stage2a-relay-peer-signed-attestation.live-peer-synthetic.json',
+    'fixtures/positive/stage2a-relay-peer-verified.live-peer-synthetic.json',
+    'fixtures/positive/stage2a-reservation-payload.v3-synthetic.json',
+    'fixtures/positive/stage2a-runner-member-set-fd3.cooperative-two-member-synthetic.json',
+    'fixtures/positive/stage2a-runner-member-set-fd3.two-member-synthetic.json',
+    'fixtures/positive/stage2a-signed-reservation.v3-synthetic.json',
+    'fixtures/qualification/v3/q-presign-argv-synthetic.json',
+    'fixtures/reservation/v1/machine-658-synthetic.json',
+    'fixtures/reservation/v3/machine-qualification-candidate-invalid-bytes.json',
+    'fixtures/reservation/v3/machine-qualification-candidate-synthetic.json',
+    'fixtures/reservation/v3/soul-cooperative-b-member-arm-exchange.two-member-synthetic.json',
+    'fixtures/reservation/v3/soul-cooperative-b-observed.attach-synthetic.json',
+    'fixtures/reservation/v3/soul-cooperative-launch-inputs.brokered-b.synthetic.json',
+    'fixtures/reservation/v3/soul-cooperative-launch-inputs.synthetic.json',
+    'fixtures/reservation/v3/soul-cooperative-member-ready.two-member-synthetic.json',
+    'fixtures/reservation/v3/soul-cooperative-r-inventory.synthetic.json',
+    'fixtures/reservation/v3/soul-cooperative-signed-reservation.brokered-b.synthetic.json',
+    'fixtures/reservation/v3/soul-cooperative-signed-reservation.synthetic.json',
+    'fixtures/reservation/v3/stage2a-b-member-arm-exchange.two-member-synthetic.json',
+    'fixtures/reservation/v3/stage2a-b-member-authority.two-member-synthetic.json',
+    'fixtures/reservation/v3/stage2a-cooperative-b-fd3.synthetic.json',
+    'fixtures/reservation/v3/stage2a-cooperative-bridge-bind.synthetic.json',
+    'fixtures/reservation/v3/stage2a-member-attach.cooperative-two-member-synthetic.json',
+    'fixtures/reservation/v3/stage2a-member-attach.two-member-synthetic.json',
+    'fixtures/reservation/v3/stage2a-member-live-lease.two-member-synthetic.json',
+    'fixtures/reservation/v3/stage2a-member-runtime-lease.protected-synthetic.json',
+    'fixtures/reservation/v3/stage2a-member-set.synthetic.json',
+    'fixtures/reservation/v3/stage2a-relay-peer.synthetic.json',
+    'fixtures/reservation/v3/stage2a-runner-member-set-fd3.synthetic.json',
+  ]),
+});
+
+const isPrivateH88 = (pin) => pin.private_candidate === true
+  && Object.keys(pin).length === Object.keys(H_PRIVATE_CONTRACTS_PIN).length
+  && Object.entries(H_PRIVATE_CONTRACTS_PIN).every(([key, value]) =>
+    Array.isArray(value)
+      ? Array.isArray(pin[key]) && pin[key].length === value.length && value.every((part, i) => pin[key][i] === part)
+      : pin[key] === value);
+
 const isHV0102 = (pin) => pin.tag === H_V0102.tag && pin.commit === H_V0102.commit
   && pin.digest === H_V0102.digest && pin.files === H_V0102.files;
+
+const reviewedRuntime = (pin) => isPrivateH88(pin) ? H_PRIVATE_88
+  : isHV0102(pin) && !Object.hasOwn(pin, 'private_candidate') ? { ...H_V0102, excluded: H_V0102_EXCLUDED } : undefined;
 
 // The raw release is checked against the entire pin before this projection is
 // computed. Machine A separately proves selected+excluded equals that full
 // release at installation; H rechecks the exact selected bytes at startup.
 export function hRuntimeSelection(pin, fullManifest) {
-  if (!isHV0102(pin) || !fullManifest || typeof fullManifest !== 'object'
-    || Array.isArray(fullManifest) || Object.keys(fullManifest).length !== H_V0102.files
-    || H_V0102_EXCLUDED.some((path) => !Object.hasOwn(fullManifest, path))) {
+  const reviewed = reviewedRuntime(pin);
+  if (!reviewed || !fullManifest || typeof fullManifest !== 'object'
+    || Array.isArray(fullManifest) || Object.keys(fullManifest).length !== pin.files
+    || reviewed.excluded.some((path) => !Object.hasOwn(fullManifest, path))) {
     throw new Error('H runtime Contracts selection is unavailable for this release');
   }
   if (`sha256:${sha256(Buffer.from(canonicalize(fullManifest), 'utf8'))}` !== pin.digest) {
     throw new Error('H runtime Contracts full source differs from the pin');
   }
-  const omitted = new Set(H_V0102_EXCLUDED);
+  const omitted = new Set(reviewed.excluded);
   const selected = Object.fromEntries(Object.entries(fullManifest).filter(([path]) => !omitted.has(path)));
   const digest = `sha256:${sha256(Buffer.from(canonicalize(selected), 'utf8'))}`;
-  if (Object.keys(selected).length !== H_V0102.runtimeFiles || digest !== H_V0102.runtimeDigest) {
+  if (Object.keys(selected).length !== reviewed.runtimeFiles || digest !== reviewed.runtimeDigest) {
     throw new Error('H runtime Contracts selection differs from the reviewed release');
   }
-  return Object.freeze({ digest_algorithm: ALGORITHM, digest, files: H_V0102.runtimeFiles,
-    excluded_hq_release_paths: Object.freeze(H_V0102_EXCLUDED.map((path) => `${VENDOR_PREFIX}${path}`)) });
+  return Object.freeze({ digest_algorithm: ALGORITHM, digest, files: reviewed.runtimeFiles,
+    excluded_hq_release_paths: Object.freeze(reviewed.excluded.map((path) => `${VENDOR_PREFIX}${path}`)) });
 }
 
 export function compareSemver(a, b) {
@@ -153,7 +429,9 @@ export function readPin(path = PIN_PATH) {
   const problems = [];
   if (pin.schema_version !== 1) problems.push('schema_version must be 1');
   if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\.git$/.test(pin.repository ?? '')) problems.push('repository must be an https GitHub URL ending in .git');
-  if (!/^v\d+\.\d+\.\d+$/.test(pin.tag ?? '')) problems.push('tag must be vMAJOR.MINOR.PATCH');
+  if (Object.hasOwn(pin, 'private_candidate')) {
+    if (!isPrivateH88(pin)) problems.push('private H candidate does not match the reviewed Contracts tuple');
+  } else if (!/^v\d+\.\d+\.\d+$/.test(pin.tag ?? '')) problems.push('tag must be vMAJOR.MINOR.PATCH');
   if (!/^[0-9a-f]{40}$/.test(pin.commit ?? '')) problems.push('commit must be a full 40-hex SHA');
   if (!Array.isArray(pin.paths) || pin.paths.length === 0 || [...pin.paths].sort().join() !== pin.paths.join()) problems.push('paths must be a non-empty sorted list');
   if (pin.digest_algorithm !== ALGORITHM) problems.push(`digest_algorithm must be ${ALGORITHM}`);
@@ -298,7 +576,7 @@ export function verifyVendored(dir, pin = readPin()) {
 // snapshot. Recompute the source-mode manifest here so an omitted, extra or
 // changed Contracts file cannot be accepted by metadata alone.
 export function verifySelectedVendored(dir, pin, selection) {
-  if (!isHV0102(pin) || !selection || selection.root !== ROOT
+  if (!reviewedRuntime(pin) || !selection || selection.root !== ROOT
     || !/^sha256:[0-9a-f]{64}$/.test(selection.metadataSha256)
     || !Number.isSafeInteger(selection.metadataSize) || selection.metadataSize < 1
     || selection.metadataSize > 65536 || !Array.isArray(selection.vendorRows)) {
@@ -323,7 +601,8 @@ export function verifySelectedVendored(dir, pin, selection) {
 // Pure content check for the authenticated wrapper above. A direct call to
 // this helper does not set preloader state or grant protected launch authority.
 export function verifySelectedVendoredTree(dir, pin, metadata, vendorRows) {
-  if (!isHV0102(pin) || !metadata || typeof metadata !== 'object'
+  const reviewed = reviewedRuntime(pin);
+  if (!reviewed || !metadata || typeof metadata !== 'object'
     || !Array.isArray(vendorRows)) {
     throw new Error('H release metadata does not bind the reviewed Contracts subset');
   }
@@ -333,10 +612,10 @@ export function verifySelectedVendoredTree(dir, pin, metadata, vendorRows) {
     || !runtime || typeof runtime !== 'object' || Array.isArray(runtime)
     || Object.keys(runtime).sort().join(',') !== ['digest_algorithm', 'digest', 'files',
       'excluded_hq_release_paths'].sort().join(',')
-    || runtime.digest_algorithm !== ALGORITHM || runtime.digest !== H_V0102.runtimeDigest
-    || runtime.files !== H_V0102.runtimeFiles
+    || runtime.digest_algorithm !== ALGORITHM || runtime.digest !== reviewed.runtimeDigest
+    || runtime.files !== reviewed.runtimeFiles
     || JSON.stringify(runtime.excluded_hq_release_paths) !== JSON.stringify(
-      H_V0102_EXCLUDED.map((path) => `${VENDOR_PREFIX}${path}`))) {
+      reviewed.excluded.map((path) => `${VENDOR_PREFIX}${path}`))) {
     throw new Error('H release metadata does not bind the reviewed Contracts subset');
   }
   const { root, entries } = vendoredEntries(dir, pin.paths);
@@ -368,8 +647,10 @@ export function verify(pin = readPin()) {
   if (process.env.HQ_INTERIM_OFFLINE === '1') {
     const dir = join(ROOT, 'vendor/soul-contracts');
     const selection = authenticatedSelectedH();
+    if (pin.private_candidate === true && !selection) throw new Error('private H candidate requires an authenticated selection');
     return selection ? verifySelectedVendored(dir, pin, selection) : verifyVendored(dir, pin);
   }
+  if (pin.private_candidate === true) throw new Error('private H candidate requires a sealed offline runtime');
   return withFetchedTag(pin.repository, pin.tag, (repo, commit, work) => {
     if (commit !== pin.commit) throw new Error(`tag ${pin.tag} now points at ${commit}, not the pinned ${pin.commit}; refusing a moved tag`);
     const entries = treeEntries(repo, commit, pin.paths);

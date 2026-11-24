@@ -25,13 +25,12 @@ function parseCanonical(bytes) {
   return value;
 }
 
-export function verifyCooperativeProof(result, machineKey, kind) {
+function verifyMachineProof(result, machineKey, purpose, kind) {
   if (!result || Object.keys(result).sort().join(',') !== 'envelope_base64url,sha256'
     || !Buffer.isBuffer(machineKey) || machineKey.length !== 32) invalid();
   const bytes = decode(result.envelope_base64url, 48 * 1024);
   if (digest(bytes) !== result.sha256) invalid();
   const envelope = parseCanonical(bytes);
-  const purpose = `agent-bot/soul-cooperative-${kind}/v3`;
   if (!envelope || Object.keys(envelope).sort().join(',') !== KEYS
     || envelope.schema_version !== 3 || envelope.purpose !== purpose
     || envelope.issuer_public_key_base64url !== machineKey.toString('base64url')) invalid();
@@ -42,8 +41,20 @@ export function verifyCooperativeProof(result, machineKey, kind) {
     || !verify(null, Buffer.concat([Buffer.from(purpose + '\0'), payloadBytes]), key, signature)) invalid();
   const payload = parseCanonical(payloadBytes);
   if (!payload || payload.contract !== 'machine/v3' || payload.schema_version !== 3
-    || payload.kind !== `soul-cooperative-${kind}`) invalid();
+    || payload.kind !== kind) invalid();
   return payload;
+}
+
+export function verifyCooperativeProof(result, machineKey, kind) {
+  return verifyMachineProof(result, machineKey, `agent-bot/soul-cooperative-${kind}/v3`, `soul-cooperative-${kind}`);
+}
+
+export function verifyDirectQualificationPre(result, machineKey) {
+  return verifyMachineProof(result, machineKey, 'agent-bot/stage2a-direct-q-pre/v3', 'stage2a-direct-q-pre');
+}
+
+export function verifyDirectQualificationCapture(result, machineKey) {
+  return verifyMachineProof(result, machineKey, 'agent-bot/stage2a-direct-q-capture/v3', 'stage2a-direct-q-capture');
 }
 
 export function match(value, expected) {

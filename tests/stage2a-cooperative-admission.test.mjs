@@ -1,9 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
 import { listenStage2aCooperativeAdmission, listenStage2aCooperativeBroker } from '../hq/stage2a-r-admission.mjs';
+
+import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
+import { verifyCooperativeMemberReady } from '../hq/stage2a-protected-start.mjs';
 
 const ROOT = '/Library/Application Support/ai.true-line.agent-bot-hq';
 const hash = (...parts) => createHash('sha256').update(parts.join('\0')).digest('hex');
@@ -294,4 +297,42 @@ test('C listener refuses an endpoint substitution or missing verifier before bin
   assert.equal(f.options, undefined);
   const g = fixture();
   await assert.rejects(listenStage2aCooperativeAdmission({ reservation: g.pinned, hqUid: 309 }), /cooperative R admission/);
+});
+
+test('cooperative Ready signs all joins and cannot substitute an independently observed bridge', () => {
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const pinned = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+  const digest = (name) => shaBytes(Buffer.from(name));
+  const issued_at = '2026-11-23T12:00:00Z', expires_at = '2026-11-23T12:00:20Z';
+  const common = { profile_in_force: 'managed-cooperative', host_id: 'host', installation_id: 'installation',
+    start_id: 'start', hq_epoch: 'epoch', reservation_sha256: digest('reservation'),
+    assignment_envelope_sha256: digest('assignment'), provisional_hq_mapping_sha256: digest('map') };
+  const members = ['m_lead', 'm_spec'].map((member_id, i) => ({
+    member_id, launch_id: 'launch-' + i, member_selector: 'selector-' + i, grant_sha256: digest('grant-' + i),
+    launcher_process: { pid: 10 + i }, child_process: { pid: 20 + i },
+  }));
+  const observation = { payload: { ...common, issued_at, members }, envelope_sha256: digest('observation') };
+  const evidence = { observation, authoritySHA256: digest('authority'), bridgeObservedSHA256: digest('bridge'),
+    hObservationSHA256s: [digest('h0'), digest('h1')], armReceiptSHA256s: [digest('b0'), digest('b1')],
+    now: Date.parse(issued_at) };
+  const payload = { ...common, contract: 'machine/v3', kind: 'soul-cooperative-member-ready', schema_version: 3,
+    child_observation_envelope_sha256: observation.envelope_sha256,
+    member_b_authority_envelope_sha256: evidence.authoritySHA256, bridge_observed_sha256: evidence.bridgeObservedSHA256,
+    members: members.map(({ launch_id, ...member }, i) => ({ ...member, member_launch_id: launch_id,
+      h_observation_sha256: evidence.hObservationSHA256s[i], b_arm_receipt_sha256: evidence.armReceiptSHA256s[i] })),
+    issued_at, expires_at };
+  function signReady(value) {
+    const purpose = 'agent-bot/soul-cooperative-member-ready/v3';
+    const bytes = canonicalBytes(value);
+    return canonicalBytes({ schema_version: 3, purpose, issuer_public_key_base64url: pinned.toString('base64url'),
+      payload_sha256: shaBytes(bytes), payload_base64url: bytes.toString('base64url'),
+      signature_base64url: sign(null, Buffer.concat([Buffer.from(purpose + '\0'), bytes]), privateKey).toString('base64url') });
+  }
+  assert.equal(verifyCooperativeMemberReady(signReady(payload), pinned, evidence).payload.kind, payload.kind);
+  assert.throws(() => verifyCooperativeMemberReady(signReady({
+    ...payload, bridge_observed_sha256: digest('other bridge'),
+  }), pinned, evidence), /unavailable/);
+  assert.throws(() => verifyCooperativeMemberReady(signReady({ ...payload,
+    members: [{ ...payload.members[0], b_arm_receipt_sha256: evidence.armReceiptSHA256s[1] }, payload.members[1]],
+  }), pinned, evidence), /unavailable/);
 });

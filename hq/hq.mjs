@@ -48,7 +48,7 @@ import { createStandaloneSigner } from './standalone-signer.mjs';
 import { createEnrollment, DEFAULT_IDENTITY_SERVICE, validateEnrollmentConfig } from './enrollment.mjs';
 import { createLauncher, LAUNCH_OPERATIONS } from './launch.mjs';
 import { createSoulStarter } from './soul-start.mjs';
-import { bindBridgeAuthority, listenBridgeEndpoint, memberBrokerDispatch, planBridgeEndpoints } from './bridge-endpoints.mjs';
+import { bindBridgeAuthority, listenBridgeEndpoint, memberBrokerDispatch, planBridgeEndpoints, readCooperativeBridgePeer } from './bridge-endpoints.mjs';
 import { loadPlugins } from './plugins.mjs';
 import { authenticatePeerUid, checkOwnerControlSupport, OWNER_CONTROL_PATH, OWNER_PEER_CHECK } from './owner-control.mjs';
 import { checkSocketPath, listenSocket } from './socket.mjs';
@@ -198,6 +198,10 @@ export function createHQ({
   bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
   qualificationAuthorizer,       // trusted one-use installed test-provider operation; never owner config
   relayIngressAuthorizer,        // trusted one-use B test-provider; absent until A finalization is wired
+  cooperativeBBindProvider,      // trusted cooperative B bind state; absent in production
+  cooperativeBPolicyProvider,    // trusted same-bound A policy delivery; absent in production
+  memberArmProvider,             // trusted paired A observation/arm provider; absent in production
+  relayPeerAuthority,            // trusted v3 bound B + paired A live CLI verifier; absent in production
   protectedAdmission,            // future pinned Machine verifier; absent in production until signed contracts ship
   createCooperativeStart,        // owner lifecycle for a paired cooperative launch
   cooperativeAdmission,          // paired A reservation/attach/watch client; never owner config
@@ -228,6 +232,7 @@ export function createHQ({
   const brokerCallers = new Map();
   const bridgePeers = new Map();
   const bridgeListeners = new Map();
+  const cooperativeBridgeListeners = new Map();
   const runnerAdmissions = new Map();
   const openingRunnerAdmissions = new Set();
   const cooperativeListeners = new Map();
@@ -354,7 +359,7 @@ export function createHQ({
     });
     soulStarter = createSoulStarter({ core, home, machineLaunch: soulLaunch,
       verifyMachineReservation: soulVerifier, verifyMachineCompletion: soulCompletionVerifier,
-      protectedStart, cooperativeStart: createCooperativeStart?.(core),
+      protectedStart, cooperativeStart: createCooperativeStart?.(core, store.readCommittedReceipts),
       mode: () => host?.mode ?? 'starting', hqUid: uid,
       harnessUids: harnessPlan.endpoints.map((endpoint) => endpoint.uid), machineHqEpoch });
     // Whether the provisioner's rule lets HQ start each harness account;
@@ -401,6 +406,10 @@ export function createHQ({
           onDisconnect: bridgeAuthority?.onDisconnect?.bind(bridgeAuthority) },
       qualificationAuthorizer,
       relayIngressAuthorizer,
+      relayPeerAuthority,
+      memberArmProvider,
+      cooperativeBPolicyProvider,
+      cooperativeBBindProvider,
       protectedAdmission,
       cooperativeAdmission: cooperativeGuard?.client,
     });
@@ -466,7 +475,7 @@ export function createHQ({
         ).finally(() => { checkingPair = undefined; });
         await checkingPair;
       }
-      return ['soul.start', 'soul.starts', 'soul.stop'].includes(op) ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta);
+      return ['soul.start', 'soul.starts', 'soul.stop', 'soul.qualify-direct'].includes(op) ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta);
     }
 
     try {
@@ -513,7 +522,13 @@ export function createHQ({
       for (const endpoint of bridgeEndpoints) {
         const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
           enableBridgeQualification: typeof qualificationAuthorizer === 'function',
-          enableBridgeRelayIngress: typeof relayIngressAuthorizer === 'function' });
+          enableBridgeRelayIngress: typeof relayIngressAuthorizer === 'function',
+          enableCooperativeBBind: host.provided('hq-admission')?.stage2aCooperativeBBindEnabledV3?.() === true,
+          enableCooperativeBPolicy: typeof cooperativeBPolicyProvider === 'function',
+          enableMemberArmExchange: host.provided('hq-admission')?.stage2aMemberArmExchangeEnabledV3?.() === true,
+          enableRelayPeerChallenge: typeof bridgeAuthority?.verifyLiveStartV3 === 'function'
+            && typeof relayPeerAuthority?.boundStart === 'function'
+            && typeof relayPeerAuthority?.attest === 'function' });
         bridgeListeners.set(endpoint.installationId, listener);
         sockets.push(listener);
       }
@@ -564,6 +579,7 @@ export function createHQ({
     for (const s of sockets) await s.close();
     sockets = [];
     bridgeListeners.clear();
+    cooperativeBridgeListeners.clear();
     const report = await host.stop({ reason });
     await bridgeStop; // uncertain B containment cannot produce hq.stopped
     for (const [id, s] of coreTable(core, 'sessions')) if (!s.closed_at) coreTable(core, 'sessions').set(id, { ...s, closed_at: clock.now() });
@@ -576,14 +592,15 @@ export function createHQ({
     stop,
     paths,
     status: () => host.status(),
-    openProtectedAdmission: async ({ installed, assignment, selectors, renewLive, onLost }) => {
+    openProtectedAdmission: async ({ installed, assignment, selectors, renewLive, onLost, memberAttachProvider }) => {
       const key = selectors?.reservation_sha256;
       if (!running || !key || runnerAdmissions.has(key) || openingRunnerAdmissions.has(key))
         fail('host.launch_unavailable', 'protected R admission is unavailable');
       openingRunnerAdmissions.add(key);
       try {
         const listener = await listenStage2aRunnerAdmission({ installed, assignment, selectors,
-          hqUid: uid, core, renewLive, onLost, protectedAdmission,
+          hqUid: uid, core, renewLive, onLost, protectedAdmission, memberAttachProvider,
+          withLiveRuntime: host.provided('hq-admission')?.withLiveRuntime,
           admissionDispatch: (op, meta) => host.dispatch(op, meta) });
         if (!running) { await listener.close(); fail('host.launch_unavailable', 'HQ stopped during protected R admission'); }
         runnerAdmissions.set(key, listener);
@@ -594,7 +611,7 @@ export function createHQ({
         } });
       } finally { openingRunnerAdmissions.delete(key); }
     },
-    openCooperativeAdmission: async ({ reservation, openAcpStream, onLost }) => {
+    openCooperativeAdmission: async ({ reservation, openAcpStream, onLost, memberAttachProvider }) => {
       const key = reservation?.sha256;
       if (!running || !key || cooperativeGuard?.isRevoked(key)
         || cooperativeListeners.has(key) || openingCooperativeListeners.has(key)
@@ -620,6 +637,8 @@ export function createHQ({
           hqUid: uid, core, machineAttach: (value) => cooperativeAdmission.attach(value),
           verifyAttachReceipt: (receipt, expected) => cooperativeAdmission.verifyAttachReceipt(receipt, expected),
           isLive: (value) => cooperativeGuard.client.watchHealthy(value), openAcpStream, onLost: lost,
+          memberAttachProvider, withLiveRuntime: host.provided('hq-admission')?.withLiveRuntime,
+          assertRunnerLive: (value) => cooperativeGuard.client.assertLive(value),
           admissionDispatch: (op, meta) => {
             if (op !== 'launch' && op !== 'launch.stop') return host.dispatch(op, meta);
             const service = host.provided('hq-admission');
@@ -627,9 +646,9 @@ export function createHQ({
               fail('host.launch_unavailable', 'cooperative member launch is unavailable');
             return service.cooperativeMemberLaunch(op, meta);
           } });
-        if (admission.brokerPin.reservation_sha256 !== key)
+        if (admission.reservationSHA256 !== key)
           fail('host.launch_unavailable', 'cooperative reservation digest changed after verification');
-        broker = await listenStage2aCooperativeBroker({ admission, hqUid: uid, core,
+        if (admission.brokerPin) broker = await listenStage2aCooperativeBroker({ admission, hqUid: uid, core,
           callers: brokerCallers, onLost: lost,
           brokerDispatch: (kind, payload, session) => memberBrokerDispatch(host, kind, payload, session),
           brokerClosed: (session) => host.brokerClosed(session) });
@@ -639,11 +658,11 @@ export function createHQ({
           if (!closing) {
             cooperativeGuard.revoke(key);
             if (cooperativeListeners.get(key)?.close === close) cooperativeListeners.delete(key);
-            closing = Promise.all([broker.close(), admission.close()]).then(() => {});
+            closing = Promise.all([broker?.close(), admission.close()]).then(() => {});
           }
           return closing;
         };
-        const listener = Object.freeze({ path: admission.path, brokerPath: broker.path, close });
+        const listener = Object.freeze({ path: admission.path, brokerPath: broker?.path, close });
         cooperativeListeners.set(key, listener);
         return listener;
       } catch (error) {
@@ -651,6 +670,53 @@ export function createHQ({
         await admission?.close().catch(() => {});
         throw error;
       } finally { openingCooperativeListeners.delete(key); }
+    },
+    qualifyDirectProtectedClaim: (startId) => {
+      if (!running) fail('host.launch_unavailable', 'HQ direct qualification is unavailable');
+      return soulStarter.qualifyDirectProtectedClaim(startId);
+    },
+    openCooperativeBridgeEndpoint: async ({ bridgeAssignment, handlers }) => {
+      const endpoint = bridgeAssignment?.endpoint;
+      const key = endpoint?.installationId;
+      if (!running || platform !== 'darwin' || !key || !endpoint.parentIdentity
+        || cooperativeBridgeListeners.has(key) || bridgeEndpoints.some((other) => other.path === endpoint.path || other.uid === endpoint.uid)
+        || [...cooperativeBridgeListeners.values()].some((other) =>
+          other.endpoint.path === endpoint.path || other.endpoint.uid === endpoint.uid)
+        || typeof handlers?.stage2aCooperativeBBindChallengeV3 !== 'function'
+        || typeof handlers.stage2aCooperativeBBindV3 !== 'function'
+        || typeof handlers.stage2aCooperativeBPolicyV3 !== 'function') {
+        fail('host.launch_unavailable', 'cooperative B endpoint is unavailable');
+      }
+      const marker = { endpoint };
+      cooperativeBridgeListeners.set(key, marker);
+      try {
+        const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
+          enableCooperativeBBind: true, enableCooperativeBPolicy: true,
+          enableMemberArmExchange: typeof handlers.stage2aCooperativeMemberObserveV3 === 'function'
+            && typeof handlers.stage2aCooperativeMemberArmV3 === 'function', cooperativeHandlers: handlers });
+        if (!running || cooperativeBridgeListeners.get(key) !== marker) {
+          await listener.close();
+          fail('host.launch_unavailable', 'cooperative B endpoint stopped during startup');
+        }
+        marker.listener = listener;
+        sockets.push(listener);
+        let closed;
+        return Object.freeze({ close: () => {
+          if (!closed) {
+            if (cooperativeBridgeListeners.get(key) === marker) cooperativeBridgeListeners.delete(key);
+            sockets = sockets.filter((entry) => entry !== listener);
+            closed = listener.close();
+          }
+          return closed;
+        } });
+      } catch (error) {
+        if (cooperativeBridgeListeners.get(key) === marker) cooperativeBridgeListeners.delete(key);
+        throw error;
+      }
+    },
+    cooperativeBridgeKernelPeer: (connection, expected) => {
+      if (!running) fail('host.launch_unavailable', 'cooperative B broker is unavailable');
+      return readCooperativeBridgePeer(bridgePeers, connection, expected);
     },
     bridgeBrokerIdentity: (installationId) => {
       if (!running || typeof installationId !== 'string') fail('host.launch_unavailable', 'HQ bridge broker is unavailable');

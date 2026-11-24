@@ -1072,3 +1072,41 @@ test('cooperative plans exceeding the signed channel limit are refused', () => {
   });
   assert.throws(() => validatedMembersPlan(id, { state: 'found', body: saved }), /unsupported structure/);
 });
+
+test('paired HQ signs bridge provisioning only for exact per-installation roles and directories', arm, async (t) => {
+  const installation_id = 'inst_bridge';
+  const select = (domain) => createHash('sha256').update(domain + '\0' + installation_id).digest('hex').slice(0, 20);
+  const runner = '_abm-sr-' + createHash('sha256').update(installation_id).digest('hex').slice(0, 20);
+  const bridge = '_abm-br-' + select('agent-bot-soul-bridge/v1');
+  const slot = select('agent-bot-soul-endpoint-installation/v1');
+  const base = '/Library/Application Support/ai.true-line.agent-bot-hq/';
+  const directory = (target, owner, group, mode, identity) =>
+    ({ kind: 'directory', target: base + target, action: 'create', owner, group, mode, ...identity });
+  const plan = { version: 3, hq_account: role, dir: 'none', members: [bridge], steps: [
+    { kind: 'hq-account', target: role, action: 'none', group: role, mode: '0700',
+      detail: 'exists; dedicated; home /var/agent-bot-hq; its password is checked at apply', uid: 300, gid: 300 },
+    { kind: 'account', target: bridge, action: 'create', group: bridge, mode: '0700',
+      detail: `Soul bridge home /var/agent-bot-soul-bridge-${bridge}, shell /usr/bin/false, private group, no password, no other groups`,
+      uid: 302, gid: 302 },
+    ...['ipc', 'm', 's', 'r'].map((name) => directory(name, 'root', 'wheel', '0755')),
+    directory('ipc/' + bridge, role, bridge, '2750', { uid: 300, gid: 302 }),
+    directory('m/' + slot, runner, bridge, '2750', { uid: 301, gid: 302 }),
+    directory('s/' + slot, bridge, runner, '2750', { uid: 302, gid: 301 }),
+    directory('r/' + slot, role, runner, '2750', { uid: 300, gid: 301 }),
+  ], purpose: 'soul-bridge-provision', soul_bridges: [
+    { soul_id: 'agent_01234567-0123-4567-0123-456789abcdef', installation_id, account: bridge },
+  ] };
+  const saved = (value) => {
+    const plan_canonical = JSON.stringify(value) + '\n';
+    return { plan_id: id, plan_digest: createHash('sha256').update(plan_canonical).digest('hex'), plan_canonical };
+  };
+  const f = await fixture(t, plan.purpose, 300);
+  f.state.saved = saved(plan);
+  await f.pin();
+  const line = await f.issue();
+  writeFileSync(f.challengeFile, line);
+  writeFileSync(f.proofFile, JSON.stringify(proof(JSON.parse(line).body, f.owner)));
+  assert.equal((await f.approve()).state, 'approved');
+  plan.steps.at(-1).gid = 302;
+  assert.throws(() => validatedMembersPlan(id, { state: 'found', body: saved(plan) }), /unsupported structure/);
+});

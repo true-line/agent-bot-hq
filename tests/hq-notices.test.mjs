@@ -17,6 +17,7 @@ test('notice factory requires released schemas and default HQ registers guarded 
   assert.throws(() => noticesPlugin({ schemas: { 'notice-query': schemas['notice-query'] } }), /pinned hq\/v1 notice-result schema/);
   const t = await startHQ({ plugins: [referenceBroker({ name: 'agent-comms' })] });
   try {
+    assert.equal(t.hq.host.registrations().kinds.some(({ key }) => key === 'hq.notices.protected.peek.v1'), false);
     assert.deepEqual(t.hq.host.registrations().kinds.filter(({ key }) => key.startsWith('notices.')).map(({ key }) => key).sort(), ['notices.consume-one', 'notices.peek']);
     const entry = await t.entry();
     const admitted = await entry.request('Hello', hello());

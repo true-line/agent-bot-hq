@@ -125,28 +125,63 @@ export function authenticatePeerUid(socket, uid) {
 // Observe the connecting PID from the accepted descriptor, with the same
 // kernel UID check. This is an HQ-local role gate; Machine must authenticate
 // a protected Hello independently before publishing managed provenance.
-export function observePeerPid(socket, uid) {
+function observeKernel(args, maxBytes, socket) {
   return new Promise((resolve) => {
-    if (!Number.isSafeInteger(uid) || uid < 1) { resolve(null); return; }
     let probe;
     try {
-      probe = spawn(interpreter, [...helper, 'peer-pid', String(uid)], {
-        ...helperOptions, stdio: ['ignore', 'pipe', 'ignore', socket],
+      probe = spawn(interpreter, [...helper, ...args], {
+        ...helperOptions, stdio: ['ignore', 'pipe', 'ignore', ...(socket ? [socket] : [])],
       });
     } catch { resolve(null); return; }
     let output = '';
     let overflow = false;
     probe.stdout.on('data', (chunk) => {
       output += chunk.toString('ascii');
-      if (output.length > 32) { overflow = true; probe.kill('SIGKILL'); }
+      if (output.length > maxBytes) { overflow = true; probe.kill('SIGKILL'); }
     });
     probe.once('error', () => resolve(null));
-    probe.once('close', (code) => {
-      if (code !== 0 || overflow || !/^[1-9][0-9]{0,9}\n$/.test(output)) { resolve(null); return; }
-      const pid = Number(output.trim());
-      resolve(Number.isSafeInteger(pid) && pid > 1 ? pid : null);
-    });
+    probe.once('close', (code) => resolve(code === 0 && !overflow ? output : null));
   });
+}
+
+const peerObservations = new WeakMap();
+async function observeKernelPeer(socket, args, maxBytes) {
+  if (!socket || socket.destroyed) return null;
+  if (process.platform !== 'darwin') return observeKernel(args, maxBytes, socket);
+  // Passing the accepted descriptor through the helper interrupts libuv's
+  // Darwin read registration. Stop reading before the probe and rearm it
+  // afterward, preserving a listener's existing pause before authentication.
+  const prior = peerObservations.get(socket);
+  const observation = Promise.resolve(prior).then(async () => {
+    if (socket.destroyed) return null;
+    const wasFlowing = socket.readableFlowing === true;
+    if (wasFlowing) socket.pause();
+    try { return await observeKernel(args, maxBytes, socket); }
+    finally { if (wasFlowing && !socket.destroyed) socket.resume(); }
+  });
+  peerObservations.set(socket, observation);
+  try { return await observation; }
+  finally { if (peerObservations.get(socket) === observation) peerObservations.delete(socket); }
+}
+
+export async function observePeerPid(socket, uid) {
+  if (!Number.isSafeInteger(uid) || uid < 1) return null;
+  const output = await observeKernelPeer(socket, ['peer-pid', String(uid)], 32);
+  if (!/^[1-9][0-9]{0,9}\n$/.test(output ?? '')) return null;
+  const pid = Number(output.trim());
+  return Number.isSafeInteger(pid) && pid > 1 ? pid : null;
+}
+
+export async function observeDarwinPeerIdentity(socket, expectedUid) {
+  if (!darwin || !Number.isSafeInteger(expectedUid) || expectedUid < 1) return null;
+  const output = await observeKernelPeer(socket, ['peer-audit', String(expectedUid)], 96);
+  if (!/^\d+(?: \d+){5}\n$/.test(output ?? '')) return null;
+  const values = output.trim().split(' ').map(Number);
+  const [uid, gid, pid, pid_version, start_seconds, start_micros] = values;
+  if (!values.every(Number.isSafeInteger) || uid !== expectedUid || gid < 1 || pid < 2
+    || pid_version < 1 || pid_version > 0xffffffff || start_seconds < 1
+    || start_micros < 0 || start_micros >= 1e6) return null;
+  return Object.freeze({ uid, gid, pid, pid_version, start_seconds, start_micros });
 }
 
 export { authenticatePeerUid as authenticateOwner };
@@ -157,4 +192,17 @@ function socketCheck(args, socket) {
     probe.once('error', () => resolve(false));
     probe.once('close', (code) => resolve(code === 0));
   });
+}
+
+
+export async function observeDarwinProcessIdentity(expectedPid, expectedUid, expectedGid) {
+  if (!darwin || ![expectedPid, expectedUid, expectedGid].every((value) =>
+    Number.isSafeInteger(value) && value > 0) || expectedPid < 2) return null;
+  const output = await observeKernel(['process-identity', String(expectedUid), String(expectedGid), String(expectedPid)], 96);
+  if (!/^\d+(?: \d+){4}\n$/.test(output ?? '')) return null;
+  const values = output.trim().split(' ').map(Number);
+  const [uid, gid, pid, start_seconds, start_micros] = values;
+  if (!values.every(Number.isSafeInteger) || uid !== expectedUid || gid !== expectedGid
+    || pid !== expectedPid || start_seconds < 1 || start_micros < 0 || start_micros >= 1e6) return null;
+  return Object.freeze({ uid, gid, pid, start_seconds, start_micros });
 }

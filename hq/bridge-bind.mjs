@@ -6,6 +6,7 @@ import { createHmac, createHash, timingSafeEqual } from 'node:crypto';
 import { fail } from '../sdk/errors.mjs';
 
 export const BRIDGE_BIND_CONTEXT = 'agent-bot-stage2a-bridge-bind-v1';
+export const BRIDGE_BIND_V3_CONTEXT = 'agent-bot-stage2a-bridge-bind-v3';
 export const BRIDGE_BIND_V2_CONTEXT = 'agent-bot-stage2a-bridge-bind-v2';
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const START = /^st_[0-9a-f]{24}$/;
@@ -20,6 +21,13 @@ const V2 = { label: BRIDGE_BIND_V2_CONTEXT, separator: '\0', verify: 'verifyLive
   ['installation_id', ID], ['start_id', START], ['launch_id', LAUNCH],
   ['plan_id', ID], ['plan_digest', SHA], ['reservation_digest', DIGEST],
 ] };
+const V3 = { label: BRIDGE_BIND_V3_CONTEXT, separator: '\0', verify: 'verifyLiveStartV3', fields: [
+  ['installation_id', ID], ['start_id', START], ['plan_id', ID], ['plan_digest', SHA],
+  ['reservation_digest', DIGEST], ['assignment_envelope_sha256', DIGEST],
+  ['authority_envelope_sha256', DIGEST], ['member_selectors_sha256', DIGEST],
+] };
+const paired = (protocol) => protocol !== V1;
+const authorityMethod = (protocol, name) => `${name}${protocol === V3 ? 'V3' : 'V2'}`;
 const BIND_TTL_MS = 30_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_PENDING = 4096;
@@ -36,11 +44,20 @@ const selectorsOf = (protocol, input, withProof = false) => {
   return Object.fromEntries(protocol.fields.map(([key]) => [key, input[key]]));
 };
 const sameSelectors = (protocol, a, b) => protocol.fields.every(([key]) => a[key] === b[key]);
+const BRIDGE_PROCESS_FIELDS = ['pid', 'uid', 'gid', 'start_seconds', 'start_micros', 'executable_sha256'];
+const sameProcess = (a, b) => BRIDGE_PROCESS_FIELDS.every((field) => a[field] === b[field]);
+const validBridgeProcess = (p, uid) => record(p) && p.uid === uid
+  && Number.isSafeInteger(p.pid) && p.pid >= 2 && Number.isSafeInteger(p.gid) && p.gid > 0
+  && Number.isSafeInteger(p.start_seconds) && p.start_seconds > 0
+  && Number.isSafeInteger(p.start_micros) && p.start_micros >= 0 && p.start_micros < 1e6
+  && matches(DIGEST, p.executable_sha256);
 const sameContext = (protocol, a, b) => sameSelectors(protocol, a, b) && a.hq_epoch === b.hq_epoch
   && a.bridge_uid === b.bridge_uid && a.broker_socket === b.broker_socket
   && a.reservationExpires === b.reservationExpires && a.member_socket === b.member_socket
   && a.soul_artifact_sha256 === b.soul_artifact_sha256
-  && (protocol === V2 || timingSafeEqual(a.proof_key, b.proof_key));
+  && (protocol !== V3 || (a.b_authority_sha256 === b.b_authority_sha256
+    && sameProcess(a.bridge_process, b.bridge_process)))
+  && (paired(protocol) || timingSafeEqual(a.proof_key, b.proof_key));
 const validContext = (protocol, value, selectors) => validSelectors(protocol, value) && sameSelectors(protocol, value, selectors)
   && matches(SHA, value.hq_epoch) && Number.isSafeInteger(value.bridge_uid)
   && value.bridge_uid >= 300 && value.bridge_uid <= 399
@@ -59,6 +76,7 @@ function proofFor(protocol, key, nonce, context) {
 }
 
 export const bridgeBindProof = (key, nonce, context) => proofFor(V1, key, nonce, context);
+export const bridgeBindProofV3 = (key, nonce, context) => proofFor(V3, key, nonce, context);
 export const bridgeBindProofV2 = (key, nonce, context) => proofFor(V2, key, nonce, context);
 
 // verifyLiveStartV2 is pinned HQ entry-point code. On each call it must
@@ -98,16 +116,16 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     return promise;
   };
   const configured = (protocol) => typeof authority?.[protocol.verify] === 'function'
-    && (protocol === V2 ? typeof authority.verifyProofV2 === 'function'
-      && typeof authority.isCurrentPeerV2 === 'function'
-      && typeof authority.matchesAssignmentV2 === 'function' && typeof authority.onDisconnectV2 === 'function'
+    && (paired(protocol) ? typeof authority[authorityMethod(protocol, 'verifyProof')] === 'function'
+      && typeof authority[authorityMethod(protocol, 'isCurrentPeer')] === 'function'
+      && typeof authority[authorityMethod(protocol, 'matchesAssignment')] === 'function' && typeof authority[authorityMethod(protocol, 'onDisconnect')] === 'function'
       : typeof authority.onDisconnect === 'function')
     && typeof clock?.now === 'function' && typeof random?.hex === 'function'
     && typeof receipts?.append === 'function'
     && typeof timers?.setTimeout === 'function' && typeof timers?.clearTimeout === 'function';
   const available = (protocol) => !stopping && !containmentUnconfirmed && configured(protocol);
   const bridgeStatus = () => ({ state: containmentUnconfirmed ? 'containment_unconfirmed'
-    : stopping ? 'stopping' : configured(V2) || configured(V1) ? 'bind-enabled' : 'unavailable' });
+    : stopping ? 'stopping' : configured(V3) || configured(V2) || configured(V1) ? 'bind-enabled' : 'unavailable' });
   const connectionOf = (meta) => typeof meta?.connection === 'string' && meta.connection ? meta.connection : refuse();
   const check = async (protocol, selectors, connection, phase) => {
     const context = await authority[protocol.verify](selectors, connection, phase);
@@ -115,34 +133,39 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     let finalizedLiveExpires;
     try {
       if (!validContext(protocol, context, selectors)
-        || (protocol === V2 ? Object.hasOwn(context, 'proof_key') : !validKey(context.proof_key))) refuse();
-      if (protocol === V2) {
+        || (paired(protocol) ? Object.hasOwn(context, 'proof_key') : !validKey(context.proof_key))) refuse();
+      if (paired(protocol)) {
         if (Object.hasOwn(context, 'runtime_id') || !Buffer.isBuffer(context.reservation_bytes)
           || !context.reservation_bytes.length || digest(context.reservation_bytes) !== selectors.reservation_digest
           || !Number.isSafeInteger(context.reservation_expires_at)
           || !matches(DIGEST, context.soul_artifact_sha256)
           || typeof context.member?.socket_path !== 'string' || !context.member.socket_path.startsWith('/')
-          || authority.matchesAssignmentV2(context, selectors, connection) !== true) refuse();
+          || authority[authorityMethod(protocol, 'matchesAssignment')](context, selectors, connection) !== true) refuse();
         reservationExpires = context.reservation_expires_at;
         finalizedLiveExpires = context.finalized_live_expires_at;
         if (finalizedLiveExpires !== undefined && (phase !== 'receipt' || !Number.isSafeInteger(finalizedLiveExpires))) refuse();
       }
+      if (protocol === V3 && (!matches(DIGEST, context.b_authority_sha256)
+        || !validBridgeProcess(context.bridge_process, context.bridge_uid))) refuse();
       // Keep a field snapshot across the challenge and Machine recheck.
       return Object.freeze({ ...selectors, protocol, hq_epoch: context.hq_epoch, reservationExpires, finalizedLiveExpires,
-        ...(protocol === V2 ? { member_socket: context.member.socket_path,
+        ...(paired(protocol) ? { member_socket: context.member.socket_path,
           soul_artifact_sha256: context.soul_artifact_sha256 } : {}),
         bridge_uid: context.bridge_uid, broker_socket: context.broker_socket,
+        ...(protocol === V3 ? { b_authority_sha256: context.b_authority_sha256,
+          bridge_process: Object.freeze(Object.fromEntries(BRIDGE_PROCESS_FIELDS.map((key) =>
+            [key, context.bridge_process[key]]))) } : {}),
         ...(protocol === V1 ? { proof_key: Buffer.from(context.proof_key) } : {}) });
     } catch (error) {
-      if (protocol === V2) await quarantine(protocol, connection, undefined, 'bridge-verified-context-invalid');
+      if (paired(protocol)) await quarantine(protocol, connection, undefined, 'bridge-verified-context-invalid');
       throw error;
     }
   };
   const startKey = (context) => [context.hq_epoch, context.installation_id, context.start_id].join('\0');
-  const quarantineKey = (protocol, connection, context) => protocol === V2 ? `v2:${connection}` : startKey(context);
+  const quarantineKey = (protocol, connection, context) => paired(protocol) ? `${protocol.label}:${connection}` : startKey(context);
   const usable = (context, connection) => available(context.protocol) && !closed.has(connection)
     && !quarantines.has(quarantineKey(context.protocol, connection, context))
-    && (context.protocol !== V2 || authority.isCurrentPeerV2(connection) === true);
+    && (!paired(context.protocol) || authority[authorityMethod(context.protocol, 'isCurrentPeer')](connection) === true);
   const nowMs = () => {
     const now = clock.now();
     if (!Number.isSafeInteger(now) || now < 0 || now > 8_640_000_000_000_000 - BIND_TTL_MS) refuse();
@@ -152,8 +175,10 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     ...Object.fromEntries(context.protocol.fields.map(([field]) => [field, context[field]])),
     hq_epoch: context.hq_epoch, bridge_uid: context.bridge_uid,
     broker_socket: context.broker_socket,
-    ...(context.protocol === V2 ? { member_socket: context.member_socket,
+    ...(paired(context.protocol) ? { member_socket: context.member_socket,
       soul_artifact_sha256: context.soul_artifact_sha256 } : {}),
+    ...(context.protocol === V3 ? { b_authority_sha256: context.b_authority_sha256,
+      bridge_process: context.bridge_process } : {}),
     ...(receipt ? { bind_receipt_sha256: digest(receipt) } : {}),
   });
   const bounded = (operation, label) => {
@@ -174,9 +199,9 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     const stopped = context ? observation(context, receipt) : undefined;
     let requested;
     try {
-      requested = protocol === V2
+      requested = paired(protocol)
         ? Promise.resolve().then(async () => {
-          if (await authority.onDisconnectV2(connection, reason, stopped) !== true)
+          if (await authority[authorityMethod(protocol, 'onDisconnect')](connection, reason, stopped) !== true)
             throw new Error('Machine did not confirm the bridge containment request');
         })
         : authority.onDisconnect(stopped, reason);
@@ -246,7 +271,7 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     const connection = connectionOf(meta);
     if (closed.has(connection) || challenges.has(connection) || verifying.has(connection)
       || live.has(connection) || inFlight.has(connection)
-      || (protocol === V2 && quarantines.has(quarantineKey(protocol, connection)))
+      || (paired(protocol) && quarantines.has(quarantineKey(protocol, connection)))
       || inFlight.size >= MAX_PENDING) refuse();
     inFlight.add(connection);
     let context;
@@ -255,7 +280,7 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
       if (!usable(context, connection)) refuse();
       const claim = startKey(context);
       if (claimedStarts.has(claim)) {
-        if (protocol === V2) {
+        if (paired(protocol)) {
           // A trusted verifier must never retain two connections for one
           // spent start. Revoke the existing receipt and contain both claims.
           await forgetBridgeConnection(claimedStarts.get(claim), undefined, 'bridge-duplicate-verified-start');
@@ -290,7 +315,7 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
         if (challenges.has(connection) || verifying.has(connection) || live.has(connection))
           await forgetBridgeConnection(connection, undefined, 'bridge-challenge-failed');
         else await quarantine(protocol, connection, context, 'bridge-challenge-failed');
-      } else if (protocol === V2 && authority.retainsChallengeStopV2?.(connection) === true) {
+      } else if (paired(protocol) && authority[authorityMethod(protocol, 'retainsChallengeStop')]?.(connection) === true) {
         // A cooperative authority retains its stop target before awaiting
         // A's live reply. Keep failures visible even before a challenge exists.
         await quarantine(protocol, connection, undefined, 'bridge-challenge-failed').catch(() => {});
@@ -318,11 +343,11 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
       const now = nowMs();
       if (!usable(context, connection) || verifying.get(connection) !== pending
         || pending.expires <= now || !sameContext(protocol, context, pending.context)) refuse();
-      if (protocol === V2) {
+      if (paired(protocol)) {
         const proof = Object.freeze({ ...selectors, hq_epoch: context.hq_epoch,
           bridge_uid: context.bridge_uid, broker_socket: context.broker_socket,
           challenge: pending.nonce, proof: input.proof });
-        if (await bounded(authority.verifyProofV2(proof, connection),
+        if (await bounded(authority[authorityMethod(protocol, 'verifyProof')](proof, connection),
           'Machine bridge proof verification deadline exceeded') !== true) refuse();
       } else {
         const expected = proofFor(protocol, context.proof_key, pending.nonce, context);
@@ -338,7 +363,7 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
       verifying.delete(connection);
       const binding = { receipt, context, observation: observation(context, receipt), expires: context.reservationExpires };
       live.set(connection, binding);
-      if (protocol === V2) armReceiptDeadline(connection, binding);
+      if (paired(protocol)) armReceiptDeadline(connection, binding);
       return { bind_receipt: receipt };
     } catch {
       await forgetBridgeConnection(connection, undefined, 'bridge-bind-failed');
@@ -367,9 +392,9 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
       if (!usable(context, connection) || live.get(connection) !== binding) refuse();
       const selectors = Object.fromEntries(protocol.fields.map(([key]) => [key, context[key]]));
       const checking = check(protocol, selectors, connection, 'receipt');
-      const current = await (protocol === V2 ? bounded(checking, 'Machine bridge verification deadline exceeded') : checking);
+      const current = await (paired(protocol) ? bounded(checking, 'Machine bridge verification deadline exceeded') : checking);
       if (!usable(current, connection) || live.get(connection) !== binding || !sameContext(protocol, current, context)) refuse();
-      if (protocol === V2) {
+      if (paired(protocol)) {
         if (binding.finalized && current.finalizedLiveExpires === undefined) refuse();
         binding.finalized = current.finalizedLiveExpires !== undefined;
         binding.expires = current.finalizedLiveExpires ?? context.reservationExpires;
@@ -409,6 +434,22 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     const observation = await recheckBridge(connection, binding);
     if (live.get(connection) !== binding || binding.receipt !== receipt) refuse();
     return observation;
+  }
+
+  function currentBridgeConnectionV3(connection, receipt) {
+    if (!matches(SHA, receipt)) return false;
+    const binding = live.get(connection);
+    return binding?.context.protocol === V3 && binding.receipt === receipt
+      && binding.expires > nowMs() && usable(binding.context, connection);
+  }
+
+  async function boundBridgeConnectionV3(connection, receipt, requireFinalized = false) {
+    if (!currentBridgeConnectionV3(connection, receipt)) refuse();
+    const binding = live.get(connection);
+    const state = await recheckBridge(connection, binding);
+    if (!currentBridgeConnectionV3(connection, receipt) || live.get(connection) !== binding
+      || (requireFinalized && !binding.finalized)) refuse();
+    return state;
   }
 
   // Source-only qualification fixture. This injected host boundary must verify
@@ -512,6 +553,12 @@ export function createBridgeBindAdmission({ authority, qualificationAuthorizer, 
     bridgeBindChallengeV2: (...args) => track(bridgeBindChallenge(V2, ...args)),
     verifyBridgeBindingV2: (...args) => track(verifyBridgeBinding(V2, ...args)),
     boundBridgeV2: (...args) => track(boundBridge(V2, ...args)),
+    bridgeBindChallengeV3: (...args) => track(bridgeBindChallenge(V3, ...args)),
+    verifyBridgeBindingV3: (...args) => track(verifyBridgeBinding(V3, ...args)),
+    boundBridgeV3: (...args) => track(boundBridge(V3, ...args)),
+    currentBridgeConnectionV3,
+    boundBridgeConnectionV3: (connection, receipt) => track(boundBridgeConnectionV3(connection, receipt)),
+    finalizedBridgeConnectionV3: (connection, receipt) => track(boundBridgeConnectionV3(connection, receipt, true)),
     boundBridgeConnectionV2: (...args) => track(boundBridgeConnectionV2(...args)),
     qualifyBridgeMessagesV2: (...args) => track(qualifyBridgeMessagesV2(...args)),
     bridgeRelayIngressEnabledV2: () => typeof relayIngressAuthorizer === 'function' && available(V2),

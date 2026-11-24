@@ -14,14 +14,14 @@ const fields = (value, names) => value != null && typeof value === 'object' && !
 
 const runnerName = (installationId) => `_abm-sr-${createHash('sha256').update(installationId).digest('hex').slice(0, 20)}`;
 
-function account(step, name, ids) {
+function account(step, name, ids, role = 'runner') {
   if (!fields(step, 'kind,target,action,group,mode,detail,uid,gid') ||
       step.kind !== 'account' || step.target !== name || step.group !== name || step.mode !== '0700' ||
       !Number.isInteger(step.uid) || step.uid < 300 || step.uid > 399 || step.gid !== step.uid || ids.has(step.uid)) return false;
   ids.add(step.uid);
-  const home = `/var/agent-bot-soul-runner-${name}`;
-  if (step.action === 'create') return step.detail === `Soul runner home ${home}, shell /usr/bin/false, private group, no password, no other groups`;
-  if (step.action === 'none') return step.detail === `exists; Soul runner home ${home}; its password is checked at apply`;
+  const home = `/var/agent-bot-soul-${role}-${name}`;
+  if (step.action === 'create') return step.detail === `Soul ${role} home ${home}, shell /usr/bin/false, private group, no password, no other groups`;
+  if (step.action === 'none') return step.detail === `exists; Soul ${role} home ${home}; its password is checked at apply`;
   if (step.action !== 'repair' || typeof step.detail !== 'string') return false;
   const match = /^exists; home (.+) has mode ([0-7]{4}) and is set to 0700; its password is checked at apply$/.exec(step.detail);
   return !!match && match[1] === home && match[2] !== '0700';
