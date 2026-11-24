@@ -130,6 +130,8 @@ others can write it, and refuses unknown keys:
 }
 ```
 
+For a fresh [local-only deployment](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0047-harbor-is-the-control-plane-of-a-linked-machine.md), set `"enrollment": { "source": "local-only" }`. HQ verifies its paired Machine and starts local work without a Harbor account. Status reports the device as `unenrolled` and the identity-service link as `not-linked`. The local-only configuration refuses a Machine with an enrollment binding or state containing a previous, current, or pending device enrollment. The protected launch requirements still apply.
+
 `node hq/main.mjs enroll --harness NAME` starts the grant and displays the code to approve. The enrollment server must match the administrator-configured origin. The service must support the signed enrollment receipt. Legacy local enrollment records cannot authorize the Machine-held identity.
 
 A routine Machine restart preserves enrollment. Human-readable

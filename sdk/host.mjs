@@ -43,6 +43,7 @@ export function createHost({
   initTimeoutMs = 10_000,
   stopDeadlineMs = 5_000,
   core = createCore(),
+  localOnly = false,
   services = {},
   // HQ adds its own status fields (profile reasons, sockets, the legacy
   // daemon); they are merged into every status answer.
@@ -282,7 +283,9 @@ export function createHost({
       if (!DEVICE_STATES.includes(reported)) enterSafe(`signer reported no device status (one of ${DEVICE_STATES.join(', ')})`);
       else {
         device = core.deviceRevoked ? 'revoked' : reported;
-        if (device === 'unenrolled') enterSafe('device not enrolled: run enroll');
+        if (device === 'unenrolled' && !(localOnly && core.identity.link === 'not-linked')) {
+          enterSafe('device not enrolled: run enroll');
+        }
         if (device === 'revoked') revokeDevice(core, 'the signer reported the device revoked at startup');
       }
     }
