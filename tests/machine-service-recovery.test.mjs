@@ -9,6 +9,7 @@ import { qualificationApprovalDetail, qualificationPurpose } from '../hq/machine
 import { validatedMembersPlan } from '../hq/machine-members-plans.mjs';
 import { cooperativeInstallPurpose } from '../hq/machine-soul-cooperative-launch.mjs';
 import { protectedInstallPurpose } from '../hq/machine-soul-protected-launch.mjs';
+import { soulBridgeAccountsPurpose } from '../hq/machine-soul-runner-accounts.mjs';
 import { machineCommandInHome } from '../hq/machine-channel.mjs';
 
 const action = 'hq-service-recovery';
@@ -471,6 +472,131 @@ function protectedInstallPlan(machineKey, roleUid = 300, change = () => {}) {
   const plan_canonical = harnessJSON(plan);
   return { plan_id: id, plan_canonical, plan_digest: createHash('sha256').update(plan_canonical).digest('hex') };
 }
+
+function runtimeV3InstallPlan(machineKey, change = () => {}) {
+  return protectedInstallPlan(machineKey, 300, plan => {
+    const request = plan.soul_protected_launch;
+    request.schema = 'agent-bot-machine/soul-protected-launch-install/v3';
+    const policy = request.policy;
+    delete request.policy;
+    request.runtime_v3 = {
+      inventory_source: '/reviewed/r-inventory.jcs', inventory_digest: 'sha256:' + '7'.repeat(64),
+      limits: { max_files: 512, max_file_bytes: 402653184, max_total_bytes: 1073741824 },
+      components: ['adapter', 'node', 'souls'].map(component => ({
+        component_id: component, source_repository: 'true-line/agent-bot-' + component,
+        source_commit: 'a'.repeat(40), artifact_format: 'tar',
+        artifact_source: `/reviewed/${component}.tar`, release_artifact_sha256: 'sha256:' + '8'.repeat(64),
+        manifest_source: `/reviewed/${component}.jcs`, release_manifest_sha256: 'sha256:' + '9'.repeat(64),
+      })),
+      source_roots: { adapter: '/reviewed/adapter', node: '/reviewed/node', souls: '/reviewed/souls' },
+    };
+    request.policy = policy;
+    const installation = request.policy.measurement_binding.installation_id;
+    const domain = 'R-runtime';
+    const hash = value => createHash('sha256').update(value).digest('hex');
+    const slot = hash(`agent-bot/stage2a-domain-slot/v3\0${domain}\0${installation}`).slice(0, 20);
+    const name = hash(`agent-bot/stage2a-domain-snapshot/v3\0${domain}\0${installation}`).slice(0, 24);
+    const sealed = `/private/var/db/managed-machine/soul-snapshots/r_${slot}/snap_${name}`;
+    request.policy.node = `${sealed}/runtime/bin/node`;
+    request.policy.entry = `${sealed}/runtime/bin/agent-bot-souls.mjs`;
+    request.policy.launch_inputs.selected_command = request.policy.node;
+    plan.steps[0].detail = 'seal reviewed R runtime in A, persist per-Soul authority and root applied receipt; defer the protected launch rule';
+    change(plan);
+  });
+}
+
+function soulBridgePlan(change = () => {}) {
+  const installation = 'install-one';
+  const name = '_abm-br-' + createHash('sha256').update('agent-bot-soul-bridge/v1\0' + installation).digest('hex').slice(0, 20);
+  const runner = '_abm-sr-' + createHash('sha256').update(installation).digest('hex').slice(0, 20);
+  const slot = createHash('sha256').update('agent-bot-soul-endpoint-installation/v1\0' + installation).digest('hex').slice(0, 20);
+  const root = '/Library/Application Support/ai.true-line.agent-bot-hq';
+  const directory = (target, owner, group, mode, uid, gid) => ({ kind: 'directory', target,
+    action: 'create', owner, group, mode, ...(uid === undefined ? {} : { uid, gid }) });
+  const plan = { version: 3, hq_account: role, dir: 'none', members: [name], steps: [
+    { kind: 'hq-account', target: role, action: 'none', group: role, mode: '0700',
+      detail: 'exists; dedicated; home /var/agent-bot-hq; its password is checked at apply', uid: 300, gid: 300 },
+    { kind: 'account', target: name, action: 'create', group: name, mode: '0700',
+      detail: `Soul bridge home /var/agent-bot-soul-bridge-${name}, shell /usr/bin/false, private group, no password, no other groups`, uid: 302, gid: 302 },
+    ...[`${root}/ipc`, `${root}/m`, `${root}/s`, `${root}/r`].map(path => directory(path, 'root', 'wheel', '0755')),
+    directory(`${root}/ipc/${name}`, role, name, '2750', 300, 302),
+    directory(`${root}/m/${slot}`, runner, name, '2750', 301, 302),
+    directory(`${root}/s/${slot}`, name, runner, '2750', 302, 301),
+    directory(`${root}/r/${slot}`, role, runner, '2750', 300, 301),
+  ], purpose: soulBridgeAccountsPurpose, soul_bridges: [
+    { soul_id: 'agent_11111111-1111-1111-1111-111111111111', installation_id: installation, account: name },
+  ] };
+  change(plan);
+  const plan_canonical = harnessJSON(plan);
+  return { plan_id: id, plan_canonical, plan_digest: createHash('sha256').update(plan_canonical).digest('hex') };
+}
+
+test('paired v3 R-only install and B provisioning preserve signed owner handoff', arm, async t => {
+  const r = await fixture(t, protectedInstallPurpose);
+  const machineKey = JSON.parse(r.state.saved.plan_canonical).soul_protected_launch.machine_public_key;
+  r.state.saved = runtimeV3InstallPlan(machineKey);
+  await r.pin();
+  const exportedR = await r.issue();
+  writeFileSync(r.challengeFile, exportedR + '\n');
+  writeFileSync(r.proofFile, JSON.stringify(proof(JSON.parse(exportedR).body, r.owner)));
+  assert.equal((await r.approve()).state, 'approved');
+  const b = await fixture(t, soulBridgeAccountsPurpose);
+  b.state.saved = soulBridgePlan();
+  await b.pin();
+  const exportedB = await b.issue();
+  writeFileSync(b.challengeFile, exportedB + '\n');
+  writeFileSync(b.proofFile, JSON.stringify(proof(JSON.parse(exportedB).body, b.owner)));
+  assert.equal((await b.approve()).state, 'approved');
+  const fresh = await b.issue();
+  writeFileSync(b.challengeFile, fresh + '\n');
+  assert.equal((await b.cancel()).state, 'cancelled');
+});
+
+test('v3 R and B handoffs reject changed scope before owner challenge', arm, async t => {
+  const r = await fixture(t, protectedInstallPurpose);
+  const machineKey = JSON.parse(r.state.saved.plan_canonical).soul_protected_launch.machine_public_key;
+  await r.pin();
+  for (const change of [
+    p => { p.soul_protected_launch.runtime_v3.source_roots.node = '/private/var/db/managed-machine/soul-snapshots/r_bad'; },
+    p => { p.soul_protected_launch.runtime_v3.components[1].release_manifest_sha256 = 'bad'; },
+    p => { p.soul_protected_launch.policy.node = '/reviewed/node'; },
+    p => { p.steps[0].detail = 'install rule now'; },
+  ]) {
+    r.state.saved = runtimeV3InstallPlan(machineKey, change);
+    await assert.rejects(r.issue(), /unsupported structure|outside the paired protected/);
+  }
+  const b = await fixture(t, soulBridgeAccountsPurpose);
+  await b.pin();
+  for (const change of [
+    p => { p.steps.at(-1).mode = '2770'; },
+    p => { p.steps.at(-2).owner = role; },
+    p => { p.steps[1].uid = 300; p.steps[1].gid = 300; },
+  ]) {
+    b.state.saved = soulBridgePlan(change);
+    await assert.rejects(b.issue(), /unsupported structure|outside the paired HQ Soul bridge/);
+  }
+});
+
+test('v3 R handoff binds the optional two-member owner projection without widening v1', arm, () => {
+  const machineKey = 'a'.repeat(64);
+  const memberSet = 'sha256:' + 'b'.repeat(64);
+  const saved = runtimeV3InstallPlan(machineKey, plan => {
+    const request = plan.soul_protected_launch;
+    const policy = request.policy;
+    policy.bridge_qualification.client_key_sha256 = 'sha256:da4fec28d868ca5cf8f00f43869f703f138bd4211683b8637a751b904860ddf0';
+    policy.member_bridge_qualifications = ['adapter', 'souls'].map(member_id => ({
+      member_id, ...policy.bridge_qualification,
+    }));
+    delete request.policy;
+    request.owner_plan_member_set_sha256 = memberSet;
+    request.policy = policy;
+  });
+  assert.equal(validatedMembersPlan(id, { state: 'found', body: saved }).soul_protected_launch.owner_plan_member_set_sha256, memberSet);
+  const old = protectedInstallPlan(machineKey, 300, plan => {
+    plan.soul_protected_launch.owner_plan_member_set_sha256 = memberSet;
+  });
+  assert.throws(() => validatedMembersPlan(id, { state: 'found', body: old }), /unsupported structure/);
+});
 
 test('paired protected Soul install exports the signed plan and forwards exact owner proof', arm, async (t) => {
   const f = await fixture(t, protectedInstallPurpose);
