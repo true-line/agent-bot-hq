@@ -358,3 +358,29 @@ Use `cancel --challenge-file FILE --socket PATH` with the same verb to abandon
 the challenge. Approval authorizes only the saved plan named in the proof.
 Machine's root apply and installed receipt are separate steps; this handoff
 does not establish physical acceptance or open protected launch.
+
+For a v3 R-only install, the signed challenge additionally names the reviewed
+R inventory digest, component release pins, source roots and resource limits.
+The v3 plan seals R in Machine custody and defers the protected launch rule.
+Use the same `soul-protected-launch-install` export, approve and cancel verbs;
+the owner proof must cover the exact v3 plan and digest.
+
+### Review one Soul bridge provisioning plan
+
+Machine creates a separate `soul-bridge-provision` plan for each installation's
+credential-sidecar role and fixed endpoint directories. Export its signed
+challenge from the paired HQ account after pinning Machine status:
+
+```sh
+node hq/main.mjs machine soul-bridge-provision export "$plan_id" --socket "$socket" > "$challenge_file"
+```
+
+Review the bridge account, its UID, the linked runner identity, directory
+ownership and modes, and the exact plan digest. Submit the owner's proof:
+
+```sh
+node hq/main.mjs machine soul-bridge-provision approve --challenge-file "$challenge_file" --proof-file "$proof_file" --socket "$socket"
+```
+
+Use `soul-bridge-provision cancel --challenge-file FILE --socket PATH` to
+abandon a challenge. Machine's root apply and receipt remain separate.

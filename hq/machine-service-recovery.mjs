@@ -6,7 +6,7 @@ import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
 import { validatedMembersPlan, validPlanId } from './machine-members-plans.mjs';
 import { accountsPurpose } from './machine-harness-accounts.mjs';
-import { soulRunnerAccountsPurpose } from './machine-soul-runner-accounts.mjs';
+import { soulRunnerAccountsPurpose, checkSoulBridgeAccounts, soulBridgeAccountsPurpose } from './machine-soul-runner-accounts.mjs';
 import { qualificationApprovalDetail, qualificationPurpose } from './machine-harness-qualification.mjs';
 import { checkUpgradeRecords } from './machine-service-upgrade.mjs';
 import { checkHarnessLaunchPlan, isHarnessLaunchHandoff } from './machine-harness-launch.mjs';
@@ -14,7 +14,7 @@ import { checkCooperativeInstallPlan, cooperativeInstallPurpose } from './machin
 import { checkProtectedInstallPlan, protectedInstallPurpose } from './machine-soul-protected-launch.mjs';
 
 export const isServiceHandoff = (verb) => verb === 'hq-service-recovery' || verb === 'hq-service-upgrade' ||
-  isHarnessLaunchHandoff(verb) || verb === accountsPurpose || verb === soulRunnerAccountsPurpose ||
+  isHarnessLaunchHandoff(verb) || verb === accountsPurpose || verb === soulRunnerAccountsPurpose || verb === soulBridgeAccountsPurpose ||
   verb === qualificationPurpose || verb === protectedInstallPurpose || verb === cooperativeInstallPurpose;
 const role = '_agent-bot-hq';
 const maxFrame = 64 * 1024;
@@ -61,6 +61,10 @@ function ownerPublicKey(encoded) {
 }
 
 function checkPlanScope(plan, action, id, roleUid, machineKey) {
+  if (action === soulBridgeAccountsPurpose || plan.purpose === soulBridgeAccountsPurpose) {
+    if (action !== plan.purpose) throw new Error('outside the paired HQ Soul bridge account scope');
+    return checkSoulBridgeAccounts(plan, roleUid);
+  }
   if (action === cooperativeInstallPurpose || plan.purpose === cooperativeInstallPurpose) {
     if (action !== plan.purpose) throw new Error('outside the paired cooperative Soul launch install plan scope');
     return checkCooperativeInstallPlan(plan, roleUid, machineKey);

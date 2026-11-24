@@ -6,6 +6,7 @@ import { posix } from 'node:path';
 export const protectedInstallPurpose = 'soul-protected-launch-install';
 const root = '/Library/Application Support/ai.true-line.agent-bot-hq';
 const detail = 'install exact pinned launcher, sandbox policies, Machine public key, per-Soul rule and A-owned authority; publish root applied receipt';
+const runtimeDetail = 'seal reviewed R runtime in A, persist per-Soul authority and root applied receipt; defer the protected launch rule';
 const id = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const account = /^[a-z_][a-z0-9_-]{0,31}$/;
 const hex = /^[0-9a-f]{64}$/;
@@ -97,12 +98,64 @@ function validNested(policy, request) {
     const file = inputs.files.find(r => r.path === relativePath);
     return !!file && (!executable || (Number.parseInt(file.mode, 8) & 0o010) !== 0);
   };
+  const runtimeCode = request.runtime_v3 ? (() => {
+    const installation = binding.installation_id;
+    const slot = prefix(`agent-bot/stage2a-domain-slot/v3\0R-runtime\0${installation}`);
+    const name = createHash('sha256').update(`agent-bot/stage2a-domain-snapshot/v3\0R-runtime\0${installation}`).digest('hex').slice(0, 24);
+    const sealed = `/private/var/db/managed-machine/soul-snapshots/r_${slot}/snap_${name}`;
+    return policy.node === `${sealed}/runtime/bin/node` && policy.entry === `${sealed}/runtime/bin/agent-bot-souls.mjs`;
+  })() : runtime(policy.node, 'bin/node', true) && runtime(policy.entry, 'bin/agent-bot-souls.mjs', false);
   return fields(binding.snapshots, 'definition,launch_inputs')
     && snapshot(binding.snapshots.definition, path('definition'), policy.machine_uid, runner.gid)
     && snapshot(binding.snapshots.launch_inputs, path('inputs'), policy.machine_uid, runner.gid)
-    && runtime(policy.node, 'bin/node', true)
-    && runtime(policy.entry, 'bin/agent-bot-souls.mjs', false)
+    && runtimeCode
     && absolute(request.definition_source) && absolute(request.launch_inputs_source);
+}
+
+function validRuntimeV3(runtime) {
+  if (!fields(runtime, 'inventory_source,inventory_digest,limits,components,source_roots')
+    || !absolute(runtime.inventory_source) || !digest.test(runtime.inventory_digest)
+    || !fields(runtime.limits, 'max_files,max_file_bytes,max_total_bytes')
+    || !Number.isSafeInteger(runtime.limits.max_files) || runtime.limits.max_files < 1 || runtime.limits.max_files > 512
+    || !Number.isSafeInteger(runtime.limits.max_file_bytes) || runtime.limits.max_file_bytes < 1 || runtime.limits.max_file_bytes > 402653184
+    || !Number.isSafeInteger(runtime.limits.max_total_bytes) || runtime.limits.max_total_bytes < 1 || runtime.limits.max_total_bytes > 1073741824
+    || !Array.isArray(runtime.components) || runtime.components.length < 3 || runtime.components.length > 32
+    || !object(runtime.source_roots) || Object.keys(runtime.source_roots).length !== runtime.components.length) return false;
+  let prior = '';
+  const roots = new Set();
+  const components = new Set();
+  for (const row of runtime.components) {
+    if (!object(row) || !['component_id,source_repository,source_commit,artifact_format,artifact_source,release_artifact_sha256,manifest_source,release_manifest_sha256',
+      'component_id,source_repository,source_commit,source_tag,artifact_format,artifact_source,release_artifact_sha256,manifest_source,release_manifest_sha256'].includes(Object.keys(row).join(','))
+      || !id.test(row.component_id) || row.component_id <= prior
+      || !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(row.source_repository)
+      || !/^[0-9a-f]{40}$/.test(row.source_commit)
+      || (row.source_tag !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._+/-]{0,127}$/.test(row.source_tag))
+      || !['tar', 'raw', 'zip'].includes(row.artifact_format)
+      || !absolute(row.artifact_source) || !absolute(row.manifest_source)
+      || !digest.test(row.release_artifact_sha256) || !digest.test(row.release_manifest_sha256)) return false;
+    const sourceRoot = runtime.source_roots[row.component_id];
+    if (!absolute(sourceRoot) || sourceRoot === '/private/var/db/managed-machine/soul-snapshots'
+      || sourceRoot.startsWith('/private/var/db/managed-machine/soul-snapshots/') || roots.has(sourceRoot)) return false;
+    roots.add(sourceRoot);
+    components.add(row.component_id);
+    prior = row.component_id;
+  }
+  return ['node', 'souls', 'adapter'].every(component => components.has(component));
+}
+
+function validMemberQualifiers(rows, base) {
+  if (!Array.isArray(rows) || rows.length !== 2
+    || base.client_key_sha256 !== 'sha256:da4fec28d868ca5cf8f00f43869f703f138bd4211683b8637a751b904860ddf0'
+    || base.response_text.length > 2048) return false;
+  let prior = '';
+  for (const row of rows) {
+    if (!fields(row, 'member_id,model,request_sha256,headers_sha256,client_key_sha256,http_host,messages_query,response_text')
+      || !id.test(row.member_id) || row.member_id <= prior
+      || Object.keys(base).some(key => row[key] !== base[key])) return false;
+    prior = row.member_id;
+  }
+  return true;
 }
 
 export function validProtectedInstallPlan(plan, roleUid, machineKey) {
@@ -111,14 +164,21 @@ export function validProtectedInstallPlan(plan, roleUid, machineKey) {
     || plan.purpose !== protectedInstallPurpose || !Array.isArray(plan.members)
     || plan.members.length !== 2 || !Array.isArray(plan.steps) || plan.steps.length !== 1) return false;
   const request = plan.soul_protected_launch;
-  if (!fields(request, 'schema,machine_public_key,artifact_source,bridge_binary_source,definition_source,launch_inputs_source,policy')
-    || request.schema !== 'agent-bot-machine/soul-protected-launch-install/v1'
+  const v3 = request?.schema === 'agent-bot-machine/soul-protected-launch-install/v3';
+  const memberSet = Object.hasOwn(request ?? {}, 'owner_plan_member_set_sha256');
+  if (!(v3 ? fields(request, memberSet
+    ? 'schema,machine_public_key,artifact_source,bridge_binary_source,definition_source,launch_inputs_source,runtime_v3,owner_plan_member_set_sha256,policy'
+    : 'schema,machine_public_key,artifact_source,bridge_binary_source,definition_source,launch_inputs_source,runtime_v3,policy')
+    : fields(request, 'schema,machine_public_key,artifact_source,bridge_binary_source,definition_source,launch_inputs_source,policy'))
+    || (v3 ? !validRuntimeV3(request.runtime_v3) : request.schema !== 'agent-bot-machine/soul-protected-launch-install/v1')
+    || (memberSet && (!v3 || !digest.test(request.owner_plan_member_set_sha256)))
     || typeof request.machine_public_key !== 'string' || !/^[0-9a-f]{64}$/.test(request.machine_public_key)
     || (machineKey !== undefined && request.machine_public_key !== machineKey)
     || ![request.artifact_source, request.bridge_binary_source, request.definition_source,
       request.launch_inputs_source].every(absolute)) return false;
   const policy = request.policy;
-  if (!fields(policy, 'schema,machine_account,machine_uid,machine_gid,plan_owner,hq_uid,approved_until,canonical_plan,root_receipt,claims,snapshot_namespace,relay_parent,legacy_spent_start_ids,launcher_sha256,artifact_path,runner,bridge,measurement_binding,definition,launch_inputs,node,entry,bridge_executable,bridge_qualification')
+  const policyFields = 'schema,machine_account,machine_uid,machine_gid,plan_owner,hq_uid,approved_until,canonical_plan,root_receipt,claims,snapshot_namespace,relay_parent,legacy_spent_start_ids,launcher_sha256,artifact_path,runner,bridge,measurement_binding,definition,launch_inputs,node,entry,bridge_executable,bridge_qualification';
+  if (!fields(policy, policyFields + (memberSet ? ',member_bridge_qualifications' : ''))
     || policy.schema !== 'agent-bot-machine/stage2a-installed-authority/v1'
     || typeof policy.machine_account !== 'string' || !account.test(policy.machine_account)
     || !Number.isSafeInteger(policy.machine_uid) || policy.machine_uid < 400
@@ -133,7 +193,8 @@ export function validProtectedInstallPlan(plan, roleUid, machineKey) {
     || !Array.isArray(policy.legacy_spent_start_ids) || policy.legacy_spent_start_ids.length !== 0
     || typeof policy.launcher_sha256 !== 'string' || !hex.test(policy.launcher_sha256)
     || !absolute(policy.artifact_path) || !absolute(policy.node) || !absolute(policy.entry)
-    || !validNested(policy, request)) return false;
+    || !validNested(policy, request)
+    || (memberSet && !validMemberQualifiers(policy.member_bridge_qualifications, policy.bridge_qualification))) return false;
   const binding = policy.measurement_binding;
   const runner = policy.runner;
   const bridge = policy.bridge;
@@ -166,7 +227,7 @@ export function validProtectedInstallPlan(plan, roleUid, machineKey) {
     && policy.artifact_path === `${root}/soul-artifacts/${prefix(binding.installation_id, 'agent-bot-soul-endpoint-installation/v1\0')}.soul`
     && fields(step, 'kind,target,action,detail')
     && step.kind === 'soul-protected-launch' && step.target === binding.installation_id
-    && step.action === 'write' && step.detail === detail;
+    && step.action === 'write' && step.detail === (v3 ? runtimeDetail : detail);
 }
 
 export function checkProtectedInstallPlan(plan, roleUid, machineKey) {

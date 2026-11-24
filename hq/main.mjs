@@ -54,7 +54,7 @@ import { createStage2aCooperativeMachine } from './stage2a-cooperative-machine.m
 import { createStage2aCooperativeStarter } from './stage2a-cooperative-start.mjs';
 import { createStage2aQualificationProvider } from './stage2a-qualification-provider.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine soul-bridge-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
