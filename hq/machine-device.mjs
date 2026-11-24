@@ -57,7 +57,7 @@ function checkLegacy(home) {
     ' Verify enrollment history before authorizing a custody change.');
 }
 
-export function createMachineSigner({ home, enrollment, request = machineRoleDevice, capture = capturePairedEnrollmentProof, keysFor = releaseServerKeys, clock = { now: Date.now } }) {
+export function createMachineSigner({ home, enrollment, localOnly = false, request = machineRoleDevice, capture = capturePairedEnrollmentProof, keysFor = releaseServerKeys, clock = { now: Date.now } }) {
   let current;
   let reason = 'Machine device identity has not been verified';
   let disconnectedPair;
@@ -91,6 +91,12 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
       checkLegacy(home);
       const response = await request('identity', undefined, expectedPair);
       const identity = checkReply(response, 'identity');
+      if (localOnly) {
+        const files = inspectFiles(home, 'identity', ['device.json', 'device.previous.json', 'pending-receipt.json']);
+        if (identity.device_id || files.some(file => file.state !== 'absent')) {
+          throw new Error('Local-only HQ requires an unlinked Machine and no prior or pending HQ enrollment records');
+        }
+      }
       if (started !== revision) throw new Error('Machine custody changed during the identity check');
       current = { ...identity, pair: verifiedMachinePair(response) };
       disconnectedPair = undefined;
@@ -142,18 +148,20 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
       thumbprint: current.thumbprint, generation: current.generation, key_files: 0 }
       : { available: false, backend: 'machine', reason };
   }
-  const signer = {
+  async function deviceStatus(expectedPair) {
+    await refresh(expectedPair);
+    return localOnly ? 'unenrolled' : enrollment.deviceStatus();
+  }
+  const machineSigner = {
     source: 'paired Machine/keyd', report,
     disconnectedPair: () => disconnectedPair,
-    async recheckPair(pair) {
-      await refresh(pair);
-      return enrollment.deviceStatus();
-    },
-    async deviceStatus() {
-      await refresh();
-      const state = await enrollment.deviceStatus();
-      return state;
-    },
+    recheckPair: deviceStatus,
+    deviceStatus: () => deviceStatus(),
+    sign() { unavailable('Machine approval-record signing is unavailable'); },
+  };
+  if (localOnly) return { ...machineSigner, verify: () => false };
+  const signer = {
+    ...machineSigner,
     async enroll(payload) {
       await refresh();
       return enrollment.enroll(payload);
@@ -300,7 +308,6 @@ export function createMachineSigner({ home, enrollment, request = machineRoleDev
       requestProof() { unavailable('Machine has no authorized DPoP action for this operation'); },
     },
     createKey() { unavailable('Device key rotation requires administrator action in Machine/keyd'); },
-    sign() { unavailable('Machine approval-record signing is unavailable'); },
     async verify(bytes, signature) {
       try {
         await refresh();
