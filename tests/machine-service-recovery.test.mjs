@@ -205,6 +205,62 @@ function upgradePlan(change = () => {}) {
   return { plan_id: id, plan_digest: createHash('sha256').update(plan_canonical).digest('hex'), plan_canonical };
 }
 
+function stage2aUpgradePlan(change = () => {}) {
+  return upgradePlan((content, service) => {
+    const installation = 'hq-test-123';
+    const hash = (domain) => createHash('sha256').update(`agent-bot/stage2a-domain-${domain}/v3\0H-code\0${installation}`).digest('hex');
+    const namespace = `/private/var/db/managed-machine/soul-snapshots/hq_${hash('slot').slice(0, 20)}`;
+    const snapshot = hash('snapshot').slice(0, 24);
+    const root = `${namespace}/snap_${snapshot}`;
+    const sha = 'sha256:' + 'a'.repeat(64);
+    content.next.service.stage2a = {
+      host_id: 'test-host', installation_id: installation, machine_account: '_agent-bot-machine',
+      machine_uid: 501, machine_gid: 501, reader_uid: 301, reader_gid: 301,
+      authority_key_sha256: sha, guard_module_sha256: sha,
+      preloader_path: 'hq/stage2a-h-preloader.mjs', inventory_source: '/test/inventory.jcs',
+      inventory_digest: sha, inventory_limits: { max_files: 20, max_file_bytes: 1024, max_total_bytes: 2048 },
+      contracts_source: { tag: 'v0.10.2', commit: 'b'.repeat(40), full_digest: sha,
+        full_files: 10, runtime_digest: sha, runtime_files: 10 },
+      components: [{ component_id: 'hq' }, { component_id: 'node' }],
+    };
+    const runtime = [`${root}/bin/node`, '--no-addons', '--disallow-code-generation-from-strings',
+      '--import', `${root}/hq/stage2a-h-preloader.mjs`, `${root}/hq/main.mjs`, 'run', '--home',
+      '/var/agent-bot-hq/.agent-bot-hq', '--owner-account', 'operator'];
+    const outer = ['/usr/bin/ruby', '--disable-gems', `${root}/helpers/darwin-owner.rb`, 'launch', ...runtime];
+    content.next.stage2a = {
+      namespace, root, inventory_path: `${namespace}/inventory_${snapshot}.jcs`,
+      public_key_path: '/Library/Application Support/ai.true-line.agent-bot-hq/soul-authority.pub',
+      descriptor_path: '/Library/Application Support/ai.true-line.agent-bot-hq/h-v3/descriptor.json',
+      ruby_sha256: sha, guard_module_path: `${root}/hq/stage2a-selected-code.mjs`, launcher_sha256: sha,
+      runtime_argv: runtime, outer_argv: outer,
+    };
+    content.next.plist = content.next.plist.replace(/(<key>ProgramArguments<\/key><array>\n)[\s\S]*?(<\/array>)/,
+      (_, start, end) => start + outer.map((arg) => `<string>${arg}</string>\n`).join('') + end);
+    change(content, service);
+  });
+}
+
+test('paired service upgrade accepts the Machine v3 H launch and rejects changed launch inputs', arm, async (t) => {
+  const f = await fixture(t, 'hq-service-upgrade');
+  await f.pin();
+  f.state.saved = stage2aUpgradePlan();
+  const exported = await f.issue();
+  assert.equal(exported, f.state.raw);
+  for (const change of [
+    (c) => { c.next.stage2a.outer_argv[5] = '--inspect'; },
+    (c) => { c.next.stage2a.root += '-other'; },
+    (c) => { c.next.stage2a.descriptor_path += '-other'; },
+    (c) => { c.next.service.stage2a.preloader_path = 'hq/other.mjs'; },
+    (c) => { c.next.plist = c.next.plist.replace('--no-addons', '--inspect'); },
+    (c) => { c.previous.stage2a = c.next.stage2a; },
+  ]) {
+    f.state.saved = stage2aUpgradePlan(change);
+    const before = f.requests.length;
+    await assert.rejects(f.issue());
+    assert.deepEqual(f.requests.slice(before).map((r) => r.verb), ['members-plans']);
+  }
+});
+
 test('paired service upgrade verifies both signed releases and requires its own owner consent', arm, async (t) => {
   const purpose = 'hq-service-upgrade';
   const f = await fixture(t, purpose);
