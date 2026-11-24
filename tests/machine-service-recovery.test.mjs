@@ -839,6 +839,47 @@ function qualificationPlan(change, { previewOnly = false } = {}) {
   return { plan_id: id, plan_digest: createHash('sha256').update(plan_canonical).digest('hex'), plan_canonical };
 }
 
+test('paired qualification reads Machine schema 2 candidate plans and rejects changed bindings', () => {
+  const candidate = {
+    host_uuid: 'A0000000-0000-0000-0000-000000000001',
+    installation_id: 'installation-1',
+    installed_plan_digest: 'a'.repeat(64),
+    runtime_inventory_sha256: 'b'.repeat(64),
+    component_id: 'claude',
+    manifest: { path: '/Library/AgentBotQualificationSmoke620/manifest.json', sha256: 'c'.repeat(64) },
+    test_plan: { path: '/Library/AgentBotQualificationSmoke620/test-plan.json', sha256: 'd'.repeat(64) },
+  };
+  const schema2 = change => qualificationPlan((plan, run) => {
+    run.request = { candidate: structuredClone(candidate), ...run.request, schema_version: 2 };
+    change?.(plan, run);
+  });
+  assert.equal(validatedMembersPlan(id, { state: 'found', body: schema2() }).purpose, qualificationPurpose);
+  const pendingRunner = change => schema2((_plan, run) => {
+    run.request.runner.binary_path = '/private/var/db/managed-machine/qualification-q/qualification-runner.mjs';
+    run.request.runner.source_path = '/Library/AgentBotQualificationSmoke620/qualification-runner.mjs';
+    change?.(run.request.runner);
+  });
+  assert.equal(validatedMembersPlan(id, { state: 'found', body: pendingRunner() }).purpose, qualificationPurpose);
+  for (const change of [
+    r => { delete r.source_path; },
+    r => { r.source_path = r.binary_path; },
+    r => { r.source_path = '/private/var/db/managed-machine/qualification-q/source.mjs'; },
+    r => { r.source_path = 'relative/source.mjs'; },
+  ]) {
+    assert.throws(() => validatedMembersPlan(id, { state: 'found', body: pendingRunner(change) }),
+      /unsupported structure/);
+  }
+  for (const change of [
+    r => { r.candidate.host_uuid = 'not-a-host-uuid'; },
+    r => { r.candidate.installed_plan_digest = 'not-a-digest'; },
+    r => { r.candidate.manifest.path = '../relative'; },
+    r => { r.candidate.extra = true; },
+  ]) {
+    assert.throws(() => validatedMembersPlan(id, { state: 'found', body: schema2((_plan, run) => change(run.request)) }),
+      /unsupported structure/);
+  }
+});
+
 test('paired qualification transfers only the exact signed plan and accepts a purpose-bound proof', arm, async (t) => {
   const f = await fixture(t, qualificationPurpose);
   await assert.rejects(machineCommandInHome(
@@ -881,6 +922,7 @@ test('paired qualification refuses a re-digested plan outside the fixed test sco
   await f.pin();
   for (const change of [
     (plan) => { plan.steps[0].action = 'create'; },
+    (_plan, run) => { run.request = null; },
     (_plan, run) => { run.one_use = false; },
     (_plan, run) => { run.member_state = 'ambient'; },
     (_plan, run) => { run.gates[3].profile = 'managed-protected'; },
