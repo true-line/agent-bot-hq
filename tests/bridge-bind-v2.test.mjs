@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createHmac } from 'node:crypto';
+import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
 import { bridgeBindProofV2, createBridgeBindAdmission } from '../hq/bridge-bind.mjs';
 
 const key = Buffer.alloc(32, 0x41);
@@ -15,8 +16,12 @@ const context = Object.freeze({ ...selectors, hq_epoch: 'd'.repeat(64), bridge_u
   soul_artifact_sha256: `sha256:${'f'.repeat(64)}` });
 const connection = { connection: 'bb_1' };
 const denied = { code: 'host.launch_unavailable' };
+const relayPeer = { uid: 321, pid: 700, pid_version: 1, start_seconds: 1795520001,
+  start_micros: 120000, parent_pid: 600, parent_uid: 321,
+  parent_start_seconds: 1795520000, parent_start_micros: 110000 };
 
-function fixture({ timers, qualificationAuthorizer, relayIngressAuthorizer } = {}) {
+function fixture({ timers, qualificationAuthorizer, relayIngressAuthorizer,
+  relayPrewriteAuthorizer, relayCompletionAuthorizer } = {}) {
   let now = 1_000;
   let sequence = 0;
   let verified = context;
@@ -32,6 +37,8 @@ function fixture({ timers, qualificationAuthorizer, relayIngressAuthorizer } = {
   const service = createBridgeBindAdmission({
     qualificationAuthorizer,
     relayIngressAuthorizer,
+    relayPrewriteAuthorizer,
+    relayCompletionAuthorizer,
     authority: {
       async verifyLiveStartV2(scope, peer, phase) {
         scopes.push([scope, peer]);
@@ -309,6 +316,7 @@ test('a finalized receipt refuses if Machine subsequently loses finalized live a
 });
 
 const qualificationRequest = { model: 'fixture-model', prompt_sha256: `sha256:${'a'.repeat(64)}` };
+const relayRequest = { ...qualificationRequest, peer: relayPeer };
 const qualificationResult = { model: qualificationRequest.model, text: 'fixture', stop_reason: 'end_turn',
   usage: { input_tokens: 1, output_tokens: 1 } };
 
@@ -368,7 +376,7 @@ test('a synthetic qualification callback cannot enable installed test-provider r
   assert.equal(f.service.bridgeRelayIngressEnabledV2(), false);
   const { bind_receipt } = await f.bind();
   f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
-  await assert.rejects(f.service.relayBridgeIngressV2(qualificationRequest, connection, bind_receipt), denied);
+  await assert.rejects(f.service.relayBridgeIngressV2(relayRequest, connection, bind_receipt), denied);
   assert.throws(() => fixture({ qualificationAuthorizer: async () => qualificationResult,
     relayIngressAuthorizer: async () => qualificationResult }), /cannot share a bridge/);
   await f.service.revokeAll();
@@ -383,18 +391,18 @@ test('installed test-provider relay ingress needs the exact finalized B connecti
   assert.equal(f.service.bridgeRelayIngressEnabledV2(), true);
   const { bind_receipt } = await f.bind();
   f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
-  const relay = (input = qualificationRequest, peer = connection, receipt = bind_receipt) =>
+  const relay = (input = relayRequest, peer = connection, receipt = bind_receipt) =>
     f.service.relayBridgeIngressV2(input, peer, receipt);
-  await assert.rejects(relay(qualificationRequest, { connection: 'bb_other' }), denied);
-  await assert.rejects(relay(qualificationRequest, connection, '0'.repeat(64)), denied);
+  await assert.rejects(relay(relayRequest, { connection: 'bb_other' }), denied);
+  await assert.rejects(relay(relayRequest, connection, '0'.repeat(64)), denied);
   for (const field of ['reservation_sha256', 'bind_receipt_sha256', 'path', 'credential']) {
-    await assert.rejects(relay({ ...qualificationRequest, [field]: 'caller-claim' }), denied);
+    await assert.rejects(relay({ ...relayRequest, [field]: 'caller-claim' }), denied);
   }
   assert.deepEqual(authorizations, []);
   assert.deepEqual(await relay(), qualificationResult);
   await assert.rejects(relay(), denied);
   assert.equal(authorizations.length, 1);
-  assert.deepEqual(authorizations[0].request, qualificationRequest);
+  assert.deepEqual(authorizations[0].request, relayRequest);
   assert.equal(authorizations[0].observation.reservation_digest, selectors.reservation_digest);
   assert.equal(authorizations[0].observation.bind_receipt_sha256, digest(bind_receipt));
   assert.equal(Object.hasOwn(authorizations[0].observation, 'proof_key'), false);
@@ -404,7 +412,7 @@ test('installed test-provider relay ingress needs the exact finalized B connecti
 test('installed test-provider relay ingress refuses unfinalized B and a disconnected in-flight result', async () => {
   const unfinalized = fixture({ relayIngressAuthorizer: async () => assert.fail('unfinalized B dispatched') });
   const first = await unfinalized.bind();
-  await assert.rejects(unfinalized.service.relayBridgeIngressV2(qualificationRequest, connection, first.bind_receipt), denied);
+  await assert.rejects(unfinalized.service.relayBridgeIngressV2(relayRequest, connection, first.bind_receipt), denied);
   assert.equal(unfinalized.stops.length, 1);
 
   const entered = Promise.withResolvers();
@@ -412,9 +420,9 @@ test('installed test-provider relay ingress refuses unfinalized B and a disconne
   const raced = fixture({ relayIngressAuthorizer: () => { entered.resolve(); return answer.promise; } });
   const second = await raced.bind();
   raced.setVerified({ ...context, finalized_live_expires_at: 90_000 });
-  const pending = assert.rejects(raced.service.relayBridgeIngressV2(qualificationRequest, connection, second.bind_receipt), denied);
+  const pending = assert.rejects(raced.service.relayBridgeIngressV2(relayRequest, connection, second.bind_receipt), denied);
   await entered.promise;
-  await assert.rejects(raced.service.relayBridgeIngressV2(qualificationRequest, connection, second.bind_receipt), denied);
+  await assert.rejects(raced.service.relayBridgeIngressV2(relayRequest, connection, second.bind_receipt), denied);
   await raced.service.forgetBridgeConnection(connection.connection, second.bind_receipt);
   answer.resolve(qualificationResult);
   await pending;
@@ -429,8 +437,132 @@ test('installed test-provider relay ingress contains an altered response without
   } });
   const { bind_receipt } = await f.bind();
   f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
-  await assert.rejects(f.service.relayBridgeIngressV2(qualificationRequest, connection, bind_receipt), denied);
-  await assert.rejects(f.service.relayBridgeIngressV2(qualificationRequest, connection, bind_receipt), denied);
+  await assert.rejects(f.service.relayBridgeIngressV2(relayRequest, connection, bind_receipt), denied);
+  await assert.rejects(f.service.relayBridgeIngressV2(relayRequest, connection, bind_receipt), denied);
   assert.equal(calls, 1);
   assert.equal(f.stops.length, 1);
+});
+
+test('B completion needs the same finalized ingress and records one checked client write', async () => {
+  const completed = [];
+  const prewrites = [];
+  const f = fixture({ relayIngressAuthorizer: async () => qualificationResult,
+    relayPrewriteAuthorizer: async (value) => {
+      prewrites.push(value);
+      return { accepted: true, prewrite_receipt: 'a'.repeat(64) };
+    },
+    relayCompletionAuthorizer: async (value) => { completed.push(value); return true; } });
+  assert.equal(f.service.bridgeRelayPrewriteEnabledV2(), true);
+  assert.equal(f.service.bridgeRelayCompletionEnabledV2(), true);
+  const { bind_receipt } = await f.bind();
+  f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
+  const prewrite = { selectors, bind_receipt_sha256: digest(bind_receipt),
+    request_sha256: qualificationRequest.prompt_sha256, prompt_sha256: digest('stock prompt'),
+    model: qualificationRequest.model, peer: relayPeer, peer_sha256: canonicalDigest(relayPeer), http_status: 200,
+    response_wire_sha256: digest('HTTP/1.1 200 OK\r\n'), response_wire_bytes: 19 };
+  const completion = { ...prewrite,
+    write_started_at: '2026-11-24T01:02:03.123456789Z',
+    write_completed_at: '2026-11-24T01:02:03.124456789Z',
+    prewrite_receipt: 'a'.repeat(64), completion_origin_mac: 'b'.repeat(64) };
+  const report = (value = completion, peer = connection, receipt = bind_receipt) =>
+    f.service.completeBridgeIngressV2(value, peer, receipt);
+  await assert.rejects(report(), denied);
+  await assert.rejects(report(completion, { connection: 'bb_other' }), denied);
+  await f.service.relayBridgeIngressV2(relayRequest, connection, bind_receipt);
+  assert.notEqual(prewrite.request_sha256, prewrite.prompt_sha256);
+  await assert.rejects(report(), denied);
+  await assert.rejects(f.service.prewriteBridgeRelayV2({ ...prewrite, peer_sha256: digest('wrong') },
+    connection, bind_receipt), denied);
+  await assert.rejects(f.service.prewriteBridgeRelayV2(prewrite, { connection: 'bb_other' }, bind_receipt), denied);
+  assert.deepEqual(await f.service.prewriteBridgeRelayV2(prewrite, connection, bind_receipt),
+    { accepted: true, prewrite_receipt: 'a'.repeat(64) });
+  assert.equal(prewrites.length, 1);
+  assert.equal(prewrites[0].prewrite.prompt_sha256, prewrite.prompt_sha256);
+  await assert.rejects(f.service.prewriteBridgeRelayV2(prewrite, connection, bind_receipt), denied);
+  await assert.rejects(report({ ...completion, selectors: { ...selectors, start_id: `st_${'0'.repeat(24)}` } }), denied);
+  await assert.rejects(report({ ...completion, request_sha256: digest('other request') }), denied);
+  await assert.rejects(report({ ...completion, prompt_sha256: undefined }), denied);
+  await assert.rejects(report({ ...completion, peer_sha256: digest('wrong peer') }), denied);
+  await assert.rejects(report({ ...completion, peer: { ...relayPeer, pid_version: 2 },
+    peer_sha256: canonicalDigest({ ...relayPeer, pid_version: 2 }) }), denied);
+  await assert.rejects(report({ ...completion, http_status: 503 }), denied);
+  await assert.rejects(report({ ...completion, prewrite_receipt: 'c'.repeat(64) }), denied);
+  await assert.rejects(report({ ...completion, response_wire_sha256: digest('different wire') }), denied);
+  await assert.rejects(report({ ...completion, completion_origin_mac: 'bad' }), denied);
+  assert.equal(completed.length, 0);
+  assert.deepEqual(await report(), { accepted: true });
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].completion.response_wire_sha256, completion.response_wire_sha256);
+  assert.equal(completed[0].observation.bind_receipt_sha256, completion.bind_receipt_sha256);
+  await assert.rejects(report(), denied);
+  await f.service.revokeAll();
+});
+
+test('a late Machine prewrite response after B disconnect cannot authorize completion', async () => {
+  const entered = Promise.withResolvers();
+  const answer = Promise.withResolvers();
+  let completed = 0;
+  const f = fixture({ relayIngressAuthorizer: async () => qualificationResult,
+    relayPrewriteAuthorizer: () => { entered.resolve(); return answer.promise; },
+    relayCompletionAuthorizer: async () => { completed++; return true; } });
+  const { bind_receipt } = await f.bind();
+  f.setVerified({ ...context, finalized_live_expires_at: 90_000 });
+  await f.service.relayBridgeIngressV2(relayRequest, connection, bind_receipt);
+  const prewrite = { selectors, bind_receipt_sha256: digest(bind_receipt),
+    request_sha256: qualificationRequest.prompt_sha256, prompt_sha256: digest('different prompt'),
+    model: qualificationRequest.model, peer: relayPeer, peer_sha256: canonicalDigest(relayPeer),
+    response_wire_sha256: digest('wire'), response_wire_bytes: 4, http_status: 200 };
+  const pending = assert.rejects(f.service.prewriteBridgeRelayV2(prewrite, connection, bind_receipt), denied);
+  await entered.promise;
+  await f.service.forgetBridgeConnection(connection.connection, bind_receipt);
+  answer.resolve({ accepted: true, prewrite_receipt: 'a'.repeat(64) });
+  await pending;
+  await assert.rejects(f.service.completeBridgeIngressV2({ ...prewrite,
+    write_started_at: '2026-11-24T01:02:03Z', write_completed_at: '2026-11-24T01:02:04Z',
+    prewrite_receipt: 'a'.repeat(64), completion_origin_mac: 'b'.repeat(64) },
+  connection, bind_receipt), denied);
+  assert.equal(completed, 0);
+  assert.equal(f.stops.length, 1);
+});
+
+test('v3 binds the exact member set and gates finalized state on the same B connection', async () => {
+  const { launch_id: _legacyLaunch, ...base } = selectors;
+  const v3 = { ...base, assignment_envelope_sha256: digest('assignment'),
+    authority_envelope_sha256: digest('authority'), member_selectors_sha256: digest('selectors') };
+  const process = { pid: 401, uid: context.bridge_uid, gid: context.bridge_uid,
+    start_seconds: 1234, start_micros: 56, executable_sha256: digest('bridge') };
+  let verified = { ...context, ...v3, b_authority_sha256: v3.reservation_digest, bridge_process: process };
+  let current = true;
+  let sequence = 0;
+  const label = 'agent-bot-stage2a-bridge-bind-v3';
+  const proofFor = (nonce) => createHmac('sha256', key).update([
+    label, nonce, context.hq_epoch, v3.installation_id, v3.start_id, v3.plan_id, v3.plan_digest,
+    v3.reservation_digest, v3.assignment_envelope_sha256, v3.authority_envelope_sha256,
+    v3.member_selectors_sha256, String(context.bridge_uid), context.broker_socket,
+  ].join('\0')).digest('hex');
+  const svc = createBridgeBindAdmission({ authority: {
+    verifyLiveStartV3: async () => verified,
+    verifyProofV3: async (request, id) => id === connection.connection
+      && request.proof === proofFor(request.challenge) && request.member_selectors_sha256 === v3.member_selectors_sha256,
+    matchesAssignmentV3: () => true,
+    isCurrentPeerV3: () => current,
+    onDisconnectV3: async () => true,
+  }, clock: { now: () => 1000 }, random: { hex: () => (++sequence).toString(16).padStart(64, '0') },
+  receipts: { append: async () => {} } });
+  try {
+    const challenge = await svc.bridgeBindChallengeV3(v3, connection);
+    assert.equal(challenge.context, label);
+    const proof = { ...v3, proof: proofFor(challenge.nonce) };
+    await assert.rejects(svc.verifyBridgeBindingV3(proof, { connection: 'bb_other' }), denied);
+    const { bind_receipt } = await svc.verifyBridgeBindingV3(proof, connection);
+    assert.equal(svc.currentBridgeConnectionV3(connection.connection, bind_receipt), true);
+    await assert.rejects(svc.finalizedBridgeConnectionV3(connection.connection, bind_receipt), denied);
+    verified = { ...verified, finalized_live_expires_at: 10_000 };
+    const finalized = await svc.finalizedBridgeConnectionV3(connection.connection, bind_receipt);
+    assert.equal(finalized.member_selectors_sha256, v3.member_selectors_sha256);
+    assert.deepEqual(finalized.bridge_process, process);
+    current = false;
+    assert.equal(svc.currentBridgeConnectionV3(connection.connection, bind_receipt), false);
+    await assert.rejects(svc.finalizedBridgeConnectionV3(connection.connection, bind_receipt), denied);
+  } finally { await svc.revokeAll(); }
 });

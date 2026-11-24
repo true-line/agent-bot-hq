@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import fs, { readFileSync, writeFileSync } from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
-import { DIGEST, SOUL, hello, startHQ } from './hq-harness.mjs';
+import { pathToFileURL } from 'node:url';
+import { bindProof, PROTECTED_GRANT_REFUSAL_RECEIPT } from '../hq/admission.mjs';
+import { commsCheckout } from './support/comms-checkout.mjs';
+import { legacySigner } from '../hq/legacy.mjs';
+import { DIGEST, SOUL, fakeLegacy, hello, schemas, startHQ } from './hq-harness.mjs';
 
 const sha = (byte) => `sha256:${byte.repeat(64)}`;
 const next = () => {
@@ -14,7 +18,7 @@ const next = () => {
 
 // Synthetic trusted-client fixture: it exercises HQ sequencing only. It is
 // not a Machine signature or qualification proof and cannot enable production.
-function machine({ finalized, entered, aborts, cooperativePeers = 0 }) {
+function machine({ finalized, entered, aborts, cooperativePeers = 0, startByte = '1' }) {
   return {
     async acceptPeer() { return cooperativePeers-- > 0 ? null : { machine_peer: 'fixture-live-R' }; },
     async peerDisconnected(_socket, context) { if (context) this.onLoss?.(); },
@@ -23,9 +27,9 @@ function machine({ finalized, entered, aborts, cooperativePeers = 0 }) {
     watchHealthy() { return true; },
     async verifyHelloStart({ connection, payload, hello_payload_sha256: digest }) {
       assert.equal(connection.machine_peer, 'fixture-live-R');
-      return { reservation_sha256: sha('a'), definition_measurement: sha('b'),
+      return { reservation_sha256: sha(startByte === '1' ? 'a' : '9'), definition_measurement: sha('b'),
         launch_input_measurement: sha('c'), broker_bind_receipt_sha256: sha('d'),
-        start_id: `st_${'1'.repeat(24)}`, launch_id: `ln_${'2'.repeat(24)}`,
+        start_id: `st_${startByte.repeat(24)}`, launch_id: `ln_${'2'.repeat(24)}`,
         hq_epoch: '3'.repeat(64), soul_id: payload.soul_id,
         installation_id: payload.installation_id, definition_digest: payload.definition_digest,
         hello_payload_sha256: digest, profile_in_force: 'managed-protected' };
@@ -416,4 +420,157 @@ test('failed Machine watcher transport closes active runtime and lease authority
     assert.equal(held, false);
     assert.ok(aborts.includes(expected.start_id));
   } finally { await t.done(); }
+});
+
+test('a protected grant belongs to its bound runtime before and after HQ restart', async () => {
+  let home;
+  let priorHandle;
+  for (const [index, startByte] of ['1', '2'].entries()) {
+    const finalized = next();
+    const entered = next();
+    const t = await startProtectedHQ({ home, protectedAdmission: machine({ finalized, entered, aborts: [], startByte }) });
+    home = t.home;
+    try {
+      const entry = await t.entry();
+      const pending = entry.request('Hello', hello({ request_id: `req_grant_${index}` }));
+      const expected = await Promise.race([entered.promise, pending.then((response) => {
+        throw new Error(`Hello returned before grant test finalization: ${JSON.stringify(response)}`);
+      })]);
+      finalized.resolve(expected);
+      const admission = await pending;
+      assert.equal(admission.ok, true, JSON.stringify(admission));
+      const [a, b] = admission.result.admitted_runtimes;
+      const equips = await Promise.all([a, b].map(({runtime_id}) => entry.request('Equip', { runtime_id })));
+      assert.ok(equips.every(({ok}) => ok));
+      const [handleA, handleB] = equips.map(({result}) => result.grant_handles[0].handle);
+      assert.notEqual(handleA, handleB);
+
+      let effects = 0;
+      const effect = (scope) => {
+        effects++;
+        assert.equal(scope.start_id, `st_${startByte.repeat(24)}`);
+        assert.equal(scope.grant_handle, undefined);
+        return scope.member_id;
+      };
+      const { withProtectedGrant } = t.hq.host.provided('hq-admission');
+      await assert.rejects(withProtectedGrant(a.runtime_id, handleA + '\n', sha('c'), effect),
+        (error) => error.code === 'host.invalid_request');
+      await assert.rejects(withProtectedGrant(a.runtime_id, handleA, sha('c') + '\n', effect),
+        (error) => error.code === 'host.invalid_request');
+      assert.equal(await withProtectedGrant(a.runtime_id, handleA, sha('c'), effect), a.member_id);
+      assert.equal(await withProtectedGrant(b.runtime_id, handleB, sha('d'), effect), b.member_id);
+      let committedRefusal;
+      await assert.rejects(withProtectedGrant(b.runtime_id, handleA, sha('e'), effect),
+        (error) => {
+          committedRefusal = error[PROTECTED_GRANT_REFUSAL_RECEIPT];
+          return error.code === 'caller_mismatch';
+        });
+      if (priorHandle) {
+        assert.notEqual(priorHandle, handleA);
+        await assert.rejects(withProtectedGrant(b.runtime_id, priorHandle, sha('f'), effect),
+          (error) => error.code === 'caller_mismatch');
+      }
+      assert.equal(effects, 2);
+      priorHandle = handleA;
+
+      const { receipts } = JSON.parse(readFileSync(join(home, 'store.json'), 'utf8'));
+      const issued = receipts.find(({kind, runtime_id}) => kind === 'hq.equip' && runtime_id === a.runtime_id);
+      const denied = receipts.find(({kind, runtime_id}) => kind === 'hq.protected.grant.refused' && runtime_id === b.runtime_id);
+      assert.deepEqual(committedRefusal, denied);
+      assert.ok(denied.seq > issued.seq);
+      assert.equal(denied.grant_handle_sha256, issued.grant_handle_sha256);
+      assert.equal(denied.start_id, issued.start_id);
+      assert.equal(denied.member_id, b.member_id);
+      assert.equal(denied.request_sha256, sha('e'));
+      assert.equal(denied.effect_invoked, false);
+      assert.equal(JSON.stringify(receipts).includes(handleA), false);
+      assert.equal(JSON.stringify(receipts).includes(handleB), false);
+      if (index === 1) assert.equal(receipts.filter(({kind}) => kind === 'hq.protected.grant.refused').length, 3);
+    } finally {
+      await t.done({ keep: index === 0 });
+    }
+  }
+});
+
+test('a cooperative runtime cannot use a protected grant even with its own equipped handle', async () => {
+  const t = await startHQ();
+  try {
+    const entry = await t.entry();
+    const admitted = await entry.request('Hello', hello());
+    assert.equal(admitted.result.profile, 'managed-cooperative');
+    const { runtime_id } = admitted.result.admitted_runtimes[0];
+    const equipped = await entry.request('Equip', { runtime_id });
+    const { handle } = equipped.result.grant_handles[0];
+    const { withProtectedGrant } = t.hq.host.provided('hq-admission');
+    await assert.rejects(withProtectedGrant(runtime_id, handle, sha('a'), () => assert.fail('protected effect')),
+      (error) => error.code === 'profile_insufficient');
+  } finally { await t.done(); }
+});
+
+
+test('protected notice peek refuses copied real Equip handles at the bound broker across restart', async () => {
+  const { brokerPlugin } = await import(pathToFileURL(join(commsCheckout(), 'lib/hq-plugin/broker.mjs')).href);
+  const kind = 'hq.notices.protected.peek.v1';
+  const harness = 'notice-bot';
+  const repo = 'Example/Project';
+  // Exercise the proposed closed wire in the source fixture. Production
+  // registration requires this schema in the authenticated Contracts bundle.
+  const protectedPeek = {
+    type: 'object', additionalProperties: false, required: ['grant_handle', 'query'],
+    properties: { grant_handle: { type: 'string', pattern: '^gh_[a-f0-9]{32}$' },
+      query: { $ref: schemas['notice-query'].$id } },
+  };
+  let home;
+  let previousHandle;
+  for (const [index, startByte] of ['1', '2'].entries()) {
+    const finalized = next();
+    const entered = next();
+    const t = await startProtectedHQ({ home, protectedAdmission: machine({ finalized, entered, aborts: [], startByte }),
+      schemas: { ...schemas, 'protected-notice-peek': protectedPeek },
+      enrollment: { ...legacySigner({ run: fakeLegacy().run }), allowsHarness: (name) => name === harness },
+      config: { acceptedDefinitions: { [SOUL]: [DIGEST] }, notices: { harnesses: [harness],
+        scopes: hello().requested_roles.map(({ member_id, adapter_id, role }) => ({
+          soul_id: SOUL, definition_digest: DIGEST, member_id, adapter_id, role, harness, repo,
+        })) } },
+      plugins: [brokerPlugin({ noticeTimers: { setTimer: () => ({ unref() {} }), clearTimer() {} } })] });
+    home = t.home;
+    try {
+      const entry = await t.entry();
+      const pending = entry.request('Hello', hello({ request_id: `req_notice_grant_${index}` }));
+      finalized.resolve(await Promise.race([entered.promise, pending.then(() => {
+        throw new Error('Hello completed before protected finalization');
+      })]));
+      const admission = await pending;
+      assert.equal(admission.ok, true, JSON.stringify(admission));
+      const [r1, b2] = admission.result.admitted_runtimes;
+      const handles = await Promise.all([r1, b2].map(async ({ runtime_id }) => {
+        const response = await entry.request('Equip', { runtime_id });
+        assert.equal(response.ok, true, JSON.stringify(response));
+        return response.result.grant_handles[0].handle;
+      }));
+      const peer = await t.member();
+      const nonce = await peer.request('bind.challenge', { runtime_id: r1.runtime_id });
+      assert.equal(nonce.ok, true, JSON.stringify(nonce));
+      const bound = await peer.request('bind', { runtime_id: r1.runtime_id,
+        proof: bindProof(r1.channel_binding, nonce.result.nonce, r1.runtime_id) });
+      assert.equal(bound.ok, true, JSON.stringify(bound));
+      const query = { contract: 'hq/v1', request_id: 't01_notice_peek', operation: 'peek',
+        required_capabilities: ['notices-v1'], installation_epoch: admission.result.installation_epoch,
+        lease_generation: admission.result.lease_generation };
+      const own = await peer.request(kind, { grant_handle: handles[0], query });
+      assert.equal(own.ok, true, JSON.stringify(own));
+      assert.deepEqual(own.result.notices, []);
+      for (const handle of [handles[1], ...(previousHandle ? [previousHandle] : [])]) {
+        const refused = await peer.request(kind, { grant_handle: handle, query });
+        assert.equal(refused.refusal?.error ?? refused.host_refusal?.code, 'caller_mismatch', JSON.stringify(refused));
+      }
+      previousHandle = handles[1];
+      const { receipts } = JSON.parse(readFileSync(join(home, 'store.json'), 'utf8'));
+      const issued = receipts.find(r => r.kind === 'hq.equip' && r.runtime_id === b2.runtime_id);
+      const refusals = receipts.filter(r => r.kind === 'hq.protected.grant.refused' && r.runtime_id === r1.runtime_id);
+      assert.equal(refusals.length, index + 1);
+      assert.equal(refusals[0].grant_handle_sha256, issued.grant_handle_sha256);
+      assert.ok(refusals.every(r => r.effect_invoked === false));
+    } finally { await t.done({ keep: index === 0 }); }
+  }
 });

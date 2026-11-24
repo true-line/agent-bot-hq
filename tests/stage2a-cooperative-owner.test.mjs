@@ -20,14 +20,16 @@ test('paired cooperative proof binds reservation, projection, R identity, provid
   const configBytes = canonicalBytes(config);
   const qualification = { config_sha256: digest(configBytes), config_base64url: configBytes.toString('base64url') };
   const createProof = (kind, body) => {
-    const purpose = `agent-bot/soul-cooperative-${kind}/v3`;
-    const payload = canonicalBytes({ contract: 'machine/v3', kind: `soul-cooperative-${kind}`, schema_version: 3, ...body });
+    const name = kind.startsWith('stage2a-direct-q-') ? kind : `soul-cooperative-${kind}`;
+    const purpose = `agent-bot/${name}/v3`;
+    const payload = canonicalBytes({ contract: 'machine/v3', kind: name, schema_version: 3, ...body });
     const raw = canonicalBytes({ purpose, schema_version: 3, issuer_public_key_base64url: machineKey.toString('base64url'),
       payload_base64url: payload.toString('base64url'), payload_sha256: digest(payload),
       signature_base64url: sign(null, Buffer.concat([Buffer.from(purpose + '\0'), payload]), privateKey).toString('base64url') });
     return { envelope_base64url: raw.toString('base64url'), sha256: digest(raw) };
   };
-  let ids, identity, attachment, reserveRequest, reserveResult;
+  let ids, identity, attachment, reserveRequest, reserveResult, directPre, directCapture, witnessChallenge;
+  const witnessNonce = Buffer.alloc(32, 7).toString('base64url');
   let lostReserve = false, expiredResult = false, badResult = false;
   let reserveCalls = 0, resultCalls = 0, projectionCalls = 0;
   let missingDirectAdapter = true;
@@ -82,6 +84,26 @@ test('paired cooperative proof binds reservation, projection, R identity, provid
           resultCalls++;
           assert.deepEqual(request, reserveRequest);
           body = reserveResult;
+          break;
+        case 'stage2a-cooperative-q-begin-v3':
+          assert.equal(request.attach_sha256, attachment.sha256);
+          body = directPre;
+          break;
+        case 'stage2a-cooperative-q-witness-begin-v3':
+          assert.equal(request.pre_response_sha256, directPre.sha256);
+          body = witnessChallenge;
+          break;
+        case 'stage2a-cooperative-q-witness-finish-v3':
+          assert.equal(request.challenge_base64url, witnessNonce);
+          assert.equal(request.cooperative_start_receipt_sha256, full('a'));
+          assert.equal(request.hq_refusal_receipt_sha256, full('b'));
+          body = { witness_sha256: full('c') };
+          break;
+        case 'stage2a-cooperative-q-finish-v3':
+          assert.equal(request.pre_response_sha256, directPre.sha256);
+          assert.equal(request.witness_sha256, full('c'));
+          assert.ok(!Object.hasOwn(request, 'hq_refusal_receipt_base64url'));
+          body = directCapture;
           break;
         case 'stage2a-cooperative-launch-inputs-v3':
           projectionCalls++;
@@ -155,6 +177,40 @@ test('paired cooperative proof binds reservation, projection, R identity, provid
   await assert.rejects(machine.provide({ context, request }), /mismatched/);
   machine.markAcp(reserved, context, { destroyed: false });
   await assert.rejects(machine.provide({ context, request }), /mismatched/);
+  const qPre = { ...ids, hq_epoch: installation.hq_epoch, reservation_sha256: reserved.sha256,
+    attach_sha256: attach.sha256, session_id: '5'.repeat(32), q_challenge_sha256: full('6'),
+    test_plan_sha256: full('7'), pre_observation_sha256: full('8'),
+    case_nonce_base64url: Buffer.alloc(32, 2).toString('base64url'),
+    issued_at: date(-100), expires_at: date(1000) };
+  directPre = createProof('stage2a-direct-q-pre', qPre);
+  const pre = await machine.beginDirectQualification(reserved);
+  assert.deepEqual(pre, directPre);
+  directCapture = createProof('stage2a-direct-q-capture', {
+    ...ids, hq_epoch: qPre.hq_epoch, reservation_sha256: reserved.sha256, attach_sha256: attach.sha256,
+    session_id: qPre.session_id, test_plan_sha256: qPre.test_plan_sha256, pre_response_sha256: pre.sha256,
+    hq_refusal_receipt_sha256: full('b'), witness_sha256: full('c'), status: 'unqualified', host_credit: false,
+    machine_protected_authority_absent: true, runner_pid: 101, dispatcher_pid: 100,
+    runner_start_seconds: 123, runner_start_micros: 45, completed_at: date(0),
+    post_observation_sha256: full('1'), q_wire_sha256: full('2'), q_index_sha256: full('3'), q_eof_receipt_sha256: full('4'),
+  });
+  witnessChallenge = { ...ids, hq_epoch: qPre.hq_epoch, reservation_sha256: reserved.sha256,
+    attach_sha256: attach.sha256, session_id: qPre.session_id, pre_response_sha256: full('0'),
+    challenge_base64url: witnessNonce };
+  await assert.rejects(machine.beginDirectQualificationWitness(reserved, pre), /mismatched/);
+  witnessChallenge.pre_response_sha256 = pre.sha256;
+  const challengeForWitness = await machine.beginDirectQualificationWitness(reserved, pre);
+  const witness = await machine.finishDirectQualificationWitness(reserved, pre, challengeForWitness, {
+    cooperative_start_receipt_base64url: 'c3RhcnQ', cooperative_start_receipt_sha256: full('a'),
+    hq_refusal_receipt_base64url: 'cmVmdXNhbA', hq_refusal_receipt_sha256: full('b'),
+  });
+  assert.equal((await machine.finishDirectQualification(reserved, pre, witness, full('b'))).payload.host_credit, false);
+  assert.equal(machine.verifyDirectQualificationPre(pre).session_id, qPre.session_id);
+  assert.throws(() => machine.verifyDirectQualificationPre(createProof('stage2a-direct-q-pre', {
+    ...qPre, attach_sha256: full('9'),
+  })), /mismatched/);
+  assert.throws(() => machine.verifyDirectQualificationPre(createProof('stage2a-direct-q-pre', {
+    ...qPre, expires_at: date(-1),
+  })), /mismatched/);
   malformedProvider = false;
   await assert.rejects(machine.provide({ context, request }), /mismatched/, 'unsigned retry cannot undo one-use consumption');
   const projection = await machine.projectLaunch(context);
@@ -190,9 +246,10 @@ test('paired cooperative proof binds reservation, projection, R identity, provid
 test('owner takeover waits for ticketed ACP and stop fences channels before awaiting Machine', async () => {
   const { Duplex } = await import('node:stream');
   const { createStage2aCooperativeStarter } = await import('../hq/stage2a-cooperative-start.mjs');
+  const { createSoulStarter } = await import('../hq/soul-start.mjs');
   const socket = () => new Duplex({ read() {}, write(_chunk, _encoding, done) { done(); } });
   const events = [];
-  let openAcp, ready, confirm;
+  let openAcp, ready, confirm, launchId;
   const waiting = new Promise((resolve) => { ready = resolve; });
   const signedCutoff = new Promise((resolve) => { confirm = resolve; });
   const installation = { installation_id: 'installation', runner_uid: 551, hq_epoch: '0'.repeat(64),
@@ -200,22 +257,71 @@ test('owner takeover waits for ticketed ACP and stop fences channels before awai
   const fakeReservation = { sha256: `sha256:${'0'.repeat(64)}`, payload: {
     assignment: { runner_uid: 551, runner_gid: 551 }, measurement_binding: { claimed_definition_digest: 'definition' },
   } };
+  const preProof = { sha256: 'sha256:' + '3'.repeat(64) };
+  let witnessed;
+  const witnessNonce = Buffer.alloc(32, 3).toString('base64url');
+  const witnessDigest = 'sha256:' + 'f'.repeat(64);
   const client = {
     lookup: async () => installation,
-    reserve: async (_installation, { startId }) => {
+    reserve: async (_installation, { startId, launchId: launched }) => {
       assert.equal(startId, installation.reviewed_start_id);
+      launchId = launched;
       return fakeReservation;
     },
     projection: async () => { events.push('projection'); return {}; },
     watch() {},
     markAcp: () => { events.push('ticketed'); },
     runnerPid: () => 100,
+    watchHealthy: () => true,
+    assertLive: async () => true,
+    beginDirectQualification: async (reservation) => {
+      assert.equal(reservation, fakeReservation);
+      return preProof;
+    },
+    beginDirectQualificationWitness: async (reservation, prior) => {
+      assert.equal(reservation, fakeReservation);
+      assert.equal(prior, preProof);
+      assert.equal(core.receipts.length, 2);
+      return witnessNonce;
+    },
+    finishDirectQualificationWitness: async (reservation, prior, challenge, rows) => {
+      assert.equal(reservation, fakeReservation);
+      assert.equal(prior, preProof);
+      assert.equal(challenge, witnessNonce);
+      witnessed = rows;
+      return witnessDigest;
+    },
+    finishDirectQualification: async (reservation, prior, witness, receiptSHA256) => {
+      assert.equal(reservation, fakeReservation);
+      assert.equal(prior, preProof);
+      assert.equal(witness, witnessDigest);
+      assert.equal(receiptSHA256, witnessed.hq_refusal_receipt_sha256);
+      return witnessed;
+    },
+    verifyDirectQualificationPre: (input) => {
+      assert.equal(input, preProof);
+      return { installation_id: installation.installation_id, start_id: installation.reviewed_start_id,
+        launch_id: launchId, hq_epoch: installation.hq_epoch, reservation_sha256: fakeReservation.sha256,
+        attach_sha256: 'sha256:' + '4'.repeat(64), session_id: '5'.repeat(32),
+        q_challenge_sha256: 'sha256:' + '6'.repeat(64), test_plan_sha256: 'sha256:' + '7'.repeat(64),
+        case_nonce_base64url: Buffer.alloc(32, 1).toString('base64url'),
+        expires_at: new Date(Date.now() + 1000).toISOString() };
+    },
     revoke: () => { events.push('revoke'); },
     stop: async () => { events.push('machine-stop'); return signedCutoff; },
   };
   const core = { random: { hex: (n) => randomBytes(n).toString('hex') },
-    clock: { now: Date.now }, receipts: [] };
+    clock: { now: Date.now }, profile: 'managed-cooperative', receipts: [] };
+  core.persistReceipt = async (record) => {
+    const receipt = { ...record, seq: core.receipts.length + 1 };
+    core.receipts.push(receipt);
+    return receipt;
+  };
   const stage = createStage2aCooperativeStarter({ machine: client, core,
+    readCommittedReceipts: async (seqs) => {
+      assert.deepEqual(seqs, [1, 2]);
+      return structuredClone(core.receipts);
+    },
     openAdmission: async ({ openAcpStream }) => {
       events.push('bound');
       openAcp = openAcpStream;
@@ -234,6 +340,30 @@ test('owner takeover waits for ticketed ACP and stop fences channels before awai
   const owner = socket();
   token.open()(owner);
   assert.equal(stage.report()[0].state, 'running');
+  const hybrid = createSoulStarter({ core, cooperativeStart: stage, mode: () => 'running',
+    protectedStart: { start: () => assert.fail('protected effects must stay closed for the active direct package') } });
+  await assert.rejects(hybrid.dispatch('soul.start', {
+    auth: 'owner', takeover: true, payload: { package_path: '/soul', requested_profile: 'managed-protected' },
+  }), { code: 'profile_insufficient' });
+  const persistReceipt = core.persistReceipt;
+  core.persistReceipt = undefined;
+  await assert.rejects(hybrid.qualifyDirectProtectedClaim(token.result.start_id), /unavailable/);
+  core.persistReceipt = persistReceipt;
+  const captured = await hybrid.dispatch('soul.qualify-direct', {
+    auth: 'owner', payload: { start_id: token.result.start_id },
+  });
+  const raw = Buffer.from(captured.hq_refusal_receipt_base64url, 'base64url');
+  assert.equal(captured.hq_refusal_receipt_sha256, digest(raw));
+  const receipt = JSON.parse(raw);
+  assert.deepEqual(receipt, core.receipts[1]);
+  assert.equal(receipt.refusal_code, 'profile_insufficient');
+  assert.equal(receipt.pre_response_sha256, preProof.sha256);
+  assert.equal(receipt.reservation_sha256, fakeReservation.sha256);
+  assert.equal(receipt.cooperative_start_receipt_seq, core.receipts[0].seq);
+  assert.equal(receipt.cooperative_start_receipt_sha256, digest(canonicalBytes(core.receipts[0])));
+  await assert.rejects(hybrid.dispatch('soul.qualify-direct', {
+    auth: 'owner', payload: { start_id: token.result.start_id },
+  }), /already used/);
   const stop = stage.stop(token.result.start_id);
   assert.equal(stage.report()[0].state, 'stopping');
   assert.equal(acp.destroyed, true);

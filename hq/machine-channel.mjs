@@ -2,6 +2,7 @@
 // seed belongs to the service account. It is independent of the HQ signer.
 import { isUtf8 } from 'node:buffer';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
+import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
 import { isServiceHandoff, serviceHandoffArgs, serviceHandoff } from './machine-service-recovery.mjs';
 import { membersPlanResult, validPlanId } from './machine-members-plans.mjs';
 import { execFileSync } from 'node:child_process';
@@ -16,8 +17,102 @@ const PKCS8 = Buffer.from('302e020100300506032b657004220420', 'hex');
 const SPKI = Buffer.from('302a300506032b6570032100', 'hex');
 const HEX_KEY = /^[0-9a-f]{64}$/i;
 const MAX_MESSAGE = 64 * 1024;
+const CAPTURE_FIELDS = Object.freeze({
+  'stage2a-capture-begin': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+    'hq_epoch', 'plan_id', 'plan_digest', 'selector', 'signature_base64url',
+    'child_start_receipt_sha256', 'hq_launch_receipt_base64url', 'hq_launch_receipt_sha256',
+    'acp_in_size_bytes', 'acp_in_sha256', 'acp_out_size_bytes', 'acp_out_sha256'],
+  'stage2a-capture-append': ['capture_id', 'channel', 'offset', 'chunk_base64url', 'chunk_sha256'],
+  'stage2a-capture-finish': ['capture_id', 'acp_in_sha256', 'acp_out_sha256'],
+});
+const CAPTURE_STATES = Object.freeze({
+  'stage2a-capture-begin': 'capture-begun',
+  'stage2a-capture-append': 'capture-appended',
+  'stage2a-capture-finish': 'capture-finished',
+});
+const isCaptureVerb = (verb) => Object.hasOwn(CAPTURE_FIELDS, verb);
+const captureDigest = (bytes) => `sha256:${fingerprint(bytes)}`;
+const captureBase64 = (value, min, max) => typeof value === 'string'
+  && value.length >= min && value.length <= max && /^[A-Za-z0-9_-]+$/.test(value)
+  && Buffer.from(value, 'base64url').toString('base64url') === value;
+const captureKeys = (value, keys) => value && typeof value === 'object' && !Array.isArray(value)
+  && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
+
+function validStage2aCaptureRequest(verb, value) {
+  const digest = /^sha256:[0-9a-f]{64}$/;
+  const captureId = (id) => captureBase64(id, 43, 43)
+    && Buffer.from(id, 'base64url').length === 32;
+  if (verb === 'stage2a-capture-begin') {
+    const selector = value.selector;
+    const id = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+    const selectorFields = ['schema', 'installation_id', 'start_id', 'launch_id',
+      'reservation_sha256', 'plan_id', 'plan_digest', 'hq_epoch', 'session_id', 'sequence',
+      'test_plan_sha256', 'challenge_base64url', 'expires_at_ms'];
+    if (!digest.test(value.reservation_sha256 ?? '')
+      || !id.test(value.installation_id ?? '')
+      || !/^st_[0-9a-f]{24}$/.test(value.start_id ?? '')
+      || !/^ln_[0-9a-f]{24}$/.test(value.launch_id ?? '')
+      || !id.test(value.plan_id ?? '')
+      || !/^[0-9a-f]{64}$/.test(value.plan_digest ?? '')
+      || !/^[0-9a-f]{64}$/.test(value.hq_epoch ?? '')
+      || !captureKeys(selector, selectorFields)
+      || selector.schema !== 'agent-bot-machine/stage2a-inner-acp-capture-selector/v1'
+      || ['installation_id', 'start_id', 'launch_id', 'reservation_sha256', 'plan_id',
+        'plan_digest', 'hq_epoch'].some((key) => selector[key] !== value[key])
+      || !/^[0-9a-f]{32}$/.test(selector.session_id ?? '')
+      || !Number.isSafeInteger(selector.sequence) || selector.sequence < 1
+      || !digest.test(selector.test_plan_sha256 ?? '')
+      || !captureId(selector.challenge_base64url)
+      || !Number.isSafeInteger(selector.expires_at_ms)
+      || selector.expires_at_ms <= Date.now() || selector.expires_at_ms > Date.now() + 120000
+      || !captureBase64(value.signature_base64url, 86, 86)
+      || Buffer.from(value.signature_base64url, 'base64url').length !== 64
+      || !digest.test(value.child_start_receipt_sha256 ?? '')
+      || !captureBase64(value.hq_launch_receipt_base64url, 1, 21846)
+      || !digest.test(value.hq_launch_receipt_sha256 ?? '')) return false;
+    const receipt = Buffer.from(value.hq_launch_receipt_base64url, 'base64url');
+    if (receipt.length > 16384 || captureDigest(receipt) !== value.hq_launch_receipt_sha256) return false;
+    try {
+      if (!canonicalBytes(parseStrict(new TextDecoder('utf-8', { fatal: true }).decode(receipt)))
+        .equals(receipt)) return false;
+    } catch { return false; }
+    return ['acp_in', 'acp_out'].every((channel) =>
+      Number.isSafeInteger(value[`${channel}_size_bytes`])
+      && value[`${channel}_size_bytes`] > 0
+      && value[`${channel}_size_bytes`] <= 4 * 1024 * 1024
+      && digest.test(value[`${channel}_sha256`] ?? ''))
+      && value.acp_in_size_bytes + value.acp_out_size_bytes <= 8 * 1024 * 1024;
+  }
+  if (!captureId(value.capture_id)) return false;
+  if (verb === 'stage2a-capture-finish') return digest.test(value.acp_in_sha256 ?? '')
+    && digest.test(value.acp_out_sha256 ?? '');
+  if (!['acp_in', 'acp_out'].includes(value.channel)
+    || !Number.isSafeInteger(value.offset) || value.offset < 0
+    || !captureBase64(value.chunk_base64url, 1, 43691)
+    || !digest.test(value.chunk_sha256 ?? '')) return false;
+  const chunk = Buffer.from(value.chunk_base64url, 'base64url');
+  return chunk.length > 0 && chunk.length <= 32768
+    && captureDigest(chunk) === value.chunk_sha256;
+}
+const DIRECT_Q_VERBS = new Set(['stage2a-cooperative-q-begin-v3', 'stage2a-cooperative-q-finish-v3']);
 const COOPERATIVE_STATES = new Map([
   ['stage2a-cooperative-live-v3', 'cooperative-live'],
+  ['stage2a-cooperative-b-exec-v3', 'cooperative-b-granted'],
+  ['stage2a-cooperative-b-verify-v3', 'cooperative-b-verified'],
+  ['stage2a-cooperative-b-observe-v3', 'cooperative-b-observed'],
+  ['stage2a-cooperative-member-policy-v3', 'cooperative-member-policy'],
+  ['stage2a-cooperative-provisional-map-v3', 'cooperative-provisional-map'],
+  ['stage2a-cooperative-child-exec-v3', 'cooperative-child-granted'],
+  ['stage2a-cooperative-child-observe-v3', 'cooperative-child-observed'],
+  ['stage2a-cooperative-member-ready-v3', 'cooperative-member-ready'],
+  ['stage2a-cooperative-b-live-v3', 'cooperative-b-live'],
+  ['stage2a-cooperative-member-live-v3', 'cooperative-member-live'],
+  ['stage2a-cooperative-relay-peer-v3', 'cooperative-relay-peer'],
+  ['stage2a-cooperative-relay-ingress-v3', 'cooperative-relay-ingress'],
+  ['stage2a-cooperative-q-begin-v3', 'cooperative-q-pre'],
+  ['stage2a-cooperative-q-finish-v3', 'cooperative-q-captured'],
+  ['stage2a-cooperative-q-witness-begin-v3', 'cooperative-q-witness-challenge'],
+  ['stage2a-cooperative-q-witness-finish-v3', 'cooperative-q-witnessed'],
   ['stage2a-cooperative-lookup-v3', 'cooperative-found'],
   ['stage2a-cooperative-provider-v3', 'cooperative-provided'],
   ['stage2a-cooperative-reserve-v3', 'cooperative-reserved'],
@@ -27,6 +122,22 @@ const COOPERATIVE_STATES = new Map([
   ['stage2a-cooperative-abort-v3', 'cooperative-aborted'],
   ['stage2a-cooperative-stop-v3', 'cooperative-stopped'],
 ]);
+const T03_STATES = new Map([
+  ['stage2a-t03-positive', 't03-positive-recorded'],
+  ['stage2a-t03-prewrite-peer', 't03-prewrite-peer-observed'],
+  ['stage2a-t03-ready', 't03-ready-observed'],
+  ['stage2a-t03-sibling-credential-witness', 't03-sibling-credential-witnessed'],
+  ['stage2a-t03-complete', 't03-completion-recorded'],
+]);
+const T03_BASE = ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
+  'plan_id', 'plan_digest', 'hq_epoch'];
+const T03_FIELDS = {
+  'stage2a-t03-positive': [...T03_BASE, 'receipt', 'broker_completion'],
+  'stage2a-t03-prewrite-peer': [...T03_BASE, 'child_receipt_sha256', 'broker_prewrite'],
+  'stage2a-t03-ready': [...T03_BASE, 'ready'],
+  'stage2a-t03-sibling-credential-witness': [...T03_BASE, 'witness'],
+  'stage2a-t03-complete': [...T03_BASE, 'result', 'network'],
+};
 const fingerprint = (raw) => createHash('sha256').update(raw).digest('hex');
 const disconnectedPairs = new WeakMap();
 const verifiedPairs = new WeakMap();
@@ -153,7 +264,7 @@ function responseFields(line) {
 function authenticatedResponse(line, nonce, pinned, verb, capture = false) {
   const { value: r, body } = responseFields(line);
   if ((isServiceHandoff(verb) || verb === 'hq-device' || COOPERATIVE_STATES.has(verb)
-    || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)) && Object.keys(r).some((field) =>
+    || isCaptureVerb(verb) || T03_STATES.has(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)) && Object.keys(r).some((field) =>
     !['ok', 'diagnostic', 'message', 'state', 'body', 'timestamp', 'nonce', 'request_nonce', 'signature'].includes(field))) {
     throw new Error('unexpected Machine ' + verb + ' response field');
   }
@@ -196,7 +307,8 @@ function exchange(socketPath, request) {
     const chunks = [];
     let size = 0;
     let connected = false;
-    const timer = setTimeout(() => stream.destroy(new Error('Machine request timed out')), 10000);
+    const timer = setTimeout(() => stream.destroy(new Error('Machine request timed out')),
+      DIRECT_Q_VERBS.has(request.verb) ? 130000 : 10000);
     stream.once('connect', () => {
       connected = true;
       stream.write(JSON.stringify(request) + '\n');
@@ -299,11 +411,20 @@ export const machineRoleStage2aStop = (request) => machineRoleStage2a('stage2a-s
 export const machineRoleStage2aFinalizeB = (request) => machineRoleStage2a('stage2a-finalize-b', request);
 export const machineRoleStage2aLive = (request) => machineRoleStage2a('stage2a-live', request);
 export const machineRoleStage2aProvider = (request) => machineRoleStage2a('stage2a-provider', request);
+export const machineRoleStage2aT03Positive = (request) => machineRoleStage2a('stage2a-t03-positive', request);
+export const machineRoleStage2aT03PrewritePeer = (request) => machineRoleStage2a('stage2a-t03-prewrite-peer', request);
+export const machineRoleStage2aT03Ready = (request) => machineRoleStage2a('stage2a-t03-ready', request);
+export const machineRoleStage2aT03SiblingWitness = (request) =>
+  machineRoleStage2a('stage2a-t03-sibling-credential-witness', request);
+export const machineRoleStage2aT03Complete = (request) => machineRoleStage2a('stage2a-t03-complete', request);
 export const machineRoleStage2aChildReady = (request) => machineRoleStage2a('stage2a-child-ready', request);
 export const machineRoleStage2aHelloStart = (request) => machineRoleStage2a('stage2a-hello-start', request);
 export const machineRoleStage2aHelloFinalize = (request) => machineRoleStage2a('stage2a-hello-finalize', request);
 export const machineRoleStage2aHelloAbort = (request) => machineRoleStage2a('stage2a-hello-abort', request);
 export const machineRoleStage2aPeerRole = (request) => machineRoleStage2a('stage2a-peer-role', request);
+export const machineRoleStage2aCaptureBegin = (request) => machineRoleStage2a('stage2a-capture-begin', request);
+export const machineRoleStage2aCaptureAppend = (request) => machineRoleStage2a('stage2a-capture-append', request);
+export const machineRoleStage2aCaptureFinish = (request) => machineRoleStage2a('stage2a-capture-finish', request);
 
 function stage2aListResult(body, daemon, hqUid) {
   const id = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -442,7 +563,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       planID = args[1];
       socket = args[3];
     }
-  } else if ((COOPERATIVE_STATES.has(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb))
+  } else if ((COOPERATIVE_STATES.has(verb) || isCaptureVerb(verb) || T03_STATES.has(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb))
     && args.length === 2 && args[0] === '--socket') {
     socket = args[1];
   }
@@ -527,7 +648,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     }
     if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))
       || Object.keys(deviceFields).length !== keys.length || !/^(legacy|[a-f0-9]{64})$/.test(deviceFields.hq_epoch)) throw new Error('invalid Machine device fields');
-  } else if (['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role', 'stage2a-stop', 'stage2a-finalize-b'].includes(verb)) {
+  } else if (isCaptureVerb(verb) || T03_STATES.has(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role', 'stage2a-stop', 'stage2a-finalize-b'].includes(verb)) {
     const selectors = {
       'stage2a-lookup': ['package_path'],
       'stage2a-list': [],
@@ -556,6 +677,8 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         'plan_id', 'plan_digest', 'hq_epoch', 'peer_uid', 'peer_pid'],
       'stage2a-provider': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
         'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'model', 'prompt_sha256'],
+      ...T03_FIELDS,
+      ...CAPTURE_FIELDS,
     };
     const expected = selectors[verb];
     const id = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -585,7 +708,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       || (verb === 'stage2a-prepare-b' && !validStage2aPrepareB(deviceFields))
       || (['stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider',
         'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize',
-        'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)
+        'stage2a-hello-abort', 'stage2a-peer-role', ...T03_STATES.keys()].includes(verb)
         && (!reservation.test(deviceFields.reservation_sha256)
         || !id.test(deviceFields.installation_id) || !/^st_[0-9a-f]{24}$/.test(deviceFields.start_id)
         || !/^ln_[0-9a-f]{24}$/.test(deviceFields.launch_id) || !id.test(deviceFields.plan_id)
@@ -618,7 +741,20 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
         || Array.isArray(deviceFields.expected)
         || Buffer.byteLength(JSON.stringify(deviceFields.expected)) > 4096))
       || (verb === 'stage2a-provider' && (!reservation.test(deviceFields.bind_receipt_sha256)
-        || !id.test(deviceFields.model) || !reservation.test(deviceFields.prompt_sha256)))) {
+        || !id.test(deviceFields.model) || !reservation.test(deviceFields.prompt_sha256)))
+      || (verb === 'stage2a-t03-prewrite-peer' && (!reservation.test(deviceFields.child_receipt_sha256)
+        || !deviceFields.broker_prewrite || typeof deviceFields.broker_prewrite !== 'object'
+        || Array.isArray(deviceFields.broker_prewrite)))
+      || (verb === 'stage2a-t03-positive' && (!deviceFields.receipt
+        || typeof deviceFields.receipt !== 'object' || Array.isArray(deviceFields.receipt)))
+      || (T03_STATES.has(verb) && (!deviceFields[T03_FIELDS[verb].at(-1)]
+        || typeof deviceFields[T03_FIELDS[verb].at(-1)] !== 'object'
+        || Array.isArray(deviceFields[T03_FIELDS[verb].at(-1)])
+        || (verb === 'stage2a-t03-complete' && (!deviceFields.result
+          || typeof deviceFields.result !== 'object' || Array.isArray(deviceFields.result)))
+        || Buffer.byteLength(JSON.stringify(deviceFields)) > 8192))
+      || (isCaptureVerb(verb) && (!validStage2aCaptureRequest(verb, deviceFields)
+        || Buffer.byteLength(JSON.stringify(deviceFields)) > 48 * 1024))) {
       throw new Error('invalid Stage 2a Machine reservation selectors');
     }
   } else if (COOPERATIVE_STATES.has(verb)) {
@@ -653,6 +789,8 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       'plan_id', 'plan_digest', 'hq_epoch', 'peer_uid', 'peer_pid'],
     'stage2a-provider': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
       'plan_id', 'plan_digest', 'hq_epoch', 'bind_receipt_sha256', 'model', 'prompt_sha256'],
+    ...T03_FIELDS,
+    ...CAPTURE_FIELDS,
   }[verb];
   const stage2aRequest = stage2aFields
     ? Buffer.from(JSON.stringify(Object.fromEntries(stage2aFields.map((key) => [key, deviceFields[key]])))).toString('base64url')
@@ -679,22 +817,93 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     return Object.freeze({ body: r.body, machineKey: Buffer.from(daemon) });
   }
   if (stage2aFields) {
-    const expectedState = { 'stage2a-lookup': 'found', 'stage2a-list': 'listed',
+    const expectedState = { ...CAPTURE_STATES, 'stage2a-lookup': 'found', 'stage2a-list': 'listed',
       'stage2a-reserve': 'reserved', 'stage2a-exec': 'granted',
       'stage2a-verify-b': 'verified', 'stage2a-prepare-b': 'prepared',
       'stage2a-stop': 'stopped', 'stage2a-finalize-b': 'finalized',
       'stage2a-live': 'live', 'stage2a-provider': 'provided',
+      ...Object.fromEntries(T03_STATES),
       'stage2a-child-ready': 'child-ready', 'stage2a-hello-start': 'hello-started',
       'stage2a-hello-finalize': 'hello-finalized', 'stage2a-hello-abort': 'hello-aborted',
       'stage2a-peer-role': 'peer-verified' }[verb];
     if (r.state !== expectedState) throw new Error('unexpected signed Machine Stage 2a state');
     const body = r.body;
+    if (isCaptureVerb(verb)) {
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        throw new Error('invalid signed Machine ACP capture body');
+      }
+      if (verb === 'stage2a-capture-begin') {
+        if (!captureKeys(body, ['capture_id', 'expires_at_ms'])
+          || !captureBase64(body.capture_id, 43, 43)
+          || Buffer.from(body.capture_id, 'base64url').length !== 32
+          || !Number.isSafeInteger(body.expires_at_ms)
+          || body.expires_at_ms <= Date.now()
+          || body.expires_at_ms > deviceFields.selector.expires_at_ms) {
+          throw new Error('invalid signed Machine ACP capture begin');
+        }
+        return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
+      }
+      if (verb === 'stage2a-capture-append') {
+        const chunkLength = Buffer.from(deviceFields.chunk_base64url, 'base64url').length;
+        if (!captureKeys(body, ['capture_id', 'channel', 'next_offset_bytes'])
+          || body.capture_id !== deviceFields.capture_id || body.channel !== deviceFields.channel
+          || body.next_offset_bytes !== deviceFields.offset + chunkLength) {
+          throw new Error('invalid signed Machine ACP capture append');
+        }
+        return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
+      }
+      if (!captureKeys(body, ['capture_id', 'receipt_envelope_base64url', 'receipt_sha256'])
+        || body.capture_id !== deviceFields.capture_id
+        || !captureBase64(body.receipt_envelope_base64url, 1, 21846)
+        || !/^sha256:[0-9a-f]{64}$/.test(body.receipt_sha256)) {
+        throw new Error('invalid signed Machine ACP capture finish');
+      }
+      const envelope = Buffer.from(body.receipt_envelope_base64url, 'base64url');
+      if (envelope.length > 16384 || captureDigest(envelope) !== body.receipt_sha256) {
+        throw new Error('Machine ACP capture receipt digest mismatch');
+      }
+      return Object.freeze({ capture_id: body.capture_id, receipt_envelope: envelope,
+        receipt_sha256: body.receipt_sha256, daemon_fingerprint: fingerprint(daemon) });
+    }
+    if (T03_STATES.has(verb)) {
+      if (verb === 'stage2a-t03-prewrite-peer') {
+        if (!body || typeof body !== 'object' || Array.isArray(body)
+          || Object.keys(body).join(',') !== 'prewrite_receipt'
+          || !/^[0-9a-f]{64}$/.test(body.prewrite_receipt)) {
+          throw new Error('invalid signed Machine T03 prewrite peer response');
+        }
+        return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
+      }
+      if (verb === 'stage2a-t03-sibling-credential-witness') {
+        if (!body || typeof body !== 'object' || Array.isArray(body)
+          || Object.keys(body).sort().join(',') !== 'accepted,lease_sequence,metadata_sha256'
+          || body.accepted !== true
+          || !/^sha256:[0-9a-f]{64}$/.test(body.metadata_sha256)
+          || !Number.isSafeInteger(body.lease_sequence) || body.lease_sequence < 1
+          || body.metadata_sha256 !== deviceFields.witness.metadata_sha256
+          || body.lease_sequence !== deviceFields.witness.lease_sequence) {
+          throw new Error('invalid signed Machine T03 sibling witness response');
+        }
+        return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
+      }
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).length !== 1
+        || (verb === 'stage2a-t03-ready'
+          ? body.accepted !== true
+          : !/^sha256:[0-9a-f]{64}$/.test(body.sha256 ?? ''))) {
+        throw new Error('invalid signed Machine T03 response');
+      }
+      return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
+    }
     if (verb === 'stage2a-list') return stage2aListResult(body, daemon, uid);
     if (verb === 'stage2a-lookup') {
       if (!body || typeof body !== 'object' || Array.isArray(body)
-        || Object.keys(body).length !== 5
+        || Object.keys(body).length !== (body.qualification_start_id === undefined ? 5 : 6)
         || !['installation_id', 'plan_id', 'plan_digest', 'runner_account', 'bridge_account']
           .every((key) => Object.hasOwn(body, key))
+        || (body.qualification_start_id !== undefined
+          && (!Object.hasOwn(body, 'qualification_start_id')
+            || !/^st_[0-9a-f]{24}$/.test(body.qualification_start_id)))
         || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(body.installation_id)
         || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(body.plan_id)
         || !/^[0-9a-f]{64}$/.test(body.plan_digest)

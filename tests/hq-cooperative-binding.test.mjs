@@ -106,3 +106,36 @@ test('local C/H loss revokes a live cooperative runtime even while Machine repor
     assert.equal(aborts, 1);
   } finally { await host.stop(); }
 });
+
+test('brokered cooperative Hello withholds both runtimes until aggregate readiness', async () => {
+  let entered;
+  let accept;
+  const pending = new Promise((resolve) => { entered = resolve; });
+  const ready = new Promise((resolve) => { accept = resolve; });
+  const host = createTestHost({
+    config: { 'hq-admission': { acceptedDefinitions: { [SOUL]: [DIGEST] } } },
+    plugins: [admissionPlugin({ schemas, cooperativeAdmission: {
+      assertLive: async () => true, watchHealthy: () => true, abort: async () => {},
+    } })],
+  });
+  try {
+    await host.start();
+    const request = hello({ installation_id: start.installation_id });
+    const reply = host.dispatch('Hello', { auth: 'entry-point', session: 'ep_r', payload: request,
+      cooperativeStart: { ...start, adapter_transport: 'brokered-b',
+        prepareMemberSet: (rows) => { entered(rows); return ready; } },
+    });
+    const rows = await pending;
+    assert.equal(rows.length, 2);
+    for (const row of rows) {
+      assert.equal(host.table('hq-admission', 'runtimes')[row.runtime_id].cooperative_state, 'pending');
+      await assert.rejects(host.provided('hq-admission').withLiveRuntime(row.runtime_id, 'ep_r', () => {}),
+        /revoked|not finalized/);
+    }
+    accept(DIGEST);
+    assert.equal((await reply).admitted_runtimes.length, 2);
+    for (const row of rows) {
+      assert.equal(host.table('hq-admission', 'runtimes')[row.runtime_id].cooperative_state, 'active');
+    }
+  } finally { accept(DIGEST); await host.stop(); }
+});
