@@ -46,6 +46,8 @@ test('concurrent verifiers publish a complete cache, repair it and still refuse 
   writeFileSync(join(root, 'hq/stage2a-h-preloader.mjs'),
     'export function authenticatedSelectedH() { return null; }\n');
   copyFileSync(new URL('../scripts/soul-contracts.mjs', import.meta.url), cli);
+  copyFileSync(new URL('../scripts/h-v0103-excluded.mjs', import.meta.url),
+    join(root, 'scripts/h-v0103-excluded.mjs'));
   const verify = () => run(process.execPath, [cli, 'verify'], { env });
   const cache = join(root, '.cache/soul-contracts');
   const tree = join(cache, commit);
