@@ -1,6 +1,6 @@
 // The pinned qualification response is disclosed by Machine only after its
 // durable one-use claim and current finalized B lease checks succeed.
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, request as httpRequest } from 'node:http';
 import { parseStrict } from '../sdk/wire/strict-json.mjs';
 import { canonicalize } from '../sdk/wire/canonical-json.mjs';
@@ -16,6 +16,8 @@ const exact = (value, keys) => value && typeof value === 'object' && !Array.isAr
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const providerPath = '/stage2a/local-provider/v1';
 const observationPath = '/stage2a/local-provider/v1/observation';
+export const OBSERVED_BODY_LOCAL_TEST_MODE = 'observed-body-local-test/v1';
+const observedProofHeader = 'x-agent-bot-stage2a-provider-auth';
 const maxHTTPBytes = 8192;
 const serviceTimeout = 5000;
 
@@ -30,7 +32,15 @@ export function stage2aLocalProviderPort(plan) {
   return 49152 + (value % 16384);
 }
 
-export function openLocalProviderService(plan) {
+export function openLocalProviderService(plan, { mode } = {}) {
+  if (mode !== undefined && mode !== OBSERVED_BODY_LOCAL_TEST_MODE) {
+    throw new TypeError('unsupported local provider mode');
+  }
+  const observedMode = mode === OBSERVED_BODY_LOCAL_TEST_MODE;
+  // This token never crosses into the Soul, B, Machine config, or a receipt.
+  // It distinguishes HQ's internal POST from a local process racing the same
+  // reachable listener with a copied digest body after authorization.
+  let observedProof = observedMode ? randomBytes(32) : undefined;
   const port = stage2aLocalProviderPort(plan);
   let config;
   let invocations = 0;
@@ -74,6 +84,16 @@ export function openLocalProviderService(plan) {
       || Number(request.headers['content-length']) > maxHTTPBytes) {
       reply(400, { error: 'invalid_request' }); return;
     }
+    if (observedMode) {
+      const supplied = request.headers[observedProofHeader];
+      const bytes = typeof supplied === 'string' && /^[A-Za-z0-9_-]{43}$/.test(supplied)
+        ? Buffer.from(supplied, 'base64url') : undefined;
+      if (!observedProof || !bytes || bytes.length !== 32
+        || bytes.toString('base64url') !== supplied
+        || !timingSafeEqual(bytes, observedProof)) {
+        reply(403, { error: 'not_authorized' }); return;
+      }
+    }
     try {
       const chunks = [];
       let length = 0;
@@ -85,13 +105,22 @@ export function openLocalProviderService(plan) {
       const bytes = Buffer.concat(chunks);
       if (bytes.length !== Number(request.headers['content-length'])) throw new Error('length mismatch');
       const input = parseStrict(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-      if (!exact(input, ['model', 'request_sha256']) || !Buffer.from(canonicalize(input)).equals(bytes)
+      if (!exact(input, observedMode
+        ? ['mode', 'model', 'observed_body_sha256'] : ['model', 'request_sha256'])
+        || !Buffer.from(canonicalize(input)).equals(bytes)
         || !config || invocations !== 0 || input.model !== config.model
-        || input.request_sha256 !== config.request_sha256) {
+        || (observedMode
+          ? input.mode !== OBSERVED_BODY_LOCAL_TEST_MODE
+            || input.observed_body_sha256 !== config.observed_body_sha256
+          : input.request_sha256 !== config.request_sha256)) {
         reply(403, { error: 'not_authorized' }); return;
       }
+      if (observedMode) {
+        observedProof.fill(0);
+        observedProof = undefined;
+      }
       invocations++;
-      lastRequestSHA256 = input.request_sha256;
+      lastRequestSHA256 = observedMode ? input.observed_body_sha256 : input.request_sha256;
       lastResponseSHA256 = digest(Buffer.from(config.response_text));
       reply(200, { ...config, invocation: invocations,
         response_sha256: lastResponseSHA256 });
@@ -186,19 +215,30 @@ export function openLocalProviderService(plan) {
       }
       return Object.freeze({ ipv4, ipv6 });
     },
-    async invoke(approved) {
+    async invoke(approved, { signal } = {}) {
       await ready;
+      try {
+      if (signal?.aborted) throw new Error('local provider invocation was stopped');
       config = Object.freeze({ ...approved });
       if (invocations !== 0) throw new Error('local provider was already invoked');
-      const body = Buffer.from(canonicalize({ model: config.model,
-        request_sha256: config.request_sha256 }));
+      if (observedMode && (!exact(config, ['mode', 'model', 'observed_body_sha256', 'response_text'])
+        || config.mode !== OBSERVED_BODY_LOCAL_TEST_MODE
+        || !ID.test(config.model) || !DIGEST.test(config.observed_body_sha256)
+        || typeof config.response_text !== 'string' || !config.response_text
+        || config.response_text.length > 4096)) {
+        throw new Error('observed-body local provider config differs from authorization');
+      }
+      const body = Buffer.from(canonicalize(observedMode
+        ? { mode, model: config.model, observed_body_sha256: config.observed_body_sha256 }
+        : { model: config.model, request_sha256: config.request_sha256 }));
       const requestedAtMS = Date.now();
       let responseBytes;
       let respondedAtMS;
       const result = await new Promise((resolve, reject) => {
         const request = httpRequest({ host: '127.0.0.1', port, method: 'POST', path: providerPath,
           agent: false, timeout: serviceTimeout, headers: { 'content-type': 'application/json',
-            'content-length': String(body.length), connection: 'close' } }, (response) => {
+            'content-length': String(body.length), connection: 'close',
+            ...(observedMode ? { [observedProofHeader]: observedProof.toString('base64url') } : {}) } }, (response) => {
           const responseLength = response.headers['content-length'];
           if (response.statusCode !== 200 || response.headers['content-type'] !== 'application/json'
             || !/^[1-9][0-9]{0,3}$/.test(responseLength ?? '')
@@ -222,13 +262,21 @@ export function openLocalProviderService(plan) {
           });
           response.once('error', reject);
         });
+        const onAbort = () => request.destroy(new Error('local provider invocation was stopped'));
+        signal?.addEventListener('abort', onAbort, { once: true });
+        request.once('close', () => signal?.removeEventListener('abort', onAbort));
         request.once('timeout', () => request.destroy(new Error('local provider timed out')));
         request.once('error', reject);
         request.end(body);
       });
-      if (!exact(result, ['model', 'request_sha256', 'response_text', 'invocation',
-        'response_sha256']) || result.model !== config.model
-        || result.request_sha256 !== config.request_sha256
+      if (!exact(result, observedMode
+        ? ['mode', 'model', 'observed_body_sha256', 'response_text', 'invocation', 'response_sha256']
+        : ['model', 'request_sha256', 'response_text', 'invocation', 'response_sha256'])
+        || result.model !== config.model
+        || (observedMode
+          ? result.mode !== OBSERVED_BODY_LOCAL_TEST_MODE
+            || result.observed_body_sha256 !== config.observed_body_sha256
+          : result.request_sha256 !== config.request_sha256)
         || result.response_text !== config.response_text
         || result.response_sha256 !== digest(Buffer.from(config.response_text))
         || result.invocation !== 1 || invocations !== 1
@@ -241,10 +289,16 @@ export function openLocalProviderService(plan) {
         response_body_bytes: responseBytes.length,
         requested_at_ms: requestedAtMS, responded_at_ms: respondedAtMS,
         provider_config_sha256: sha(Buffer.from(canonicalize(config))),
+        ...(observedMode ? { mode, observed_body_sha256: config.observed_body_sha256 } : {}),
       });
       return result;
+      } catch (error) {
+        if (observedProof) { observedProof.fill(0); observedProof = undefined; }
+        throw error;
+      }
     },
     async close() {
+      if (observedProof) { observedProof.fill(0); observedProof = undefined; }
       await ready.catch(() => {});
       await Promise.all(servers.map(closeServer));
     },
