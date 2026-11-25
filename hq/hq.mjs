@@ -195,6 +195,7 @@ export function createHQ({
   machineHqEpoch,                // signed current paired epoch from Machine list; never owner config
   protectedStart,                // HQ-started Machine-authorized R/B lifecycle from trusted entry point
   createProtectedStart,          // trusted factory bound to HQ's durable launch receipt writer
+  stoppedStartDiagnostic,        // paired, stopped-only owner proof; never owner config
   bridgeAuthority,               // authenticated Machine live-start/B proof client; never config or owner input
   bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
   qualificationAuthorizer,       // trusted one-use installed test-provider operation; never owner config
@@ -473,6 +474,11 @@ export function createHQ({
     const disconnectedPair = startup.mode === 'safe' ? signer.disconnectedPair?.() : undefined;
     let checkingPair;
     async function ownerDispatch(op, meta) {
+      if (op === 'soul.protected-stopped-refusal') {
+        if (!running || host.mode !== 'running' || typeof stoppedStartDiagnostic !== 'function')
+          fail('host.launch_unavailable', 'stopped protected start diagnostic is unavailable');
+        return stoppedStartDiagnostic(meta.payload);
+      }
       // A cold connection refusal must leave HQ in safe mode. A requested
       // status can verify the original pairing and guide the explicit restart.
       if (op === 'status' && disconnectedPair && host.mode === 'safe') {

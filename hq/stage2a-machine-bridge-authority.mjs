@@ -64,10 +64,11 @@ function matchesInstalled(payload, installed) {
 
 export function createStage2aMachineBridgeAuthority({ machinePublicKey, verifyReservation,
   machineLive = machineRoleStage2aLive, machineVerifyB = machineRoleStage2aVerifyB,
-  machineStop = machineRoleStage2aStop, now = () => Date.now() } = {}) {
+  machineStop = machineRoleStage2aStop, onStopVerified, now = () => Date.now() } = {}) {
   if (!Buffer.isBuffer(machinePublicKey) || machinePublicKey.length !== 32
     || typeof verifyReservation !== 'function' || typeof machineLive !== 'function'
     || typeof machineVerifyB !== 'function' || typeof machineStop !== 'function'
+    || (onStopVerified !== undefined && typeof onStopVerified !== 'function')
     || typeof now !== 'function') refuse();
   const starts = new Map();
   const connections = new Map();
@@ -186,6 +187,10 @@ export function createStage2aMachineBridgeAuthority({ machinePublicKey, verifyRe
           bridge_uid: record.installed.bridge_uid, runner_pid: record.runnerPid,
           bridge_pid: record.bridgePid } });
       if (checked.envelope_sha256 !== stopped.sha256 || checked.both_uids_idle !== true) refuse();
+      await onStopVerified?.({ expected: Object.freeze({ ...record.selectors,
+        runner_uid: record.installed.runner_uid, bridge_uid: record.installed.bridge_uid,
+        runner_pid: record.runnerPid, bridge_pid: record.bridgePid }),
+      envelope: Buffer.from(stopped.envelope), sha256: stopped.sha256 });
       starts.delete(record.selectors.reservation_sha256);
       for (const [id, bound] of connections) if (bound === record) connections.delete(id);
       return true;
@@ -199,5 +204,6 @@ export function createStage2aMachineBridgeAuthority({ machinePublicKey, verifyRe
   }
 
   return Object.freeze({ register, setRolePid, markFinalized, verifyLiveStartV2,
-    verifyProofV2, onDisconnectV2, currentLiveStart, stopStart });
+    verifyProofV2, onDisconnectV2, currentLiveStart, stopStart,
+    hasStart: (reservationSHA256) => starts.has(reservationSHA256) });
 }
