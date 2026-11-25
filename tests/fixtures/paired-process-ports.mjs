@@ -27,6 +27,8 @@ const fetchLocal = globalThis.fetch;
 globalThis.fetch = (url, options) => {
   const target = new URL(url);
   assert.equal(target.origin, 'https://agents.true-line.ai');
-  assert.ok(['/.well-known/agent-bot-server-key', '/oauth/device_authorization', '/oauth/token'].includes(target.pathname));
+  assert.ok([
+    '/.well-known/agent-bot-server-key', '/oauth/device_authorization', '/oauth/token', '/api/daemon/whoami',
+  ].includes(target.pathname));
   return fetchLocal(new URL(target.pathname, local), { ...options, redirect: 'error' });
 };
