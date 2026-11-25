@@ -21,10 +21,11 @@ const CHALLENGE = Buffer.alloc(32, 7).toString('base64url');
 const CHALLENGE2 = Buffer.alloc(32, 8).toString('base64url');
 
 function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckFails = false,
-  ackIsPreviousLease = false, hqCodeReady = true, reservationVerifier } = {}) {
+  ackIsPreviousLease = false, hqCodeReady = true, reservationVerifier, persistLaunch } = {}) {
   const events = [];
   let providerAttempts = 0;
   let activation;
+  let launchReceipt;
   let leaseSequence = 0;
   const installed = {
     installation_id: 'install-1', package_root: packageRoot, plan_id: 'plan-1',
@@ -156,15 +157,22 @@ function fixture(packageRoot, { runnerFails = false, ackFails = false, childAckF
           return true;
         } };
     },
+    recordLaunch: async (record) => {
+      assert.ok(events.includes('R-child-ack'));
+      events.push('launch-receipt');
+      launchReceipt = record;
+      return persistLaunch ? persistLaunch(record) : { seq: 1 };
+    },
     onFinalized: async () => {
       assert.ok(events.includes('Machine-live'), 'provider needs Machine-confirmed live R');
+      assert.ok(events.includes('launch-receipt'), 'provider needs durable launch receipt');
       providerAttempts++;
       events.push('provider-registered');
     },
     random: () => 'a'.repeat(24),
   });
   return { starter, events, get providerAttempts() { return providerAttempts; },
-    get activation() { return activation; } };
+    get activation() { return activation; }, get launchReceipt() { return launchReceipt; } };
 }
 
 test('machine/v2 policy refuses protected start before Machine lookup without H code proof', async () => {
@@ -203,11 +211,23 @@ test('one-use provider opens only after B, R and stock child are ready', async (
     const f = fixture(root);
     await f.starter.start({ package_path: root, requested_profile: 'managed-protected' });
     assert.equal(f.providerAttempts, 1);
-    assert.deepEqual(f.events.slice(-15), ['B-finalized', 'runner-started',
+    assert.deepEqual(f.events.slice(-16), ['B-finalized', 'runner-started',
       'runner:402', 'Machine-live', 'R-activated',
       'Machine-live', 'R-live', 'R-ack', 'child-launched', 'child-started',
       'Machine-child-ready', 'child-receipt-sent', 'child-accepted', 'R-child-ack',
-      'provider-registered']);
+      'launch-receipt', 'provider-registered']);
+    assert.deepEqual(f.launchReceipt, {
+      start_id: 'st_' + 'a'.repeat(24), launch_id: 'ln_' + 'a'.repeat(24), installation_id: 'install-1',
+      soul_id: 'soul-1', package_path: root, pid: 404, runner_uid: 311, runner_gid: 312, hq_epoch: EPOCH,
+      protected: true, plan_id: 'plan-1', plan_digest: PLAN, profile_in_force: 'managed-protected',
+      reservation_sha256: RESERVATION, child_start_receipt_sha256: CHILD,
+      bind_receipt_sha256: BIND, b_finalization_sha256: FINAL,
+      relay_socket: { path: '/private/tmp/relay/' + createHash('sha256')
+        .update(['agent-bot-soul-endpoint-start/v1', 'install-1', 'st_' + 'a'.repeat(24)].join('\0'))
+        .digest('hex').slice(0, 20) + '.sock',
+      socket: { uid: 310, gid: 312, mode: 0o660, device: '1', inode: '2' } },
+      child_launcher_pid: 403, child_pid: 404, runner_pid: 402, bridge_pid: 401,
+    });
     assert.deepEqual(Object.keys(f.activation).sort(), [
       'schema', 'reservation_sha256', 'start_id', 'launch_id',
       'runner_wrapper_pid',
@@ -220,6 +240,18 @@ test('one-use provider opens only after B, R and stock child are ready', async (
     assert.equal(Buffer.from(f.activation.finalization_envelope_base64url, 'base64url').toString(),
       FINAL_BYTES.toString());
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('launch receipt persistence failure contains roles before provider or takeover', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'stage2a-hq-start-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const root = realpathSync(dir);
+  const f = fixture(root, { persistLaunch: async () => { throw new Error('launch receipt disk failure'); } });
+  await assert.rejects(f.starter.start({ package_path: root,
+    requested_profile: 'managed-protected' }), /launch receipt disk failure/);
+  assert.equal(f.providerAttempts, 0);
+  assert.deepEqual(f.events.slice(-4), ['R-child-ack', 'launch-receipt',
+    'R-admission-closed', 'Machine-stop']);
 });
 
 test('R refusal of child receipt leaves the one-use provider closed', async () => {
