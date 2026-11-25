@@ -368,6 +368,84 @@ test('Machine proof cannot outlive the signed B policy', async () => {
   } finally { await provider.stop(); }
 });
 
+test('completion may finish after signed expiry when prewrite was accepted in time', async () => {
+  const value = fixture('5', undefined, undefined,
+    (payload) => { payload.expires_at = new Date(NOW + 2000).toISOString(); });
+  let clock = NOW;
+  value.options.now = () => clock;
+  value.options.observeCurrentStart = async () => ({ phase: 'finalized',
+    selectors: value.selectors, bind_receipt_sha256: bindSHA,
+    expires_at_ms: NOW + 10_000, runner_pid: 4000, bridge_pid: 4200, child_pid: 4100 });
+  value.options.machinePrewrite = async (prewrite) => prewriteProofReply(prewrite,
+    { expires_at: new Date(NOW + 1500).toISOString() });
+  const connection = {};
+  const provider = await bound(value, connection);
+  try {
+    await provider.authorize(value.frame, connection);
+    const prewrite = prewriteFor(value, provider.invocationReceipt());
+    const proof = await provider.prewrite(prewrite, connection);
+    clock = NOW + 2001;
+    const ack = await provider.complete({ core: completionFor(prewrite,
+      proof.prewrite_receipt), completion_origin_mac: '8'.repeat(64) }, connection);
+    assert.equal(ack.accepted, true);
+  } finally { await provider.stop(); }
+});
+
+test('delayed Machine ingress cannot outlive signed reservation, assignment or B policy', async () => {
+  const short = new Date(NOW + 2000).toISOString();
+  for (const [name, mutateAssignment, mutatePolicy, expiredAt] of [
+    ['reservation', undefined, undefined, NOW + 20_001],
+    ['assignment', (payload) => { payload.expires_at = short; }, undefined, NOW + 2001],
+    ['B policy', undefined, (payload) => { payload.expires_at = short; }, NOW + 2001],
+  ]) {
+    const value = fixture('4', undefined, mutateAssignment, mutatePolicy);
+    let clock = NOW;
+    let posts = 0;
+    const entered = deferred();
+    const release = deferred();
+    const authorization = signed(
+      'agent-bot/stage2a-observed-body-local-test-ingress-authorization/v1', {
+        schema: 'agent-bot-machine/stage2a-observed-body-local-test-ingress-authorization/v1',
+        kind: 'observed-body-local-test-ingress-authorization', selectors: value.selectors,
+        ingress_core_sha256: jcsSHA(value.core), provider_claim_sha256: sha('late-claim'),
+        issued_at: new Date(NOW).toISOString(),
+        expires_at: new Date(NOW + 50_000).toISOString(),
+      });
+    value.options.now = () => clock;
+    value.options.observeCurrentStart = async () => ({ phase: 'finalized',
+      selectors: value.selectors, bind_receipt_sha256: bindSHA,
+      expires_at_ms: NOW + 60_000, runner_pid: 4000, bridge_pid: 4200, child_pid: 4100 });
+    value.options.machineIngress = async () => {
+      value.counts.ingress++;
+      entered.resolve();
+      await release.promise;
+      return { authorization_envelope_base64url: authorization.toString('base64url'),
+        authorization_envelope_sha256: sha(authorization) };
+    };
+    value.options.openService = (...args) => {
+      const service = openLocalProviderService(...args);
+      return { ...service, invoke: (...invokeArgs) => {
+        posts++;
+        return service.invoke(...invokeArgs);
+      } };
+    };
+    const connection = {};
+    const provider = await bound(value, connection);
+    try {
+      const pending = provider.authorize(value.frame, connection);
+      await entered.promise;
+      clock = expiredAt;
+      release.resolve();
+      await assert.rejects(pending, /unavailable/, name);
+      assert.equal(value.counts.ingress, 1, name);
+      assert.equal(value.counts.provider, 0, name);
+      assert.equal(posts, 0, name);
+      assert.equal(provider.invocationReceipt(), undefined, name);
+      await assert.rejects(provider.probeReachability(), undefined, name);
+    } finally { await provider.stop(); }
+  }
+});
+
 test('forged HQ digest cannot reach Machine Provider or invoke the local service', async () => {
   const value = fixture('a');
   const connection = {};
@@ -562,36 +640,41 @@ test('stop during deferred prewrite or completion prevents late acknowledgement'
   }
 });
 
-test('Provider expiry during a deferred reachability probe causes zero HTTP POSTs', async () => {
-  const value = fixture('3');
-  let clock = NOW;
-  let posts = 0;
-  const entered = deferred();
-  const release = deferred();
-  value.options.now = () => clock;
-  value.options.observeCurrentStart = async () => ({ phase: 'finalized',
-    selectors: value.selectors, bind_receipt_sha256: bindSHA,
-    expires_at_ms: NOW + 10_000, runner_pid: 4000, bridge_pid: 4200, child_pid: 4100 });
-  value.options.openService = (plan, opts) => {
-    const real = openLocalProviderService(plan, opts);
-    return { ...real,
-      probeReachability: async () => {
-        entered.resolve();
-        await release.promise;
-        return real.probeReachability();
-      },
-      invoke: (...args) => { posts++; return real.invoke(...args); } };
-  };
-  const connection = {};
-  const provider = await bound(value, connection);
-  const pending = provider.authorize(value.frame, connection);
-  await entered.promise;
-  clock = NOW + 4500;
-  release.resolve();
-  await assert.rejects(pending, /unavailable/);
-  assert.equal(posts, 0);
-  assert.equal(provider.invocationReceipt(), undefined);
-  await assert.rejects(provider.probeReachability());
+test('Provider or signed B-policy expiry during a deferred probe causes zero HTTP POSTs', async () => {
+  for (const [name, value, expiredAt] of [
+    ['Provider', fixture('3'), NOW + 4500],
+    ['B policy', fixture('4', undefined, undefined,
+      (payload) => { payload.expires_at = new Date(NOW + 2000).toISOString(); }), NOW + 2001],
+  ]) {
+    let clock = NOW;
+    let posts = 0;
+    const entered = deferred();
+    const release = deferred();
+    value.options.now = () => clock;
+    value.options.observeCurrentStart = async () => ({ phase: 'finalized',
+      selectors: value.selectors, bind_receipt_sha256: bindSHA,
+      expires_at_ms: NOW + 10_000, runner_pid: 4000, bridge_pid: 4200, child_pid: 4100 });
+    value.options.openService = (plan, opts) => {
+      const real = openLocalProviderService(plan, opts);
+      return { ...real,
+        probeReachability: async () => {
+          entered.resolve();
+          await release.promise;
+          return real.probeReachability();
+        },
+        invoke: (...args) => { posts++; return real.invoke(...args); } };
+    };
+    const connection = {};
+    const provider = await bound(value, connection);
+    const pending = provider.authorize(value.frame, connection);
+    await entered.promise;
+    clock = expiredAt;
+    release.resolve();
+    await assert.rejects(pending, /unavailable/, name);
+    assert.equal(posts, 0, name);
+    assert.equal(provider.invocationReceipt(), undefined, name);
+    await assert.rejects(provider.probeReachability());
+  }
 });
 
 test('expired, future and overlong signed reservations never open a listener', () => {

@@ -321,6 +321,8 @@ export function createStage2aLocalTestProvider({ reservationEnvelope, memberAssi
     || policy.members[0].qualification.mode !== OBSERVED_BODY_LOCAL_TEST_MODE
     || !exact(policy.members[1].qualification, ['mode'])
     || policy.members[1].qualification.mode !== 'disabled') refuse();
+  const signedAuthorityExpiresAt = Math.min(Date.parse(reservation.expires_at),
+    Date.parse(assigned.expires_at), Date.parse(p.expires_at));
   const selectedMember = policy.members.find((member) => member.member_id
     === policy.local_test?.selected_member_id);
   if (!selectedMember || selectedMember !== policy.members[0]
@@ -359,11 +361,13 @@ export function createStage2aLocalTestProvider({ reservationEnvelope, memberAssi
     if (token !== generation || abort.signal.aborted || phase !== required) refuse();
   };
 
-  const live = async () => {
+  const live = async (beforeFirstByte = true) => {
     const current = await observeCurrentStart(expected);
+    const observedAt = now();
     if (current?.phase !== 'finalized' || !sameSelectors(current.selectors, expected)
       || current.bind_receipt_sha256 !== bindReceiptSHA256
-      || !Number.isSafeInteger(current.expires_at_ms) || current.expires_at_ms <= now()
+      || !Number.isSafeInteger(current.expires_at_ms) || current.expires_at_ms <= observedAt
+      || (beforeFirstByte && signedAuthorityExpiresAt <= observedAt)
       || !['runner_pid', 'bridge_pid', 'child_pid'].every((key) =>
         Number.isSafeInteger(current[key]) && current[key] > 1)) refuse();
     return current;
@@ -441,6 +445,8 @@ export function createStage2aLocalTestProvider({ reservationEnvelope, memberAssi
         const signedAuthorization = checkedAuthorization(authorization,
           machinePublicKey, expected, frame.core, now);
         authorizationSHA256 = authorization.authorization_envelope_sha256;
+        await live();
+        active(token, 'ingress-attempted');
         const provided = await machineProvider({ selectors: expected,
           authorization_envelope_sha256: authorizationSHA256,
           model: localTest.model, observed_body_sha256: frame.core.observed_body_sha256 },
@@ -480,7 +486,7 @@ export function createStage2aLocalTestProvider({ reservationEnvelope, memberAssi
         active(token, 'ingress-attempted');
         await live();
         active(token, 'ingress-attempted');
-        if (provided.expires_at_ms <= now()
+        if (signedAuthorityExpiresAt <= now() || provided.expires_at_ms <= now()
           || Date.parse(signedAuthorization.expires_at) <= now()) refuse();
         const response = await service.invoke(config, { signal: abort.signal });
         active(token, 'ingress-attempted');
@@ -583,7 +589,7 @@ export function createStage2aLocalTestProvider({ reservationEnvelope, memberAssi
           || canonicalize(frame.core.peer) !== canonicalize(prewriteCore.peer)
           || !time(frame.core.write_started_at) || !time(frame.core.write_completed_at)
           || Date.parse(frame.core.write_started_at) > Date.parse(frame.core.write_completed_at)) refuse();
-        await live();
+        await live(false);
         active(token, 'completion-attempted');
         const reply = await machineComplete(frame, { signal: abort.signal });
         active(token, 'completion-attempted');
