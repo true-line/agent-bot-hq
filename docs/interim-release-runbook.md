@@ -102,6 +102,45 @@ old offline HQ pins cannot be remotely revoked by publishing retired metadata.
 Issue #122 remains open until release, coverage, success, refusal and rollback
 evidence is recorded.
 
+## Remove the Homebrew installation on macOS
+
+Use a login Terminal in the administrator account that owns Homebrew.
+If you installed a Soul launch grant, retire it through the paired HQ
+before removing the HQ service. See the
+[Machine launch rule procedure](https://github.com/true-line/agent-bot-machine/blob/main/docs/plans/member-accounts.md#review-a-macos-harness-launch-rule).
+
+Remove the dedicated HQ service first, while the Machine CLI is available.
+List the applied plans and substitute the ID for the current installation
+in both commands below. Review the dry run before applying the removal.
+
+```sh
+sudo managed-machine members uninstall-hq --list
+sudo managed-machine members uninstall-hq PLAN_ID --dry-run
+sudo managed-machine members uninstall-hq PLAN_ID
+```
+
+If removal is interrupted, run `--list` again and use the `resume_plan_id`
+with the same removal command. If you installed only the HQ formula, start
+with `brew uninstall` below.
+
+```sh
+brew uninstall agent-bot-hq
+```
+
+If you also want to remove Machine, run the following without `sudo`.
+It unloads the Machine daemon and keyd and uninstalls the Machine formula.
+
+```sh
+managed-machine uninstall
+```
+
+The service and package removals preserve the dedicated macOS account and
+its home, enrollment and pairing state, keys, receipts, and any HQ archive
+or Node runtime staged outside Homebrew. Review those separately when
+retiring the device. If you installed the owner-approval helper separately,
+follow the helper removal link in
+[Machine’s uninstall guide](https://github.com/true-line/agent-bot-machine#uninstall-on-macos).
+
 ## Verify the HQ-to-Machine channel
 
 For [HQ #56](https://github.com/true-line/agent-bot-hq/issues/56), provision
