@@ -60,11 +60,12 @@ export function createStage2aLocalTestQIssuer({ exchange, machinePublicKey }) {
       || q.approval_reference.plan_digest !== reply.plan_sha256.slice(7)
       || q.plan_sha256 !== reply.plan_sha256
       || canonicalDigest(q.plan) !== q.plan_sha256) refuse();
-    return Object.freeze({ plan_id: reply.plan_id, installation_id: q.plan.installation_id,
-      installed_plan_id: q.plan.installed_plan_id, installed_plan_digest: q.plan.installed_plan_digest,
-      owner_plan_sha256: q.plan.owner_plan_sha256, host_uuid: q.plan.host_uuid,
+    // Machine's root staging command strictly decodes the four-field issue reply.
+    return Object.freeze({
+      plan_id: reply.plan_id,
       plan_sha256: reply.plan_sha256,
       approval_envelope_base64url: reply.approval_envelope_base64url,
-      approval_envelope_sha256: reply.approval_envelope_sha256 });
+      approval_envelope_sha256: reply.approval_envelope_sha256,
+    });
   };
 }

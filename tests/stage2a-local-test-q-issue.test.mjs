@@ -42,19 +42,19 @@ function signedQ() {
   return { key, reply };
 }
 
-test('owner Q issue returns only an A-signed envelope bound to the requested guest', async () => {
+test('owner Q issue returns the exact Machine staging reply after verifying the installation', async () => {
   const { key, reply } = signedQ();
   let selected;
   const issue = createStage2aLocalTestQIssuer({ machinePublicKey: key,
     exchange: async (id) => { selected = id; return reply; } });
   const result = await issue({ plan_id: planId, installation_id: installationId });
   assert.equal(selected, planId);
-  assert.equal(result.installation_id, installationId);
-  assert.equal(result.approval_envelope_sha256, reply.approval_envelope_sha256);
-  assert.equal(result.plan_sha256, reply.plan_sha256);
-  assert.deepEqual(Object.keys(result).sort(), ['approval_envelope_base64url',
-    'approval_envelope_sha256', 'host_uuid', 'installation_id', 'installed_plan_digest',
-    'installed_plan_id', 'owner_plan_sha256', 'plan_id', 'plan_sha256'].sort());
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    plan_id: reply.plan_id,
+    plan_sha256: reply.plan_sha256,
+    approval_envelope_base64url: reply.approval_envelope_base64url,
+    approval_envelope_sha256: reply.approval_envelope_sha256,
+  });
 });
 
 test('Q issue refuses selectors and envelopes that do not bind the expected guest and key', async () => {
