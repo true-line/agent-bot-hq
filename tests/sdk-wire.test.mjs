@@ -125,6 +125,20 @@ test('dependentRequired validates present properties and refuses malformed depen
   }
 });
 
+test('propertyNames validates every object key and checks its subschema', () => {
+  const schema = { type: 'object', propertyNames: { pattern: '^x-' },
+    properties: { 'x-known': { type: 'integer' } }, additionalProperties: true };
+  assert.deepEqual(validate(schema, { 'x-known': 1, 'x-other': 'value' }), []);
+  assert.deepEqual(validate(schema, { 'x-known': 1, 'a/b~c': 2 })
+    .map(({ path, keyword }) => [path, keyword]), [['/a~1b~0c', 'pattern']]);
+  assert.deepEqual(validate({ type: 'object', propertyNames: false }, {}), []);
+  assert.equal(validate({ type: 'object', propertyNames: false }, { a: 1 })[0].path, '/a');
+  assert.deepEqual(validate({ type: 'array', propertyNames: false }, ['a']), []);
+  assert.throws(() => checkSchemaSupported({ propertyNames: { dependentSchemas: {} } }),
+    /keyword dependentSchemas/);
+  assert.throws(() => checkSchemaSupported({ propertyNames: [] }), TypeError);
+});
+
 test('offline references and composition validate every branch and fail closed', () => {
   const external = {
     $id: 'https://example.test/defs.json',
