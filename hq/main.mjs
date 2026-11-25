@@ -43,6 +43,7 @@ import { productionPluginsDir, readPins } from './plugins.mjs';
 import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { connectSocket } from './socket.mjs';
 import { machineRoleCommand, machineRoleStage2aCooperative, machineRoleStage2aList,
+  machineRoleStage2aLocalTestQIssue,
   machineRoleStage2aT03Positive, machineRoleStage2aT03PrewritePeer, machineRoleStage2aT03Ready,
   machineRoleStage2aT03SiblingWitness, machineRoleStage2aT03Complete } from './machine-channel.mjs';
 import { relaySoulAcp } from './soul-acp-relay.mjs';
@@ -55,12 +56,13 @@ import { authenticatedSelectedH } from './stage2a-h-preloader.mjs';
 import { createStage2aCooperativeMachine } from './stage2a-cooperative-machine.mjs';
 import { createStage2aCooperativeStarter, openInstalledCooperativeMemberProvider } from './stage2a-cooperative-start.mjs';
 import { createStage2aQualificationProvider } from './stage2a-qualification-provider.mjs';
+import { createStage2aLocalTestQIssuer } from './stage2a-local-test-q-issue.mjs';
 import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
 import { verifiedT03ChildStart, verifyT03RelayPeer } from './stage2a-t03-peer.mjs';
 import { checkedT03SiblingWitness, recordT03SiblingWitness,
   waitForT03SiblingWitnesses } from './stage2a-t03-sibling.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine soul-bridge-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|soul local-test-q-issue --plan-id ID --installation-id ID|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine soul-bridge-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
@@ -85,6 +87,14 @@ function parse(argv) {
       if (!/^st_[0-9a-f]{24}$/.test(args.startId ?? '') || args.cmd !== 'soul' || !['stop', 'qualify-direct'].includes(args.sub)) {
         throw new Error('--start-id needs a valid start ID and is only for soul stop or soul qualify-direct');
       }
+    } else if (argv[i] === '--plan-id' || argv[i] === '--installation-id') {
+      const flag = argv[i], value = argv[++i];
+      if (args.cmd !== 'soul' || args.sub !== 'local-test-q-issue' || !value || value.startsWith('--')) {
+        throw new Error(`${flag} is only for soul local-test-q-issue`);
+      }
+      const key = flag === '--plan-id' ? 'planId' : 'installationId';
+      if (args[key] !== undefined) throw new Error(`duplicate ${flag}`);
+      args[key] = value;
     } else if (argv[i] === '--profile') {
       args.profile = argv[++i];
       if (args.cmd !== 'soul' || args.sub !== 'start' || args.profile !== 'managed-protected') {
@@ -299,6 +309,10 @@ async function main(argv) {
       const epochs = new Set(installed.map((entry) => entry.hq_epoch));
       if (epochs.size > 1) throw new Error('Machine installed Soul plans disagree on HQ pairing epoch');
       const selectedH = authenticatedSelectedH();
+      const localTestQIssuer = managedHq && ownerControl && selectedH && machinePublicKey
+        && selectedH.machinePublicKey === machinePublicKey.toString('hex')
+        ? createStage2aLocalTestQIssuer({ exchange: machineRoleStage2aLocalTestQIssue,
+          machinePublicKey }) : undefined;
       const verifyHQCodeReady = () => Boolean(managedHq && selectedH && machinePublicKey
         && selectedH.machinePublicKey === machinePublicKey.toString('hex')
         && installed.length && installed.every((entry) => entry.host_id === selectedH.hostId));
@@ -503,7 +517,7 @@ async function main(argv) {
           await provider?.close();
         },
       })) : undefined;
-      hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins,
+      hq = createHQ({ home: args.home, ownerControl, localTestQIssuer, schemas: loadSchemas(), pins,
         pluginsDir, devPlugins: args.devPlugins, bridgeAssignments: installed,
         bridgeAuthority: authority, machineHqEpoch: epochs.values().next().value,
         createProtectedStart, protectedAdmission, createCooperativeStart, cooperativeAdmission: cooperativeMachine,
@@ -675,6 +689,17 @@ async function main(argv) {
     } finally { await client.close(); }
   }
   if (args.cmd === 'soul') {
+    if (args.sub === 'local-test-q-issue') {
+      if (!useOwnerControl || !args.planId || !args.installationId) {
+        throw new Error('soul local-test-q-issue needs owner-control, --plan-id and --installation-id');
+      }
+      const result = await ask(controlPath, 'soul.local-test-q-issue', {
+        plan_id: args.planId, installation_id: args.installationId,
+      });
+      if (!result.ok) throw new Error(JSON.stringify(result.refusal ?? result.host_refusal ?? result));
+      console.log(JSON.stringify(result.result));
+      return;
+    }
     if (args.sub === 'start') {
       await startSoul(controlPath, args.soul, args.profile);
       return;

@@ -95,6 +95,7 @@ function validStage2aCaptureRequest(verb, value) {
     && captureDigest(chunk) === value.chunk_sha256;
 }
 const DIRECT_Q_VERBS = new Set(['stage2a-cooperative-q-begin-v3', 'stage2a-cooperative-q-finish-v3']);
+const LOCAL_TEST_Q_ISSUE = 'stage2a-local-test-q-issue-v1';
 const COOPERATIVE_STATES = new Map([
   ['stage2a-cooperative-live-v3', 'cooperative-live'],
   ['stage2a-cooperative-b-exec-v3', 'cooperative-b-granted'],
@@ -264,7 +265,7 @@ function responseFields(line) {
 function authenticatedResponse(line, nonce, pinned, verb, capture = false) {
   const { value: r, body } = responseFields(line);
   if ((isServiceHandoff(verb) || verb === 'hq-device' || COOPERATIVE_STATES.has(verb)
-    || isCaptureVerb(verb) || T03_STATES.has(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)) && Object.keys(r).some((field) =>
+    || isCaptureVerb(verb) || T03_STATES.has(verb) || verb === LOCAL_TEST_Q_ISSUE || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb)) && Object.keys(r).some((field) =>
     !['ok', 'diagnostic', 'message', 'state', 'body', 'timestamp', 'nonce', 'request_nonce', 'signature'].includes(field))) {
     throw new Error('unexpected Machine ' + verb + ' response field');
   }
@@ -406,6 +407,8 @@ export const machineRoleStage2aExec = (request) => machineRoleStage2a('stage2a-e
 export const machineRoleStage2aVerifyB = (request) => machineRoleStage2a('stage2a-verify-b', request);
 export const machineRoleStage2aLookup = (request) => machineRoleStage2a('stage2a-lookup', request);
 export const machineRoleStage2aList = () => machineRoleStage2a('stage2a-list', {});
+export const machineRoleStage2aLocalTestQIssue = (planId) =>
+  machineRoleStage2a(LOCAL_TEST_Q_ISSUE, { plan_id: planId });
 export const machineRoleStage2aPrepareB = (request) => machineRoleStage2a('stage2a-prepare-b', request);
 export const machineRoleStage2aStop = (request) => machineRoleStage2a('stage2a-stop', request);
 export const machineRoleStage2aFinalizeB = (request) => machineRoleStage2a('stage2a-finalize-b', request);
@@ -563,7 +566,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       planID = args[1];
       socket = args[3];
     }
-  } else if ((COOPERATIVE_STATES.has(verb) || isCaptureVerb(verb) || T03_STATES.has(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb))
+  } else if ((COOPERATIVE_STATES.has(verb) || isCaptureVerb(verb) || T03_STATES.has(verb) || verb === LOCAL_TEST_Q_ISSUE || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-stop', 'stage2a-finalize-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role'].includes(verb))
     && args.length === 2 && args[0] === '--socket') {
     socket = args[1];
   }
@@ -648,10 +651,11 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
     }
     if (!deviceFields || !keys.every((key) => typeof deviceFields[key] === 'string' && !/[\r\n]/.test(deviceFields[key]))
       || Object.keys(deviceFields).length !== keys.length || !/^(legacy|[a-f0-9]{64})$/.test(deviceFields.hq_epoch)) throw new Error('invalid Machine device fields');
-  } else if (isCaptureVerb(verb) || T03_STATES.has(verb) || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role', 'stage2a-stop', 'stage2a-finalize-b'].includes(verb)) {
+  } else if (isCaptureVerb(verb) || T03_STATES.has(verb) || verb === LOCAL_TEST_Q_ISSUE || ['stage2a-lookup', 'stage2a-list', 'stage2a-reserve', 'stage2a-exec', 'stage2a-verify-b', 'stage2a-prepare-b', 'stage2a-live', 'stage2a-provider', 'stage2a-child-ready', 'stage2a-hello-start', 'stage2a-hello-finalize', 'stage2a-hello-abort', 'stage2a-peer-role', 'stage2a-stop', 'stage2a-finalize-b'].includes(verb)) {
     const selectors = {
       'stage2a-lookup': ['package_path'],
       'stage2a-list': [],
+      [LOCAL_TEST_Q_ISSUE]: ['plan_id'],
       'stage2a-reserve': ['plan_digest', 'installation_id', 'start_id', 'hq_epoch', 'launch_id'],
       'stage2a-exec': ['reservation_sha256', 'role', 'nonce', 'pid'],
       'stage2a-verify-b': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
@@ -691,6 +695,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       || (verb === 'stage2a-lookup' && (typeof deviceFields.package_path !== 'string'
         || !isAbsolute(deviceFields.package_path) || /[\x00\r\n]/.test(deviceFields.package_path)
         || Buffer.byteLength(deviceFields.package_path) > 4096))
+      || (verb === LOCAL_TEST_Q_ISSUE && !validPlanId(deviceFields.plan_id))
       || (verb === 'stage2a-reserve' && (!sha.test(deviceFields.plan_digest)
         || !id.test(deviceFields.installation_id) || !/^st_[0-9a-f]{24}$/.test(deviceFields.start_id)
         || !sha.test(deviceFields.hq_epoch) || !/^ln_[0-9a-f]{24}$/.test(deviceFields.launch_id)))
@@ -764,6 +769,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   const stage2aFields = {
     'stage2a-lookup': ['package_path'],
     'stage2a-list': [],
+    [LOCAL_TEST_Q_ISSUE]: ['plan_id'],
     'stage2a-reserve': ['plan_digest', 'installation_id', 'start_id', 'hq_epoch', 'launch_id'],
     'stage2a-exec': ['reservation_sha256', 'role', 'nonce', 'pid'],
     'stage2a-verify-b': ['reservation_sha256', 'installation_id', 'start_id', 'launch_id',
@@ -818,6 +824,7 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   }
   if (stage2aFields) {
     const expectedState = { ...CAPTURE_STATES, 'stage2a-lookup': 'found', 'stage2a-list': 'listed',
+      [LOCAL_TEST_Q_ISSUE]: 'local-test-q-issued',
       'stage2a-reserve': 'reserved', 'stage2a-exec': 'granted',
       'stage2a-verify-b': 'verified', 'stage2a-prepare-b': 'prepared',
       'stage2a-stop': 'stopped', 'stage2a-finalize-b': 'finalized',
@@ -892,6 +899,21 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
           ? body.accepted !== true
           : !/^sha256:[0-9a-f]{64}$/.test(body.sha256 ?? ''))) {
         throw new Error('invalid signed Machine T03 response');
+      }
+      return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
+    }
+    if (verb === LOCAL_TEST_Q_ISSUE) {
+      if (!captureKeys(body, ['plan_id', 'plan_sha256', 'approval_envelope_base64url',
+        'approval_envelope_sha256'])
+        || body.plan_id !== deviceFields.plan_id
+        || !/^sha256:[0-9a-f]{64}$/.test(body.plan_sha256)
+        || !/^sha256:[0-9a-f]{64}$/.test(body.approval_envelope_sha256)
+        || !captureBase64(body.approval_envelope_base64url, 1, 10923)) {
+        throw new Error('invalid signed Machine local-test Q issue body');
+      }
+      const envelope = Buffer.from(body.approval_envelope_base64url, 'base64url');
+      if (envelope.length > 8192 || captureDigest(envelope) !== body.approval_envelope_sha256) {
+        throw new Error('Machine local-test Q envelope digest mismatch');
       }
       return Object.freeze({ ...body, daemon_fingerprint: fingerprint(daemon) });
     }
