@@ -31,6 +31,10 @@ deployment operator owns client inventory, installation, monitoring and rollback
    Compare SHA-256 of the two archives. Record source commit, contracts commit,
    contracts digest, artifact SHA-256, builder/tool versions and both results.
    A mismatch blocks publication. Obtain the owner's approval of those bytes.
+   For a Darwin commit on main, the macOS source artifact workflow retains the
+   tested tar and checksum as `hq-darwin-arm64-<full-hq-commit>`. Use the
+   artifact from the successful run for that exact commit. Verify the downloaded
+   tar against its checksum and record the run URL and digest for approval.
    For Darwin's bundled communications broker, the pin records the published
    agent-comms release tag, source commit, built plugin tree digest and release
    asset SHA-256. The builder checks the tag-to-commit binding and verifies the
