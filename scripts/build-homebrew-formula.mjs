@@ -39,7 +39,7 @@ process.stdout.write(`class AgentBotHq < Formula
   def install
     system "/usr/bin/tar", "-xf", "${asset}"
     libexec.install "hq", "${asset}" => "agent-bot-hq-darwin-arm64.tar"
-    (bin/"agent-bot-hq").write_env_script Formula["node"].opt_bin/"node", %("#{libexec}/hq/hq/main.mjs"), {}
+    (bin/"agent-bot-hq").write_env_script Formula["node"].opt_bin/"node", [%("#{libexec}/hq/hq/main.mjs")], {}
   end
 
   def caveats

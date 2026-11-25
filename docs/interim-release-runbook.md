@@ -51,10 +51,17 @@ deployment operator owns client inventory, installation, monitoring and rollback
 
 For a reviewed public Darwin release, publish the approved tar bytes under
 `agent-bot-hq-VERSION-darwin-arm64.tar` in GitHub release `vVERSION`.
-Generate the self-tap formula with
-`node scripts/build-homebrew-formula.mjs VERSION ARCHIVE APPROVED_SHA256`
-and review it as `Formula/agent-bot-hq.rb`. After the formula is published,
-install and check it as the Homebrew administrator.
+Generate the self-tap formula in the HQ checkout.
+
+```sh
+mkdir -p Formula
+node scripts/build-homebrew-formula.mjs VERSION ARCHIVE APPROVED_SHA256 \
+  > Formula/agent-bot-hq.rb.tmp &&
+  mv Formula/agent-bot-hq.rb.tmp Formula/agent-bot-hq.rb
+```
+
+Review and publish the generated formula in the tap. Then install and check
+it as the Homebrew administrator.
 
 ```sh
 brew tap true-line/agent-bot-hq https://github.com/true-line/agent-bot-hq.git

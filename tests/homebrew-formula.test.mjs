@@ -32,6 +32,7 @@ test('the HQ formula pins the approved public Darwin archive and retains it for 
     assert.ok(formula.stdout.includes('/releases/download/v1.2.3/agent-bot-hq-1.2.3-darwin-arm64.tar'));
     assert.match(formula.stdout, /using: :nounzip/);
     assert.match(formula.stdout, /"agent-bot-hq-1.2.3-darwin-arm64.tar" => "agent-bot-hq-darwin-arm64.tar"/);
+    assert.ok(formula.stdout.includes('[%("#{libexec}/hq/hq/main.mjs")], {}'));
     assert.match(formula.stdout, /agent-bot-hq check-owner-control/);
     for (const [refused, reason] of [
       [render('0'.repeat(64)), /approved SHA-256/],
