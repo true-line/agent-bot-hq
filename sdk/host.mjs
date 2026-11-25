@@ -3,7 +3,7 @@
 // registration, and hq/v1 dispatch with auth.
 //
 // Identity is HQ core, not a plugin (PDR-0027): the host reads device status
-// from the signer itself and answers status, device.status and device.enroll.
+// from the signer itself and answers status and device operations.
 // No plugin can register those operations, and agent-bot-identity's plugin
 // registers member surfaces (tools, commands, hooks) like any other.
 //
@@ -25,7 +25,7 @@ const RUNTIME_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const BROKER = 'broker';
 const ADAPTER_CLASSES = ['inference', 'service'];
 // Operations HQ core answers itself; a plugin registering one is refused.
-const CORE_OPERATIONS = Object.freeze({ status: 'hq', 'device.status': 'hq', 'device.enroll': 'hq' });
+const CORE_OPERATIONS = Object.freeze({ status: 'hq', 'device.status': 'hq', 'device.enroll': 'hq', 'device.whoami': 'hq' });
 
 function withTimeout(promise, ms, what) {
   let timer;
@@ -360,6 +360,12 @@ export function createHost({
       return { device: device ?? 'unknown', link: core.identity.link, ...(enrollment ? { enrollment } : {}) };
     }
     if (op === 'device.enroll') return enroll(payload);
+    if (op === 'device.whoami') {
+      if (payload !== undefined) fail('host.invalid_request', 'device.whoami accepts no arguments');
+      if (device === 'revoked') fail('device_revoked', 'device revoked: re-enroll');
+      if (!core.identity.lookupMachineDevice) fail('credential_unavailable', 'device lookup requires a paired Machine and Identity link');
+      return core.identity.lookupMachineDevice();
+    }
     const reg = registries.hq.get(op);
     if (!reg) fail('host.unknown_operation', `no plugin implements ${op}`, { op });
     if (states.get(reg.plugin)?.state !== 'running') fail('host.plugin_degraded', `${reg.plugin} is ${states.get(reg.plugin)?.state}`, { plugin: reg.plugin, ...states.get(reg.plugin) });

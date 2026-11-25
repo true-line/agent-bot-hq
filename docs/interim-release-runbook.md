@@ -115,6 +115,15 @@ Machine v0.12.4 supports signed status and predates the `hq-device` operation.
 If HQ reports `MM_DAEMON_VERB_UNKNOWN` for device signing, keep the existing
 pairing and use a Machine release that supports `hq-device` before enrollment.
 
+After the owner approves enrollment and restarts HQ, run
+`node hq/main.mjs whoami --owner-control` from the authorized owner's account
+with the installed Node and HQ paths. The running HQ service uses its paired
+Machine to sign a fresh request to the configured issuer. On HTTP 200, HQ
+verifies the issuer's signature and matches the device ID to its Machine-bound
+enrollment before returning the issuer, device ID and verification result.
+Compare that ID with the enrollment output. Restart Machine and HQ, then run
+the same check and confirm the device ID is unchanged.
+
 Once the daemon pin is saved, the dedicated HQ role can retrieve the prefix
 administrator's saved members plans from a Machine with paired plan lookup.
 List up to 64 plan IDs per page. If the reply includes `next_after`, pass

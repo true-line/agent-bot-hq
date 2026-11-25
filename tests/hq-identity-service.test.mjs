@@ -284,6 +284,22 @@ test('concurrent cold Machine status checks still share one access session', asy
   } finally { client.close(); }
 });
 
+test('the owner device lookup requires the Machine self-lookup proof before reaching the daemon API', async () => {
+  const f = fixture();
+  const client = f.make();
+  const active = await startHQ({ identity: client });
+  try {
+    const entry = await active.entry();
+    const owner = await active.owner();
+    assert.equal((await entry.request('device.whoami')).host_refusal.code, 'host.auth_mismatch');
+    assert.equal((await owner.request('device.whoami', { device_id: 'other' })).host_refusal.code, 'host.invalid_request');
+    const reply = await owner.request('device.whoami');
+    assert.equal(reply.refusal.error, 'credential_unavailable');
+    assert.match(reply.refusal.explanation, /paired Machine proof/);
+    assert.equal(f.state.apiCalls, 0);
+  } finally { await active.done(); }
+});
+
 test('a cold custody status failure is normalized without an issuer request', async () => {
   const f = fixture();
   const client = f.make({ custody: { async deviceStatus() { throw new Error('sensitive detail'); } } });

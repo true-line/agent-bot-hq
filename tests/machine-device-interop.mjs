@@ -230,24 +230,27 @@ try {
   }
 
   const lookup = () => hq.core.identity.call('GET', '/api/daemon/whoami');
+  function checkLookup(reply, deviceId) {
+    assert.deepEqual(reply, {
+      issuer: origin, device_id: deviceId, signing_backend: 'machine', response_signature_verified: true,
+    });
+  }
   async function bindFreshSession() {
     await hq.settled();
     assert.equal(hq.core.identity.status().tokenCached, false);
     const before = server.state.requests.length;
     const operations = calls.length;
-    const reply = await lookup();
-    assert.equal(reply.status, 200);
+    const reply = JSON.parse((await cli('whoami')).stdout);
     assert.deepEqual(calls.slice(operations).filter(op => op !== 'identity'), ['access-assertion', 'bind-access', 'whoami']);
     const sent = server.state.requests.slice(before);
     assert.deepEqual(sent.map(r => [r.method, r.url]), [['POST', '/oauth/token'], ['GET', '/api/daemon/whoami']]);
     assert.equal(hq.core.identity.status().tokenCached, true);
     // The fixture issuer verified the assertion; retain only its public identifiers.
     const claims = JSON.parse(Buffer.from(sent[0].form.assertion.split('.')[1], 'base64url'));
-    assert.equal(reply.body.device.id, claims.iss);
+    checkLookup(reply, claims.iss);
     const warm = await lookup();
     assert.equal(warm.status, 200);
     assert.equal(warm.body.device.id, claims.iss);
-    assert.notEqual(warm.headers['agent-bot-request-jti'], reply.headers['agent-bot-request-jti']);
     assert.deepEqual(server.state.requests.slice(before + 2).map(r => [r.method, r.url]), [['GET', '/api/daemon/whoami']]);
     const requests = server.state.requests.length;
     await assert.rejects(hq.core.identity.call('GET', '/api/daemon/issuances/fixture-op'),
@@ -323,9 +326,19 @@ try {
       assert.equal(plugin.state, enrolled ? 'running' : 'waiting');
     }
     checkBroker(await startPackage(entry, home), false);
-    assert.match((await approveEnrollment(entry)).stdout, /Enrolled as device/);
+    const enrollment = (await approveEnrollment(entry)).stdout;
+    assert.match(enrollment, /Enrolled as device/);
+    const deviceId = server.state.devices.at(-1).device_id;
+    assert.ok(enrollment.includes(deviceId));
     await stopPackage();
     checkBroker(await startPackage(entry, home), true);
+    const lookupPackage = async () => JSON.parse((await runCLI(entry, home, ['whoami'])).stdout);
+    checkLookup(await lookupPackage(), deviceId);
+    await stopPackage();
+    await stopMachine();
+    await startMachine();
+    checkBroker(await startPackage(entry, home), true);
+    checkLookup(await lookupPackage(), deviceId);
     await stopPackage();
     copyFileSync(join(original, issuerPin), join(copy, issuerPin));
     assert.equal(treeDigest(copy), originalDigest);
@@ -406,7 +419,7 @@ try {
   assert.equal((await startHQ()).mode, 'safe');
   assert.equal((await cliStatus()).hq.signer.available, false);
   await assertNoLocalSigner();
-  assert.deepEqual(server.state.requests.filter(r => r.url.startsWith('/api/daemon/')).map(r => r.url), Array(4).fill('/api/daemon/whoami'));
+  assert.deepEqual(server.state.requests.filter(r => r.url.startsWith('/api/daemon/')).map(r => r.url), Array(packagedCLI ? 6 : 4).fill('/api/daemon/whoami'));
   console.log('Verified signed self-lookups on one enrolled device across Machine restart and warm-token refusal on outage and revocation.');
 } finally {
   try {

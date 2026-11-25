@@ -19,6 +19,7 @@ test('unenrolled: safe mode; status and device.status answer, nothing else does,
     const owner = await t.owner();
     assert.equal((await owner.request('status')).result.mode, 'safe');
     assert.equal((await owner.request('device.status')).result.device, 'unenrolled');
+    assert.equal((await owner.request('device.whoami')).host_refusal.code, 'host.safe_mode');
     assert.equal((await owner.request('souls.list')).host_refusal.code, 'host.safe_mode');
     const entry = await t.entry();
     assert.equal((await entry.request('Hello', hello())).host_refusal.code, 'host.safe_mode');
