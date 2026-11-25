@@ -191,7 +191,6 @@ export function createHQ({
   soulCompletionVerifier,        // independent Machine containment signature verifier
   machineHqEpoch,                // signed current paired epoch from Machine list; never owner config
   protectedStart,                // HQ-started Machine-authorized R/B lifecycle from trusted entry point
-  createProtectedStart,          // trusted factory with HQ's durable launch receipt writer
   bridgeAuthority,               // authenticated Machine live-start/B proof client; never config or owner input
   bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
   qualificationAuthorizer,       // trusted one-use installed test-provider operation; never owner config
@@ -344,8 +343,6 @@ export function createHQ({
         return admission.withLiveRuntime(runtimeId, caller, fn);
       },
     });
-    protectedStart ??= createProtectedStart?.((record) =>
-      pushReceipt(core, { ...record, plugin: 'hq', kind: 'hq.soul.started' }));
     soulStarter = createSoulStarter({ core, home, machineLaunch: soulLaunch,
       verifyMachineReservation: soulVerifier, verifyMachineCompletion: soulCompletionVerifier,
       protectedStart, cooperativeStart: createCooperativeStart?.(core),

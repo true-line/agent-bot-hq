@@ -261,9 +261,7 @@ async function main(argv) {
         machinePublicKey, authority,
         stopReservation: (reservationSHA256) => protectedStart.stopReservation(reservationSHA256),
       }) : undefined;
-      let protectedStart;
-      const createProtectedStart = installed.length ? (recordLaunch) => (protectedStart = createStage2aProtectedStarter({
-        recordLaunch,
+      const protectedStart = installed.length ? createStage2aProtectedStarter({
         installations: installed, authority, verifyReservation,
         getBrokerIdentity: (installationId) => hq.bridgeBrokerIdentity(installationId),
         verifyBoundBridge: (selectors, digest) => hq.boundBridgeV2(selectors, digest),
@@ -293,11 +291,11 @@ async function main(argv) {
           }));
         },
         onStopped: (reservationSHA256) => { providers.delete(reservationSHA256); },
-      })) : undefined;
+      }) : undefined;
       hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins,
         pluginsDir, devPlugins: args.devPlugins, bridgeAssignments: installed,
         bridgeAuthority: authority, machineHqEpoch: epochs.values().next().value,
-        createProtectedStart, protectedAdmission, createCooperativeStart, cooperativeAdmission: cooperativeMachine,
+        protectedStart, protectedAdmission, createCooperativeStart, cooperativeAdmission: cooperativeMachine,
         qualificationAuthorizer: installed.length ? ({ request, observation }) => {
           const provider = providers.get(observation?.reservation_digest);
           if (!provider) throw new Error('Machine protected provider start is unavailable');
