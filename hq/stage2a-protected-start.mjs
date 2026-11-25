@@ -4,6 +4,10 @@
 import { lstatSync, realpathSync } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { pipeline } from 'node:stream';
+import { canonicalBytes, canonicalDigest } from '../sdk/wire/canonical-json.mjs';
+import { validate } from '../sdk/wire/schema.mjs';
+import { matchesObservedMemberGrants, verifyStage2aBridgeMemberAuthority } from './stage2a-relay-peer.mjs';
+import { verifyStage2aMachineEnvelope } from './stage2a-stop.mjs';
 import { takeover } from './socket.mjs';
 import { machineRoleStage2aLookup, machineRoleStage2aReserve,
   machineRoleStage2aFinalizeB, machineRoleStage2aChildReady } from './machine-channel.mjs';
@@ -74,6 +78,204 @@ function activateRunner(runner, assignment, reservationSHA256, live, finalizatio
   });
 }
 
+export function verifyCooperativeMemberReady(bytes, machinePublicKey, {
+  observation, authoritySHA256, bridgeObservedSHA256, hObservationSHA256s, armReceiptSHA256s, now,
+}) {
+  const ready = verifyStage2aMachineEnvelope(bytes, machinePublicKey,
+    'agent-bot/soul-cooperative-member-ready/v3', { schemaVersion: 3, maxBytes: 16_384 });
+  const r = ready.payload, c = observation.payload;
+  const scope = ['profile_in_force', 'host_id', 'installation_id', 'start_id', 'hq_epoch',
+    'reservation_sha256', 'assignment_envelope_sha256', 'provisional_hq_mapping_sha256'];
+  if (!exact(r, ['contract', 'kind', 'schema_version', ...scope, 'child_observation_envelope_sha256',
+    'member_b_authority_envelope_sha256', 'bridge_observed_sha256', 'members', 'issued_at', 'expires_at'])
+    || r.contract !== 'machine/v3' || r.kind !== 'soul-cooperative-member-ready' || r.schema_version !== 3
+    || r.profile_in_force !== 'managed-cooperative' || scope.some((field) => r[field] !== c[field])
+    || r.child_observation_envelope_sha256 !== observation.envelope_sha256
+    || !DIGEST.test(authoritySHA256 ?? '') || r.member_b_authority_envelope_sha256 !== authoritySHA256
+    || !DIGEST.test(bridgeObservedSHA256 ?? '') || r.bridge_observed_sha256 !== bridgeObservedSHA256
+    || !(Date.parse(c.issued_at) <= Date.parse(r.issued_at) && Date.parse(r.issued_at) <= now
+      && now < Date.parse(r.expires_at)) || !Array.isArray(r.members) || r.members.length !== 2
+    || c.members?.length !== 2 || hObservationSHA256s?.length !== 2 || armReceiptSHA256s?.length !== 2) refuse();
+  for (const [i, row] of r.members.entries()) {
+    const observed = c.members[i];
+    if (!exact(row, ['member_id', 'member_launch_id', 'member_selector', 'grant_sha256',
+      'launcher_process', 'child_process', 'h_observation_sha256', 'b_arm_receipt_sha256'])
+      || ['member_id', 'member_selector', 'grant_sha256'].some((field) => row[field] !== observed[field])
+      || row.member_launch_id !== observed.launch_id
+      || canonicalDigest(row.launcher_process) !== canonicalDigest(observed.launcher_process)
+      || canonicalDigest(row.child_process) !== canonicalDigest(observed.child_process)
+      || !DIGEST.test(row.h_observation_sha256 ?? '') || row.h_observation_sha256 !== hObservationSHA256s[i]
+      || !DIGEST.test(row.b_arm_receipt_sha256 ?? '') || row.b_arm_receipt_sha256 !== armReceiptSHA256s[i]) refuse();
+  }
+  return ready;
+}
+
+// One protected start owns both wrappers. This is invoked from the pending
+// Hello transaction boundary. Only the later selector-bound attach owns ACP.
+export function createStage2aPrestartedMembers({ machinePublicKey, schemas, schemaReferences = [],
+  submitMap, startMember, observeChildren, deliverObservation, waitForReady, stop, recordHChildObservation,
+  profile = 'managed-protected', now = Date.now } = {}) {
+  if ((profile === 'managed-cooperative' && typeof recordHChildObservation !== 'function')
+    || !schemas?.assignment || !schemas.mapping || !schemas.authority || !schemas.observation || !schemas.ready
+    || [submitMap, startMember, observeChildren, deliverObservation, waitForReady, stop, now]
+      .some((method) => typeof method !== 'function')) refuse();
+  const digest = (bytes) => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+  const names = Object.values(schemas);
+  const refs = (schema) => [...new Map([...schemaReferences, ...names].filter((entry) =>
+    entry?.$id && entry.$id !== schema.$id).map((entry) => [entry.$id, entry])).values()];
+  const validatePayload = (schema, payload) => {
+    if (validate(schema, payload, { schemas: refs(schema) }).length) refuse();
+    return payload;
+  };
+  const signed = (bytes, kind, schema) => {
+    const envelope = verifyStage2aMachineEnvelope(bytes, machinePublicKey,
+      `agent-bot/stage2a-member-set-${kind}/v1`, { maxBytes: 16_384 });
+    validatePayload(schema, envelope.payload);
+    return envelope;
+  };
+  let started = false;
+  return async function prepare({ selectors, expectedAuthority, assignmentBytes, authorityBytes, pendingRuntimes }) {
+    if (started) refuse();
+    started = true;
+    const handles = [];
+    let cancelled = false;
+    let timer;
+    const contain = async () => {
+      cancelled = true;
+      await Promise.allSettled(handles.map((handle) => Promise.resolve().then(() => handle.stop())));
+      await stop();
+    };
+    const work = async () => {
+      const assignment = signed(assignmentBytes, 'assignment', schemas.assignment);
+      const a = assignment.payload;
+      const authority = verifyStage2aBridgeMemberAuthority(authorityBytes, { machinePublicKey,
+        schema: schemas.authority, assignmentSchema: schemas.assignment,
+        schemas: refs(schemas.assignment).filter((schema) => schema.$id !== schemas.authority.$id),
+        expected: { ...expectedAuthority, ...selectors, profile_in_force: profile },
+        assignmentBytes, now: now() });
+      const match = (left, right, fields) => fields.every((field) => left?.[field] === right?.[field]);
+      const scope = ['profile_in_force', 'host_id', 'installation_id', 'soul_id', 'start_id', 'hq_epoch'];
+      const runtime = new Map(pendingRuntimes.map((row) => [row.member_id, row]));
+      if (pendingRuntimes.length !== 2 || runtime.size !== 2 || cancelled) refuse();
+      const map = validatePayload(schemas.mapping, {
+        contract: 'hq/v1', kind: 'stage2a-provisional-member-map', schema_version: 1,
+        ...Object.fromEntries(scope.map((field) => [field, a[field]])),
+        assignment_envelope_sha256: assignment.envelope_sha256,
+        runtime_state: 'provisional', acp_authority: 'withheld',
+        members: a.members.map((member) => {
+          const rt = runtime.get(member.member_id);
+          if (!rt || rt.role !== member.role) refuse();
+          return { member_id: member.member_id, member_selector: member.member_selector,
+            runtime_id: rt.runtime_id, channel_binding: rt.channel_binding };
+        }), issued_at: new Date(now()).toISOString().replace('.000Z', 'Z'), expires_at: a.expires_at,
+      });
+      const mapBytes = canonicalBytes(map), mapDigest = digest(mapBytes);
+      const ack = await submitMap({ ...selectors,
+        provisional_hq_mapping_base64url: mapBytes.toString('base64url'), provisional_hq_mapping_sha256: mapDigest });
+      if (ack?.accepted !== true || ack.sha256 !== mapDigest || cancelled) refuse();
+      const children = await Promise.all(a.members.map(async (member) => {
+        const child = await startMember(selectors, Object.freeze({ ...member }));
+        if (typeof child?.stop !== 'function') refuse();
+        if (cancelled) { await child.stop(); refuse(); }
+        handles.push(child);
+        const status = await child.waitChildStarted();
+        if (cancelled || status.child_launcher_pid !== child.pid || status.grant_sha256 !== child.grantSHA256
+          || !DIGEST.test(child.grantSHA256) || !Number.isSafeInteger(status.child_pid)
+          || status.child_pid < 2 || status.child_pid === child.pid) refuse();
+        return { child, member, status };
+      }));
+      const hObservations = profile === 'managed-cooperative'
+        ? await Promise.all(children.map(({ child, member, status }) => recordHChildObservation({
+          member, launcherPid: child.pid, childPid: status.child_pid, grantSHA256: child.grantSHA256,
+        }))) : [];
+      if (cancelled) refuse();
+      const evidence = children.map(({ child, member, status }, i) => ({
+        member_id: member.member_id, member_selector: member.member_selector,
+        member_launch_id: member.launch_id, child_launcher_pid: child.pid, child_pid: status.child_pid,
+        grant_sha256: child.grantSHA256,
+        ...(hObservations[i] ? { h_observation_sha256: hObservations[i].sha256,
+          h_observation_base64url: hObservations[i].base64url } : {}),
+      }));
+      const observationBytes = await observeChildren({ ...selectors, members: evidence });
+      const observation = signed(observationBytes, 'child-observation', schemas.observation);
+      const c = observation.payload;
+      if (cancelled || !match(c, a, [...scope, 'reservation_sha256'])
+        || c.assignment_envelope_sha256 !== assignment.envelope_sha256
+        || c.provisional_hq_mapping_sha256 !== mapDigest
+        || canonicalDigest(c.provisional_hq_mapping) !== mapDigest) refuse();
+      const memberGrants = c.members.map((row, i) => {
+        const observed = evidence[i];
+        const h = hObservations[i]?.row;
+        if ((h && (!match(row.launcher_process, h.launcher_process, ['pid','uid','gid','start_seconds','start_micros'])
+          || !match(row.child_process, h.child_process, ['pid','uid','gid','start_seconds','start_micros'])))
+          || row.launcher_process.pid !== observed.child_launcher_pid || row.child_process.pid !== observed.child_pid
+          || row.child_process.uid !== a.runner_uid || row.child_process.gid !== a.runner_gid
+          || row.child_process.executable_sha256 !== a.members[i].command_sha256
+          || row.runtime_id !== map.members[i].runtime_id) refuse();
+        return Object.freeze({ member_id: observed.member_id, member_selector: observed.member_selector,
+          launch_id: observed.member_launch_id, grant_sha256: observed.grant_sha256,
+          launcher_process: Object.freeze({ ...row.launcher_process }) });
+      });
+      if (!matchesObservedMemberGrants(a, c.members, memberGrants) || Date.parse(c.expires_at) <= now()) refuse();
+      await Promise.all(children.map(({ child, member }) =>
+        deliverObservation(child, member, observationBytes, observation.envelope_sha256)));
+      if (cancelled) refuse();
+      const readiness = await waitForReady({ selectors, observationBytes, memberGrants, children,
+        provisionalMappingSHA256: mapDigest });
+      if (cancelled) refuse();
+      if (profile === 'managed-cooperative') {
+        const { readyBytes, armReceiptSHA256s, armRowsBase64url, bridgeObservedBase64url } = readiness ?? {};
+        const readyEvidence = Object.freeze({ observation, authoritySHA256: authority.envelope_sha256,
+          bridgeObservedSHA256: expectedAuthority.bridgeObservedSHA256,
+          hObservationSHA256s: Object.freeze(hObservations.map(({ sha256 }) => sha256)),
+          armReceiptSHA256s: Object.freeze([...(armReceiptSHA256s ?? [])]) });
+        verifyCooperativeMemberReady(readyBytes, machinePublicKey, { ...readyEvidence, now: now() });
+        const rawMatches = (encoded, expected) => {
+          if (typeof encoded !== 'string' || encoded.length > 21_846) return false;
+          const bytes = Buffer.from(encoded, 'base64url');
+          return bytes.toString('base64url') === encoded && digest(bytes) === expected;
+        };
+        if (!rawMatches(bridgeObservedBase64url, readyEvidence.bridgeObservedSHA256)
+          || !Array.isArray(armRowsBase64url) || armRowsBase64url.length !== 2
+          || !armRowsBase64url.every((raw, i) => rawMatches(raw, readyEvidence.armReceiptSHA256s[i]))) refuse();
+        return Object.freeze({ assignment, assignmentBytes, authorityBytes, observationBytes, readyBytes, readyEvidence,
+          armRowsBase64url: Object.freeze([...armRowsBase64url]), bridgeObservedBase64url, memberGrants: Object.freeze(memberGrants), children: Object.freeze(children), provisionalMappingSHA256: mapDigest });
+      }
+      const readyBytes = readiness;
+      const ready = signed(readyBytes, 'ready', schemas.ready);
+      const r = ready.payload;
+      if (cancelled || !match(r, a, [...scope, 'reservation_sha256'])
+        || r.assignment_envelope_sha256 !== assignment.envelope_sha256
+        || r.child_observation_envelope_sha256 !== observation.envelope_sha256
+        || r.member_b_authority_envelope_sha256 !== authority.envelope_sha256
+        || r.b_authority_sha256 !== a.b_authority.envelope_sha256 || r.provisional_hq_mapping_sha256 !== mapDigest
+        || !match(r.bridge_process, a.bridge, ['uid', 'gid'])
+        || !expectedAuthority.bridge_process
+        || canonicalDigest(r.bridge_process) !== canonicalDigest(expectedAuthority.bridge_process)
+        || !(Date.parse(r.issued_at) <= now() && now() < Date.parse(r.expires_at))) refuse();
+      for (const [i, row] of r.members.entries()) {
+        const observed = c.members[i], arm = row.bridge_arm;
+        if (!match(row, observed, ['member_id', 'member_selector', 'launch_id', 'runtime_id'])
+          || !match(row, arm, ['member_id', 'member_selector', 'runtime_id'])
+          || arm.bridge_uid !== r.bridge_process.uid || arm.state !== 'armed'
+          || arm.child_observation_envelope_sha256 !== observation.envelope_sha256
+          || ['pid', 'uid', 'gid', 'start_seconds', 'start_micros'].some((field) =>
+            arm[`adapter_${field}`] !== observed.child_process[field])
+          || canonicalDigest(arm) !== row.bridge_arm_receipt_sha256) refuse();
+      }
+      return Object.freeze({ assignment, assignmentBytes, authorityBytes, observationBytes, readyBytes,
+        memberGrants: Object.freeze(memberGrants), children: Object.freeze(children), provisionalMappingSHA256: mapDigest });
+    };
+    try {
+      return await Promise.race([work(), new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Stage 2a member-set prestart timed out')), 20_000);
+        timer.unref?.();
+      })]);
+    } catch (error) { await contain(); throw error; }
+    finally { clearTimeout(timer); }
+  };
+}
+
 export function createStage2aProtectedStarter({ installations, authority, verifyReservation,
   getBrokerIdentity, verifyBoundBridge, machineLookup = machineRoleStage2aLookup,
   machineReserve = machineRoleStage2aReserve, machineFinalize = machineRoleStage2aFinalizeB,
@@ -81,7 +283,8 @@ export function createStage2aProtectedStarter({ installations, authority, verify
   openProtectedAdmission,
   prepareBridge = prepareStage2aBridge, startRole = startStage2aRole,
   verifyHQCodeReady = () => false,
-  onFinalized, onStopped, random = (bytes) => randomBytes(bytes).toString('hex') } = {}) {
+  recordLaunch, onFinalized, onStopped, onT03Event,
+  random = (bytes) => randomBytes(bytes).toString('hex') } = {}) {
   if (!Array.isArray(installations) || typeof authority?.register !== 'function'
     || typeof authority.stopStart !== 'function' || typeof authority.currentLiveStart !== 'function'
     || typeof verifyReservation !== 'function'
@@ -90,7 +293,8 @@ export function createStage2aProtectedStarter({ installations, authority, verify
     || typeof machineReserve !== 'function' || typeof machineFinalize !== 'function'
     || typeof machineChildReady !== 'function'
     || typeof prepareBridge !== 'function' || typeof startRole !== 'function'
-    || typeof verifyHQCodeReady !== 'function' || typeof random !== 'function') refuse();
+    || typeof verifyHQCodeReady !== 'function' || typeof recordLaunch !== 'function'
+    || typeof random !== 'function') refuse();
   const byId = new Map(installations.map((i) => [i.installation_id, i]));
   if (byId.size !== installations.length) refuse();
   const slots = new Map();
@@ -194,6 +398,7 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         observation.bind_receipt_sha256);
         if (!bound || bound.bind_receipt_sha256 !== observation.bind_receipt_sha256) refuse();
         const relay_socket = stage2aRelayClaim(installed, startId, observation);
+        slot.relaySocket = relay_socket;
         const finalized = await machineFinalize({ ...selectors,
           bind_receipt_sha256: observation.bind_receipt_sha256, relay_socket });
         authority.markFinalized(reserved.sha256, { envelope: finalized.envelope,
@@ -237,7 +442,9 @@ export function createStage2aProtectedStarter({ installations, authority, verify
       // The stock ACP child has its own one-use Machine grant and process
       // group. R remains an admission supervisor and never carries ACP bytes.
       slot.child = await startRole({ account: installed.runner_account, role: 'child',
-        reservationSHA256: reserved.sha256 });
+        reservationSHA256: reserved.sha256,
+        onT03Event: onT03Event && ((event) => onT03Event({ event, installed, assignment, selectors,
+          childReceiptSHA256: slot.childReceiptSHA256, stop: () => stop(slot) })) });
       slot.child.done?.then(() => { void stop(slot).catch(() => {}); });
       const childStarted = await slot.child.waitChildStarted();
       if (childStarted.child_launcher_pid !== slot.child.pid
@@ -251,6 +458,7 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         || !Number.isSafeInteger(childReceipt?.expires_at_ms)
         || childReceipt.expires_at_ms <= Date.now()) refuse();
       await slot.child.sendChildReceipt(childReceipt);
+      slot.childReceiptSHA256 = childReceipt.sha256;
       await slot.child.waitChildAccepted(childReceipt.sha256);
       await slot.runner.waitRunnerChildReady({ reservationSHA256: reserved.sha256,
         startId, launchId, childStartSHA256: childReceipt.sha256,
@@ -258,14 +466,30 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         helloFinalizationSHA256: helloFinalization.sha256,
         helloFinalizationEnvelope: helloFinalization.envelope });
       if (slot.stopPromise) refuse();
-      // Do not expose the one-use provider before R and the stock child have
-      // both acknowledged A's signed current start and child receipts.
-      await onFinalized?.({ installed, assignment, selectors,
-        bindReceiptSHA256: live.bind_receipt_sha256 });
       const result = { start_id: startId, launch_id: launchId, installation_id: installed.installation_id,
         soul_id: installed.soul_id, package_path: source, pid: childStarted.child_pid,
         runner_uid: installed.runner_uid, runner_gid: installed.runner_gid,
         hq_epoch: installed.hq_epoch, profile: 'managed-protected', protected: true };
+      const { profile, ...started } = result;
+      const receipt = await recordLaunch({ ...started,
+        plan_id: installed.plan_id, plan_digest: installed.plan_digest, profile_in_force: profile,
+        reservation_sha256: reserved.sha256, child_start_receipt_sha256: childReceipt.sha256,
+        bind_receipt_sha256: live.bind_receipt_sha256, b_finalization_sha256: live.finalization_sha256,
+        relay_socket: slot.relaySocket,
+        child_launcher_pid: childStarted.child_launcher_pid, child_pid: childStarted.child_pid,
+        runner_pid: slot.runner.pid, bridge_pid: slot.bridge.pid });
+      if (!Number.isSafeInteger(receipt?.seq) || receipt.seq < 1
+        || slot.stopPromise || stopping || childReceipt.expires_at_ms <= Date.now()) refuse();
+      // Do not expose the one-use provider before R and the stock child have
+      // both acknowledged A's signed current start and child receipts.
+      await onFinalized?.({ installed, assignment, selectors,
+        bindReceiptSHA256: live.bind_receipt_sha256,
+        finalizationSHA256: live.finalization_sha256,
+        childReceiptSHA256: childReceipt.sha256,
+        childReceiptEnvelope: childReceipt.envelope,
+        childLauncherPID: childStarted.child_launcher_pid,
+        childPID: childStarted.child_pid,
+        relaySocket: slot.relaySocket });
       return takeover(result, { open: () => (socket) => {
         if (stopping || slot.stopPromise) { socket.destroy(); return; }
         const cut = () => { socket.destroy(); void stop(slot); };

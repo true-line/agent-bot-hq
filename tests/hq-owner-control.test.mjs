@@ -7,7 +7,7 @@ import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { authenticateOwner, checkOwnerControlSupport, observePeerPid, OWNER_CONTROL_PATH } from '../hq/owner-control.mjs';
+import { authenticateOwner, checkOwnerControlSupport, observeDarwinPeerIdentity, observePeerPid, OWNER_CONTROL_PATH } from '../hq/owner-control.mjs';
 
 test('owner control compares the connected peer UID with the configured owner', { skip: !['linux', 'darwin'].includes(process.platform) }, async (t) => {
   checkOwnerControlSupport();
@@ -30,6 +30,24 @@ test('owner control compares the connected peer UID with the configured owner', 
       client.destroy();
     }
   } finally { await new Promise((resolve) => server.close(resolve)); }
+});
+
+test('Darwin peer probes preserve reads on an already flowing Unix socket', {
+  skip: process.platform !== 'darwin' || process.getuid() === 0, timeout: 5000,
+}, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'hq-peer-stream-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'peer.sock'), server = createServer().listen(path);
+  await once(server, 'listening');
+  const accepted = once(server, 'connection'), client = createConnection(path);
+  const [peer] = await accepted;
+  t.after(() => { client.destroy(); peer.destroy(); server.close(); });
+  for (const value of ['first', 'second', 'third']) {
+    const data = once(peer, 'data');
+    assert.equal((await observeDarwinPeerIdentity(peer, process.getuid()))?.pid, process.pid);
+    client.write(value);
+    assert.equal((await data)[0].toString(), value);
+  }
 });
 
 test('peer PID comes from the connecting process, not the HQ listener', { skip: !['linux', 'darwin'].includes(process.platform), timeout: 10000 }, async (t) => {

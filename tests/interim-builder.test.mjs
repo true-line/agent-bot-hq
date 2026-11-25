@@ -38,7 +38,9 @@ test('interim artifact is reproducible, runs offline and refuses changed contrac
     writeFileSync(join(repo, 'hq/main.mjs'), "import { verify } from '../scripts/soul-contracts.mjs'; verify(); console.log('offline-ok');\n");
     writeFileSync(join(repo, 'hq/stage2a-h-preloader.mjs'),
       'export function authenticatedSelectedH() { return null; }\n');
-    for (const f of ['soul-contracts.mjs', 'build-interim-release.mjs']) cpSync(join(root, 'scripts', f), join(repo, 'scripts', f));
+    for (const f of ['soul-contracts.mjs', 'h-v0103-excluded.mjs', 'build-interim-release.mjs']) {
+      cpSync(join(root, 'scripts', f), join(repo, 'scripts', f));
+    }
     run('git', ['init', '-q', repo]);
     run('git', ['-C', repo, 'add', '.']);
     // A local disposable Git object fixture; it is never pushed or published.

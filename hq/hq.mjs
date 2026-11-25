@@ -5,10 +5,9 @@
 // RISK-008 in the platform's register); hq/legacy.mjs is the bridge.
 //
 // Bootstrap follows §4.4 through the SDK host: HQ core reads device status
-// first (here from the legacy enrollment, through the HQ signer), an
-// unenrolled device or an unavailable signer is safe mode, a revoked one is
-// device_revoked, and plugins start only after that. The sockets open in every mode, so the owner
-// can always ask for status.
+// first through the HQ signer. An unavailable signer or missing required
+// enrollment puts HQ in safe mode. A revoked device runs in device_revoked.
+// The sockets open in every mode, so the owner can always ask for status.
 //
 // Layout of the state directory (0700; HQ's account):
 //   config.json     owner-written settings, read-only to HQ (optional)
@@ -49,7 +48,7 @@ import { createStandaloneSigner } from './standalone-signer.mjs';
 import { createEnrollment, DEFAULT_IDENTITY_SERVICE, validateEnrollmentConfig } from './enrollment.mjs';
 import { createLauncher, LAUNCH_OPERATIONS } from './launch.mjs';
 import { createSoulStarter } from './soul-start.mjs';
-import { bindBridgeAuthority, listenBridgeEndpoint, memberBrokerDispatch, planBridgeEndpoints } from './bridge-endpoints.mjs';
+import { bindBridgeAuthority, listenBridgeEndpoint, memberBrokerDispatch, planBridgeEndpoints, readCooperativeBridgePeer } from './bridge-endpoints.mjs';
 import { loadPlugins } from './plugins.mjs';
 import { authenticatePeerUid, checkOwnerControlSupport, OWNER_CONTROL_PATH, OWNER_PEER_CHECK } from './owner-control.mjs';
 import { checkSocketPath, listenSocket } from './socket.mjs';
@@ -127,6 +126,10 @@ export function validateConfig(c) {
     if (c.legacy.supervise !== undefined && typeof c.legacy.supervise !== 'boolean') throw new Error('HQ config: legacy.supervise is a boolean');
     if (c.legacy.probeIntervalMs !== undefined && !(Number.isSafeInteger(c.legacy.probeIntervalMs) && c.legacy.probeIntervalMs >= 1000)) throw new Error('HQ config: legacy.probeIntervalMs is an integer of at least 1000');
   }
+  if (c.enrollment?.source === 'local-only') {
+    if (c.signer?.backend === 'secure-enclave') throw new Error('HQ config: local-only enrollment requires the paired Machine backend');
+    if (c.legacy?.supervise) throw new Error('HQ config: local-only enrollment cannot supervise the legacy daemon');
+  }
   return c;
 }
 
@@ -167,7 +170,7 @@ export function createHQ({
   home,
   schemas,                       // pinned schemas by name: hq/v1 (admission.mjs SCHEMA_NAMES), task/v1 and wire/v1 (tasks.mjs TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES)
   config,                        // defaults to <home>/config.json
-  signer,                        // explicit signer for isolated component tests
+  signer: injectedSigner,        // explicit signer for isolated component tests
   createDeviceSigner = createMachineSigner,
   createStandaloneDeviceSigner = createStandaloneSigner,
   enrollment,                    // where device status and enrollment come from: the config's source by
@@ -190,11 +193,19 @@ export function createHQ({
   soulVerifier,                  // independent Machine reservation signature verifier pinned by trusted HQ entry point
   soulCompletionVerifier,        // independent Machine containment signature verifier
   machineHqEpoch,                // signed current paired epoch from Machine list; never owner config
+  localTestQIssuer,              // paired A Q issuance, exposed only on authenticated owner-control
   protectedStart,                // HQ-started Machine-authorized R/B lifecycle from trusted entry point
+  createProtectedStart,          // trusted factory bound to HQ's durable launch receipt writer
   bridgeAuthority,               // authenticated Machine live-start/B proof client; never config or owner input
   bridgeAssignments = [],       // verified installed assignments from that same trusted entry point
   qualificationAuthorizer,       // trusted one-use installed test-provider operation; never owner config
   relayIngressAuthorizer,        // trusted one-use B test-provider; absent until A finalization is wired
+  relayPrewriteAuthorizer,       // trusted A live positive-peer observation before B's full write
+  relayCompletionAuthorizer,     // trusted post-write completion on the bound B connection
+  cooperativeBBindProvider,      // trusted cooperative B bind state; absent in production
+  cooperativeBPolicyProvider,    // trusted same-bound A policy delivery; absent in production
+  memberArmProvider,             // trusted paired A observation/arm provider; absent in production
+  relayPeerAuthority,            // trusted v3 bound B + paired A live CLI verifier; absent in production
   protectedAdmission,            // future pinned Machine verifier; absent in production until signed contracts ship
   createCooperativeStart,        // owner lifecycle for a paired cooperative launch
   cooperativeAdmission,          // paired A reservation/attach/watch client; never owner config
@@ -214,7 +225,7 @@ export function createHQ({
   let sockets = [];
   let timer;
   let profileInfo;
-  let legacyRunner = legacy;
+  let legacyRunner;
   let running = false;
   let firstTick = Promise.resolve();
   let pluginLoad = [];
@@ -225,6 +236,7 @@ export function createHQ({
   const brokerCallers = new Map();
   const bridgePeers = new Map();
   const bridgeListeners = new Map();
+  const cooperativeBridgeListeners = new Map();
   const runnerAdmissions = new Map();
   const openingRunnerAdmissions = new Set();
   const cooperativeListeners = new Map();
@@ -258,7 +270,7 @@ export function createHQ({
     try { await legacyRunner.tick(); } catch (e) { core.logs.push({ level: 'warn', plugin: 'hq', at: clock.now(), message: `legacy probe failed: ${e.message}` }); }
     if (host.mode === 'running') {
       try {
-        if ((await signer.deviceStatus()) === 'revoked') revokeDevice(core, 'the enrollment reports the device revoked');
+        if ((await core.signer.deviceStatus()) === 'revoked') revokeDevice(core, 'the enrollment reports the device revoked');
       } catch { /* an unreadable signer at runtime changes nothing; status shows the last probe */ }
     }
   }
@@ -278,11 +290,13 @@ export function createHQ({
     if (running) throw new Error('HQ is already running');
     ensurePrivateDir(home, { uid });
     const cfg = validateConfig(config ?? readConfig(home, { uid }));
+    const localOnly = cfg.enrollment?.source === 'local-only';
     // Enrollment events become receipts (an enrollment only starts once HQ is up).
     const onEnrollmentEvent = (e) => { if (core) pushReceipt(core, { plugin: 'hq', ...e }).catch(() => {}); };
-    enrollment ??= (s) => createEnrollment({ home, signer: s, server: cfg.enrollment?.server, uid, clock, onEvent: onEnrollmentEvent });
+    const deviceEnrollment = localOnly ? undefined : enrollment
+      ?? ((s) => createEnrollment({ home, signer: s, server: cfg.enrollment?.server, uid, clock, onEvent: onEnrollmentEvent }));
     const factory = cfg.signer?.backend === 'secure-enclave' ? createStandaloneDeviceSigner : createDeviceSigner;
-    signer ??= factory({ home, enrollment, clock });
+    const signer = injectedSigner ?? factory({ home, enrollment: deviceEnrollment, localOnly, clock });
     let restartRequired = false;
     const signerReport = () => {
       const report = typeof signer.report === 'function' ? signer.report() : undefined;
@@ -300,7 +314,7 @@ export function createHQ({
       });
     };
     profileInfo = hostProfile();
-    legacyRunner ??= legacyDaemon({ supervise: cfg.legacy?.supervise === true, clock });
+    legacyRunner = legacy ?? legacyDaemon({ supervise: cfg.legacy?.supervise === true, clock });
 
     harnessPlan = cfg.harnesses
       ? planHarnessEndpoints(cfg.harnesses, { hqUid: uid, hqAccount: account, platform, ...(accounts ? { resolve: accounts } : {}), ...(harnessLstat ? { lstat: harnessLstat } : {}) })
@@ -312,12 +326,16 @@ export function createHQ({
     if (platform === 'darwin' && (harnessPlan.endpoints.length || bridgeEndpoints.length)) checkOwnerControlSupport();
     if (platform !== 'win32') for (const p of [paths.control, paths.admission, paths.broker, ...harnessPlan.endpoints.map((e) => e.path)]) checkSocketPath(p, platform);
     store = openStore(home, { uid });
+    let identityService = unlinkedIdentity();
+    if (!localOnly) {
+      identityService = identity ?? (signer.custody || cfg.enrollment?.source === 'hq'
+        ? createIdentityService({ server: cfg.enrollment?.server ?? DEFAULT_IDENTITY_SERVICE, enrollment: signer.enrollment, custody: signer.custody, keySet: serverKeys, clock })
+        : identityService);
+    }
     core = createCore({
       clock, random, signer,
       profile: profileInfo.profile,
-      identity: identity ?? (signer.custody || cfg.enrollment?.source === 'hq'
-        ? createIdentityService({ server: cfg.enrollment?.server ?? DEFAULT_IDENTITY_SERVICE, enrollment: signer.enrollment, custody: signer.custody, keySet: serverKeys, clock })
-        : unlinkedIdentity()),
+      identity: identityService,
       persist: () => store.persist(),
       persistReceipt: (entry) => store.persistReceipt(entry),
       persistPluginWrite: (change) => store.persistPluginWrite(change),
@@ -343,9 +361,11 @@ export function createHQ({
         return admission.withLiveRuntime(runtimeId, caller, fn);
       },
     });
+    protectedStart ??= createProtectedStart?.((record) =>
+      pushReceipt(core, { ...record, plugin: 'hq', kind: 'hq.soul.started' }));
     soulStarter = createSoulStarter({ core, home, machineLaunch: soulLaunch,
       verifyMachineReservation: soulVerifier, verifyMachineCompletion: soulCompletionVerifier,
-      protectedStart, cooperativeStart: createCooperativeStart?.(core),
+      protectedStart, cooperativeStart: createCooperativeStart?.(core, store.readCommittedReceipts),
       mode: () => host?.mode ?? 'starting', hqUid: uid,
       harnessUids: harnessPlan.endpoints.map((endpoint) => endpoint.uid), machineHqEpoch });
     // Whether the provisioner's rule lets HQ start each harness account;
@@ -392,6 +412,12 @@ export function createHQ({
           onDisconnect: bridgeAuthority?.onDisconnect?.bind(bridgeAuthority) },
       qualificationAuthorizer,
       relayIngressAuthorizer,
+      relayPrewriteAuthorizer,
+      relayCompletionAuthorizer,
+      relayPeerAuthority,
+      memberArmProvider,
+      cooperativeBPolicyProvider,
+      cooperativeBBindProvider,
       protectedAdmission,
       cooperativeAdmission: cooperativeGuard?.client,
     });
@@ -416,6 +442,7 @@ export function createHQ({
     host = createHost({
       plugins: [...builtIn, ...accepted],
       core,
+      localOnly,
       ...(initTimeoutMs ? { initTimeoutMs } : {}),
       ...(stopDeadlineMs ? { stopDeadlineMs } : {}),
       extraStatus: () => ({
@@ -451,12 +478,18 @@ export function createHQ({
       // status can verify the original pairing and guide the explicit restart.
       if (op === 'status' && disconnectedPair && host.mode === 'safe') {
         checkingPair ??= signer.recheckPair(disconnectedPair).then(
-          state => { restartRequired = state === 'enrolled'; },
+          state => { restartRequired = state === 'enrolled' || (localOnly && state === 'unenrolled'); },
           () => { restartRequired = false; },
         ).finally(() => { checkingPair = undefined; });
         await checkingPair;
       }
-      return ['soul.start', 'soul.starts', 'soul.stop'].includes(op) ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta);
+      return ['soul.start', 'soul.starts', 'soul.stop', 'soul.qualify-direct'].includes(op) ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta);
+    }
+    function ownerControlDispatch(op, meta) {
+      if (op !== 'soul.local-test-q-issue') return ownerDispatch(op, meta);
+      if (meta.auth !== 'owner') fail('host.auth_mismatch', 'local-test Q issue is owner-only');
+      if (typeof localTestQIssuer !== 'function') fail('host.launch_unavailable', 'paired local-test Q issue is unavailable');
+      return localTestQIssuer(meta.payload);
     }
 
     try {
@@ -480,7 +513,7 @@ export function createHQ({
       ];
       if (ownerControl) {
         sockets.push(await listenSocket({
-          path: OWNER_CONTROL_PATH, activated: ownerControl, auth: 'owner', core, dispatch: ownerDispatch, takeover: true,
+          path: OWNER_CONTROL_PATH, activated: ownerControl, auth: 'owner', core, dispatch: ownerControlDispatch, takeover: true,
           newSession: () => openSession(ownerControl.account, ownerControl.uid), endSession: closeSession,
         }));
       }
@@ -503,7 +536,15 @@ export function createHQ({
       for (const endpoint of bridgeEndpoints) {
         const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
           enableBridgeQualification: typeof qualificationAuthorizer === 'function',
-          enableBridgeRelayIngress: typeof relayIngressAuthorizer === 'function' });
+          enableBridgeRelayIngress: typeof relayIngressAuthorizer === 'function',
+          enableBridgeRelayPrewrite: typeof relayPrewriteAuthorizer === 'function',
+          enableBridgeRelayCompletion: typeof relayCompletionAuthorizer === 'function',
+          enableCooperativeBBind: host.provided('hq-admission')?.stage2aCooperativeBBindEnabledV3?.() === true,
+          enableCooperativeBPolicy: typeof cooperativeBPolicyProvider === 'function',
+          enableMemberArmExchange: host.provided('hq-admission')?.stage2aMemberArmExchangeEnabledV3?.() === true,
+          enableRelayPeerChallenge: typeof bridgeAuthority?.verifyLiveStartV3 === 'function'
+            && typeof relayPeerAuthority?.boundStart === 'function'
+            && typeof relayPeerAuthority?.attest === 'function' });
         bridgeListeners.set(endpoint.installationId, listener);
         sockets.push(listener);
       }
@@ -554,6 +595,7 @@ export function createHQ({
     for (const s of sockets) await s.close();
     sockets = [];
     bridgeListeners.clear();
+    cooperativeBridgeListeners.clear();
     const report = await host.stop({ reason });
     await bridgeStop; // uncertain B containment cannot produce hq.stopped
     for (const [id, s] of coreTable(core, 'sessions')) if (!s.closed_at) coreTable(core, 'sessions').set(id, { ...s, closed_at: clock.now() });
@@ -566,14 +608,15 @@ export function createHQ({
     stop,
     paths,
     status: () => host.status(),
-    openProtectedAdmission: async ({ installed, assignment, selectors, renewLive, onLost }) => {
+    openProtectedAdmission: async ({ installed, assignment, selectors, renewLive, onLost, memberAttachProvider }) => {
       const key = selectors?.reservation_sha256;
       if (!running || !key || runnerAdmissions.has(key) || openingRunnerAdmissions.has(key))
         fail('host.launch_unavailable', 'protected R admission is unavailable');
       openingRunnerAdmissions.add(key);
       try {
         const listener = await listenStage2aRunnerAdmission({ installed, assignment, selectors,
-          hqUid: uid, core, renewLive, onLost, protectedAdmission,
+          hqUid: uid, core, renewLive, onLost, protectedAdmission, memberAttachProvider,
+          withLiveRuntime: host.provided('hq-admission')?.withLiveRuntime,
           admissionDispatch: (op, meta) => host.dispatch(op, meta) });
         if (!running) { await listener.close(); fail('host.launch_unavailable', 'HQ stopped during protected R admission'); }
         runnerAdmissions.set(key, listener);
@@ -584,7 +627,7 @@ export function createHQ({
         } });
       } finally { openingRunnerAdmissions.delete(key); }
     },
-    openCooperativeAdmission: async ({ reservation, openAcpStream, onLost }) => {
+    openCooperativeAdmission: async ({ reservation, openAcpStream, onLost, memberAttachProvider }) => {
       const key = reservation?.sha256;
       if (!running || !key || cooperativeGuard?.isRevoked(key)
         || cooperativeListeners.has(key) || openingCooperativeListeners.has(key)
@@ -610,6 +653,8 @@ export function createHQ({
           hqUid: uid, core, machineAttach: (value) => cooperativeAdmission.attach(value),
           verifyAttachReceipt: (receipt, expected) => cooperativeAdmission.verifyAttachReceipt(receipt, expected),
           isLive: (value) => cooperativeGuard.client.watchHealthy(value), openAcpStream, onLost: lost,
+          memberAttachProvider, withLiveRuntime: host.provided('hq-admission')?.withLiveRuntime,
+          assertRunnerLive: (value) => cooperativeGuard.client.assertLive(value),
           admissionDispatch: (op, meta) => {
             if (op !== 'launch' && op !== 'launch.stop') return host.dispatch(op, meta);
             const service = host.provided('hq-admission');
@@ -617,9 +662,9 @@ export function createHQ({
               fail('host.launch_unavailable', 'cooperative member launch is unavailable');
             return service.cooperativeMemberLaunch(op, meta);
           } });
-        if (admission.brokerPin.reservation_sha256 !== key)
+        if (admission.reservationSHA256 !== key)
           fail('host.launch_unavailable', 'cooperative reservation digest changed after verification');
-        broker = await listenStage2aCooperativeBroker({ admission, hqUid: uid, core,
+        if (admission.brokerPin) broker = await listenStage2aCooperativeBroker({ admission, hqUid: uid, core,
           callers: brokerCallers, onLost: lost,
           brokerDispatch: (kind, payload, session) => memberBrokerDispatch(host, kind, payload, session),
           brokerClosed: (session) => host.brokerClosed(session) });
@@ -629,11 +674,11 @@ export function createHQ({
           if (!closing) {
             cooperativeGuard.revoke(key);
             if (cooperativeListeners.get(key)?.close === close) cooperativeListeners.delete(key);
-            closing = Promise.all([broker.close(), admission.close()]).then(() => {});
+            closing = Promise.all([broker?.close(), admission.close()]).then(() => {});
           }
           return closing;
         };
-        const listener = Object.freeze({ path: admission.path, brokerPath: broker.path, close });
+        const listener = Object.freeze({ path: admission.path, brokerPath: broker?.path, close });
         cooperativeListeners.set(key, listener);
         return listener;
       } catch (error) {
@@ -641,6 +686,53 @@ export function createHQ({
         await admission?.close().catch(() => {});
         throw error;
       } finally { openingCooperativeListeners.delete(key); }
+    },
+    qualifyDirectProtectedClaim: (startId) => {
+      if (!running) fail('host.launch_unavailable', 'HQ direct qualification is unavailable');
+      return soulStarter.qualifyDirectProtectedClaim(startId);
+    },
+    openCooperativeBridgeEndpoint: async ({ bridgeAssignment, handlers }) => {
+      const endpoint = bridgeAssignment?.endpoint;
+      const key = endpoint?.installationId;
+      if (!running || platform !== 'darwin' || !key || !endpoint.parentIdentity
+        || cooperativeBridgeListeners.has(key) || bridgeEndpoints.some((other) => other.path === endpoint.path || other.uid === endpoint.uid)
+        || [...cooperativeBridgeListeners.values()].some((other) =>
+          other.endpoint.path === endpoint.path || other.endpoint.uid === endpoint.uid)
+        || typeof handlers?.stage2aCooperativeBBindChallengeV3 !== 'function'
+        || typeof handlers.stage2aCooperativeBBindV3 !== 'function'
+        || typeof handlers.stage2aCooperativeBPolicyV3 !== 'function') {
+        fail('host.launch_unavailable', 'cooperative B endpoint is unavailable');
+      }
+      const marker = { endpoint };
+      cooperativeBridgeListeners.set(key, marker);
+      try {
+        const listener = await listenBridgeEndpoint(endpoint, { hqUid: uid, host, core, peers: bridgePeers,
+          enableCooperativeBBind: true, enableCooperativeBPolicy: true,
+          enableMemberArmExchange: typeof handlers.stage2aCooperativeMemberObserveV3 === 'function'
+            && typeof handlers.stage2aCooperativeMemberArmV3 === 'function', cooperativeHandlers: handlers });
+        if (!running || cooperativeBridgeListeners.get(key) !== marker) {
+          await listener.close();
+          fail('host.launch_unavailable', 'cooperative B endpoint stopped during startup');
+        }
+        marker.listener = listener;
+        sockets.push(listener);
+        let closed;
+        return Object.freeze({ close: () => {
+          if (!closed) {
+            if (cooperativeBridgeListeners.get(key) === marker) cooperativeBridgeListeners.delete(key);
+            sockets = sockets.filter((entry) => entry !== listener);
+            closed = listener.close();
+          }
+          return closed;
+        } });
+      } catch (error) {
+        if (cooperativeBridgeListeners.get(key) === marker) cooperativeBridgeListeners.delete(key);
+        throw error;
+      }
+    },
+    cooperativeBridgeKernelPeer: (connection, expected) => {
+      if (!running) fail('host.launch_unavailable', 'cooperative B broker is unavailable');
+      return readCooperativeBridgePeer(bridgePeers, connection, expected);
     },
     bridgeBrokerIdentity: (installationId) => {
       if (!running || typeof installationId !== 'string') fail('host.launch_unavailable', 'HQ bridge broker is unavailable');

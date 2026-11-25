@@ -26,7 +26,7 @@ test('signed Machine role and Hello survive the actual socket context copy', asy
     hq_epoch: selectors.hq_epoch, soul_id: 'soul-1', host_id: 'host-1',
     claimed_definition_digest: digest('5'), definition_measurement: digest('6'),
     launch_input_measurement: digest('7'), runner_uid: 311, bridge_uid: 312 };
-  const peerProcess = { pid: 505, uid: 311 };
+  const peerProcess = { pid: 505, uid: 311, gid: 311, start_seconds: 100, start_micros: 50 };
   const runner = { pid: 503, uid: 311 };
   const bridge = { pid: 504, uid: 312 };
   let peerChanged = false;
@@ -60,7 +60,7 @@ test('signed Machine role and Hello survive the actual socket context copy', asy
       return signed('agent-bot/stage2a-peer-role/v1', {
         schema: 'agent-bot-machine/stage2a-peer-role/v1', ...selectors,
         role: 'runner', peer_uid: 311, peer_pid: peerProcess.pid,
-        peer_process: peerChanged ? { ...peerProcess, birthtime: 'changed' } : peerProcess,
+        peer_process: peerChanged ? { ...peerProcess, start_micros: 51 } : peerProcess,
         runner, bridge, definition_measurement: installed.definition_measurement,
         launch_input_measurement: installed.launch_input_measurement,
         profile_in_force: 'managed-protected', issued_at_ms: now - 100,
@@ -154,7 +154,11 @@ test('signed Machine role and Hello survive the actual socket context copy', asy
   assert.deepEqual(verifier.finalizationFor(selectors),
     { envelope: final.envelope, sha256: final.sha256 });
   assert.deepEqual(calls, ['peer', 'hello', 'peer', 'finalize']);
+  const preparePeer = await verifier.refreshRunnerPeer(copiedContext);
+  assert.equal(preparePeer.processSHA256, sha(canonicalBytes(peerProcess)));
+  assert.equal(preparePeer.isCurrent(), true);
   peerChanged = true;
+  await assert.rejects(verifier.refreshRunnerPeer(copiedContext), /Machine protected Hello authority is unavailable/);
   await assert.rejects(verifier.assertLive(copied),
     /Machine protected Hello authority is unavailable/);
   unwatch();

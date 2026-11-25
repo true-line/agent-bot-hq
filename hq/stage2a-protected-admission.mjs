@@ -72,7 +72,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
     return record;
   }
 
-  function registerStart({ installed, assignment, selectors, getBindReceiptSHA256 } = {}) {
+  function registerStart({ installed, assignment, selectors, getBindReceiptSHA256, prestartMembers } = {}) {
     if (!installed || !assignment || !exact(selectors, STOP_FIELDS)
       || !DIGEST.test(selectors.reservation_sha256)
       || !assignmentMatches(assignment, selectors)
@@ -80,9 +80,10 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
       || installed.plan_id !== selectors.plan_id || installed.plan_digest !== selectors.plan_digest
       || installed.hq_epoch !== selectors.hq_epoch
       || typeof getBindReceiptSHA256 !== 'function'
+      || (prestartMembers !== undefined && typeof prestartMembers !== 'function')
       || starts.has(selectors.reservation_sha256)) refuse();
     const record = { installed, assignment, selectors: Object.freeze({ ...selectors }),
-      getBindReceiptSHA256, hello: null, finalized: false, lost: false,
+      getBindReceiptSHA256, prestartMembers, prestarted: null, hello: null, finalized: false, lost: false,
       lastLiveAt: now(), watch: null, timer: null };
     starts.set(selectors.reservation_sha256, record);
     return Object.freeze({ close: () => {
@@ -122,8 +123,28 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
     const context = Object.freeze({ ...selectors, peer_uid, peer_pid,
       role: signed.role, [PEER_TOKEN]: token });
     contexts.set(token, { record, expiresAt: signed.expires_at_ms,
-      role: signed.role, peerProcess: signed.peer_process });
+      role: signed.role, peerProcess: signed.peer_process, socket: _socket });
     return context;
+  }
+
+  async function refreshRunnerPeer(connection) {
+    const peer = peerFor(connection);
+    if (!peer || peer.role !== 'runner' || peer.record.lost || peer.socket?.destroyed
+      || !peer.record.finalized) refuse();
+    const helloPeer = peerFor(peer.record.hello?.connection);
+    if (!helloPeer || !same(peer.peerProcess, helloPeer.peerProcess)) refuse();
+    const { installed, assignment, selectors } = peer.record;
+    const refreshed = await acceptPeer(peer.socket, { installed, assignment, selectors,
+      peer_uid: connection.peer_uid, peer_pid: connection.peer_pid });
+    const live = peerFor(refreshed);
+    const process = live?.peerProcess;
+    if (live?.role !== 'runner' || !same(process, peer.peerProcess)
+      || !Number.isSafeInteger(process.start_seconds) || process.start_seconds <= 0
+      || !Number.isSafeInteger(process.start_micros) || process.start_micros < 0
+      || process.start_micros >= 1e6) refuse();
+    const processSHA256 = sha(canonicalBytes(process));
+    return Object.freeze({ processSHA256, isCurrent: () => !peer.record.lost
+      && !peer.socket?.destroyed && live.expiresAt > now() });
   }
 
   async function verifyHelloStart({ connection, caller, payload, hello_payload_sha256 } = {}) {
@@ -190,6 +211,21 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
     return true;
   }
 
+  async function prepareMemberSet(expected, pendingRuntimes) {
+    const record = recordForExpected(expected);
+    if (!record.prestartMembers) return;
+    if (!record.hello || record.finalized || record.prestarted
+      || expected.hello_payload_sha256 !== record.hello.binding.hello_payload_sha256) refuse();
+    record.prestarted = await record.prestartMembers({ selectors: record.selectors, pendingRuntimes });
+    if (!record.prestarted || record.lost) refuse();
+  }
+
+  function prestartedFor(selectors) {
+    const record = recordFor(selectors);
+    if (!record.finalized || !record.prestarted) refuse();
+    return record.prestarted;
+  }
+
   async function finalize(expected) {
     const record = recordForExpected(expected);
     const hello = record.hello;
@@ -202,6 +238,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
       || expected.profile_in_force !== 'managed-protected'
       || !Number.isSafeInteger(expected.installation_epoch)
       || expected.installation_epoch < 1) refuse();
+    if (record.prestartMembers && !record.prestarted) refuse();
     const reply = await machineHelloFinalize({ ...record.selectors,
       start_envelope_sha256: hello.startSHA256, expected });
     const signed = checkedReply(reply, machinePublicKey, FINAL_PURPOSE,
@@ -307,7 +344,7 @@ export function createStage2aProtectedAdmission({ machinePublicKey, authority,
     await abort(context);
   }
 
-  return Object.freeze({ registerStart, acceptPeer, verifyHelloStart,
+  return Object.freeze({ registerStart, acceptPeer, refreshRunnerPeer, verifyHelloStart, prepareMemberSet, prestartedFor,
     verifyDefinitionMapping, finalize, verifyFinalization, abort,
     finalizationFor, watchLiveness, assertLive, peerDisconnected, watchHealthy });
 }

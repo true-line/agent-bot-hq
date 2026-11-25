@@ -120,6 +120,36 @@ test('cooperative HQ reports profile_insufficient on the owner control socket be
   } finally { stream?.destroy(); await t.done(); }
 });
 
+test('only the owner CLI can invoke the exact one-use direct qualification start', async () => {
+  const startId = `st_${'a'.repeat(24)}`;
+  const calls = [];
+  const t = await startHQ({ createCooperativeStart: () => ({
+    report: () => [], stopAll: async () => {},
+    qualifyDirectProtectedClaim: async (id) => { calls.push(id); return { status: 'unqualified', host_credit: false }; },
+  }) });
+  try {
+    const entry = await t.entry();
+    const denied = await entry.request('soul.qualify-direct', { start_id: startId });
+    assert.equal(denied.ok, false);
+    assert.deepEqual(calls, []);
+    const owner = await t.owner();
+    for (const payload of [{}, { start_id: 'st_bad' }, { start_id: startId, extra: true }]) {
+      const invalid = await owner.request('soul.qualify-direct', payload);
+      assert.equal(invalid.host_refusal.code, 'host.invalid_request');
+    }
+    assert.deepEqual(calls, []);
+    const cli = spawn(process.execPath, [new URL('../hq/main.mjs', import.meta.url).pathname,
+      'soul', 'qualify-direct', '--home', t.home, '--start-id', startId], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    cli.stdout.on('data', (chunk) => { stdout += chunk; });
+    cli.stderr.on('data', (chunk) => { stderr += chunk; });
+    const exit = await new Promise((resolve) => cli.on('close', resolve));
+    assert.equal(exit, 0, stderr);
+    assert.deepEqual(JSON.parse(stdout), { status: 'unqualified', host_credit: false });
+    assert.deepEqual(calls, [startId]);
+  } finally { await t.done(); }
+});
+
 test('an ACP runner stream error stops the Machine process and releases only after containment', { timeout: 10000 }, async () => {
   for (const side of ['stdin', 'stdout']) {
     const home = tempHome();

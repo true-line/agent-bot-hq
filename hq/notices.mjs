@@ -1,5 +1,6 @@
 // Guarded local notice consumer for Accepted PDR-0062; schemas come from
 // the normal digest-verified release loader, as for tasksPlugin.
+import { createHash } from 'node:crypto';
 import { definePlugin } from '../sdk/plugin.mjs';
 import { fail } from '../sdk/errors.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
@@ -7,6 +8,8 @@ import { checkRequiredCapabilities } from '../sdk/wire/versions.mjs';
 import { canonicalBytes } from '../sdk/wire/canonical-json.mjs';
 
 export const NOTICE_SCHEMA_NAMES = Object.freeze(['notice-query', 'notice-result']);
+export const PROTECTED_NOTICE_PEEK_SCHEMA = 'protected-notice-peek';
+const PROTECTED_NOTICE_PEEK_KIND = 'hq.notices.protected.peek.v1';
 const CAPABILITIES = Object.freeze(['notices-v1']);
 const MAX_SOURCE_BYTES = 65_536;
 const MAX_RESULT_BYTES = 524_288;
@@ -36,7 +39,13 @@ export function noticesPlugin({ schemas } = {}) {
       const admission = ctx.deps['hq-admission'];
       if (typeof admission?.withNoticeScope !== 'function') throw new Error('hq-admission does not provide withNoticeScope');
       const mailbox = ctx.deps['agent-comms']?.notices;
-      const consume = (operation) => async (request, meta) => {
+      const protectedSchema = schemas[PROTECTED_NOTICE_PEEK_SCHEMA];
+      const consume = (operation, protectedPeek = false) => async (input, meta) => {
+        if (protectedPeek && (!input || Object.keys(input).sort().join(',') !== 'grant_handle,query'
+          || validate(protectedSchema, input, { schemas: [schemas['notice-query']] }).length)) {
+          fail('host.invalid_request', 'invalid protected notice peek');
+        }
+        const request = protectedPeek ? input.query : input;
         // Typed protocol checks precede the closed schema, which is explicitly
         // executed: broker registration alone does not validate its payload.
         if (request?.contract !== 'hq/v1') fail('unsupported_version', 'notice queries require hq/v1');
@@ -47,7 +56,7 @@ export function noticesPlugin({ schemas } = {}) {
         if (request.operation !== operation) fail('caller_mismatch', 'notice operation differs from the broker kind');
         const context = { installation_epoch: request.installation_epoch, lease_generation: request.lease_generation,
           ...(Object.hasOwn(request, 'expected_repository') ? { expected_repository: request.expected_repository } : {}) };
-        return admission.withNoticeScope(meta?.runtime_id, context, async (scope) => {
+        const effect = async (scope) => {
           const method = operation === 'peek' ? 'peek' : 'consumeOne';
           if (typeof mailbox?.[method] !== 'function') fail('host.plugin_degraded', 'scoped local notice mailbox is unavailable');
           const count = request.count ?? 1;
@@ -81,8 +90,15 @@ export function noticesPlugin({ schemas } = {}) {
           });
           if (!result || canonicalBytes(returned).compare(canonicalBytes(result.notices)) !== 0) fail('host.invalid_request', 'mailbox did not preserve its prepared notice result');
           return result;
-        });
+        };
+        if (!protectedPeek) return admission.withNoticeScope(meta?.runtime_id, context, effect);
+        const requestSHA256 = 'sha256:' + createHash('sha256').update(canonicalBytes(input)).digest('hex');
+        return admission.withProtectedNoticePeek(meta?.runtime_id, input.grant_handle, requestSHA256, context, effect);
       };
+      if (protectedSchema) {
+        if (typeof admission.withProtectedNoticePeek !== 'function') throw new Error('HQ protected notice admission is unavailable');
+        ctx.broker.registerKind({ kind: PROTECTED_NOTICE_PEEK_KIND, schema: protectedSchema, consume: consume('peek', true) });
+      }
       for (const operation of ['peek', 'consume-one']) ctx.broker.registerKind({ kind: `notices.${operation}`, schema: schemas['notice-query'], consume: consume(operation) });
     },
   });

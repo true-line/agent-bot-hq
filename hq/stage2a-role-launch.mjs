@@ -127,12 +127,12 @@ function firstLine(child, parse, timeoutMs, limit, resume = false, rejectRemaind
   });
 }
 
-function bridgeReadyFrom(line) {
+function bridgeReadyFrom(line, cooperative = false) {
   if (line.length > 1024) throw new Error('Soul bridge readiness is too large');
   const ready = parseStrict(line.toString('utf8'));
   const socket = ready?.relay_socket;
   if (!ready || typeof ready !== 'object' || Array.isArray(ready)
-    || Object.keys(ready).length !== 2
+    || Object.keys(ready).length !== (cooperative ? 6 : 2)
     || !Object.hasOwn(ready, 'bind_receipt_sha256') || !Object.hasOwn(ready, 'relay_socket')
     || !DIGEST.test(ready.bind_receipt_sha256)
     || !socket || typeof socket !== 'object' || Array.isArray(socket)
@@ -143,8 +143,16 @@ function bridgeReadyFrom(line) {
     || socket.inode === 0 || socket.mode !== 0o660) {
     throw new Error('invalid Soul bridge readiness');
   }
+  const extra = cooperative ? ['bridge_pid', 'bridge_start_seconds', 'bridge_start_micros', 'grant_nonce'] : [];
+  if (cooperative && (!Number.isSafeInteger(ready.bridge_pid) || ready.bridge_pid < 2
+    || !Number.isSafeInteger(ready.bridge_start_seconds) || ready.bridge_start_seconds <= 0
+    || !Number.isSafeInteger(ready.bridge_start_micros) || ready.bridge_start_micros < 0 || ready.bridge_start_micros >= 1e6
+    || !NONCE.test(ready.grant_nonce ?? '')
+    || Buffer.from(ready.grant_nonce, 'base64url').toString('base64url') !== ready.grant_nonce)) {
+    throw new Error('invalid cooperative B readiness process');
+  }
   return Object.freeze({ bind_receipt_sha256: ready.bind_receipt_sha256,
-    relay_socket: Object.freeze({ ...socket }) });
+    relay_socket: Object.freeze({ ...socket }), ...Object.fromEntries(extra.map((key) => [key, ready[key]])) });
 }
 
 function runnerActivationFrom(line) {
@@ -204,7 +212,7 @@ function bounded(promise, timeoutMs, label) {
 
 // Machine writes child lifecycle receipts to the fixed wrapper's stderr.
 // ACP stdout remains reserved for the stock protocol stream.
-function childProgress(child) {
+function childProgress(child, cooperative, onT03Event) {
   if (!child.stderr || typeof child.stderr.on !== 'function') {
     throw new Error('protected child status pipe is unavailable');
   }
@@ -214,6 +222,7 @@ function childProgress(child) {
   let phase = 0;
   let failure;
   let waiter;
+  let t03Chain = Promise.resolve();
   const fail = (error) => {
     if (failure) return;
     failure = error;
@@ -225,25 +234,46 @@ function childProgress(child) {
     else queue.push(value);
   };
   child.stderr.on('data', (chunk) => {
-    if (failure || phase === kinds.length) return;
+    if (failure || (phase === kinds.length && !onT03Event)) return;
     buffer = Buffer.concat([buffer, chunk]);
-    while (phase < kinds.length) {
+    while (true) {
       const end = buffer.indexOf(0x0a);
       if (end < 0) {
-        if (buffer.length > 1024) fail(new Error('protected child status is too large'));
+        if (buffer.length > (phase === kinds.length ? 8192 : 1024)) fail(new Error('protected child status is too large'));
         break;
       }
-      if (end > 1024) { fail(new Error('protected child status is too large')); return; }
+      if (end > (phase === kinds.length ? 8192 : 1024)) {
+        fail(new Error('protected child status is too large')); return;
+      }
       let event;
       try { event = parseStrict(buffer.subarray(0, end).toString('utf8')); }
       catch { fail(new Error('invalid protected child status')); return; }
+      if (phase === kinds.length) {
+        if (!event || typeof event !== 'object' || Array.isArray(event)
+          || !['t03-probe-ready', 't03-probe-result', 't03-sibling-credential-witness'].includes(event.kind)
+          || Object.keys(event).sort().join(',') !== (event.kind === 't03-probe-ready'
+            ? 'kind,ready' : event.kind === 't03-probe-result' ? 'kind,result' : 'kind,witness')
+          || !event[event.kind === 't03-probe-ready' ? 'ready'
+            : event.kind === 't03-probe-result' ? 'result' : 'witness']
+          || typeof event[event.kind === 't03-probe-ready' ? 'ready'
+            : event.kind === 't03-probe-result' ? 'result' : 'witness'] !== 'object') {
+          fail(new Error('unexpected protected T03 child status')); return;
+        }
+        t03Chain = t03Chain.then(() => {
+          if (failure) return;
+          return onT03Event(event);
+        }).catch(fail);
+        buffer = buffer.subarray(end + 1);
+        continue;
+      }
       if (!event || typeof event !== 'object' || Array.isArray(event)
         || event.kind !== kinds[phase]) {
         fail(new Error('unexpected protected child status')); return;
       }
       const fields = phase === 0
-        ? ['kind', 'child_pid', 'child_launcher_pid', 'grant_sha256']
-        : phase === 1 ? ['kind', 'receipt_sha256', 'lease_sequence'] : ['kind'];
+        ? ['kind', 'child_pid', 'child_launcher_pid', 'grant_sha256',
+          ...(cooperative ? ['child_process', 'launcher_process'] : [])]
+        : phase === 1 ? ['kind', cooperative ? 'ready_sha256' : 'receipt_sha256', 'lease_sequence'] : ['kind'];
       if (Object.keys(event).sort().join(',') !== fields.sort().join(',')) {
         fail(new Error('unexpected protected child status fields')); return;
       }
@@ -251,7 +281,7 @@ function childProgress(child) {
       phase += 1;
       deliver(Object.freeze(event));
     }
-    if (phase === kinds.length) buffer = Buffer.alloc(0);
+    if (phase === kinds.length && !onT03Event) buffer = Buffer.alloc(0);
   });
   child.stderr.once('error', () => fail(new Error('protected child status pipe failed')));
   child.once('close', () => {
@@ -271,29 +301,31 @@ function childProgress(child) {
 // bind the reservation to an authenticated live start and obtain Machine's
 // signed stop/completion before releasing any installation occupancy.
 export async function startStage2aRole({ account, role, reservationSHA256,
-  machineExec = machineRoleStage2aExec, spawnProcess = spawn, timeoutMs = 12000 } = {}) {
+  machineExec = machineRoleStage2aExec, spawnProcess = spawn, timeoutMs = 12000,
+  cooperativeBridge = false, cooperativeChild = false, onT03Event } = {}) {
   if (typeof account !== 'string'
     || !(role === 'runner' && RUNNER_ACCOUNT.test(account)
       || role === 'bridge' && BRIDGE_ACCOUNT.test(account)
       || role === 'child' && RUNNER_ACCOUNT.test(account))
+    || (cooperativeBridge && role !== 'bridge') || (cooperativeChild && role !== 'child')
     || !DIGEST.test(reservationSHA256 ?? '')
     || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 14000) {
     throw new Error('invalid Soul launcher assignment');
   }
   const command = role === 'runner' ? 'soul-run'
-    : role === 'bridge' ? 'soul-bridge' : 'soul-child';
+    : role === 'bridge' ? (cooperativeBridge ? 'cooperative-soul-bridge' : 'soul-bridge') : cooperativeChild ? 'cooperative-soul-child' : 'soul-child';
   const child = spawnProcess('/usr/bin/sudo', ['-n', '-u', account, '--', STAGE2A_LAUNCHER, command], {
     stdio: ['pipe', 'pipe', role === 'child' ? 'pipe' : 'ignore'], shell: false,
     env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LANG: 'C' },
   });
-  const progress = role === 'child' ? childProgress(child) : undefined;
+  const progress = role === 'child' ? childProgress(child, cooperativeChild, onT03Event) : undefined;
   const done = new Promise((resolve) => {
     child.once('close', (exit_code, signal) => resolve({ exit_code, signal, contained: false }));
   });
   child.stdin.on('error', () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); });
   child.stdout.on('error', () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM'); });
   try {
-    const challenge = await firstLine(child, (line) => challengeFrom(line, role), timeoutMs, 512);
+    const challenge = await firstLine(child, (line) => challengeFrom(line, cooperativeBridge ? 'cooperative-bridge' : role), timeoutMs, 512);
     const grant = await bounded(machineExec({ reservation_sha256: reservationSHA256,
       role, nonce: challenge.nonce, pid: challenge.pid }), timeoutMs, 'Machine role grant');
     await writeGrant(child, grant?.grantLine);
@@ -312,7 +344,7 @@ export async function startStage2aRole({ account, role, reservationSHA256,
         return started;
       },
       sendChildReceipt: async (receipt) => {
-        if (role !== 'child' || !Buffer.isBuffer(receipt?.envelope)
+        if (role !== 'child' || cooperativeChild || !Buffer.isBuffer(receipt?.envelope)
           || !DIGEST.test(receipt?.sha256 ?? '')
           || !Number.isSafeInteger(receipt?.expires_at_ms)
           || receipt.expires_at_ms <= Date.now()) throw new Error('invalid protected child receipt');
@@ -327,7 +359,7 @@ export async function startStage2aRole({ account, role, reservationSHA256,
           throw new Error('invalid protected child receipt selector');
         }
         const accepted = await progress.next('child-accepted', 5000);
-        if (accepted.receipt_sha256 !== receiptSHA256
+        if ((cooperativeChild ? accepted.ready_sha256 : accepted.receipt_sha256) !== receiptSHA256
           || !Number.isSafeInteger(accepted.lease_sequence)
           || accepted.lease_sequence < 1) throw new Error('protected child receipt was not accepted');
         await progress.next('started', 5000);
@@ -402,7 +434,7 @@ export async function startStage2aRole({ account, role, reservationSHA256,
         }
         readinessAttempted = true;
         try {
-          const ready = await firstLine(child, bridgeReadyFrom, 5000, 1024, true);
+          const ready = await firstLine(child, (line) => bridgeReadyFrom(line, cooperativeBridge), 5000, 1024, true);
           const verified = await bounded(Promise.resolve().then(() => verify(ready)), 5000,
             'Soul bridge readiness verification');
           if (verified !== true || child.exitCode !== null || child.signalCode !== null) {

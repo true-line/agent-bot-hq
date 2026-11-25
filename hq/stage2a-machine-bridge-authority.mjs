@@ -27,7 +27,9 @@ function matchesInstalled(payload, installed) {
   if (!a || !m || !installed || payload.host_id !== installed.host_id
     || payload.installed_plan_receipt_sha256 !== installed.root_receipt_sha256
     || m.profile_in_force !== 'managed-protected'
-    || m.contract !== 'machine/v2' || m.schema_version !== 2
+    || !((m.contract === 'machine/v2' && m.schema_version === 2)
+      || (payload.kind === 'stage2a-qualification-candidate-reservation'
+        && m.contract === 'machine/v3' && m.schema_version === 3))
     || m.definition_measurement !== installed.definition_measurement
     || m.claimed_definition_digest !== installed.claimed_definition_digest
     || m.launch_input_measurement !== installed.launch_input_measurement
@@ -70,7 +72,7 @@ export function createStage2aMachineBridgeAuthority({ machinePublicKey, verifyRe
   const starts = new Map();
   const connections = new Map();
 
-  // verifyReservation must verify the signed machine/v2 schema and exact
+  // verifyReservation must verify the signed contract schema and exact
   // enrolled issuer without spending the claim. Machine Live is the durable
   // active-claim check and is repeated at every admission phase.
   async function register({ envelope, sha256, installed, killRoles, runnerPid = 0,
