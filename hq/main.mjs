@@ -329,8 +329,10 @@ async function main(argv) {
         machinePublicKey, authority,
         stopReservation: (reservationSHA256) => protectedStart.stopReservation(reservationSHA256),
       }) : undefined;
-      const protectedStart = installed.length ? createStage2aProtectedStarter({
-        installations: installed, authority, verifyReservation, verifyHQCodeReady,
+      let protectedStart;
+      const createProtectedStart = installed.length ? (recordLaunch) =>
+        (protectedStart = createStage2aProtectedStarter({
+        recordLaunch, installations: installed, authority, verifyReservation, verifyHQCodeReady,
         getBrokerIdentity: (installationId) => hq.bridgeBrokerIdentity(installationId),
         verifyBoundBridge: (selectors, digest) => hq.boundBridgeV2(selectors, digest),
         onT03Event: async ({ event, installed: plan, assignment, selectors,
@@ -500,11 +502,11 @@ async function main(argv) {
           providerStarts.delete(reservationSHA256);
           await provider?.close();
         },
-      }) : undefined;
+      })) : undefined;
       hq = createHQ({ home: args.home, ownerControl, schemas: loadSchemas(), pins,
         pluginsDir, devPlugins: args.devPlugins, bridgeAssignments: installed,
         bridgeAuthority: authority, machineHqEpoch: epochs.values().next().value,
-        protectedStart, protectedAdmission, createCooperativeStart, cooperativeAdmission: cooperativeMachine,
+        createProtectedStart, protectedAdmission, createCooperativeStart, cooperativeAdmission: cooperativeMachine,
         // Production B uses its dedicated v2 relay ingress. The synthetic
         // bridge qualification route stays disabled so it cannot consume the
         // installed one-use Machine provider response.

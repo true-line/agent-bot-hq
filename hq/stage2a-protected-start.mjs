@@ -283,7 +283,7 @@ export function createStage2aProtectedStarter({ installations, authority, verify
   openProtectedAdmission,
   prepareBridge = prepareStage2aBridge, startRole = startStage2aRole,
   verifyHQCodeReady = () => false,
-  onFinalized, onStopped, onT03Event,
+  recordLaunch, onFinalized, onStopped, onT03Event,
   random = (bytes) => randomBytes(bytes).toString('hex') } = {}) {
   if (!Array.isArray(installations) || typeof authority?.register !== 'function'
     || typeof authority.stopStart !== 'function' || typeof authority.currentLiveStart !== 'function'
@@ -293,7 +293,8 @@ export function createStage2aProtectedStarter({ installations, authority, verify
     || typeof machineReserve !== 'function' || typeof machineFinalize !== 'function'
     || typeof machineChildReady !== 'function'
     || typeof prepareBridge !== 'function' || typeof startRole !== 'function'
-    || typeof verifyHQCodeReady !== 'function' || typeof random !== 'function') refuse();
+    || typeof verifyHQCodeReady !== 'function' || typeof recordLaunch !== 'function'
+    || typeof random !== 'function') refuse();
   const byId = new Map(installations.map((i) => [i.installation_id, i]));
   if (byId.size !== installations.length) refuse();
   const slots = new Map();
@@ -465,6 +466,20 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         helloFinalizationSHA256: helloFinalization.sha256,
         helloFinalizationEnvelope: helloFinalization.envelope });
       if (slot.stopPromise) refuse();
+      const result = { start_id: startId, launch_id: launchId, installation_id: installed.installation_id,
+        soul_id: installed.soul_id, package_path: source, pid: childStarted.child_pid,
+        runner_uid: installed.runner_uid, runner_gid: installed.runner_gid,
+        hq_epoch: installed.hq_epoch, profile: 'managed-protected', protected: true };
+      const { profile, ...started } = result;
+      const receipt = await recordLaunch({ ...started,
+        plan_id: installed.plan_id, plan_digest: installed.plan_digest, profile_in_force: profile,
+        reservation_sha256: reserved.sha256, child_start_receipt_sha256: childReceipt.sha256,
+        bind_receipt_sha256: live.bind_receipt_sha256, b_finalization_sha256: live.finalization_sha256,
+        relay_socket: slot.relaySocket,
+        child_launcher_pid: childStarted.child_launcher_pid, child_pid: childStarted.child_pid,
+        runner_pid: slot.runner.pid, bridge_pid: slot.bridge.pid });
+      if (!Number.isSafeInteger(receipt?.seq) || receipt.seq < 1
+        || slot.stopPromise || stopping || childReceipt.expires_at_ms <= Date.now()) refuse();
       // Do not expose the one-use provider before R and the stock child have
       // both acknowledged A's signed current start and child receipts.
       await onFinalized?.({ installed, assignment, selectors,
@@ -475,10 +490,6 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         childLauncherPID: childStarted.child_launcher_pid,
         childPID: childStarted.child_pid,
         relaySocket: slot.relaySocket });
-      const result = { start_id: startId, launch_id: launchId, installation_id: installed.installation_id,
-        soul_id: installed.soul_id, package_path: source, pid: childStarted.child_pid,
-        runner_uid: installed.runner_uid, runner_gid: installed.runner_gid,
-        hq_epoch: installed.hq_epoch, profile: 'managed-protected', protected: true };
       return takeover(result, { open: () => (socket) => {
         if (stopping || slot.stopPromise) { socket.destroy(); return; }
         const cut = () => { socket.destroy(); void stop(slot); };
