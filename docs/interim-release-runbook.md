@@ -49,6 +49,27 @@ deployment operator owns client inventory, installation, monitoring and rollback
 
 ## Distribution and activation
 
+For a reviewed public Darwin release, publish the approved tar bytes under
+`agent-bot-hq-VERSION-darwin-arm64.tar` in GitHub release `vVERSION`.
+Generate the self-tap formula with
+`node scripts/build-homebrew-formula.mjs VERSION ARCHIVE APPROVED_SHA256`
+and review it as `Formula/agent-bot-hq.rb`. After the formula is published,
+install and check it as the Homebrew administrator.
+
+```sh
+brew tap true-line/agent-bot-hq https://github.com/true-line/agent-bot-hq.git
+brew install agent-bot-hq
+brew list --versions agent-bot-hq
+brew --prefix agent-bot-hq
+brew test agent-bot-hq
+```
+
+Use the retained archive under `$(brew --prefix agent-bot-hq)/libexec`
+as the source for [Machine's macOS HQ LaunchDaemon setup](https://github.com/true-line/agent-bot-machine/blob/main/docs/plans/member-accounts.md#macos-hq-launchdaemon).
+Stage the archive and an approved standalone Node runtime under the root-owned
+paths that Machine verifies. Start the dedicated service through the approved
+Machine plan. Use `agent-bot-hq status --owner-control` to query that service.
+
 The deployment operator records an inventory of all intended enrolled HQ
 clients, current artifact and pin, owner, online status and update confirmation.
 Install and verify the approved digest on each target while the existing signer
