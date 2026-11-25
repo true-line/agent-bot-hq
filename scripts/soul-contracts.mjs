@@ -22,6 +22,8 @@ export const PIN_PATH = join(ROOT, 'governance/soul-contracts.json');
 export const ALGORITHM = 'sha256-manifest-v1';
 const CACHE = join(ROOT, '.cache/soul-contracts');
 const MODES = new Set(['100644', '100755']);
+export { H_V0103_EXCLUDED } from './h-v0103-excluded.mjs';
+import { H_V0103_EXCLUDED } from './h-v0103-excluded.mjs';
 const H_V0102 = Object.freeze({
   tag: 'v0.10.2',
   commit: 'b216ae9f5889ba00d38ef9b3e3bc9f60f54e90bd',
@@ -29,6 +31,14 @@ const H_V0102 = Object.freeze({
   files: 469,
   runtimeDigest: 'sha256:6cbab934ebed9248e4bff1d5bff14cdea9f7ac1f6be93d3eceb2ef8c2365c85b',
   runtimeFiles: 362,
+});
+const H_V0103 = Object.freeze({
+  tag: 'v0.10.3',
+  commit: '896b693b23219444dcbe4af4083fd1bc4b9f178c',
+  digest: 'sha256:e72bee1f4471c127a5557fd45756511595aa2e4c2423ed76be52373d46d8a2f3',
+  files: 658,
+  runtimeDigest: 'sha256:f7a9e2ffd25960d9e8297b13da2fce5207b116d52d71d2853d564b4fc6b2cd26',
+  runtimeFiles: 163,
 });
 const VENDOR_PREFIX = 'vendor/soul-contracts/';
 export const H_V0102_EXCLUDED = Object.freeze([
@@ -386,9 +396,12 @@ const isPrivateH88 = (pin) => pin.private_candidate === true
 
 const isHV0102 = (pin) => pin.tag === H_V0102.tag && pin.commit === H_V0102.commit
   && pin.digest === H_V0102.digest && pin.files === H_V0102.files;
+const isHV0103 = (pin) => pin.tag === H_V0103.tag && pin.commit === H_V0103.commit
+  && pin.digest === H_V0103.digest && pin.files === H_V0103.files;
 
 const reviewedRuntime = (pin) => isPrivateH88(pin) ? H_PRIVATE_88
-  : isHV0102(pin) && !Object.hasOwn(pin, 'private_candidate') ? { ...H_V0102, excluded: H_V0102_EXCLUDED } : undefined;
+  : isHV0103(pin) && !Object.hasOwn(pin, 'private_candidate') ? { ...H_V0103, excluded: H_V0103_EXCLUDED }
+    : isHV0102(pin) && !Object.hasOwn(pin, 'private_candidate') ? { ...H_V0102, excluded: H_V0102_EXCLUDED } : undefined;
 
 // The raw release is checked against the entire pin before this projection is
 // computed. Machine A separately proves selected+excluded equals that full
