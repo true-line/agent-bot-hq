@@ -10,9 +10,10 @@
 // Prints one JSON line: { "connected": true, "responses": [...] } or
 // { "connected": false, "error": "<code>" }.
 import { createHmac } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 
-const input = JSON.parse(process.argv[2]);
+const input = JSON.parse(process.argv[2] === '-' ? readFileSync(0, 'utf8') : process.argv[2]);
 const socket = connect(input.path);
 const waiting = new Map();
 let next = 1;

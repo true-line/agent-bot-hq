@@ -26,6 +26,13 @@ function stageSource(pin, work) {
       git(['-C', repository, 'fetch', '--quiet', '--no-tags', '--depth=1', COMMS,
         pin.source_commit + ':refs/heads/' + pin.source_commit]);
     }
+    if (pin.source_tag && spawnSync('git', ['-C', repository, 'show-ref', '--verify', '--quiet', `refs/tags/${pin.source_tag}`], { env: gitEnv, stdio: 'ignore' }).status !== 0) {
+      git(['-C', repository, 'fetch', '--quiet', '--no-tags', COMMS, `refs/tags/${pin.source_tag}:refs/tags/${pin.source_tag}`]);
+    }
+  }
+  if (pin.source_tag) {
+    const tagged = git(['-C', repository, 'rev-parse', `refs/tags/${pin.source_tag}^{commit}`]).trim();
+    if (tagged !== pin.source_commit) throw new Error('Darwin broker release tag does not name the pinned source commit');
   }
   const src = join(work, 'broker-source');
   git(['init', '--quiet', src]);
@@ -39,7 +46,9 @@ export function stageDarwinBroker(tree, work) {
   const pin = JSON.parse(readFileSync(join(tree, 'governance/darwin-broker.json'), 'utf8'));
   if (pin.name !== 'agent-comms' || !/^\d+\.\d+\.\d+$/.test(pin.version) ||
       !/^sha256:[0-9a-f]{64}$/.test(pin.sha256) || pin.source_repository !== COMMS ||
-      !/^[0-9a-f]{40}$/.test(pin.source_commit)) throw new Error('invalid Darwin broker pin');
+      !/^[0-9a-f]{40}$/.test(pin.source_commit) ||
+      (pin.source_tag !== undefined && (!/^v\d+\.\d+\.\d+$/.test(pin.source_tag) || pin.source_tag.slice(1) !== pin.version)) ||
+      (pin.release_asset_sha256 !== undefined && !/^sha256:[0-9a-f]{64}$/.test(pin.release_asset_sha256))) throw new Error('invalid Darwin broker pin');
   const src = stageSource(pin, work);
   const plugins = join(tree, 'vendor/plugins');
   mkdirSync(plugins);

@@ -5,11 +5,16 @@ import struct
 import sys
 
 
-def peer_uid(connection):
+def peer_identity(connection):
     fmt = "iII"  # Linux struct ucred: pid_t, uid_t, gid_t.
     credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize(fmt))
     pid, uid, _ = struct.unpack(fmt, credentials)
-    return uid if pid > 0 else None
+    return (pid, uid) if pid > 0 else None
+
+
+def peer_uid(connection):
+    identity = peer_identity(connection)
+    return identity[1] if identity else None
 
 
 if sys.argv[1:] == ["probe"]:
@@ -25,4 +30,10 @@ with socket.socket(fileno=3) as sock:
         sys.exit(0 if listening and sock.getsockname() == sys.argv[2] else 1)
     if sys.argv[1] == "peer":
         sys.exit(0 if not listening and peer_uid(sock) == int(sys.argv[2]) else 1)
+    if sys.argv[1] == "peer-pid":
+        identity = peer_identity(sock)
+        if not listening and identity and identity[1] == int(sys.argv[2]) and identity[0] > 1:
+            print(identity[0])
+            sys.exit(0)
+        sys.exit(1)
     sys.exit(1)

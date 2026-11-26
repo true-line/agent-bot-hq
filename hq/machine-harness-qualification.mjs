@@ -16,6 +16,11 @@ const file = (path, sha) => digest(sha) && typeof path === 'string' &&
 const fileRef = f => fields(f, 'path,sha256') && file(f.path, f.sha256);
 const missingFile = f => fields(f, 'path,sha256') && f.path === '' && f.sha256 === '';
 const gateIds = ['T01', 'T02', 'T03', 'T21'];
+const installationId = s => typeof s === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(s);
+const hostUUID = s => typeof s === 'string' && /^[0-9A-F]{8}-(?:[0-9A-F]{4}-){3}[0-9A-F]{12}$/.test(s);
+const componentId = s => typeof s === 'string' && /^[a-z][a-z0-9_-]{0,63}$/.test(s);
+const qHome = '/private/var/db/managed-machine/qualification-q';
+const qRunnerDestination = qHome + '/qualification-runner.mjs';
 
 export function validHarnessQualification(plan, bytes) {
   if (plan.purpose !== qualificationPurpose || plan.hq_account !== '_agent-bot-hq' ||
@@ -39,14 +44,29 @@ export function validHarnessQualification(plan, bytes) {
   if (inner !== step.content) return false;
 
   const r = run.request;
-  if (!fields(r, 'schema_version,adapter,target,host,definition_revision,suite_revision,runner,test_provider') ||
-      r.schema_version !== 1 || !revision(r.definition_revision) || !revision(r.suite_revision)) return false;
+  const candidate = r?.candidate;
+  const candidateRun = r?.schema_version === 2;
+  if (!fields(r, candidateRun
+    ? 'candidate,schema_version,adapter,target,host,definition_revision,suite_revision,runner,test_provider'
+    : 'schema_version,adapter,target,host,definition_revision,suite_revision,runner,test_provider') ||
+      (r.schema_version !== 1 && !candidateRun) ||
+      !revision(r.definition_revision) || !revision(r.suite_revision) ||
+      (candidateRun && (!fields(candidate,
+        'host_uuid,installation_id,installed_plan_digest,runtime_inventory_sha256,component_id,manifest,test_plan') ||
+        !hostUUID(candidate.host_uuid) || !installationId(candidate.installation_id) ||
+        !digest(candidate.installed_plan_digest) || !digest(candidate.runtime_inventory_sha256) ||
+        !componentId(candidate.component_id) || !fileRef(candidate.manifest) || !fileRef(candidate.test_plan)))) return false;
   const { adapter, target, host, runner, test_provider: provider } = r;
+  const pendingRunner = candidateRun && runner?.binary_path === qRunnerDestination;
   if (!fields(adapter, 'id,version,package_path,package_sha256,launch,harness') ||
       !fields(target, 'account,uid') || !Number.isInteger(target.uid) || target.uid < 300 || target.uid > 399 ||
       !fields(host, 'id,model,os,os_version,os_build,architecture,enforcement_policy_sha256') ||
       host.os !== 'darwin' || host.architecture !== 'arm64' || !digest(host.enforcement_policy_sha256) ||
-      !fields(runner, 'id,version,binary_path,binary_sha256') ||
+      !fields(runner, pendingRunner
+        ? 'id,version,binary_path,binary_sha256,source_path'
+        : 'id,version,binary_path,binary_sha256') ||
+      (pendingRunner && (runner.source_path === runner.binary_path ||
+        runner.source_path.startsWith(qHome + '/') || !file(runner.source_path, runner.binary_sha256))) ||
       !fields(provider, 'id,configuration_path,configuration_sha256')) return false;
 
   const { launch, harness } = adapter;

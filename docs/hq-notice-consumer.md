@@ -2,7 +2,7 @@
 
 [HQ #130](https://github.com/true-line/agent-bot-hq/issues/130) tracks the
 host consumer for the shared
-[notice contract](https://github.com/true-line/soul-contracts/blob/v0.5.0/schemas/hq/v1/notices.md).
+[notice contract](https://github.com/true-line/soul-contracts/blob/v0.6.0/schemas/hq/v1/notices.md).
 The contract owns fields, bounds, compatibility and refusal codes;
 [Accepted PDR-0062](https://github.com/true-line/agent-bot-platform/blob/main/docs/04-decisions/PDR-0062-hq-notice-scope-and-legacy-consume-one.md)
 owns the scope and handoff decision.
@@ -48,7 +48,7 @@ no upstream fallback, automatic replay, directive or lifecycle action.
 
 ## Released contracts and validation
 
-The normal HQ schema loader verifies the complete `v0.5.0` release pin in
+The normal HQ schema loader verifies the complete `v0.6.0` release pin in
 `governance/soul-contracts.json`, then loads both notice schemas. Normal host
 construction registers `hq-notices` alongside admission and tasks. It requires
 no owner notice configuration for ordinary admission or task operation.

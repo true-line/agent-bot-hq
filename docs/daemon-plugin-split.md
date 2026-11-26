@@ -547,7 +547,7 @@ not a plugin (PDR-0027), so it is ready before any plugin code runs:
    agent-bot-identity registers its member surfaces.
 5. **`hq/v1` admissions open.** Entry points can now send `Hello`.
 
-`status`, `device.status` and `device.enroll` are answered by core; a plugin
+`status`, `device.status`, `device.enroll` and `device.whoami` are answered by core; a plugin
 that registers one is refused. If a plugin fails, it is marked `degraded`,
 its dependents don't start, and `status` reports why.
 
@@ -915,7 +915,7 @@ Every approved operation is available through both (0.4 §3, §8).
 | Authority | `grants.list/create/revoke`, `approvals.list/decide`, `destinations.list/approve`, `budgets.get/set` (ceiling and sub-allocations) |
 | Work | `tasks.offer` (the owner's task offer; the requester is the socket's auth class), `tasks.list/get` (state, waiting reason, evidence), `receipts.query`, `actions.unknown` with `actions.resolve` (owner-resolved outcome) |
 | Souls | `souls.list/get` (roles, readiness, unevaluated harnesses), `candidates.list/get` (change list, per-cell matrix, provenance warnings, cost), `evaluations.get` |
-| Device | `device.status`, `device.enroll` (starts the identity-service device grant) |
+| Device | `device.status`, `device.enroll` (starts the identity-service device grant), `device.whoami` (signed self-lookup using the paired Machine) |
 | Events | `events.subscribe` (stream on the same socket) |
 
 Today's `/v0` and `/v1` loopback routes are served by a compatibility layer

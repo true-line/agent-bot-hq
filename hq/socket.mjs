@@ -41,6 +41,7 @@ import { parseStrict } from '../sdk/wire/strict-json.mjs';
 export const MAX_LINE_BYTES = 1 << 20;
 const REQUEST_KEYS = new Set(['id', 'op', 'payload']);
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const PROTECTED_PEER_DEADLINE_MS = 5_000;
 
 const clip = (s) => {
   const text = String(s ?? '').trim() || 'refused';
@@ -80,12 +81,15 @@ export function checkSocketPath(path, platform = process.platform) {
 // `mode` is the socket file's mode: 0600 for HQ's own sockets, 0660 for a
 // harness endpoint whose directory gives it the account's group (hq/harness-accounts.mjs).
 // `takeover` enables the hook above for this listener.
-export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false, activated, authenticatePeer }) {
+export async function listenSocket({ path, auth, dispatch, core, newSession, endSession, mode = 0o600, takeover: canTakeOver = false, activated, authenticatePeer, connectionContext, connectionClosed, replaceStale = true, maxResponseBytes }) {
   if (process.platform === 'win32') throw new Error('HQ on Windows needs a named pipe with an owner DACL, which is not built yet (#89)');
   const authenticate = activated ? activated.authenticate : authenticatePeer;
   if (activated && typeof authenticate !== 'function') throw new Error('an activated listener requires peer authentication');
   checkSocketPath(path);
-  if (!activated && existsSync(path)) {
+  if (!activated && !replaceStale && lstatSync(path, { throwIfNoEntry: false })) {
+    throw new Error(`socket path ${path} is occupied`);
+  }
+  if (!activated && replaceStale && existsSync(path)) {
     if (!lstatSync(path).isSocket()) throw new Error(`${path} exists and is not a socket; refusing to replace it`);
     if (await live(path)) throw new Error(`another HQ is listening on ${path}`);
     unlinkSync(path);
@@ -111,7 +115,7 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
   }
 
   // `offer`: this request may take the connection over.
-  async function handle(line, session, offer = false) {
+  async function handle(line, session, offer = false, trustedContext) {
     let req;
     try {
       req = parseStrict(line);
@@ -124,7 +128,8 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     if (extra.length) return respondError(new HostError('host.invalid_request', `unknown request field ${extra[0]}`), id);
     if (typeof req.op !== 'string') return respondError(new HostError('host.invalid_request', 'a request names its op'), id);
     try {
-      const result = await dispatch(req.op, { auth, payload: req.payload, session, ...(offer ? { takeover: true } : {}) });
+      const result = await dispatch(req.op, { auth, payload: req.payload, session,
+        ...(trustedContext ? { protectedStart: trustedContext } : {}), ...(offer ? { takeover: true } : {}) });
       const t = takeoverOf(result);
       if (t) {
         if (offer) return { id, takeover: t };
@@ -154,7 +159,34 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
       finally { pendingChecks--; }
       if (!accepted || socket.destroyed) { socket.destroy(); return; }
     }
-    const session = newSession();
+    // Only HQ's trusted listener can supply protected-start context. A wire
+    // payload never reaches this hook, and a failed native peer check closes
+    // before any request is parsed. Null means an ordinary cooperative peer.
+    let trustedContext;
+    if (connectionContext) {
+      let timer;
+      try {
+        trustedContext = await Promise.race([
+          Promise.resolve().then(() => connectionContext(socket)),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('protected peer check timed out')), PROTECTED_PEER_DEADLINE_MS);
+            timer.unref?.();
+          }),
+        ]);
+      }
+      catch {
+        if (connectionClosed) void Promise.resolve().then(() => connectionClosed(socket, undefined)).catch(() => {});
+        socket.destroy(); return;
+      }
+      finally { clearTimeout(timer); }
+      if (socket.destroyed || (trustedContext !== null && trustedContext !== undefined
+        && (typeof trustedContext !== 'object' || Array.isArray(trustedContext)))) {
+        if (connectionClosed) void Promise.resolve().then(() => connectionClosed(socket, trustedContext)).catch(() => {});
+        socket.destroy(); return;
+      }
+      if (trustedContext) trustedContext = Object.freeze({ ...trustedContext });
+    }
+    const session = newSession(socket);
     // Bytes, not text: a takeover hands the rest of the stream on unchanged.
     // Lines split on 0x0a, which never occurs inside a UTF-8 sequence.
     let buf = Buffer.alloc(0);
@@ -162,7 +194,16 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     let lines = 0;
     let first = false; // the first request of a takeover listener is in flight
     let taken = false;
-    const send = (obj) => { if (!socket.destroyed) socket.write(`${JSON.stringify(obj)}\n`); };
+    const send = (obj) => {
+      if (socket.destroyed) return;
+      let line = `${JSON.stringify(obj)}\n`;
+      if (maxResponseBytes && Buffer.byteLength(line) > maxResponseBytes) {
+        line = `${JSON.stringify(respondError(new HostError('host.launch_unavailable',
+          'broker response exceeds its frame limit'), obj.id))}\n`;
+        if (Buffer.byteLength(line) > maxResponseBytes) { socket.destroy(); return; }
+      }
+      socket.write(line);
+    };
     const oversize = () => {
       send(respondError(new HostError('host.invalid_request', `request line exceeds ${MAX_LINE_BYTES} bytes`), null));
       socket.end();
@@ -212,14 +253,14 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
         if (canTakeOver && lines++ === 0) {
           // The first request runs alone; the rest of the buffer waits for it.
           first = true;
-          queue = queue.then(() => handle(line, session, true)).then((out) => {
+          queue = queue.then(() => handle(line, session, true, trustedContext)).then((out) => {
             first = false;
             if (out?.takeover) takeOver(out.id, out.takeover);
             else { send(out); pump(); }
           }, (e) => { first = false; send(respondError(e, null)); pump(); });
           return;
         }
-        queue = queue.then(() => handle(line, session)).then(send, (e) => send(respondError(e, null)));
+        queue = queue.then(() => handle(line, session, false, trustedContext)).then(send, (e) => send(respondError(e, null)));
       }
     }
     function onData(chunk) {
@@ -230,7 +271,10 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     if (authenticate) socket.resume();
     // The session ends after its queued requests finish, so a request still
     // in flight (a broker bind, say) cannot recreate state after the end.
-    socket.on('close', () => { queue = queue.then(() => endSession(session)).catch(() => {}); });
+    socket.on('close', () => {
+      if (connectionClosed) void Promise.resolve().then(() => connectionClosed(socket, trustedContext)).catch(() => {});
+      queue = queue.then(() => endSession(session)).catch(() => {});
+    });
   }
 
   const server = createServer({ pauseOnConnect: Boolean(authenticate) }, onConnection);
@@ -239,17 +283,18 @@ export async function listenSocket({ path, auth, dispatch, core, newSession, end
     server.listen(activated ? { fd: activated.fd } : path, () => { server.off('error', reject); resolve(); });
   });
   activated?.listener?.adopt(onConnection);
-  if (!activated) chmodSync(path, mode);
+  const close = () => new Promise((resolve) => {
+    for (const s of conns) s.destroy();
+    // libuv clears the bound pathname at close. No-replace listeners need no
+    // additional unlink and require a directory where peers cannot replace
+    // the path. A privileged replacement would require an activated fd to
+    // avoid libuv's pathname cleanup.
+    server.close(() => { if (!activated && replaceStale) { try { unlinkSync(path); } catch { /* already gone */ } } resolve(); });
+  });
+  try { if (!activated) chmodSync(path, mode); }
+  catch (error) { await close(); throw error; }
 
-  return {
-    path,
-    auth,
-    connections: () => conns.size,
-    close: () => new Promise((resolve) => {
-      for (const s of conns) s.destroy();
-      server.close(() => { if (!activated) { try { unlinkSync(path); } catch { /* already gone */ } } resolve(); });
-    }),
-  };
+  return { path, auth, connections: () => conns.size, close };
 }
 
 // A minimal client for the CLI and the tests: request(op, payload) resolves

@@ -3,7 +3,7 @@
 // registration, and hq/v1 dispatch with auth.
 //
 // Identity is HQ core, not a plugin (PDR-0027): the host reads device status
-// from the signer itself and answers status, device.status and device.enroll.
+// from the signer itself and answers status and device operations.
 // No plugin can register those operations, and agent-bot-identity's plugin
 // registers member surfaces (tools, commands, hooks) like any other.
 //
@@ -25,7 +25,7 @@ const RUNTIME_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const BROKER = 'broker';
 const ADAPTER_CLASSES = ['inference', 'service'];
 // Operations HQ core answers itself; a plugin registering one is refused.
-const CORE_OPERATIONS = Object.freeze({ status: 'hq', 'device.status': 'hq', 'device.enroll': 'hq' });
+const CORE_OPERATIONS = Object.freeze({ status: 'hq', 'device.status': 'hq', 'device.enroll': 'hq', 'device.whoami': 'hq' });
 
 function withTimeout(promise, ms, what) {
   let timer;
@@ -43,6 +43,7 @@ export function createHost({
   initTimeoutMs = 10_000,
   stopDeadlineMs = 5_000,
   core = createCore(),
+  localOnly = false,
   services = {},
   // HQ adds its own status fields (profile reasons, sockets, the legacy
   // daemon); they are merged into every status answer.
@@ -282,7 +283,9 @@ export function createHost({
       if (!DEVICE_STATES.includes(reported)) enterSafe(`signer reported no device status (one of ${DEVICE_STATES.join(', ')})`);
       else {
         device = core.deviceRevoked ? 'revoked' : reported;
-        if (device === 'unenrolled') enterSafe('device not enrolled: run enroll');
+        if (device === 'unenrolled' && !(localOnly && core.identity.link === 'not-linked')) {
+          enterSafe('device not enrolled: run enroll');
+        }
         if (device === 'revoked') revokeDevice(core, 'the signer reported the device revoked at startup');
       }
     }
@@ -345,7 +348,7 @@ export function createHost({
     };
   }
 
-  async function dispatch(op, { auth, payload, session } = {}) {
+  async function dispatch(op, { auth, payload, session, protectedStart, cooperativeStart } = {}) {
     if (!(op in HQ_OPERATIONS)) fail('host.unknown_operation', `${op} is not an hq/v1 operation`, { op });
     if (!['running', 'safe', 'device_revoked'].includes(mode)) fail('host.not_running', `host is ${mode}`);
     if (auth !== HQ_OPERATIONS[op]) fail('host.auth_mismatch', `${op} needs auth ${HQ_OPERATIONS[op]}`, { op, auth, expected: HQ_OPERATIONS[op] });
@@ -357,10 +360,20 @@ export function createHost({
       return { device: device ?? 'unknown', link: core.identity.link, ...(enrollment ? { enrollment } : {}) };
     }
     if (op === 'device.enroll') return enroll(payload);
+    if (op === 'device.whoami') {
+      if (payload !== undefined) fail('host.invalid_request', 'device.whoami accepts no arguments');
+      if (device === 'revoked') fail('device_revoked', 'device revoked: re-enroll');
+      if (!core.identity.lookupMachineDevice) fail('credential_unavailable', 'device lookup requires a paired Machine and Identity link');
+      return core.identity.lookupMachineDevice();
+    }
     const reg = registries.hq.get(op);
     if (!reg) fail('host.unknown_operation', `no plugin implements ${op}`, { op });
     if (states.get(reg.plugin)?.state !== 'running') fail('host.plugin_degraded', `${reg.plugin} is ${states.get(reg.plugin)?.state}`, { plugin: reg.plugin, ...states.get(reg.plugin) });
-    return reg.handler(structuredClone(payload), Object.freeze({ auth, session }));
+    // Only a trusted admission listener supplies either start context after
+    // its native-peer and Machine checks. Neither comes from a wire payload.
+    return reg.handler(structuredClone(payload), Object.freeze({ auth, session,
+      ...(op === 'Hello' && protectedStart ? { protectedStart } : {}),
+      ...(op === 'Hello' && cooperativeStart ? { cooperativeStart } : {}) }));
   }
 
   // Enrollment is core (PDR-0027). The test signer enrolls in place; the

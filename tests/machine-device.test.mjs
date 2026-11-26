@@ -63,6 +63,90 @@ test('enroll tells an unpaired account which Machine prerequisite is missing', a
   assert.equal(service.state.requests.length, 0);
 });
 
+test('local-only HQ starts after Machine authentication and refuses linked or uncertain state', async (t) => {
+  const home = tempHome();
+  const identityDir = join(home, 'identity');
+  const { publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const jwk = publicKey.export({ format: 'jwk' });
+  const unbound = { jwk, thumbprint: jwkThumbprint(jwk), generation: 1, key_storage: 'hardware', hq_epoch: 'ab'.repeat(32) };
+  const bound = { ...unbound, device_id: 'dev_linked', receipt_jti: 'enroll-v1:' + 'ab'.repeat(32), receipt_sha256: 'cd'.repeat(32) };
+  let machineIdentity = unbound;
+  let hq;
+  let owner;
+  let enrollmentStarts = 0;
+  const calls = [];
+  const request = async (operation) => {
+    calls.push(operation);
+    if (!machineIdentity) throw new Error('Machine refused pairing');
+    return { state: 'identity', body: machineIdentity };
+  };
+  const close = async () => {
+    await owner?.close();
+    await hq?.stop();
+    owner = hq = undefined;
+  };
+  t.after(async () => {
+    try { await close(); } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+  const configure = (source) => writeFileSync(join(home, 'config.json'), JSON.stringify({ enrollment: { source } }), { mode: 0o600 });
+  configure('local-only');
+  mkdirSync(identityDir, { mode: 0o700 });
+  writeFileSync(join(identityDir, 'server-key.json'), '{}', { mode: 0o600 });
+  const start = () => {
+    hq = createHQ({ home, schemas, createDeviceSigner: (opts) => createMachineSigner({ ...opts, request }),
+      enrollment: () => {
+        enrollmentStarts++;
+        return { deviceStatus: () => 'unenrolled' };
+      },
+      legacy: legacyDaemon({ run: fakeLegacy().run }) });
+    return hq.start();
+  };
+
+  const status = await start();
+  assert.equal(status.mode, 'running');
+  assert.equal(status.admissions, true);
+  assert.equal(status.hq.signer.available, true);
+  assert.equal(status.hq.enrollment, undefined);
+  assert.deepEqual(status.identity, { device: 'unenrolled', link: 'not-linked' });
+  owner = await connectSocket(hq.paths.control);
+  assert.equal((await owner.request('souls.list')).ok, true);
+  assert.equal((await owner.request('device.enroll', { harnesses: ['codex'] })).host_refusal.code, 'host.invalid_request');
+  await assert.rejects(hq.core.identity.call('GET', '/api/daemon/whoami'), { code: 'credential_unavailable' });
+  assert.equal(enrollmentStarts, 0);
+  await owner.close();
+  owner = undefined;
+  await hq.stop();
+  configure('hq');
+  assert.equal((await hq.start()).mode, 'safe');
+  assert.equal(enrollmentStarts, 1);
+  await hq.stop();
+  configure('local-only');
+  assert.equal((await hq.start()).mode, 'running');
+  assert.equal(enrollmentStarts, 1);
+  await close();
+  assert.deepEqual([...new Set(calls)], ['identity']);
+
+  machineIdentity = undefined;
+  assert.match((await start()).reason, /signer unavailable: Machine refused pairing/);
+  assert.equal(hq.status().mode, 'safe');
+  await close();
+
+  machineIdentity = bound;
+  assert.match((await start()).reason, /requires an unlinked Machine/);
+  assert.equal(hq.status().mode, 'safe');
+  await close();
+
+  machineIdentity = unbound;
+  for (const name of ['device.json', 'device.previous.json', 'pending-receipt.json']) {
+    const path = join(identityDir, name);
+    writeFileSync(path, '{}', { mode: 0o600 });
+    assert.match((await start()).reason, /prior or pending HQ enrollment/);
+    assert.equal(hq.status().mode, 'safe');
+    await close();
+    rmSync(path);
+  }
+});
+
 test('paired HQ enrolls through admin custody, retries lost binding, and authenticates its saved grant on restart', async (t) => {
   const role = tempHome(), home = tempHome();
   const service = await fakeIdentityService();
