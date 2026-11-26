@@ -140,7 +140,7 @@ export function fakeSigner({ device = 'enrolled' } = {}) {
 // atomicReceiptWrites is an explicit claim that the grouped receipt callback
 // participates in that publication. With no persistence hooks, the in-memory
 // host provides the same grouped transaction semantics.
-export function createCore({ clock = testClock(), random = testRandom(), profile = 'managed-cooperative', config = {}, identity = fakeIdentityService(), signer = fakeSigner(), budgets = {}, persist, persistReceipt, persistPluginWrite, atomicReceiptWrites } = {}) {
+export function createCore({ clock = testClock(), random = testRandom(), profile = 'managed-cooperative', config = {}, identity = fakeIdentityService(), signer = fakeSigner(), persist, persistReceipt, persistPluginWrite, atomicReceiptWrites } = {}) {
   if (!PROFILES.includes(profile)) throw new TypeError(`profile is one of ${PROFILES}`);
   if (atomicReceiptWrites !== undefined && typeof atomicReceiptWrites !== 'boolean') throw new TypeError('atomicReceiptWrites must be a boolean');
   const groupedReceipts = atomicReceiptWrites === true && typeof persistPluginWrite === 'function'
@@ -158,7 +158,6 @@ export function createCore({ clock = testClock(), random = testRandom(), profile
     minting: new Map(),         // same key → in-flight mint, shared by concurrent callers
     references: new Map(),      // opaque member reference → underlying reference
     approvals: new Map(),       // id → record
-    budgets: new Map(Object.entries(clone(budgets)).map(([soul, pools]) => [soul, { ceilings: pools, reserved: new Map() }])),
     members: new Map(),
     phases: new Map(),          // plugin → 'init' | 'start' | 'running' | 'stop' | 'stopped'
     deviceRevoked: false,
@@ -499,57 +498,6 @@ export function decideApproval(core, id, decision) {
   return clone(r);
 }
 
-// One ceiling per Soul with working and maintenance sub-allocations (R5).
-function budgetsService(core, plugin) {
-  const account = (soul, pool) => {
-    const a = core.budgets.get(soul);
-    if (!a || !(pool in a.ceilings)) fail('budget_exhausted', `no ${pool} budget for ${soul}`, { soul, pool });
-    return a;
-  };
-  // A plugin settles and releases only its own reservations.
-  const own = (id) => {
-    for (const a of core.budgets.values()) {
-      const r = a.reserved.get(id);
-      if (r && r.plugin === plugin) return r;
-    }
-    return fail('host.invalid_request', `no reservation ${id}`);
-  };
-  const used = (a, pool) => [...a.reserved.values()].filter((r) => r.pool === pool).reduce((s, r) => s + r.amount, 0);
-  return Object.freeze({
-    async reserve({ soul, pool = 'working', amount } = {}) {
-      refuseInInit(core, plugin, 'reserve budget');
-      requireString(soul, 'soul');
-      if (!(Number.isFinite(amount) && amount >= 0)) fail('host.invalid_request', 'amount must be a non-negative number');
-      const a = account(soul, pool);
-      if (used(a, pool) + amount > a.ceilings[pool]) fail('budget_exhausted', `${soul} ${pool} budget exhausted`, { soul, pool, ceiling: a.ceilings[pool] });
-      const id = `rsv_${core.random.hex(12)}`;
-      a.reserved.set(id, { pool, amount, plugin });
-      return id;
-    },
-    // Settle records what the action actually cost. Spend that exceeds the
-    // reservation is recorded as spent, not refused: it already happened, and
-    // later reservations fail until the pool has headroom again.
-    async settle(id, actual) {
-      refuseInInit(core, plugin, 'settle budget');
-      if (!(Number.isFinite(actual) && actual >= 0)) fail('host.invalid_request', 'actual must be a non-negative number');
-      const r = own(id);
-      if (r.settled) fail('host.invalid_request', `reservation ${id} is already settled`);
-      r.amount = actual;
-      r.settled = true;
-    },
-    async release(id) {
-      refuseInInit(core, plugin, 'release budget');
-      const r = own(id);
-      if (r.settled) fail('host.invalid_request', `reservation ${id} is settled; only an open reservation is released`);
-      for (const a of core.budgets.values()) a.reserved.delete(id);
-    },
-    async remaining({ soul, pool = 'working' } = {}) {
-      const a = account(soul, pool);
-      return a.ceilings[pool] - used(a, pool);
-    },
-  });
-}
-
 // Fake member principals. The real launcher creates per-member principals
 // and a private HOME/XDG_*/PATH/temp (0.4 §4); members get references, never
 // secrets, so an env var that looks like a credential is refused.
@@ -664,7 +612,6 @@ const FACTORIES = {
   credentials: credentialsService,
   approvals: approvalsService,
   launch: launchService,
-  budgets: budgetsService,
 };
 
 // Every call through a context checks that the context is still live. The

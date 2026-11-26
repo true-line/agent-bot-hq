@@ -13,7 +13,7 @@ test('the plan §4.1 example manifest is valid', () => {
   const p = definePlugin({
     ...base,
     optional: { 'agent-bot-souls': '>=0.1.0 <1' },
-    services: ['config', 'store', 'log', 'receipts', 'identityService', 'credentials', 'launch', 'events', 'approvals', 'budgets'],
+    services: ['config', 'store', 'log', 'receipts', 'identityService', 'credentials', 'launch', 'events', 'approvals'],
     identityServiceRoutes: ['/api/daemon/notices*'],
   });
   assert.ok(Object.isFrozen(p));
@@ -31,7 +31,7 @@ test('manifest refusals', () => {
   invalid({ ...base, requires: { [base.name]: '^0.6.0' } }, /itself/);
   invalid({ ...base, requires: { a: 'latest' } }, /invalid range/);
   invalid({ ...base, requires: { a: '^1.0.0' }, optional: { a: '^1.0.0' } }, /both required and optional/);
-  invalid({ ...base, services: ['filesystem'] }, /unknown host service filesystem/);
+  invalid({ ...base, services: ['budgets'] }, /unknown host service budgets/);
   invalid({ ...base, services: ['store', 'store'] }, /duplicates/);
   invalid({ ...base, identityServiceRoutes: ['/api/x'] }, /needs the identityService service/);
   invalid({ ...base, services: ['identityService'], identityServiceRoutes: ['api/x'] }, /absolute route/);
@@ -40,7 +40,7 @@ test('manifest refusals', () => {
 });
 
 test('host services match the plan §4.3 table, with no host-side secret store', () => {
-  assert.deepEqual([...HOST_SERVICES].sort(), ['approvals', 'budgets', 'clock', 'config', 'credentials', 'events', 'identityService', 'launch', 'log', 'profile', 'random', 'receipts', 'store']);
+  assert.deepEqual([...HOST_SERVICES].sort(), ['approvals', 'clock', 'config', 'credentials', 'events', 'identityService', 'launch', 'log', 'profile', 'random', 'receipts', 'store']);
 });
 
 test('hostApi window is N and N-1, never 0', () => {
@@ -72,6 +72,7 @@ test('hq/v1 operations: every one has an auth class; entry points are the admiss
   assert.deepEqual([...ADMISSION_OPERATIONS].sort(), ['Admit', 'Equip', 'Hello', 'Lease', 'Ready']);
   for (const op of ADMISSION_OPERATIONS) assert.equal(HQ_OPERATIONS[op], 'entry-point');
   for (const op of SAFE_MODE_OPERATIONS) assert.equal(HQ_OPERATIONS[op], 'owner', op);
+  for (const op of ['budgets.get', 'budgets.set']) assert.equal(HQ_OPERATIONS[op], undefined, op);
   for (const op of ['start', 'stop', 'pause', 'resume', 'drain', 'sleep', 'move', 'fork', 'accept-revision', 'rollback-revision', 'retire']) {
     assert.equal(HQ_OPERATIONS[op], 'owner', op);
   }

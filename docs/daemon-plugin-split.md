@@ -404,7 +404,7 @@ export default definePlugin({
   hostApi: 1,                       // HQ plugin-API major
   requires: {},                     // plugin name → semver range
   optional: { 'agent-bot-souls': '>=0.1.0 <1' },
-  services: ['config', 'store', 'log', 'receipts', 'identityService', 'credentials', 'launch', 'events', 'approvals', 'budgets'],
+  services: ['config', 'store', 'log', 'receipts', 'identityService', 'credentials', 'launch', 'events', 'approvals'],
   identityServiceRoutes: ['/api/daemon/notices*'],   // allowlist for services.identityService
   async init(ctx) { /* register; read-only probes only; return provided services */ },
   async start(ctx) {},
@@ -500,7 +500,6 @@ A subcommand route:
 | `identityService` | `call(method, route, body)` | Limited to the allowlist. Hardened per §4.7. |
 | `approvals` | `request({ action, digest, scope, reason, cost, expiry })`, `decided(id)` | Produces an HQ-signed approval record from an owner session (0.4 §8). Editing the action invalidates it (T24). |
 | `launch` | `member({ soul, role, principal, home, env })`, `track`, `stop` | Per-member principals and private `HOME`/`XDG_*`/`PATH`/temp inside the member's state (0.4 §4). |
-| `budgets` | `reserve`, `settle`, `release` | One Soul ceiling with working and maintenance sub-allocations (R5). |
 | `receipts`, `log` | `receipts.append(record)`, optionally `receipts.appendIn(tx, record)`, `log.*` | `appendIn` is exposed only when the host opts into grouped writes (normal HQ's durable transaction hook, or the in-memory host). It stages a redacted receipt with the calling plugin's active `store.tx`; both `store` and `receipts` must be declared, and the transaction's store write and receipt publish together. HQ adds sequence, time, plugin and profile. A plugin cannot stage into another plugin's or core's transaction. A custom generic `persist` callback retains optimistic visibility and rollback semantics, but cross-restart atomicity depends on that host's behavior. An older `persistPluginWrite(change)` hook keeps the legacy `change()` form for ordinary table/blob writes; task services on a host without `appendIn` keep the prior separate `receipts.append` path, with no cross-store atomicity guarantee. A custom hook must explicitly set `atomicReceiptWrites: true` on `createCore` and pass the commit context's `appendReceipt` callback before the host exposes `appendIn`; a custom `receipts` service may provide its own matching `appendIn`, while an unpaired custom store override keeps the separate path. Logs are redacted; OTLP carries no content or credentials. |
 | `events`, `clock`, `random`, `profile` | as named | `profile.current()` names the enforcement profile. |
 
@@ -912,7 +911,7 @@ Every approved operation is available through both (0.4 §3, §8).
 | --- | --- |
 | Status | `status` (profile in force, plugins and versions, identity-service and relay reachability, degraded reasons) |
 | Lifecycle | `start`, `stop`, `pause`, `resume`, `drain`, `sleep` (schedule), `move`, `fork`, `accept-revision`, `rollback-revision`, `retire` |
-| Authority | `grants.list/create/revoke`, `approvals.list/decide`, `destinations.list/approve`, `budgets.get/set` (ceiling and sub-allocations) |
+| Authority | `grants.list/create/revoke`, `approvals.list/decide`, `destinations.list/approve` |
 | Work | `tasks.offer` (the owner's task offer; the requester is the socket's auth class), `tasks.list/get` (state, waiting reason, evidence), `receipts.query`, `actions.unknown` with `actions.resolve` (owner-resolved outcome) |
 | Souls | `souls.list/get` (roles, readiness, unevaluated harnesses), `candidates.list/get` (change list, per-cell matrix, provenance warnings, cost), `evaluations.get` |
 | Device | `device.status`, `device.enroll` (starts the identity-service device grant), `device.whoami` (signed self-lookup using the paired Machine) |

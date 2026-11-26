@@ -16,7 +16,6 @@ export function createTestHost({
   tokenTtlMs,
   profile = 'managed-cooperative',
   config = {},
-  budgets = {},
   seed = 'agent-bot-sdk-test',
   start = Date.UTC(2026, 0, 1),
   initTimeoutMs = 10_000,
@@ -25,7 +24,7 @@ export function createTestHost({
   const clock = testClock(start);
   const identity = fakeIdentityService({ routes: identityRoutes, link, seed: `${seed}/identity`, ...(tokenTtlMs ? { tokenTtlMs } : {}) });
   const signer = fakeSigner({ device });
-  const core = createCore({ clock, random: testRandom(seed), profile, config, identity, signer, budgets });
+  const core = createCore({ clock, random: testRandom(seed), profile, config, identity, signer });
   const host = createHost({ plugins, core, services, initTimeoutMs, stopDeadlineMs });
   return Object.freeze({
     ...host,

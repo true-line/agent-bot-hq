@@ -419,23 +419,6 @@ test('approvals are bound to the canonical digest of the exact action (T24)', as
   await assert.rejects(approvals.verify(denied.id, action), code('approval_mismatch'));
 });
 
-test('budgets: reserve within the ceiling, refuse beyond it, release frees', async () => {
-  const p = probe('agent-comms', ['budgets']);
-  const host = createTestHost({ plugins: [p.plugin], budgets: { soul_1: { working: 10, maintenance: 2 } } });
-  await host.start();
-  const { budgets } = p.ctx.services;
-  const r1 = await budgets.reserve({ soul: 'soul_1', amount: 7 });
-  await assert.rejects(budgets.reserve({ soul: 'soul_1', amount: 4 }), code('budget_exhausted'));
-  await budgets.reserve({ soul: 'soul_1', pool: 'maintenance', amount: 2 });
-  await budgets.release(r1);
-  assert.equal(await budgets.remaining({ soul: 'soul_1' }), 10);
-  const r2 = await budgets.reserve({ soul: 'soul_1', amount: 5 });
-  await budgets.settle(r2, 3);
-  assert.equal(await budgets.remaining({ soul: 'soul_1' }), 7);
-  await assert.rejects(budgets.release(r2), code('host.invalid_request'), 'a settled reservation is not released');
-  await assert.rejects(budgets.reserve({ soul: 'soul_2', amount: 1 }), code('budget_exhausted'));
-});
-
 test('launch: members get references, never secrets', async () => {
   const p = probe('agent-bot-souls', ['launch']);
   const host = createTestHost({ plugins: [p.plugin] });
@@ -518,16 +501,14 @@ test('a timed-out init keeps running in the background but can no longer touch h
 test('init changes no host state through any service (§4.4)', async () => {
   const tries = {
     approvals: (s) => s.approvals.request({ action: { a: 1 } }),
-    budgets: (s) => s.budgets.reserve({ soul: 'soul_1', amount: 1 }),
     issue: async (s) => s.credentials.issue('gh:repo'),
     resolve: (s) => s.credentials.resolve('gh:repo', { task: 't', operation: 'o' }),
     launch: (s) => s.launch.member({ soul: 's', role: 'r', principal: 'p', home: '/h' }),
     receipts: (s) => s.receipts.append({ kind: 'x' }),
     publish: async (s) => s.events.publish('x', {}),
   };
-  const services = ['approvals', 'budgets', 'credentials', 'launch', 'receipts', 'events'];
+  const services = ['approvals', 'credentials', 'launch', 'receipts', 'events'];
   const host = createTestHost({
-    budgets: { soul_1: { working: 5 } },
     plugins: Object.entries(tries).map(([name, fn]) => plugin(name, { services, async init(ctx) { await fn(ctx.services); } })),
   });
   await host.start();
@@ -666,22 +647,6 @@ test('a live token used as an object key is redacted from receipts and logs', as
   p.ctx.services.log.info('m', { [token]: true });
   assert.equal(JSON.stringify(host.receipts()).includes(token), false);
   assert.equal(JSON.stringify(host.logs()).includes(token), false);
-});
-
-test('budgets: a plugin settles only its own reservations, with a valid amount, once', async () => {
-  const a = probe('plugin-a', ['budgets']);
-  const b = probe('plugin-b', ['budgets']);
-  const host = createTestHost({ plugins: [a.plugin, b.plugin], budgets: { soul_1: { working: 10 } } });
-  await host.start();
-  const id = await a.ctx.services.budgets.reserve({ soul: 'soul_1', amount: 4 });
-  await assert.rejects(b.ctx.services.budgets.settle(id, 0), code('host.invalid_request'));
-  await assert.rejects(b.ctx.services.budgets.release(id), code('host.invalid_request'));
-  for (const bad of [-1, NaN, Infinity, '3', undefined]) await assert.rejects(a.ctx.services.budgets.settle(id, bad), code('host.invalid_request'), String(bad));
-  assert.equal(await a.ctx.services.budgets.remaining({ soul: 'soul_1' }), 6);
-  await a.ctx.services.budgets.settle(id, 12);
-  assert.equal(await a.ctx.services.budgets.remaining({ soul: 'soul_1' }), -2, 'spend over the reservation is recorded');
-  await assert.rejects(a.ctx.services.budgets.reserve({ soul: 'soul_1', amount: 0.5 }), code('budget_exhausted'));
-  await assert.rejects(a.ctx.services.budgets.settle(id, 1), code('host.invalid_request'), 'settled once');
 });
 
 test('re-enrolling a revoked device: the next start runs with a new key', async () => {

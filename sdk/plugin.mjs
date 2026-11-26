@@ -13,7 +13,7 @@ export const HOST_API = 1;
 // The host services a plugin may declare (§4.3).
 export const HOST_SERVICES = Object.freeze([
   'config', 'store', 'log', 'receipts', 'events', 'clock', 'random', 'profile',
-  'identityService', 'credentials', 'approvals', 'launch', 'budgets',
+  'identityService', 'credentials', 'approvals', 'launch',
 ]);
 
 export const PLUGIN_NAME = /^[a-z0-9-]{1,64}$/;
