@@ -40,6 +40,13 @@ deployment operator owns client inventory, installation, monitoring and rollback
    asset SHA-256. The builder checks the tag-to-commit binding and verifies the
    staged plugin tree. Verify the published archive against its recorded asset
    SHA-256 separately; the builder reads source Git blobs, not that archive.
+   To stage Soul runner source for inspection, add
+   `--soul-runner-source <local-agent-bot-souls-repo>` to each independent build
+   of that artifact. The builder reads Git blobs from the exact commit pinned in
+   `governance/soul-runner.json`, verifies their paths, modes and digest, and
+   records the commit and digest with `source_status: "unreleased-source"` in
+   the artifact metadata. HQ does not load or execute the staged files. The
+   separate Machine-controlled launch and qualification procedures still apply.
 4. Verify the artifact digest against the approved record before extracting on
    each host. Reject paths escaping the target and unexpected symlinks. Extract
    under a new versioned directory writable only by the deployment operator;
