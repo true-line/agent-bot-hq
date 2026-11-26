@@ -448,6 +448,30 @@ test('in-memory receipt appends remain synchronously visible', async () => {
   assert.deepEqual(await Promise.all([first, second]), [1, 2]);
 });
 
+test('a released unary reservation cannot alias a new ID after the allocator restarts', async () => {
+  const dir = tempHome();
+  const configure = ({ core }) => {
+    core.budgets.set('soul', { ceilings: { working: 1 } });
+    return bindServices(core, { name: 'p', services: ['budgets'] }).budgets;
+  };
+  try {
+    const first = configure(open(dir));
+    const stale = await first.reserve({ soul: 'soul', amount: 0.25 });
+    await first.release(stale);
+
+    const reopened = open(dir); // The SDK test random source starts at the same seed.
+    const second = configure(reopened);
+    const next = await second.reserve({ soul: 'soul', amount: 0.75 });
+    assert.notEqual(next, stale);
+    const foreign = bindServices(reopened.core, { name: 'q', services: ['budgets'] }).budgets;
+    await assert.rejects(foreign.release(next), /no reservation/);
+    await assert.rejects(second.settle(stale, 0), /no reservation/);
+    await assert.rejects(second.release(stale), /no reservation/);
+    await assert.rejects(second.reserve({ soul: 'soul', pool: 'constructor', amount: 0 }), /no constructor budget/);
+    assert.equal(await second.remaining({ soul: 'soul' }), 0.25);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('the state directory must be private and owned by HQ', () => {
   const dir = tempHome();
   try {
