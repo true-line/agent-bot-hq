@@ -51,7 +51,7 @@ export function fakeLegacy({ device = 'enrolled', daemon = 'running' } = {}) {
   return { state, run };
 }
 
-export async function startHQ({ schemas: schemaSet = schemas, device = 'enrolled', daemon = 'running', supervise = false, config, home = tempHome(), plugins, draftInferenceFixture, pluginsDir, pins, devPlugins, account = 'user', platform = 'darwin', signer, enrollment, identity, accounts, harnessLstat, launch = {}, soulLaunch, soulVerifier, soulCompletionVerifier, machineHqEpoch, bridgeAuthority, protectedAdmission, createCooperativeStart, stoppedStartDiagnostic, realSudo = false } = {}) {
+export async function startHQ({ schemas: schemaSet = schemas, device = 'enrolled', daemon = 'running', supervise = false, config, home = tempHome(), plugins, pluginsDir, pins, devPlugins, account = 'user', platform = 'darwin', signer, enrollment, identity, accounts, harnessLstat, launch = {}, soulLaunch, soulVerifier, soulCompletionVerifier, machineHqEpoch, bridgeAuthority, protectedAdmission, createCooperativeStart, stoppedStartDiagnostic, realSudo = false } = {}) {
   // `realSudo`: only the CI real-account tests, only on Linux with their accounts set.
   if (realSudo && !(process.platform === 'linux' && process.env.HQ_HARNESS_ACCOUNTS)) throw new Error('realSudo is for the CI real-account tests only (Linux, HQ_HARNESS_ACCOUNTS set)');
   const legacy = fakeLegacy({ device, daemon });
@@ -80,7 +80,6 @@ export async function startHQ({ schemas: schemaSet = schemas, device = 'enrolled
     createCooperativeStart,
     stoppedStartDiagnostic,
     plugins,
-    draftInferenceFixture,
     pluginsDir,
     pins,
     devPlugins,

@@ -26,8 +26,6 @@ test('one plugin serves the broker; a second is refused, and serving closes afte
   assert.match(stateOf(host, 'second').reason, /host.duplicate_registration: broker server broker is already registered by first/);
   assert.deepEqual(host.registrations().servers, [{ key: 'broker', plugin: 'first' }]);
   assert.equal(await host.brokerAccept('bind', {}, { connection: 'bc_1' }), 'first');
-  await assert.rejects(host.brokerAccept('inference.models', {}, { connection: 'bc_1' }), code('host.unknown_kind'));
-  await assert.rejects(host.brokerAccept('inference.responses', {}, { connection: 'bc_1' }), code('host.unknown_kind'));
   assert.throws(() => late.broker.serve({ accept() {} }), code('host.registration_closed'));
   assert.throws(() => late.broker.serve({}), code('host.invalid_request'));
 });

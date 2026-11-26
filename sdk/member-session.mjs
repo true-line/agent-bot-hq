@@ -2,7 +2,6 @@
 // lib/member.mjs at 2097b8dc129737df23ae1fb1f8dc30eb4f7d8033.
 // No host authority lives here.
 import { createHmac } from 'node:crypto';
-import { MODEL_CATALOG } from './broker-stream.mjs';
 import { connectHq, HqRefusal, isRetryableMemberReadFailure } from './local-socket-client.mjs';
 
 // HQ's bind proof: HMAC-SHA256 keyed by the channel binding, over the
@@ -134,10 +133,6 @@ export async function openMemberSession({ memberSocket, memberToken, brokerSocke
     // Preserve the owner's task.commit-specific recovery path: it uses the
     // captured raw connection, not the generic query wrapper's invalidation.
     requestOnce: (captured, kind, payload) => pairOf(captured).broker.request(kind, payload),
-    // Transport owner only. Both calls use the already authenticated pair.
-    // The member session's AbortSignal closes the socket without replay.
-    inferenceCatalog: (captured, payload) => pairOf(captured).broker.request(MODEL_CATALOG, payload),
-    inferenceResponses: (captured, payload, onChunk) => pairOf(captured).broker.requestResponses(payload, onChunk),
     entryRequest(operation, payload) {
       if (!['route', 'note', 'handoffs'].includes(operation)) throw new TypeError('owner entry request is route, note or handoffs');
       return entry.request(operation, payload);

@@ -158,7 +158,7 @@ export function createCore({ clock = testClock(), random = testRandom(), profile
     minting: new Map(),         // same key → in-flight mint, shared by concurrent callers
     references: new Map(),      // opaque member reference → underlying reference
     approvals: new Map(),       // id → record
-    budgets: new Map(Object.entries(clone(budgets)).map(([soul, pools]) => [soul, { ceilings: pools }])),
+    budgets: new Map(Object.entries(clone(budgets)).map(([soul, pools]) => [soul, { ceilings: pools, reserved: new Map() }])),
     members: new Map(),
     phases: new Map(),          // plugin → 'init' | 'start' | 'running' | 'stop' | 'stopped'
     deviceRevoked: false,
@@ -500,154 +500,52 @@ export function decideApproval(core, id, decision) {
 }
 
 // One ceiling per Soul with working and maintenance sub-allocations (R5).
-const INFERENCE_TABLE = 'inference_budget';
-const UNARY_BUDGET_TABLE = 'unary_budget';
-// Outside the plugin manifest's name grammar, including in an SDK host.
-const BUDGET_NAMESPACE = '@hq';
-const budgetStore = (core) => storeService(core, BUDGET_NAMESPACE);
-const INFERENCE_POOL = 'working';
-const validCost = (amount) => Number.isFinite(amount) && amount >= 0;
-const legacyInferenceBudgets = new WeakMap();
-
-// Only the earlier draft table of the registered inference consumer has
-// accounting authority. Capture the loaded records before plugins start.
-export function loadLegacyInferenceBudget(core, plugin) {
-  const rows = plugin && core.tables.get(`${plugin}\0inference_operations`);
-  if (rows?.size) legacyInferenceBudgets.set(core, clone(rows));
-  else legacyInferenceBudgets.delete(core);
-}
-
-function* inferenceBudgetRecords(core, tx) {
-  yield* tx.list(INFERENCE_TABLE);
-  yield* legacyInferenceBudgets.get(core) ?? [];
-}
-
-function budgetAccount(core, soul, pool) {
-  const account = core.budgets.get(soul);
-  if (!account || typeof pool !== 'string' || !Object.hasOwn(account.ceilings, pool) || !validCost(account.ceilings[pool])) {
-    fail('budget_exhausted', `no ${pool} budget for ${soul}`, { soul, pool });
-  }
-  return account;
-}
-
-function budgetUsed(core, tx, soul, pool) {
-  let used = 0;
-  for (const [, row] of tx.list(UNARY_BUDGET_TABLE)) {
-    if (row?.soul !== soul || row.pool !== pool || row.state === 'released') continue;
-    if (!['open', 'settled'].includes(row.state) || !validCost(row.amount)) {
-      fail('budget_exhausted', 'unary accounting requires reconciliation before using this budget', { soul, pool });
-    }
-    used += row.amount;
-  }
-  if (pool !== INFERENCE_POOL) return used;
-  const scope = `${JSON.stringify([soul]).slice(0, -1)},`;
-  const counted = new Set();
-  for (const [key, row] of inferenceBudgetRecords(core, tx)) {
-    if (!key.startsWith(scope)) continue;
-    const amount = row?.outcome === 'completed' ? row.actual_cost : row?.outcome === 'outcome_unknown' ? row.reserved_cost : undefined;
-    if (counted.has(key) || !validCost(amount)) {
-      fail('budget_exhausted', 'inference accounting requires reconciliation before using this working budget', { soul, pool });
-    }
-    counted.add(key);
-    used += amount;
-  }
-  return used;
-}
-
-function requireBudget(core, tx, soul, pool, amount) {
-  const { ceilings } = budgetAccount(core, soul, pool);
-  if (budgetUsed(core, tx, soul, pool) + amount > ceilings[pool]) {
-    fail('budget_exhausted', `${soul} ${pool} budget exhausted`, { soul, pool, ceiling: ceilings[pool] });
-  }
-}
-
 function budgetsService(core, plugin) {
-  const { tx } = budgetStore(core);
-  // A plugin settles and releases only its own reservations.
-  const own = (transaction, id) => {
-    const row = transaction.get(UNARY_BUDGET_TABLE, id);
-    if (row?.plugin !== plugin || row.state === 'released') fail('host.invalid_request', `no reservation ${id}`);
-    return row;
+  const account = (soul, pool) => {
+    const a = core.budgets.get(soul);
+    if (!a || !(pool in a.ceilings)) fail('budget_exhausted', `no ${pool} budget for ${soul}`, { soul, pool });
+    return a;
   };
+  // A plugin settles and releases only its own reservations.
+  const own = (id) => {
+    for (const a of core.budgets.values()) {
+      const r = a.reserved.get(id);
+      if (r && r.plugin === plugin) return r;
+    }
+    return fail('host.invalid_request', `no reservation ${id}`);
+  };
+  const used = (a, pool) => [...a.reserved.values()].filter((r) => r.pool === pool).reduce((s, r) => s + r.amount, 0);
   return Object.freeze({
     async reserve({ soul, pool = 'working', amount } = {}) {
       refuseInInit(core, plugin, 'reserve budget');
       requireString(soul, 'soul');
-      if (!validCost(amount)) fail('host.invalid_request', 'amount must be a non-negative number');
-      return tx((transaction) => {
-        requireBudget(core, transaction, soul, pool, amount);
-        for (let attempt = 0; attempt < 8; attempt++) {
-          const id = `rsv_${core.random.hex(12)}`;
-          if (transaction.has(UNARY_BUDGET_TABLE, id)) continue;
-          transaction.put(UNARY_BUDGET_TABLE, id, { soul, pool, amount, plugin, state: 'open' });
-          return id;
-        }
-        fail('host.internal', 'could not allocate a unique budget reservation');
-      });
+      if (!(Number.isFinite(amount) && amount >= 0)) fail('host.invalid_request', 'amount must be a non-negative number');
+      const a = account(soul, pool);
+      if (used(a, pool) + amount > a.ceilings[pool]) fail('budget_exhausted', `${soul} ${pool} budget exhausted`, { soul, pool, ceiling: a.ceilings[pool] });
+      const id = `rsv_${core.random.hex(12)}`;
+      a.reserved.set(id, { pool, amount, plugin });
+      return id;
     },
-    // Record actual spend even if it exceeded the reservation.
+    // Settle records what the action actually cost. Spend that exceeds the
+    // reservation is recorded as spent, not refused: it already happened, and
+    // later reservations fail until the pool has headroom again.
     async settle(id, actual) {
       refuseInInit(core, plugin, 'settle budget');
-      if (!validCost(actual)) fail('host.invalid_request', 'actual must be a non-negative number');
-      return tx((transaction) => {
-        const row = own(transaction, id);
-        if (row.state !== 'open') fail('host.invalid_request', `reservation ${id} is already settled`);
-        transaction.put(UNARY_BUDGET_TABLE, id, { ...row, amount: actual, state: 'settled' });
-      });
+      if (!(Number.isFinite(actual) && actual >= 0)) fail('host.invalid_request', 'actual must be a non-negative number');
+      const r = own(id);
+      if (r.settled) fail('host.invalid_request', `reservation ${id} is already settled`);
+      r.amount = actual;
+      r.settled = true;
     },
     async release(id) {
       refuseInInit(core, plugin, 'release budget');
-      return tx((transaction) => {
-        const row = own(transaction, id);
-        if (row.state !== 'open') fail('host.invalid_request', `reservation ${id} is settled; only an open reservation is released`);
-        // Keep the ID spent across restart. A stale ID must never release or
-        // settle different work, even when allocations repeat after restart.
-        transaction.put(UNARY_BUDGET_TABLE, id, { ...row, state: 'released' });
-      });
+      const r = own(id);
+      if (r.settled) fail('host.invalid_request', `reservation ${id} is settled; only an open reservation is released`);
+      for (const a of core.budgets.values()) a.reserved.delete(id);
     },
     async remaining({ soul, pool = 'working' } = {}) {
-      return tx((transaction) => {
-        const { ceilings } = budgetAccount(core, soul, pool);
-        return ceilings[pool] - budgetUsed(core, transaction, soul, pool);
-      });
-    },
-  });
-}
-
-// Private to HQ's typed inference consumer. One durable row reserves budget
-// and fences dispatch, then records both actual spend and completion.
-export function inferenceBudgetService(core, plugin) {
-  const { tx: transact } = budgetStore(core);
-  const update = (claim, fn) => transact((transaction) => {
-    const row = transaction.get(INFERENCE_TABLE, claim.key);
-    if (row?.plugin !== plugin || row.reservation !== claim.reservation || row.outcome !== 'outcome_unknown') {
-      fail('host.invalid_request', 'inference reservation is no longer open');
-    }
-    return fn(transaction, row);
-  });
-  return Object.freeze({
-    reserve({ soul, amount, runtime_id, task_id, operation_id, destination, signal }) {
-      return transact((transaction) => {
-        signal.throwIfAborted();
-        const key = JSON.stringify([soul, task_id, operation_id]);
-        for (const [existing] of inferenceBudgetRecords(core, transaction)) {
-          if (existing === key) fail('credential_unavailable', 'the operation already has a record; reconcile before retrying');
-        }
-        requireBudget(core, transaction, soul, INFERENCE_POOL, amount);
-        const reservation = `rsv_${core.random.hex(12)}`;
-        transaction.put(INFERENCE_TABLE, key, {
-          plugin, reservation, reserved_cost: amount, runtime_id, task_id, operation_id, destination, outcome: 'outcome_unknown',
-        });
-        return { key, reservation };
-      });
-    },
-    settle(claim, usage, actualCost) {
-      return update(claim, (transaction, row) => {
-        transaction.put(INFERENCE_TABLE, claim.key, { ...row, outcome: 'completed', usage, actual_cost: actualCost });
-      });
-    },
-    release(claim) {
-      return update(claim, (transaction) => transaction.delete(INFERENCE_TABLE, claim.key));
+      const a = account(soul, pool);
+      return a.ceilings[pool] - used(a, pool);
     },
   });
 }
