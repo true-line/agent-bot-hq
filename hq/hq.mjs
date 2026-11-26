@@ -211,7 +211,6 @@ export function createHQ({
   createCooperativeStart,        // owner lifecycle for a paired cooperative launch
   cooperativeAdmission,          // paired A reservation/attach/watch client; never owner config
   plugins = [],                  // plugin objects (tests); installed ones come from pluginsDir
-  draftInferenceFixture,         // test-only plugin object, never set by the daemon entry point
   pluginsDir,                    // installed plugins, each checked against `pins` (§4.5)
   pins = { plugins: [] },        // governance/plugins.json
   devPlugins,                    // --dev-plugins: loaded without pins, always reported
@@ -445,7 +444,6 @@ export function createHQ({
       plugins: [...builtIn, ...accepted],
       core,
       localOnly,
-      draftInferenceFixture: plugins.includes(draftInferenceFixture) ? draftInferenceFixture : undefined,
       ...(initTimeoutMs ? { initTimeoutMs } : {}),
       ...(stopDeadlineMs ? { stopDeadlineMs } : {}),
       extraStatus: () => ({

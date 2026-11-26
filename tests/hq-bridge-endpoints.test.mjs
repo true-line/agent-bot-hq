@@ -121,8 +121,6 @@ async function checkBridgeTransport(enabled, relayEnabled = false, peerEnabled =
   assert.throws(() => handler.dispatch('bind', { payload: {}, session }), { code: 'host.launch_unavailable' });
   assert.throws(() => handler.dispatch('bridge.bind.challenge', { payload: {}, session }), { code: 'host.launch_unavailable' });
   assert.throws(() => handler.dispatch('bridge.bind', { payload: {}, session }), { code: 'host.launch_unavailable' });
-  assert.throws(() => handler.dispatch('inference.models', { payload: {}, session }), { code: 'host.launch_unavailable' });
-  assert.throws(() => handler.dispatch('inference.responses', { payload: {}, session }), { code: 'host.launch_unavailable' });
   handler.dispatch('bridge.bind.v2.challenge', { payload: {}, session });
   const selectors = { installation_id: 'soul-a', start_id: `st_${'a'.repeat(24)}` };
   const epoch = 'a'.repeat(64);

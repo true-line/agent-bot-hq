@@ -13,13 +13,11 @@
 // signer. Plugins add no trust boundary: they all run in HQ's trust domain,
 // which is why the host, not the plugin, owns dispatch and auth.
 import { validateCommand, validateTool } from './declarations.mjs';
-import { abortable, brokerStream, MODEL_CATALOG, RESPONSES, validCatalog, validInferenceRequest } from './broker-stream.mjs';
-import { runInference } from './inference-consumer.mjs';
 import { fail, HostError } from './errors.mjs';
 import { HQ_OPERATIONS, SAFE_MODE_OPERATIONS, ADMISSION_OPERATIONS } from './operations.mjs';
 import { HOST_API, supportedHostApis, validateManifest } from './plugin.mjs';
 import { satisfies } from './semver.mjs';
-import { bindServices, createCore, dropSubscriptions, dropTokens, DEVICE_STATES, inferenceBudgetService, loadLegacyInferenceBudget, pushReceipt, revokeDevice } from './services.mjs';
+import { bindServices, createCore, dropSubscriptions, dropTokens, DEVICE_STATES, pushReceipt, revokeDevice } from './services.mjs';
 import { parseStrict } from './wire/strict-json.mjs';
 
 const KIND = /^[a-z][a-z0-9_.-]{0,63}$/;
@@ -47,7 +45,6 @@ export function createHost({
   core = createCore(),
   localOnly = false,
   services = {},
-  draftInferenceFixture,
   // HQ adds its own status fields (profile reasons, sockets, the legacy
   // daemon); they are merged into every status answer.
   extraStatus,
@@ -163,60 +160,8 @@ export function createHost({
       broker: Object.freeze({
         registerKind({ kind, schema, consume } = {}) {
           if (typeof kind !== 'string' || !KIND.test(kind)) fail('host.invalid_request', `${name}: kind ${JSON.stringify(kind)} must match ${KIND}`);
-          if (kind === MODEL_CATALOG || kind === RESPONSES) fail('host.invalid_request', `${name}: use the typed inference registration`);
           fn(consume, `${kind} consume`);
           register(registries.kinds, name, kind, { kind, schema, consume }, 'message kind', lease);
-        },
-        registerInference({ authorize, catalog, responses } = {}) {
-          if (p !== draftInferenceFixture) fail('host.invalid_request', 'typed inference is only available to an injected test fixture');
-          fn(authorize, 'inference authority');
-          fn(catalog, 'inference catalog');
-          fn(responses, 'inference responses');
-          const { budgets, store } = ctx.services;
-          if (!budgets || !store) fail('host.invalid_request', `${name}: inference needs budgets and store services`);
-          const accounting = inferenceBudgetService(core, name);
-          const checkDevice = () => {
-            if (core.deviceRevoked) fail('credential_unavailable', 'the HQ device is revoked');
-          };
-          function deviceSignal(signal) {
-            checkDevice();
-            const revoked = new AbortController();
-            const abort = () => revoked.abort(new HostError('credential_unavailable', 'the HQ device is revoked'));
-            core.onDeviceRevoked.push(abort);
-            return {
-              signal: AbortSignal.any([signal, revoked.signal]),
-              close() {
-                const index = core.onDeviceRevoked.indexOf(abort);
-                if (index !== -1) core.onDeviceRevoked.splice(index, 1);
-              },
-            };
-          }
-          const validate = (kind, payload) => {
-            if (!validInferenceRequest(kind, payload)) fail('host.invalid_request', `invalid ${kind} input`);
-          };
-          register(registries.kinds, name, MODEL_CATALOG, { kind: MODEL_CATALOG, consume(payload, caller) {
-            validate(MODEL_CATALOG, payload);
-            return brokerStream(async (signal) => {
-              const device = deviceSignal(signal);
-              try {
-                const grant = await abortable(() => authorize(payload, caller, device.signal), device.signal);
-                if (!grant) fail('credential_unavailable', 'no approved catalog destination');
-                device.signal.throwIfAborted();
-                const result = await abortable(() => catalog(payload, grant, device.signal), device.signal);
-                if (!validCatalog(result)) fail('host.internal', 'invalid inference catalog output');
-                return result;
-              } finally { device.close(); }
-            });
-          } }, 'message kind', lease);
-          register(registries.kinds, name, RESPONSES, { kind: RESPONSES, consume(payload, caller) {
-            validate(RESPONSES, payload);
-            return brokerStream(async function* (signal) {
-              const device = deviceSignal(signal);
-              try {
-                return yield* runInference({ accounting, authorize, responses, request: payload, caller, signal: device.signal });
-              } finally { device.close(); }
-            });
-          } }, 'message kind', lease);
         },
         // The member broker socket (§4.9): one plugin serves it. HQ core
         // hands it every frame, and calls `closed(connection)` when a
@@ -353,8 +298,6 @@ export function createHost({
 
     // 3–4. Plugins: init, then start, in dependency order.
     for (const n of order) if (states.get(n).state === 'resolved') await initPlugin(n);
-    const inferenceOwner = registries.kinds.get(RESPONSES)?.plugin;
-    loadLegacyInferenceBudget(core, states.get(inferenceOwner)?.state === 'initialized' ? inferenceOwner : undefined);
     for (const n of order) if (states.get(n).state === 'initialized') await startPlugin(n);
     // 5. hq/v1 admissions open.
     mode = device === 'revoked' ? 'device_revoked' : 'running';
@@ -459,11 +402,6 @@ export function createHost({
     if (!server) fail('host.no_broker', 'no plugin serves the broker');
     if (states.get(server.plugin)?.state !== 'running') fail('host.no_broker', `${server.plugin}, which serves the broker, is ${states.get(server.plugin)?.state}`);
     if (typeof kind !== 'string' || !KIND.test(kind)) fail('host.invalid_request', `kind ${JSON.stringify(kind)} must match ${KIND}`);
-    // An installed broker may handle kinds itself instead of calling deliver.
-    // Keep the draft operations closed before invoking that broker.
-    if ((kind === MODEL_CATALOG || kind === RESPONSES) && !registries.kinds.has(kind)) {
-      fail('host.unknown_kind', `no plugin consumes ${JSON.stringify(kind)}`, { kind });
-    }
     return server.accept(kind, structuredClone(payload), Object.freeze({ connection }));
   }
 
