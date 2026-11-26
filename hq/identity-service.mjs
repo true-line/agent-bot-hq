@@ -294,13 +294,13 @@ export function createIdentityService({
     try { return await pending; } finally { if (refreshing === pending) refreshing = undefined; }
   }
 
-  return {
+  const service = {
     keySet,
     get link() { return link; },
     check,
     onRevoke(listener) { listeners.add(listener); },
     status: () => ({ link, revoked, releasePinned: true, trustedKeys: keySet.length, tokenCached: Boolean(token), revocationListenerFailed, revocationPersistenceFailed }),
-    async call(method, path, body) {
+    async call(method, path, body, { requireMachineProof = false } = {}) {
       check();
       if (typeof method !== 'string' || !/^(GET|POST|PUT|PATCH|DELETE)$/.test(method)
         || !validDaemonPath(method, path)) fail('host.invalid_request', 'the identity link accepts a daemon API method and path only');
@@ -319,6 +319,7 @@ export function createIdentityService({
       // a queue outside this enrolled device's current scope before sending.
       if (body?.harness !== undefined && !current.harnesses.includes(body.harness)) fail('host.route_not_allowed', 'the harness is outside this device enrollment');
       const machineWhoami = path === WHOAMI && typeof current.proveWhoami === 'function';
+      if (requireMachineProof && !machineWhoami) unavailable('device lookup requires a paired Machine proof');
       // For this purpose keyd chooses its own nonce. HQ supplies only the session selector.
       let jti = machineWhoami ? undefined : nonce();
       const ath = hash(current.value).toString('base64url');
@@ -351,7 +352,15 @@ export function createIdentityService({
       if (reply.status === 401) drop(); // Never replay an external write automatically.
       return reply;
     },
+    async lookupMachineDevice() {
+      const reply = await service.call('GET', WHOAMI, undefined, { requireMachineProof: true });
+      if (reply.status !== 200) unavailable(`device lookup returned HTTP ${reply.status}`);
+      return {
+        issuer: server, device_id: reply.body.device.id, signing_backend: 'machine', response_signature_verified: true,
+      };
+    },
     mint: async () => unavailable('credential-reference resolution arrives with plan row 18'),
     close() { closed = true; drop(); for (const controller of requests) controller.abort(); },
   };
+  return service;
 }

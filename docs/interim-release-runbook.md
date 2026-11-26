@@ -31,6 +31,10 @@ deployment operator owns client inventory, installation, monitoring and rollback
    Compare SHA-256 of the two archives. Record source commit, contracts commit,
    contracts digest, artifact SHA-256, builder/tool versions and both results.
    A mismatch blocks publication. Obtain the owner's approval of those bytes.
+   For a Darwin commit on main, the macOS source artifact workflow retains the
+   tested tar and checksum as `hq-darwin-arm64-<full-hq-commit>`. Use the
+   artifact from the successful run for that exact commit. Verify the downloaded
+   tar against its checksum and record the run URL and digest for approval.
    For Darwin's bundled communications broker, the pin records the published
    agent-comms release tag, source commit, built plugin tree digest and release
    asset SHA-256. The builder checks the tag-to-commit binding and verifies the
@@ -48,6 +52,34 @@ deployment operator owns client inventory, installation, monitoring and rollback
    verify each startup refuses. Test the exact archive, not a working tree.
 
 ## Distribution and activation
+
+For a reviewed public Darwin release, publish the approved tar bytes under
+`agent-bot-hq-VERSION-darwin-arm64.tar` in GitHub release `vVERSION`.
+Generate the self-tap formula in the HQ checkout.
+
+```sh
+mkdir -p Formula
+node scripts/build-homebrew-formula.mjs VERSION ARCHIVE APPROVED_SHA256 \
+  > Formula/agent-bot-hq.rb.tmp &&
+  mv Formula/agent-bot-hq.rb.tmp Formula/agent-bot-hq.rb
+```
+
+Review and publish the generated formula in the tap. Then install and check
+it as the Homebrew administrator.
+
+```sh
+brew tap true-line/agent-bot-hq https://github.com/true-line/agent-bot-hq.git
+brew install agent-bot-hq
+brew list --versions agent-bot-hq
+brew --prefix agent-bot-hq
+brew test agent-bot-hq
+```
+
+Use the retained archive under `$(brew --prefix agent-bot-hq)/libexec`
+as the source for [Machine's macOS HQ LaunchDaemon setup](https://github.com/true-line/agent-bot-machine/blob/main/docs/plans/member-accounts.md#macos-hq-launchdaemon).
+Stage the archive and an approved standalone Node runtime under the root-owned
+paths that Machine verifies. Start the dedicated service through the approved
+Machine plan. Use `agent-bot-hq status --owner-control` to query that service.
 
 The deployment operator records an inventory of all intended enrolled HQ
 clients, current artifact and pin, owner, online status and update confirmation.
@@ -80,6 +112,45 @@ Do not extend expiration silently or re-enable a suspected compromised key;
 old offline HQ pins cannot be remotely revoked by publishing retired metadata.
 Issue #122 remains open until release, coverage, success, refusal and rollback
 evidence is recorded.
+
+## Remove the Homebrew installation on macOS
+
+Use a login Terminal in the administrator account that owns Homebrew.
+If you installed a Soul launch grant, retire it through the paired HQ
+before removing the HQ service. See the
+[Machine launch rule procedure](https://github.com/true-line/agent-bot-machine/blob/main/docs/plans/member-accounts.md#review-a-macos-harness-launch-rule).
+
+Remove the dedicated HQ service first, while the Machine CLI is available.
+List the applied plans and substitute the ID for the current installation
+in both commands below. Review the dry run before applying the removal.
+
+```sh
+sudo managed-machine members uninstall-hq --list
+sudo managed-machine members uninstall-hq PLAN_ID --dry-run
+sudo managed-machine members uninstall-hq PLAN_ID
+```
+
+If removal is interrupted, run `--list` again and use the `resume_plan_id`
+with the same removal command. If you installed only the HQ formula, start
+with `brew uninstall` below.
+
+```sh
+brew uninstall agent-bot-hq
+```
+
+If you also want to remove Machine, run the following without `sudo`.
+It unloads the Machine daemon and keyd and uninstalls the Machine formula.
+
+```sh
+managed-machine uninstall
+```
+
+The service and package removals preserve the dedicated macOS account and
+its home, enrollment and pairing state, keys, receipts, and any HQ archive
+or Node runtime staged outside Homebrew. Review those separately when
+retiring the device. If you installed the owner-approval helper separately,
+follow the helper removal link in
+[Machine’s uninstall guide](https://github.com/true-line/agent-bot-machine#uninstall-on-macos).
 
 ## Verify the HQ-to-Machine channel
 
@@ -114,6 +185,15 @@ paths, as `_agent-bot-hq` on macOS or `agent-bot-hq` on Linux.
 Machine v0.12.4 supports signed status and predates the `hq-device` operation.
 If HQ reports `MM_DAEMON_VERB_UNKNOWN` for device signing, keep the existing
 pairing and use a Machine release that supports `hq-device` before enrollment.
+
+After the owner approves enrollment and restarts HQ, run
+`node hq/main.mjs whoami --owner-control` from the authorized owner's account
+with the installed Node and HQ paths. The running HQ service uses its paired
+Machine to sign a fresh request to the configured issuer. On HTTP 200, HQ
+verifies the issuer's signature and matches the device ID to its Machine-bound
+enrollment before returning the issuer, device ID and verification result.
+Compare that ID with the enrollment output. Restart Machine and HQ, then run
+the same check and confirm the device ID is unchanged.
 
 Once the daemon pin is saved, the dedicated HQ role can retrieve the prefix
 administrator's saved members plans from a Machine with paired plan lookup.

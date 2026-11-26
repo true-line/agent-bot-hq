@@ -15,7 +15,7 @@ const OWNER_VIEWS = [
   'budgets.get', 'budgets.set',
   'tasks.list', 'tasks.get', 'tasks.offer', 'receipts.query', 'actions.unknown', 'actions.resolve',
   'souls.list', 'souls.get', 'candidates.list', 'candidates.get', 'evaluations.get',
-  'device.status', 'device.enroll',
+  'device.status', 'device.enroll', 'device.whoami',
   'events.subscribe',
 ];
 

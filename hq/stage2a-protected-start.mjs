@@ -2,8 +2,8 @@
 // paired Machine authorizes their exact PIDs and signs the durable stop. The
 // owner connection carries the runner ACP stream only after B is finalized.
 import { lstatSync, realpathSync } from 'node:fs';
-import { createHash, randomBytes } from 'node:crypto';
-import { pipeline } from 'node:stream';
+import { createHash, createPublicKey, randomBytes, verify } from 'node:crypto';
+import { pipeline, Transform } from 'node:stream';
 import { canonicalBytes, canonicalDigest } from '../sdk/wire/canonical-json.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
 import { matchesObservedMemberGrants, verifyStage2aBridgeMemberAuthority } from './stage2a-relay-peer.mjs';
@@ -17,6 +17,99 @@ const exact = (value, fields) => value && typeof value === 'object' && !Array.is
   && Object.keys(value).sort().join(',') === [...fields].sort().join(',');
 const DIGEST = /^sha256:[0-9a-f]{64}$/;
 const refuse = () => { throw new Error('Machine protected Soul start is unavailable'); };
+
+const sha256 = (bytes) => 'sha256:' + createHash('sha256').update(bytes).digest('hex');
+const ACP_CHANNEL_LIMIT = 4 * 1024 * 1024;
+const ACP_RAW_LIMIT = 2 * ACP_CHANNEL_LIMIT - 65536;
+
+const CAPTURE_SCHEMA = 'agent-bot-machine/stage2a-inner-acp-capture-selector/v1';
+const SELECTORS = ['installation_id', 'start_id', 'launch_id', 'reservation_sha256', 'plan_id', 'plan_digest', 'hq_epoch'];
+const ED25519_SPKI = Buffer.from('302a300506032b6570032100', 'hex');
+
+function verifyCaptureSelection(selection, selectors, machineKey) {
+  if (!exact(selection, ['selector', 'signature_base64url', 'register'])) refuse();
+  const { selector, signature_base64url, register } = selection;
+  if (!exact(selector, ['schema', ...SELECTORS, 'session_id', 'sequence', 'test_plan_sha256',
+    'challenge_base64url', 'expires_at_ms'])
+    || selector.schema !== CAPTURE_SCHEMA || SELECTORS.some((key) => selector[key] !== selectors[key])
+    || typeof selector.session_id !== 'string' || !/^[0-9a-f]{32}$/.test(selector.session_id)
+    || !Number.isSafeInteger(selector.sequence) || selector.sequence < 1
+    || !DIGEST.test(selector.test_plan_sha256 ?? '')
+    || typeof selector.challenge_base64url !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(selector.challenge_base64url)
+    || Buffer.from(selector.challenge_base64url, 'base64url').toString('base64url') !== selector.challenge_base64url
+    || !Number.isSafeInteger(selector.expires_at_ms) || selector.expires_at_ms <= Date.now()
+    || selector.expires_at_ms > Date.now() + 120000 || typeof register !== 'function'
+    || typeof signature_base64url !== 'string' || !/^[A-Za-z0-9_-]{86}$/.test(signature_base64url)) refuse();
+  const signature = Buffer.from(signature_base64url, 'base64url');
+  const raw = canonicalBytes(selector);
+  if (signature.toString('base64url') !== signature_base64url
+    || !verify(null, Buffer.concat([Buffer.from(CAPTURE_SCHEMA + '\0'), raw]), machineKey, signature)) refuse();
+  return { selector: Object.freeze({ ...selector }), selectorSHA256: sha256(raw), register };
+}
+
+// The normal owner request has no capture field. Only a signed, selected
+// launch can create these taps on the measured child-pipe forwarding path.
+function innerAcpCapture(selection, binding, onFailure) {
+  const { selector, selectorSHA256, register } = selection;
+  const challenge = selector.challenge_base64url;
+  const expired = () => selector.expires_at_ms <= Date.now();
+  let expiryTimer;
+  let active = false;
+  let done = false;
+  let total = 0;
+  const acpIn = { buffer: undefined, length: 0 };
+  const acpOut = { buffer: undefined, length: 0 };
+  const discard = () => {
+    done = true;
+    active = false;
+    clearTimeout(expiryTimer);
+    for (const channel of [acpIn, acpOut]) {
+      channel.buffer?.fill(0, 0, channel.length);
+      channel.buffer = undefined;
+    }
+  };
+  const tap = (channel) => new Transform({
+    transform(chunk, _encoding, callback) {
+      if (active) {
+        if (expired()) {
+          discard();
+          onFailure();
+          callback(new Error('protected ACP capture expired'));
+          return;
+        }
+        if (channel.length + chunk.length > ACP_CHANNEL_LIMIT || total + chunk.length > ACP_RAW_LIMIT) {
+          discard();
+          onFailure();
+          callback(new Error('protected ACP capture exceeded its byte limit'));
+          return;
+        }
+        channel.buffer ??= Buffer.alloc(ACP_CHANNEL_LIMIT);
+        chunk.copy(channel.buffer, channel.length);
+        channel.length += chunk.length;
+        total += chunk.length;
+      }
+      callback(null, chunk);
+    },
+  });
+  register(Object.freeze({
+    ...binding, selector, selectorSHA256,
+    seal(selectedChallenge) {
+      if (!active || expired() || selectedChallenge !== challenge || !acpIn.length || !acpOut.length) refuse();
+      const inBytes = Buffer.from(acpIn.buffer.subarray(0, acpIn.length));
+      const outBytes = Buffer.from(acpOut.buffer.subarray(0, acpOut.length));
+      discard();
+      return Object.freeze({ acpIn: inBytes, acpOut: outBytes,
+        acpInSHA256: sha256(inBytes), acpOutSHA256: sha256(outBytes) });
+    },
+  }));
+  return { discard, expired, start() {
+    if (done || active || expired()) refuse();
+    active = true;
+    expiryTimer = setTimeout(() => { discard(); onFailure(); }, selector.expires_at_ms - Date.now());
+    expiryTimer.unref?.();
+    return { input: tap(acpIn), output: tap(acpOut) };
+  } };
+}
 
 function checkedLiveLease(live) {
   const encoded = live?.lease_envelope_base64url;
@@ -283,7 +376,7 @@ export function createStage2aProtectedStarter({ installations, authority, verify
   openProtectedAdmission,
   prepareBridge = prepareStage2aBridge, startRole = startStage2aRole,
   verifyHQCodeReady = () => false,
-  recordLaunch, onFinalized, onStopped, onT03Event,
+  recordLaunch, selectAcpCapture, captureMachinePublicKey, onFinalized, onStopped, onT03Event,
   random = (bytes) => randomBytes(bytes).toString('hex') } = {}) {
   if (!Array.isArray(installations) || typeof authority?.register !== 'function'
     || typeof authority.stopStart !== 'function' || typeof authority.currentLiveStart !== 'function'
@@ -294,10 +387,16 @@ export function createStage2aProtectedStarter({ installations, authority, verify
     || typeof machineChildReady !== 'function'
     || typeof prepareBridge !== 'function' || typeof startRole !== 'function'
     || typeof verifyHQCodeReady !== 'function' || typeof recordLaunch !== 'function'
+    || (selectAcpCapture !== undefined && (typeof selectAcpCapture !== 'function'
+      || !Buffer.isBuffer(captureMachinePublicKey) || captureMachinePublicKey.length !== 32))
     || typeof random !== 'function') refuse();
   const byId = new Map(installations.map((i) => [i.installation_id, i]));
   if (byId.size !== installations.length) refuse();
   const slots = new Map();
+  const spentCaptureSelections = new Map();
+  const captureMachineKey = selectAcpCapture && createPublicKey({
+    key: Buffer.concat([ED25519_SPKI, captureMachinePublicKey]), format: 'der', type: 'spki',
+  });
   let stopping = false;
 
   function armLease(slot, expiresAt) {
@@ -312,6 +411,8 @@ export function createStage2aProtectedStarter({ installations, authority, verify
     if (slot.stopPromise) return slot.stopPromise;
     slot.stopPromise = (async () => {
       clearTimeout(slot.leaseTimer);
+      slot.captureSelection?.abort(new Error('protected Soul stopped'));
+      slot.capture?.discard();
       slot.activationSent = false;
       const results = await Promise.allSettled([
         Promise.resolve().then(() => onStopped?.(slot.reservationSHA256)),
@@ -454,11 +555,43 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         child_pid: childStarted.child_pid,
         grant_sha256: childStarted.grant_sha256 });
       if (!Buffer.isBuffer(childReceipt?.envelope)
-        || !DIGEST.test(childReceipt?.sha256 ?? '')
+        || sha256(childReceipt.envelope) !== childReceipt.sha256
         || !Number.isSafeInteger(childReceipt?.expires_at_ms)
         || childReceipt.expires_at_ms <= Date.now()) refuse();
       await slot.child.sendChildReceipt(childReceipt);
       slot.childReceiptSHA256 = childReceipt.sha256;
+      // Only the trusted Machine transport can select a capture at ChildReady.
+      let capture;
+      if (selectAcpCapture) {
+        const remaining = childReceipt.expires_at_ms - Date.now();
+        if (remaining <= 0 || slot.stopPromise || stopping) refuse();
+        const pending = new AbortController();
+        slot.captureSelection = pending;
+        const timer = setTimeout(() => pending.abort(new Error('ChildReady expired')), remaining);
+        timer.unref?.();
+        let selection;
+        try {
+          const aborted = new Promise((_, reject) => pending.signal.addEventListener('abort',
+            () => reject(pending.signal.reason), { once: true }));
+          selection = await Promise.race([selectAcpCapture(Object.freeze({ ...selectors,
+            child_start_receipt_sha256: childReceipt.sha256 }), pending.signal), aborted]);
+        } finally {
+          clearTimeout(timer);
+          slot.captureSelection = undefined;
+        }
+        if (slot.stopPromise || stopping || childReceipt.expires_at_ms <= Date.now()) refuse();
+        if (selection !== undefined) {
+          capture = verifyCaptureSelection(selection, selectors, captureMachineKey);
+          const { selector } = capture;
+          const now = Date.now();
+          const replayKey = `${selector.session_id}:${selector.sequence}`;
+          for (const [key, expires] of spentCaptureSelections) {
+            if (expires <= now) spentCaptureSelections.delete(key);
+          }
+          if (spentCaptureSelections.has(replayKey) || spentCaptureSelections.size >= 256) refuse();
+          spentCaptureSelections.set(replayKey, selector.expires_at_ms);
+        }
+      }
       await slot.child.waitChildAccepted(childReceipt.sha256);
       await slot.runner.waitRunnerChildReady({ reservationSHA256: reserved.sha256,
         startId, launchId, childStartSHA256: childReceipt.sha256,
@@ -476,10 +609,21 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         reservation_sha256: reserved.sha256, child_start_receipt_sha256: childReceipt.sha256,
         bind_receipt_sha256: live.bind_receipt_sha256, b_finalization_sha256: live.finalization_sha256,
         relay_socket: slot.relaySocket,
+        ...(capture && { qualification_capture_selector_sha256: capture.selectorSHA256 }),
         child_launcher_pid: childStarted.child_launcher_pid, child_pid: childStarted.child_pid,
         runner_pid: slot.runner.pid, bridge_pid: slot.bridge.pid });
       if (!Number.isSafeInteger(receipt?.seq) || receipt.seq < 1
         || slot.stopPromise || stopping || childReceipt.expires_at_ms <= Date.now()) refuse();
+      if (capture) {
+        if (capture.selector.expires_at_ms <= Date.now()
+          || receipt.qualification_capture_selector_sha256 !== capture.selectorSHA256
+          || receipt.reservation_sha256 !== reserved.sha256
+          || receipt.child_start_receipt_sha256 !== childReceipt.sha256) refuse();
+        const receiptRaw = canonicalBytes(receipt);
+        slot.capture = innerAcpCapture(capture, {
+          receiptRaw: receiptRaw.toString('utf8'), receiptSHA256: sha256(receiptRaw),
+        }, () => { void stop(slot).catch(() => {}); });
+      }
       // Do not expose the one-use provider before R and the stock child have
       // both acknowledged A's signed current start and child receipts.
       await onFinalized?.({ installed, assignment, selectors,
@@ -491,13 +635,21 @@ export function createStage2aProtectedStarter({ installations, authority, verify
         childPID: childStarted.child_pid,
         relaySocket: slot.relaySocket });
       return takeover(result, { open: () => (socket) => {
-        if (stopping || slot.stopPromise) { socket.destroy(); return; }
-        const cut = () => { socket.destroy(); void stop(slot); };
+        const cut = () => { socket.destroy(); void stop(slot).catch(() => {}); };
+        if (stopping || slot.stopPromise || slot.capture?.expired()) { cut(); return; }
         socket.once('error', cut);
         slot.child.stdin.once?.('error', cut);
         slot.child.stdout.once?.('error', cut);
-        socket.pipe(slot.child.stdin);
-        pipeline(slot.child.stdout, socket, (error) => { if (error) cut(); });
+        if (slot.capture) {
+          let taps;
+          try { taps = slot.capture.start(); } catch { cut(); return; }
+          taps.input.once('error', cut);
+          socket.pipe(taps.input).pipe(slot.child.stdin);
+          pipeline(slot.child.stdout, taps.output, socket, (error) => { if (error) cut(); });
+        } else {
+          socket.pipe(slot.child.stdin);
+          pipeline(slot.child.stdout, socket, (error) => { if (error) cut(); });
+        }
         slot.child.resumeOutput();
         socket.once('close', () => { void stop(slot); });
         slot.child.done.then(() => { socket.end(); void stop(slot); });

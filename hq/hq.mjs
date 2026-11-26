@@ -193,6 +193,7 @@ export function createHQ({
   soulVerifier,                  // independent Machine reservation signature verifier pinned by trusted HQ entry point
   soulCompletionVerifier,        // independent Machine containment signature verifier
   machineHqEpoch,                // signed current paired epoch from Machine list; never owner config
+  localTestQIssuer,              // paired A Q issuance, exposed only on authenticated owner-control
   protectedStart,                // HQ-started Machine-authorized R/B lifecycle from trusted entry point
   createProtectedStart,          // trusted factory bound to HQ's durable launch receipt writer
   stoppedStartDiagnostic,        // paired, stopped-only owner proof; never owner config
@@ -490,6 +491,12 @@ export function createHQ({
       }
       return ['soul.start', 'soul.starts', 'soul.stop', 'soul.qualify-direct'].includes(op) ? soulStarter.dispatch(op, meta) : host.dispatch(op, meta);
     }
+    function ownerControlDispatch(op, meta) {
+      if (op !== 'soul.local-test-q-issue') return ownerDispatch(op, meta);
+      if (meta.auth !== 'owner') fail('host.auth_mismatch', 'local-test Q issue is owner-only');
+      if (typeof localTestQIssuer !== 'function') fail('host.launch_unavailable', 'paired local-test Q issue is unavailable');
+      return localTestQIssuer(meta.payload);
+    }
 
     try {
       sockets = [
@@ -512,7 +519,7 @@ export function createHQ({
       ];
       if (ownerControl) {
         sockets.push(await listenSocket({
-          path: OWNER_CONTROL_PATH, activated: ownerControl, auth: 'owner', core, dispatch: ownerDispatch, takeover: true,
+          path: OWNER_CONTROL_PATH, activated: ownerControl, auth: 'owner', core, dispatch: ownerControlDispatch, takeover: true,
           newSession: () => openSession(ownerControl.account, ownerControl.uid), endSession: closeSession,
         }));
       }
