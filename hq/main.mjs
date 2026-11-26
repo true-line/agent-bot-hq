@@ -5,6 +5,8 @@
 //                                                 run HQ in the foreground
 //   node hq/main.mjs status [--home DIR] [--json] ask a running HQ for status
 //   node hq/main.mjs souls  [--home DIR] [--json] list admitted Souls
+//   node hq/main.mjs whoami [--home DIR | --owner-control]
+//                                                 ask running HQ for a signed device lookup
 //   node hq/main.mjs enroll --harness NAME [--harness NAME]... [--force] [--name DEVICE] [--home DIR]
 //                                                 enroll this HQ with the identity service
 //                                                 (needs enrollment.source "hq" in config)
@@ -62,7 +64,7 @@ import { verifiedT03ChildStart, verifyT03RelayPeer } from './stage2a-t03-peer.mj
 import { checkedT03SiblingWitness, recordT03SiblingWitness,
   waitForT03SiblingWitnesses } from './stage2a-t03-sibling.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|soul local-test-q-issue --plan-id ID --installation-id ID|enroll|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine soul-bridge-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|soul local-test-q-issue --plan-id ID --installation-id ID|enroll|whoami|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine soul-bridge-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
@@ -77,7 +79,7 @@ function parse(argv) {
       args.ownerAccount = argv[++i];
       if (!args.ownerAccount || args.cmd !== 'run') throw new Error('--owner-account NAME is only for the systemd HQ service');
     } else if (argv[i] === '--owner-control') {
-      if (!['status', 'souls', 'soul', 'enroll'].includes(args.cmd)) throw new Error('--owner-control is only for owner socket clients');
+      if (!['status', 'souls', 'soul', 'enroll', 'whoami'].includes(args.cmd)) throw new Error('--owner-control is only for owner socket clients');
       args.ownerControl = true;
     } else if (argv[i] === '--soul') {
       args.soul = argv[++i];
@@ -717,14 +719,15 @@ async function main(argv) {
     if (args.sub !== 'rekey') throw new Error(USAGE);
     throw new Error('Device key rotation requires administrator action in Machine/keyd');
   }
-  if (args.cmd === 'status' || args.cmd === 'souls') {
-    const res = await ask(controlPath, args.cmd === 'status' ? 'status' : 'souls.list');
+  const query = { status: 'status', souls: 'souls.list', whoami: 'device.whoami' };
+  if (Object.hasOwn(query, args.cmd)) {
+    const res = await ask(controlPath, query[args.cmd]);
     if (!res.ok) {
       console.error(JSON.stringify(res.refusal ?? res.host_refusal ?? res));
       process.exitCode = 1;
       return;
     }
-    if (args.json || args.cmd === 'souls') console.log(JSON.stringify(res.result, null, 2));
+    if (args.json || args.cmd !== 'status') console.log(JSON.stringify(res.result, null, 2));
     else printStatus(res.result);
     return;
   }
