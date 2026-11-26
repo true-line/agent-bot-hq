@@ -8,13 +8,17 @@
 import { fail } from './errors.mjs';
 import { isVersion, validRange } from './semver.mjs';
 
-export const HOST_API = 1;
+export const HOST_API = 2;
 
-// The host services a plugin may declare (§4.3).
+// The host services a plugin may declare for the current host API (§4.3).
 export const HOST_SERVICES = Object.freeze([
   'config', 'store', 'log', 'receipts', 'events', 'clock', 'random', 'profile',
   'identityService', 'credentials', 'approvals', 'launch',
 ]);
+
+const V1_SERVICES = Object.freeze([...HOST_SERVICES, 'budgets']);
+
+export const hostServicesFor = (hostApi) => hostApi === 1 ? V1_SERVICES : HOST_SERVICES;
 
 export const PLUGIN_NAME = /^[a-z0-9-]{1,64}$/;
 const ROUTE = /^\/[A-Za-z0-9._~\/-]*\*?$/;
@@ -43,7 +47,8 @@ export function validateManifest(m) {
   const services = m.services ?? [];
   if (!Array.isArray(services)) problems.push('services must be a list');
   else {
-    for (const s of services) if (!HOST_SERVICES.includes(s)) problems.push(`unknown host service ${s}`);
+    const supported = hostServicesFor(m.hostApi);
+    for (const s of services) if (!supported.includes(s)) problems.push(`unknown host service ${s}`);
     if (new Set(services).size !== services.length) problems.push('services has duplicates');
   }
   const routes = m.identityServiceRoutes ?? [];

@@ -13,7 +13,7 @@ import { definePlugin } from '@agent-bot/sdk';
 export default definePlugin({
   name: 'agent-comms',
   version: '0.6.0',
-  hostApi: 1,
+  hostApi: 2,
   services: ['store', 'log'],
   async init(ctx) {
     ctx.hq.register({ op: 'tasks.list', auth: 'owner', handler: async () => ctx.services.store.tx((tx) => tx.list('tasks')) });
@@ -32,6 +32,12 @@ await host.dispatch('tasks.list', { auth: 'owner' });
 const r = await checkPlugin(plugin);
 assert.ok(r.ok, JSON.stringify(r.results.filter((x) => !x.ok)));
 ```
+
+## Plugin API compatibility
+
+HQ supports plugin APIs 2 and 1. Version 2 omits the `budgets` service.
+Version 1 plugins can still declare it and load. Budget calls return the
+same errors as an HQ with no spending limits or reservations configured.
 
 ## Modules
 

@@ -12,6 +12,7 @@ const OWNER_VIEWS = [
   'grants.list', 'grants.create', 'grants.revoke',
   'approvals.list', 'approvals.decide',
   'destinations.list', 'destinations.approve',
+  'budgets.get', 'budgets.set',
   'tasks.list', 'tasks.get', 'tasks.offer', 'receipts.query', 'actions.unknown', 'actions.resolve',
   'souls.list', 'souls.get', 'candidates.list', 'candidates.get', 'evaluations.get',
   'device.status', 'device.enroll', 'device.whoami',

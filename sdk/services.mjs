@@ -15,7 +15,7 @@
 import { createHash, createPrivateKey, createPublicKey, sign as edSign } from 'node:crypto';
 import { fail, HostError } from './errors.mjs';
 import { canonicalDigest } from './wire/canonical-json.mjs';
-import { HOST_SERVICES } from './plugin.mjs';
+import { hostServicesFor } from './plugin.mjs';
 
 export const PROFILES = Object.freeze(['managed-protected', 'managed-cooperative', 'standalone-unenforced']);
 export const DEVICE_STATES = Object.freeze(['enrolled', 'unenrolled', 'revoked']);
@@ -498,6 +498,33 @@ export function decideApproval(core, id, decision) {
   return clone(r);
 }
 
+// Version 1 plugins can load with their existing declarations. Match the
+// replies HQ gave with no spending limits or reservations configured.
+function unallocatedBudgetsService(core, plugin) {
+  const noBudget = (soul, pool) => fail('budget_exhausted', `no ${pool} budget for ${soul}`, { soul, pool });
+  const noReservation = (id) => fail('host.invalid_request', `no reservation ${id}`);
+  return Object.freeze({
+    async reserve({ soul, pool = 'working', amount } = {}) {
+      refuseInInit(core, plugin, 'reserve budget');
+      requireString(soul, 'soul');
+      if (!(Number.isFinite(amount) && amount >= 0)) fail('host.invalid_request', 'amount must be a non-negative number');
+      noBudget(soul, pool);
+    },
+    async settle(id, actual) {
+      refuseInInit(core, plugin, 'settle budget');
+      if (!(Number.isFinite(actual) && actual >= 0)) fail('host.invalid_request', 'actual must be a non-negative number');
+      noReservation(id);
+    },
+    async release(id) {
+      refuseInInit(core, plugin, 'release budget');
+      noReservation(id);
+    },
+    async remaining({ soul, pool = 'working' } = {}) {
+      noBudget(soul, pool);
+    },
+  });
+}
+
 // Fake member principals. The real launcher creates per-member principals
 // and a private HOME/XDG_*/PATH/temp (0.4 §4); members get references, never
 // secrets, so an env var that looks like a credential is refused.
@@ -612,6 +639,7 @@ const FACTORIES = {
   credentials: credentialsService,
   approvals: approvalsService,
   launch: launchService,
+  budgets: unallocatedBudgetsService,
 };
 
 // Every call through a context checks that the context is still live. The
@@ -637,7 +665,7 @@ function leased(service, lease, plugin) {
 export function bindServices(core, plugin, overrides = {}, lease = { live: true }) {
   const declared = new Set(plugin.services);
   const services = {};
-  for (const name of HOST_SERVICES) {
+  for (const name of hostServicesFor(plugin.hostApi)) {
     let instance;
     Object.defineProperty(services, name, {
       enumerable: declared.has(name),

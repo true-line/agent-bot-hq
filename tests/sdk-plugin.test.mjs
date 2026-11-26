@@ -2,11 +2,11 @@
 // table (plan §4.1, §4.2, §4.5).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { definePlugin, validateManifest, staticManifest, supportedHostApis, HOST_SERVICES } from '../sdk/plugin.mjs';
+import { definePlugin, validateManifest, staticManifest, supportedHostApis, HOST_API, HOST_SERVICES } from '../sdk/plugin.mjs';
 import { compareVersions, satisfies, validRange } from '../sdk/semver.mjs';
 import { HQ_OPERATIONS, SAFE_MODE_OPERATIONS, ADMISSION_OPERATIONS } from '../sdk/operations.mjs';
 
-const base = { name: 'agent-comms', version: '0.6.0', hostApi: 1, async init() {} };
+const base = { name: 'agent-comms', version: '0.6.0', hostApi: HOST_API, async init() {} };
 const invalid = (m, pattern) => assert.throws(() => validateManifest(m), (e) => e.code === 'host.invalid_manifest' && pattern.test(e.message));
 
 test('the plan §4.1 example manifest is valid', () => {
@@ -31,7 +31,7 @@ test('manifest refusals', () => {
   invalid({ ...base, requires: { [base.name]: '^0.6.0' } }, /itself/);
   invalid({ ...base, requires: { a: 'latest' } }, /invalid range/);
   invalid({ ...base, requires: { a: '^1.0.0' }, optional: { a: '^1.0.0' } }, /both required and optional/);
-  invalid({ ...base, services: ['budgets'] }, /unknown host service budgets/);
+  invalid({ ...base, services: ['filesystem'] }, /unknown host service filesystem/);
   invalid({ ...base, services: ['store', 'store'] }, /duplicates/);
   invalid({ ...base, identityServiceRoutes: ['/api/x'] }, /needs the identityService service/);
   invalid({ ...base, services: ['identityService'], identityServiceRoutes: ['api/x'] }, /absolute route/);
@@ -44,8 +44,15 @@ test('host services match the plan §4.3 table, with no host-side secret store',
 });
 
 test('hostApi window is N and N-1, never 0', () => {
+  assert.deepEqual(supportedHostApis(), [2, 1]);
   assert.deepEqual(supportedHostApis(1), [1]);
   assert.deepEqual(supportedHostApis(3), [3, 2]);
+});
+
+test('budget service declarations remain valid for host API 1 only', () => {
+  const services = ['budgets'];
+  assert.deepEqual(definePlugin({ ...base, hostApi: 1, services }).services, services);
+  invalid({ ...base, hostApi: 2, services }, /unknown host service budgets/);
 });
 
 test('semver comparison and ranges', () => {
@@ -72,7 +79,6 @@ test('hq/v1 operations: every one has an auth class; entry points are the admiss
   assert.deepEqual([...ADMISSION_OPERATIONS].sort(), ['Admit', 'Equip', 'Hello', 'Lease', 'Ready']);
   for (const op of ADMISSION_OPERATIONS) assert.equal(HQ_OPERATIONS[op], 'entry-point');
   for (const op of SAFE_MODE_OPERATIONS) assert.equal(HQ_OPERATIONS[op], 'owner', op);
-  for (const op of ['budgets.get', 'budgets.set']) assert.equal(HQ_OPERATIONS[op], undefined, op);
   for (const op of ['start', 'stop', 'pause', 'resume', 'drain', 'sleep', 'move', 'fork', 'accept-revision', 'rollback-revision', 'retire']) {
     assert.equal(HQ_OPERATIONS[op], 'owner', op);
   }

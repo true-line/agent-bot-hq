@@ -401,7 +401,7 @@ import { definePlugin } from '@agent-bot/sdk';
 export default definePlugin({
   name: 'agent-comms',              // ^[a-z0-9-]{1,64}$
   version: '0.6.0',                 // the plugin's semver
-  hostApi: 1,                       // HQ plugin-API major
+  hostApi: 2,                       // HQ plugin-API major
   requires: {},                     // plugin name → semver range
   optional: { 'agent-bot-souls': '>=0.1.0 <1' },
   services: ['config', 'store', 'log', 'receipts', 'identityService', 'credentials', 'launch', 'events', 'approvals'],
@@ -558,6 +558,10 @@ outage leaves the existing enrollment record in place.
 ### 4.5 Versioning and compatibility
 
 - **Plugin semver** and an integer **`hostApi`** (N and N-1 supported).
+  HQ supports plugin APIs 2 and 1. Version 2 omits the `budgets` service.
+  Version 1 manifests can still declare it and load. Calls to reserve or
+  read an allocation return `budget_exhausted`. Calls to settle or release
+  an ID return `host.invalid_request`. HQ keeps no spending records.
 - **Wire contracts version on their own** and support N and N-1 with
   explicit capability negotiation (R7): `hq/v1`, broker wire, `task/v1`,
   the 0.4 Appendix A records, the package format, and the identity-service
@@ -911,7 +915,7 @@ Every approved operation is available through both (0.4 §3, §8).
 | --- | --- |
 | Status | `status` (profile in force, plugins and versions, identity-service and relay reachability, degraded reasons) |
 | Lifecycle | `start`, `stop`, `pause`, `resume`, `drain`, `sleep` (schedule), `move`, `fork`, `accept-revision`, `rollback-revision`, `retire` |
-| Authority | `grants.list/create/revoke`, `approvals.list/decide`, `destinations.list/approve` |
+| Authority | `grants.list/create/revoke`, `approvals.list/decide`, `destinations.list/approve`, `budgets.get/set` (reserved operation names) |
 | Work | `tasks.offer` (the owner's task offer; the requester is the socket's auth class), `tasks.list/get` (state, waiting reason, evidence), `receipts.query`, `actions.unknown` with `actions.resolve` (owner-resolved outcome) |
 | Souls | `souls.list/get` (roles, readiness, unevaluated harnesses), `candidates.list/get` (change list, per-cell matrix, provenance warnings, cost), `evaluations.get` |
 | Device | `device.status`, `device.enroll` (starts the identity-service device grant), `device.whoami` (signed self-lookup using the paired Machine) |

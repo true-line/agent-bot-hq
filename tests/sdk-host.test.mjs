@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createPublicKey, verify } from 'node:crypto';
 import { createHost } from '../sdk/host.mjs';
-import { definePlugin } from '../sdk/plugin.mjs';
+import { definePlugin, HOST_API } from '../sdk/plugin.mjs';
 import { createTestHost } from '../sdk/test-host.mjs';
 import { fakeSigner } from '../sdk/services.mjs';
 import { canonicalDigest } from '../sdk/wire/canonical-json.mjs';
@@ -417,6 +417,22 @@ test('approvals are bound to the canonical digest of the exact action (T24)', as
   const denied = await approvals.request({ action });
   host.owner.decide(denied.id, 'denied');
   await assert.rejects(approvals.verify(denied.id, action), code('approval_mismatch'));
+});
+
+test('v1 and v2 plugins start together and v1 budget calls refuse without tracking spending', async () => {
+  const legacy = probe('legacy', ['budgets']);
+  let currentServices;
+  const current = plugin('current', { hostApi: HOST_API, async init(ctx) { currentServices = ctx.services; } });
+  const host = createTestHost({ plugins: [legacy.plugin, current] });
+  await host.start();
+  assert.equal(stateOf(host, 'legacy').state, 'running');
+  assert.equal(stateOf(host, 'current').state, 'running');
+  assert.equal(Object.hasOwn(currentServices, 'budgets'), false);
+  const { budgets } = legacy.ctx.services;
+  await assert.rejects(budgets.reserve({ soul: 'fixture', amount: 1 }), code('budget_exhausted'));
+  await assert.rejects(budgets.remaining({ soul: 'fixture' }), code('budget_exhausted'));
+  await assert.rejects(budgets.settle('rsv_fixture', 1), code('host.invalid_request'));
+  await assert.rejects(budgets.release('rsv_fixture'), code('host.invalid_request'));
 });
 
 test('launch: members get references, never secrets', async () => {
