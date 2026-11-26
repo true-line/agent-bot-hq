@@ -300,6 +300,19 @@ function authenticatedResponse(line, nonce, pinned, verb, capture = false) {
   return r;
 }
 
+export function verifyStage2aLiveRefusal(line, requestNonce, machinePublicKey) {
+  const r = authenticatedResponse(line, requestNonce, machinePublicKey, 'stage2a-live', true);
+  if (r.ok || r.diagnostic !== 'MM_DAEMON_UNIMPLEMENTED'
+    || r.message !== 'Stage 2a installed authority unavailable or mismatched'
+    || r.body !== undefined || r.state !== undefined) {
+    throw new Error('stopped Stage 2a selector did not receive a bare signed refusal');
+  }
+  return Object.freeze({ diagnostic: r.diagnostic,
+    request_nonce: r.request_nonce,
+    signed_response_base64url: Buffer.from(line).toString('base64url'),
+    daemon_fingerprint: fingerprint(machinePublicKey) });
+}
+
 class MissingMachineReply extends Error {}
 
 function exchange(socketPath, request) {
@@ -387,13 +400,13 @@ export function machineRoleCommand(argv) {
 // The protected start request is sent only by the dedicated HQ service over
 // its existing pinned, signed local Machine channel. No path, command, UID or
 // socket is accepted from the owner-facing Soul request.
-function machineRoleStage2a(verb, request) {
+function machineRoleStage2a(verb, request, refusalOnly = false) {
   const { account } = roleAccount(true);
   const prefix = process.platform === 'darwin' && process.arch === 'arm64' ? '/opt/homebrew' : null;
   if (!prefix) throw new Error('Stage 2a Machine reservation requires dedicated macOS HQ');
   return machineCommandInHome(
     [verb, '--socket', join(prefix, 'var/agent-machine/daemon.sock')],
-    account.homedir, account.uid, request,
+    account.homedir, account.uid, request, false, account.uid, undefined, undefined, refusalOnly,
   );
 }
 
@@ -413,6 +426,7 @@ export const machineRoleStage2aPrepareB = (request) => machineRoleStage2a('stage
 export const machineRoleStage2aStop = (request) => machineRoleStage2a('stage2a-stop', request);
 export const machineRoleStage2aFinalizeB = (request) => machineRoleStage2a('stage2a-finalize-b', request);
 export const machineRoleStage2aLive = (request) => machineRoleStage2a('stage2a-live', request);
+export const machineRoleStage2aLiveRefusal = (request) => machineRoleStage2a('stage2a-live', request, true);
 export const machineRoleStage2aProvider = (request) => machineRoleStage2a('stage2a-provider', request);
 export const machineRoleStage2aT03Positive = (request) => machineRoleStage2a('stage2a-t03-positive', request);
 export const machineRoleStage2aT03PrewritePeer = (request) => machineRoleStage2a('stage2a-t03-prewrite-peer', request);
@@ -544,7 +558,10 @@ function validStage2aSignedLiveLease(body) {
 
 // Also exercised with a temporary private home in the protocol tests. The CLI
 // always obtains its home and UID from the kernel-backed account lookup above.
-export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false, roleUid = uid, expectedPair, caseNonce) {
+export async function machineCommandInHome(argv, home, uid, deviceFields, ordinary = false, roleUid = uid, expectedPair, caseNonce, refusalOnly = false) {
+  if (refusalOnly && (argv[0] !== 'stage2a-live' || ordinary || caseNonce !== undefined)) {
+    throw new Error('refusal-only Machine call requires dedicated Stage 2a live');
+  }
   const [verb, ...args] = argv;
   const identity = verb === 'identity' && !args.length;
   let socket, hex, handoff, option = '', planID = '';
@@ -635,8 +652,10 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
       disconnectedPairs.set(observation, pair);
       return { capture: observation };
     }
-    const response = authenticatedResponse(line, nonce, daemon, fields.verb, capture);
-    return { line, response, ...(capture && { capture: Object.freeze({ requestRaw: JSON.stringify(request), responseRaw: line }) }) };
+    const response = authenticatedResponse(line, nonce, daemon, fields.verb, capture || refusalOnly);
+    return { line, response,
+      ...((capture || refusalOnly) && { requestRaw: JSON.stringify(request) }),
+      ...(capture && { capture: Object.freeze({ requestRaw: JSON.stringify(request), responseRaw: line }) }) };
   }
   if (handoff) return serviceHandoff(verb, handoff, daemon.toString('hex'), pub.toString('hex'), send,
     (line) => authenticatedResponse(line, null, daemon, verb), roleUid);
@@ -813,6 +832,12 @@ export async function machineCommandInHome(argv, home, uid, deviceFields, ordina
   });
   if (capture) return resultOfSend.capture;
   const { response: r } = resultOfSend;
+  if (refusalOnly) {
+    // A successful live reply may contain a lease. Never return it to an
+    // owner diagnostic, even when Machine unexpectedly revived the selector.
+    return Object.freeze({ ...verifyStage2aLiveRefusal(resultOfSend.line, r.request_nonce, daemon),
+      signed_request_base64url: Buffer.from(resultOfSend.requestRaw).toString('base64url') });
+  }
   const result = { client: 'agent-daemon', channel: 'signed', state: r.state, daemon_fingerprint: fingerprint(daemon) };
   if (verb === 'hq-device') {
     if (pair) verifiedPairs.set(r, pair);

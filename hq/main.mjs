@@ -41,6 +41,7 @@ import { SCHEMA_NAMES } from './admission.mjs';
 import { NOTICE_SCHEMA_NAMES, PROTECTED_NOTICE_PEEK_SCHEMA } from './notices.mjs';
 import { TASK_SCHEMA_NAMES, TASK_WIRE_SCHEMA_NAMES } from './tasks.mjs';
 import { createHQ } from './hq.mjs';
+import { pushReceipt } from '../sdk/services.mjs';
 import { productionPluginsDir, readPins } from './plugins.mjs';
 import { activatedOwnerControl, checkOwnerControlSupport, checkOwnerSocketPath, OWNER_CONTROL_PATH } from './owner-control.mjs';
 import { connectSocket } from './socket.mjs';
@@ -52,6 +53,7 @@ import { relaySoulAcp } from './soul-acp-relay.mjs';
 import { validate } from '../sdk/wire/schema.mjs';
 import { verifyStage2aProtectedCandidateReservationV3 } from './stage2a-reservation.mjs';
 import { createStage2aMachineBridgeAuthority } from './stage2a-machine-bridge-authority.mjs';
+import { createStage2aStoppedRefusal } from './stage2a-stopped-refusal.mjs';
 import { createStage2aProtectedStarter } from './stage2a-protected-start.mjs';
 import { createStage2aProtectedAdmission } from './stage2a-protected-admission.mjs';
 import { authenticatedSelectedH } from './stage2a-h-preloader.mjs';
@@ -64,7 +66,7 @@ import { verifiedT03ChildStart, verifyT03RelayPeer } from './stage2a-t03-peer.mj
 import { checkedT03SiblingWitness, recordT03SiblingWitness,
   waitForT03SiblingWitnesses } from './stage2a-t03-sibling.mjs';
 
-const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul starts|soul local-test-q-issue --plan-id ID --installation-id ID|enroll|whoami|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine soul-bridge-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
+const USAGE = 'usage: node hq/main.mjs <run|status|souls|soul start --soul DIR [--profile managed-protected]|soul stop --start-id ID|soul stopped-refusal --start-id ID|soul starts|soul local-test-q-issue --plan-id ID --installation-id ID|enroll|whoami|machine identity|machine status|machine members-plans|machine hq-service-recovery|machine hq-service-upgrade|machine harness-account-provision|machine soul-runner-provision|machine soul-bridge-provision|machine harness-launch-install|machine harness-launch-retire|machine harness-qualification-run|machine soul-protected-launch-install|check-owner-control> [--home DIR] [--plugins DIR] [--dev-plugins DIR] [--owner-account NAME | --owner-control] [--json]';
 const PINS = join(dirname(fileURLToPath(import.meta.url)), '../governance/plugins.json');
 
 function parse(argv) {
@@ -86,8 +88,8 @@ function parse(argv) {
       if (!args.soul || args.cmd !== 'soul' || args.sub !== 'start') throw new Error('--soul DIR is only for soul start');
     } else if (argv[i] === '--start-id') {
       args.startId = argv[++i];
-      if (!/^st_[0-9a-f]{24}$/.test(args.startId ?? '') || args.cmd !== 'soul' || !['stop', 'qualify-direct'].includes(args.sub)) {
-        throw new Error('--start-id needs a valid start ID and is only for soul stop or soul qualify-direct');
+      if (!/^st_[0-9a-f]{24}$/.test(args.startId ?? '') || args.cmd !== 'soul' || !['stop', 'qualify-direct', 'stopped-refusal'].includes(args.sub)) {
+        throw new Error('--start-id needs a valid start ID and a matching soul operation');
       }
     } else if (argv[i] === '--plan-id' || argv[i] === '--installation-id') {
       const flag = argv[i], value = argv[++i];
@@ -322,11 +324,17 @@ async function main(argv) {
       const verifyReservation = installed.length ? (envelope, plan, reservationSHA256) =>
         verifyStage2aProtectedCandidateReservationV3(envelope, { enrolledMachineKey: machinePublicKey,
           installed: plan, reservationSHA256, validatePayload }) : undefined;
+      let hq;
+      let stoppedRefusal;
       const authority = installed.length ? createStage2aMachineBridgeAuthority({
-        machinePublicKey, verifyReservation }) : undefined;
+        machinePublicKey, verifyReservation,
+        onStopVerified: (stop) => stoppedRefusal?.recordStop(stop) }) : undefined;
+      stoppedRefusal = authority && verifyHQCodeReady() ? createStage2aStoppedRefusal({ machinePublicKey,
+        receipts: () => hq.core.receipts,
+        persist: (receipt) => pushReceipt(hq.core, { plugin: 'hq', ...receipt }),
+        isActive: (reservationSHA256) => authority.hasStart(reservationSHA256) }) : undefined;
       const providers = new Map();
       const providerStarts = new Map();
-      let hq;
       const memberContracts = managedHq && selectedH ? loadCooperativeMemberSchemas() : undefined;
       const cooperativeMachine = managedHq && selectedH ? createStage2aCooperativeMachine({
         exchange: machineRoleStage2aCooperative, hDescriptorDigest: selectedH.descriptorDigest,
@@ -523,6 +531,7 @@ async function main(argv) {
         pluginsDir, devPlugins: args.devPlugins, bridgeAssignments: installed,
         bridgeAuthority: authority, machineHqEpoch: epochs.values().next().value,
         createProtectedStart, protectedAdmission, createCooperativeStart, cooperativeAdmission: cooperativeMachine,
+        stoppedStartDiagnostic: stoppedRefusal?.inspect,
         // Production B uses its dedicated v2 relay ingress. The synthetic
         // bridge qualification route stays disabled so it cannot consume the
         // installed one-use Machine provider response.
@@ -706,9 +715,10 @@ async function main(argv) {
       await startSoul(controlPath, args.soul, args.profile);
       return;
     }
-    if (!['stop', 'starts', 'qualify-direct'].includes(args.sub)) throw new Error(USAGE);
-    if (['stop', 'qualify-direct'].includes(args.sub) && !args.startId) throw new Error(`soul ${args.sub} needs --start-id ID`);
-    const result = await ask(controlPath, `soul.${args.sub}`,
+    if (!['stop', 'starts', 'qualify-direct', 'stopped-refusal'].includes(args.sub)) throw new Error(USAGE);
+    if (['stop', 'qualify-direct', 'stopped-refusal'].includes(args.sub) && !args.startId) throw new Error(`soul ${args.sub} needs --start-id ID`);
+    const operation = args.sub === 'stopped-refusal' ? 'soul.protected-stopped-refusal' : `soul.${args.sub}`;
+    const result = await ask(controlPath, operation,
       args.startId ? { start_id: args.startId } : undefined);
     if (!result.ok) throw new Error(JSON.stringify(result.refusal ?? result.host_refusal ?? result));
     console.log(JSON.stringify(result.result, null, 2));
