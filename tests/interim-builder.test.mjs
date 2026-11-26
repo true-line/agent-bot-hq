@@ -38,18 +38,54 @@ test('interim artifact is reproducible, runs offline and refuses changed contrac
     writeFileSync(join(repo, 'hq/main.mjs'), "import { verify } from '../scripts/soul-contracts.mjs'; verify(); console.log('offline-ok');\n");
     writeFileSync(join(repo, 'hq/stage2a-h-preloader.mjs'),
       'export function authenticatedSelectedH() { return null; }\n');
-    for (const f of ['soul-contracts.mjs', 'h-v0103-excluded.mjs', 'build-interim-release.mjs']) {
+    for (const f of ['soul-contracts.mjs', 'h-v0103-excluded.mjs', 'soul-runner.mjs', 'build-interim-release.mjs']) {
       cpSync(join(root, 'scripts', f), join(repo, 'scripts', f));
     }
+    // A local disposable Git object fixture; it is never pushed or published.
+    const ident = { ...process.env, GIT_AUTHOR_NAME: 'trueline-codex-agent[bot]', GIT_COMMITTER_NAME: 'trueline-codex-agent[bot]', GIT_AUTHOR_EMAIL: '325086705+trueline-codex-agent[bot]@users.noreply.github.com', GIT_COMMITTER_EMAIL: '325086705+trueline-codex-agent[bot]@users.noreply.github.com' };
+    const runnerRepo = join(tmp, 'runner');
+    mkdirSync(runnerRepo);
+    run('git', ['init', '-q', runnerRepo]);
+    const runnerPackage = Buffer.from('{"name":"runner-fixture"}\n');
+    const runnerEntries = [
+      { path: 'package.json', mode: '100644', bytes: runnerPackage },
+      ...['bin', 'governance', 'lib'].map((dir) => ({ path: `${dir}/fixture.txt`, mode: '100644', bytes: Buffer.from(`${dir}\n`) })),
+    ];
+    for (const { path, bytes } of runnerEntries) {
+      const file = join(runnerRepo, path);
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, bytes);
+    }
+    run('git', ['-C', runnerRepo, 'add', '.']);
+    const runnerTree = run('git', ['-C', runnerRepo, 'write-tree']).trim();
+    const runnerCommit = run('git', ['-C', runnerRepo, 'commit-tree', runnerTree, '-m', 'runner fixture'], { env: ident }).trim();
+    const runnerDigest = manifestDigest(runnerEntries);
+    writeFileSync(join(repo, 'governance/soul-runner.json'), JSON.stringify({
+      schema_version: 1, repository: 'https://github.com/true-line/agent-bot-souls.git',
+      source_commit: runnerCommit, source_status: 'unreleased-source',
+      paths: ['bin', 'governance', 'lib', 'package.json'], digest_algorithm: 'sha256-manifest-v1',
+      digest: runnerDigest.digest, files: runnerDigest.files,
+    }));
+    writeFileSync(join(runnerRepo, 'package.json'), '{}\n');
+
     run('git', ['init', '-q', repo]);
     run('git', ['-C', repo, 'add', '.']);
-    // A local disposable Git object fixture; it is never pushed or published.
     const tree = run('git', ['-C', repo, 'write-tree']).trim();
-    const ident = { ...process.env, GIT_AUTHOR_NAME: 'trueline-codex-agent[bot]', GIT_COMMITTER_NAME: 'trueline-codex-agent[bot]', GIT_AUTHOR_EMAIL: '325086705+trueline-codex-agent[bot]@users.noreply.github.com', GIT_COMMITTER_EMAIL: '325086705+trueline-codex-agent[bot]@users.noreply.github.com' };
     const fixtureCommit = run('git', ['-C', repo, 'commit-tree', tree, '-m', 'fixture'], { env: ident }).trim();
     run('git', ['-C', repo, 'update-ref', 'HEAD', fixtureCommit]);
     const sha = run('git', ['-C', repo, 'rev-parse', 'HEAD']).trim();
     const { extracted, executable } = buildAndVerifyTargets(repo, sha, contracts);
+    assert.equal(existsSync(join(extracted, 'hq/vendor/agent-bot-souls')), false);
+    const bundle = join(tmp, 'with-runner.tar');
+    run(process.execPath, [join(repo, 'scripts/build-interim-release.mjs'), sha, contracts, bundle, ...nativeTarget, '--soul-runner-source', runnerRepo], { cwd: repo });
+    const bundledTree = join(tmp, 'with-runner');
+    mkdirSync(bundledTree);
+    run('tar', ['-xf', bundle, '-C', bundledTree]);
+    assert.deepEqual(readFileSync(join(bundledTree, 'hq/vendor/agent-bot-souls/package.json')), runnerPackage);
+    const bundledMetadata = JSON.parse(readFileSync(join(bundledTree, 'hq/governance/interim-release.json')));
+    assert.deepEqual(bundledMetadata.soul_runner, {
+      source_commit: runnerCommit, source_status: 'unreleased-source', digest: runnerDigest.digest,
+    });
     assert.match(run(process.execPath, [executable], { env: { PATH: '' } }), /offline-ok/);
     writeFileSync(join(extracted, 'hq/vendor/soul-contracts/errors/one.json'), 'tampered');
     const refused = spawnSync(process.execPath, [executable], { env: { PATH: '' }, encoding: 'utf8' });
