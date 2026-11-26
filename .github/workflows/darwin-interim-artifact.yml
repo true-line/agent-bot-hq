@@ -74,3 +74,13 @@ jobs:
             xcrun swiftc scripts/check-macos-enclave.swift -o "$RUNNER_TEMP/hq-enclave-check"
             bash tests/darwin-artifact-service-account.sh "$archive" "$RUNNER_TEMP/hq-enclave-check"
           fi
+          printf '%s  hq-darwin.tar\n' "$LINUX_BUILT_SHA256" > "$archive.sha256"
+      - name: Retain the verified Darwin tar for release review
+        if: github.repository == 'true-line/agent-bot-hq' && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref_protected && matrix.major == '15'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hq-darwin-arm64-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/hq-darwin.tar
+            ${{ runner.temp }}/hq-darwin.tar.sha256
+          if-no-files-found: error
