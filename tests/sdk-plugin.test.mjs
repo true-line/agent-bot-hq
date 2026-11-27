@@ -2,18 +2,18 @@
 // table (plan §4.1, §4.2, §4.5).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { definePlugin, validateManifest, staticManifest, supportedHostApis, HOST_SERVICES } from '../sdk/plugin.mjs';
+import { definePlugin, validateManifest, staticManifest, supportedHostApis, HOST_API, HOST_SERVICES } from '../sdk/plugin.mjs';
 import { compareVersions, satisfies, validRange } from '../sdk/semver.mjs';
 import { HQ_OPERATIONS, SAFE_MODE_OPERATIONS, ADMISSION_OPERATIONS } from '../sdk/operations.mjs';
 
-const base = { name: 'agent-comms', version: '0.6.0', hostApi: 1, async init() {} };
+const base = { name: 'agent-comms', version: '0.6.0', hostApi: HOST_API, async init() {} };
 const invalid = (m, pattern) => assert.throws(() => validateManifest(m), (e) => e.code === 'host.invalid_manifest' && pattern.test(e.message));
 
 test('the plan §4.1 example manifest is valid', () => {
   const p = definePlugin({
     ...base,
     optional: { 'agent-bot-souls': '>=0.1.0 <1' },
-    services: ['config', 'store', 'log', 'receipts', 'identityService', 'credentials', 'launch', 'events', 'approvals', 'budgets'],
+    services: ['config', 'store', 'log', 'receipts', 'identityService', 'credentials', 'launch', 'events', 'approvals'],
     identityServiceRoutes: ['/api/daemon/notices*'],
   });
   assert.ok(Object.isFrozen(p));
@@ -40,12 +40,19 @@ test('manifest refusals', () => {
 });
 
 test('host services match the plan §4.3 table, with no host-side secret store', () => {
-  assert.deepEqual([...HOST_SERVICES].sort(), ['approvals', 'budgets', 'clock', 'config', 'credentials', 'events', 'identityService', 'launch', 'log', 'profile', 'random', 'receipts', 'store']);
+  assert.deepEqual([...HOST_SERVICES].sort(), ['approvals', 'clock', 'config', 'credentials', 'events', 'identityService', 'launch', 'log', 'profile', 'random', 'receipts', 'store']);
 });
 
 test('hostApi window is N and N-1, never 0', () => {
+  assert.deepEqual(supportedHostApis(), [2, 1]);
   assert.deepEqual(supportedHostApis(1), [1]);
   assert.deepEqual(supportedHostApis(3), [3, 2]);
+});
+
+test('budget service declarations remain valid for host API 1 only', () => {
+  const services = ['budgets'];
+  assert.deepEqual(definePlugin({ ...base, hostApi: 1, services }).services, services);
+  invalid({ ...base, hostApi: 2, services }, /unknown host service budgets/);
 });
 
 test('semver comparison and ranges', () => {
